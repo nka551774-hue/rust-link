@@ -91,7 +91,10 @@ fn post(url: &str, discord: bool, event: &Value) -> Result<(), String> {
         .http_status_as_error(false)
         .build()
         .send_json(&body)
-        .map_err(|error| format!("{url} could not be reached: {error}"))?;
+        .map_err(|error| {
+            let detail = error.to_string().replace(url, "<redacted webhook URL>");
+            format!("webhook endpoint could not be reached: {detail}")
+        })?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(format!("webhook answered {status}"));
@@ -419,6 +422,17 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_delivery_does_not_put_the_webhook_token_in_logs() {
+        // An invalid authority fails before any network request is attempted.
+        let target = "http://bad host/api/webhooks/123/private-webhook-token?key=private-key";
+        let error = post(target, false, &json!({ "type": "test" })).unwrap_err();
+        assert!(error.contains("could not be reached"));
+        assert!(!error.contains("private-webhook-token"));
+        assert!(!error.contains("private-key"));
+        assert!(!error.contains(target));
+    }
 
     #[test]
     fn a_discord_url_is_recognised_by_host_or_path() {

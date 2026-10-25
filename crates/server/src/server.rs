@@ -249,6 +249,17 @@ impl Server {
         }
     }
 
+    /// Register before checking the persistent state so closing before a task
+    /// starts, or between iterations, cannot lose the shutdown notification.
+    async fn shutdown_requested(&self) {
+        let notified = self.shutdown.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.closed.load(Ordering::SeqCst) {
+            notified.await;
+        }
+    }
+
     /// Starts the tasks that sample the machine, expire sessions and post the
     /// node-wide reports.
     fn start_background(self: &Arc<Self>, reports: mpsc::Receiver<()>) {
@@ -1272,7 +1283,7 @@ impl Server {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
-                _ = self.shutdown.notified() => return,
+                _ = self.shutdown_requested() => return,
                 _ = ticker.tick() => {
                     self.cpu.sample();
                     let expired: Vec<Arc<Session>> = {
@@ -1303,7 +1314,7 @@ impl Server {
         self.request_report();
         loop {
             tokio::select! {
-                _ = self.shutdown.notified() => return,
+                _ = self.shutdown_requested() => return,
                 request = reports.recv() => {
                     if request.is_none() {
                         return;

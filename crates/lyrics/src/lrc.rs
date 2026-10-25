@@ -7,6 +7,11 @@
 use crate::Line;
 use rustlink_protocol::Object;
 
+// Repeated timestamps duplicate the following text. Bound the expanded result,
+// not only the provider's response, before allocating those copies.
+const MAX_LINES: usize = 10_000;
+const MAX_TEXT_BYTES: usize = 8 << 20;
+
 /// Turns the text a timed provider returns into lines.
 ///
 /// A tag that names a field rather than a time, such as `[ar:...]`, carries no
@@ -14,6 +19,7 @@ use rustlink_protocol::Object;
 /// read as a line at time zero.
 pub fn parse(text: &str) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
+    let mut text_bytes = 0usize;
     for raw in text.split('\n') {
         let raw = raw.trim_end_matches('\r');
         let mut rest = raw;
@@ -26,6 +32,10 @@ pub fn parse(text: &str) -> Vec<Line> {
             continue;
         }
         let words = rest.trim().to_string();
+        text_bytes = text_bytes.saturating_add(stamps.len().saturating_mul(words.len()));
+        if lines.len().saturating_add(stamps.len()) > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
+            return Vec::new();
+        }
         for at in stamps {
             lines.push(Line {
                 timestamp: at,
@@ -54,7 +64,13 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
     let end = text.find(']')?;
     let body = &text[1..end];
     let colon = body.find(':')?;
-    let minutes: i64 = body[..colon].trim().parse().ok()?;
+    let decimal = |digits: &str| -> Option<i64> {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    let minutes = decimal(body[..colon].trim())?;
     let mut seconds = body[colon + 1..].trim();
     let mut fraction = 0i64;
     if let Some(dot) = seconds.find('.') {
@@ -63,15 +79,20 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
         if digits.len() > 3 {
             return None;
         }
-        let value: i64 = digits.parse().ok()?;
+        let value = decimal(digits)?;
         fraction = match digits.len() {
             1 => value * 100,
             2 => value * 10,
             _ => value,
         };
     }
-    let whole: i64 = seconds.parse().ok()?;
-    Some((end + 1, minutes * 60_000 + whole * 1000 + fraction))
+    let whole = decimal(seconds)?;
+    if whole >= 60 {
+        return None;
+    }
+    let timestamp =
+        minutes.checked_mul(60_000)?.checked_add(whole * 1000)?.checked_add(fraction)?;
+    Some((end + 1, timestamp))
 }
 
 /// Gives every line but the last the gap to the next one, which is how long it
@@ -135,5 +156,33 @@ mod tests {
     #[test]
     fn text_with_no_tags_is_no_lyrics() {
         assert!(parse("just words\nand more words").is_empty());
+    }
+
+    #[test]
+    fn malformed_and_overflowing_timestamps_are_skipped() {
+        for stamp in [
+            "[-1:02]",
+            "[00:-1]",
+            "[00:60]",
+            "[00:00.-1]",
+            "[+1:02]",
+            "[00:00.]",
+            "[9223372036854775807:00]",
+            "[153722867280912:59.999]",
+        ] {
+            let lines = parse(&format!("{stamp}invalid\n[00:01.00]valid"));
+            assert_eq!(lines.len(), 1, "{stamp}");
+            assert_eq!(lines[0].timestamp, 1000, "{stamp}");
+            assert_eq!(lines[0].line, "valid");
+        }
+        assert_eq!(parse("[153722867280912:55.807]last")[0].timestamp, i64::MAX);
+    }
+
+    #[test]
+    fn repeated_timestamps_cannot_expand_an_answer_without_a_bound() {
+        let large_line = format!("{}{}", "[00:01]".repeat(20), "a".repeat(512 << 10));
+        assert!(large_line.len() < 1 << 20);
+        assert!(parse(&large_line).is_empty());
+        assert!(parse(&format!("{}words", "[00:01]".repeat(MAX_LINES + 1))).is_empty());
     }
 }

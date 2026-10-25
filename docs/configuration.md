@@ -26,7 +26,7 @@ configured without mounting one.
 | `ffmpeg` | `ffmpeg` | The FFmpeg executable: a bare name, a path, or `none`. A bare name means a file inside `toolsDirectory` and is never looked up on `PATH`, so every node runs the build it was given. `none` switches FFmpeg off entirely. |
 | `toolsDirectory` | `.tools` | Where downloaded helpers live. |
 | `autoDownload` | `false` | Install a helper that is neither in `toolsDirectory` nor named by an explicit path. |
-| `inProcessAudio` | `true` | Decode, filter and encode in process. Turning it off sends everything through FFmpeg, which only costs performance. |
+| `inProcessAudio` | `true` | Decode, filter and encode in process. Turning it off sends everything through FFmpeg. The engines use different decoder and DSP implementations; CPU cost and filter output can differ. |
 | `lyricsSource` | `lrclib` | `lrclib` asks the database and then YouTube Music for timed lines; `none` switches lyrics off and stops the node calling anything. |
 
 FFmpeg is only needed for the containers the in-process pipeline declines, so a
@@ -89,8 +89,29 @@ one as `false` makes a player update that asks for it fail with
 | `playerUpdateSeconds` | `5` | How often a session reports the position of its players. |
 | `statsSeconds` | `60` | How often the machine is sampled for `/api/v1/stats`. |
 | `eventBuffer` | `256` | Events that may wait for a socket. A client that stops reading fills it and is then closed, because a node that drops events silently leaves a client showing something that is not happening. |
-| `opusBitrate` | `128000` | Opus bitrate in bits per second. |
+| `opusBitrate` | `192000` | Music-oriented Opus target bitrate in bits per second, from `16000` to `256000`. Higher targets use more network bandwidth. |
 | `opusComplexity` | `10` | How hard the Opus encoder works, on its own scale of zero to ten. Lowering it spends less CPU on every frame of every track, which is the knob for a node that carries more players than it has cores; the in-process pipeline and the FFmpeg fallback both follow it. |
+
+The default music profile is 48 kHz stereo Opus, 20 ms packets, a 192 kbit/s
+variable-bitrate target and complexity 10. Both engines explicitly apply the
+bitrate, complexity, VBR, audio application and packet-loss/FEC settings. FEC
+availability depends on the Opus coding mode and receiver; it is not a promise
+that every lost packet will be recovered.
+
+Only omitted settings use the new default. An existing `opusBitrate: 128000`
+or `RUSTLINK_OPUS_BITRATE` override keeps its value. A higher encoding target
+reduces the need for additional compression; transcoding cannot restore detail
+missing from the original source. Source selection, its original encoding,
+filters, Discord's voice channel and the listener's connection still affect
+what is heard. This profile is lossy, not a lossless or quality guarantee.
+
+The native pipeline converts source audio to 48 kHz before applying the
+frequency-dependent filters. Resampling preserves the beginning and flushes
+the end of the source; Ogg Opus pre-skip, output gain and end granule are applied
+when decoding. The encoder's delayed samples are flushed too. RTP uses complete
+20 ms packets and carries no Ogg trimming metadata, so an extra final packet
+can contain codec delay and silence padding. The two engines are not expected
+to produce identical encoded bytes or identical DSP samples.
 
 ## Rate limits
 
@@ -113,8 +134,8 @@ node: a configured endpoint is part of the deployment, not an optional extra.
 
 ## Environment variables
 
-Every option has one, named `RUSTLINK_` followed by the option in
-`SCREAMING_SNAKE_CASE`: `RUSTLINK_ADDRESS`, `RUSTLINK_PASSWORD`,
+The following environment overrides are supported; use these exact names:
+`RUSTLINK_ADDRESS`, `RUSTLINK_PASSWORD`,
 `RUSTLINK_FFMPEG`, `RUSTLINK_TOOLS_DIRECTORY`, `RUSTLINK_AUTO_DOWNLOAD`,
 `RUSTLINK_IN_PROCESS_AUDIO`, `RUSTLINK_LYRICS_SOURCE`, `RUSTLINK_LOG_LEVEL`,
 `RUSTLINK_LOG_FORMAT`, `RUSTLINK_LOG_COLOR`, `RUSTLINK_LOG_DIRECTORY`,
@@ -134,6 +155,7 @@ Every option has one, named `RUSTLINK_` followed by the option in
 `RUSTLINK_WEBHOOK_ENABLED`, `RUSTLINK_WEBHOOK_URL`
 and `RUSTLINK_WEBHOOK_STATE_LATENCY_SECONDS`.
 
-Spotify settings also accept `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`,
-`SPOTIFY_REFRESH_TOKEN` and `SPOTIFY_MARKET`. These override the corresponding
-configuration fields, just like the `RUSTLINK_*` variables above.
+Spotify settings use `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`,
+`SPOTIFY_REFRESH_TOKEN` and `SPOTIFY_MARKET`, without a `RUSTLINK_` prefix.
+These override the corresponding configuration fields, just like the
+`RUSTLINK_*` variables above.

@@ -46,7 +46,7 @@ impl FilterError {
 }
 
 /// A validated filter request.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FilterSet {
     /// The global volume and the volume filter combined.
     pub gain: f64,
@@ -59,6 +59,23 @@ pub struct FilterSet {
     pub distort: Option<Distortion>,
     pub mix: Option<ChannelMix>,
     pub low_pass: Option<LowPass>,
+}
+
+impl Default for FilterSet {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            bands: Vec::new(),
+            karaoke: None,
+            time: None,
+            tremolo: None,
+            vibrato: None,
+            rotation: None,
+            distort: None,
+            mix: None,
+            low_pass: None,
+        }
+    }
 }
 
 /// One peaking band, already converted from the protocol's gain scale.
@@ -509,6 +526,14 @@ impl fmt::Display for FilterSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_filter_set_is_neutral_in_both_engines() {
+        let defaults = FilterSet::default();
+        assert_eq!(defaults, parse(&Object::default(), 100).unwrap());
+        assert!(crate::dsp::DspChain::new(&defaults).is_empty());
+        assert!(defaults.render_ffmpeg().contains("volume=1.00000000"));
+    }
     use serde_json::json;
 
     fn object(value: serde_json::Value) -> Object {

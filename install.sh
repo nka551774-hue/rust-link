@@ -240,11 +240,14 @@ install_files() {
 write_config() {
     step "Writing the configuration"
     local template="$SOURCE/config.example.yaml"
+    local escaped_address escaped_password
+    escaped_address=$(sed_replacement "$ADDRESS")
+    escaped_password=$(sed_replacement "$PASSWORD")
     if [ -f "$template" ]; then
         # The example is the configuration with the three values this run knows
         # better, so every comment and every other default stays where it is.
-        sed -e "s|^address:.*|address: $ADDRESS:$PORT|" \
-            -e "s|^password:.*|password: \"$PASSWORD\"|" \
+        sed -e "s|^address:.*|address: $escaped_address:$PORT|" \
+            -e "s|^password:.*|password: \"$escaped_password\"|" \
             -e "s|^autoDownload:.*|autoDownload: true|" \
             "$template" >"$DIRECTORY/config.yaml"
     else
@@ -260,16 +263,26 @@ TEXT
     chmod 0640 "$DIRECTORY/config.yaml"
 }
 
+sed_replacement() {
+    # CLI values are literal data: '&' must not expand to the matched line,
+    # and a delimiter in a password must not become another sed command.
+    printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+}
+
 set_password() {
-    sed -i -e "s|^password:.*|password: \"$PASSWORD\"|" "$DIRECTORY/config.yaml"
+    local escaped_password
+    escaped_password=$(sed_replacement "$PASSWORD")
+    sed -i -e "s|^password:.*|password: \"$escaped_password\"|" "$DIRECTORY/config.yaml"
     note "the password in $DIRECTORY/config.yaml was replaced"
 }
 
 install_unit() {
     step "Installing the systemd unit"
+    local escaped_directory
+    escaped_directory=$(sed_replacement "$DIRECTORY")
     # The unit in the repository names the default directory and user; those
     # names are rewritten to the ones this run was given.
-    sed -e "s|/opt/rustlink|$DIRECTORY|g" \
+    sed -e "s|/opt/rustlink|$escaped_directory|g" \
         -e "s|^User=rustlink|User=$SERVICE_USER|" \
         -e "s|^Group=rustlink|Group=$SERVICE_GROUP|" \
         "$SOURCE/deploy/rustlink.service" >/etc/systemd/system/rustlink.service

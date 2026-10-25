@@ -156,7 +156,9 @@ impl Player {
     /// the node.
     pub fn playing(&self) -> bool {
         let state = self.state.lock().unwrap();
-        state.body.track.is_some() && !state.body.paused && state.body.state.connected
+        state.body.track.is_some()
+            && !state.body.paused
+            && state.connection.as_ref().is_some_and(|connection| connection.connected())
     }
 
     fn snapshot_locked(&self, state: &State) -> PlayerBody {
@@ -212,8 +214,8 @@ impl Player {
             if state.closed {
                 return Err(PlayerError::Destroyed);
             }
-            let mut restart =
-                update.position.is_some() || update.volume.is_some() || update.filters.is_some();
+            let mut restart = update.volume.is_some_and(|volume| volume.get() != state.body.volume)
+                || update.filters.as_ref().is_some_and(|filters| *filters != state.body.filters);
             if changes_track && !ignore {
                 self.stop(&mut state);
                 if let Some(previous) = state.body.track.take() {
@@ -243,6 +245,7 @@ impl Player {
                         if current.metadata.length > 0 && target > current.metadata.length {
                             target = current.metadata.length;
                         }
+                        restart |= target != state.body.state.position;
                         state.body.state.position = target;
                     }
                 }
@@ -258,10 +261,8 @@ impl Player {
             if changes_track && !ignore {
                 // A new track starts unless the same request explicitly pauses it.
                 state.body.paused = update.paused.unwrap_or(false);
-            } else if !changes_track {
-                if let Some(paused) = update.paused {
-                    state.body.paused = paused;
-                }
+            } else if let Some(paused) = update.paused {
+                state.body.paused = paused;
             }
             if let Some(filters) = &update.filters {
                 state.body.filters = filters.clone();
@@ -791,7 +792,7 @@ mod tests {
             Ok(())
         }
         fn connected(&self) -> bool {
-            true
+            self.closed.load(Ordering::Relaxed) == 0
         }
         fn ping(&self) -> i64 {
             7
@@ -941,6 +942,88 @@ mod tests {
         let end = wait_for(&events, "track.ended");
         assert_eq!(end["reason"], "finished");
         assert!(connection.frames.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn playing_status_follows_the_live_connection_and_pause_state() {
+        let (player, events, connection) = player(1000);
+        player
+            .update(update(json!({ "track": { "token": sample().token } })), false)
+            .await
+            .unwrap();
+        assert!(!player.playing(), "a loaded track has no voice connection yet");
+
+        player.update(update(json!({ "voice": voice() })), false).await.unwrap();
+        wait_for(&events, "track.started");
+        assert!(player.snapshot().state.connected);
+        assert!(player.playing(), "active playback must be counted in node stats");
+
+        player.update(update(json!({ "paused": true })), false).await.unwrap();
+        assert!(!player.playing());
+        player.update(update(json!({ "paused": false })), false).await.unwrap();
+        assert!(player.playing());
+
+        connection.close();
+        assert!(!player.snapshot().state.connected);
+        assert!(!player.playing(), "a closed transport must stop counting immediately");
+        player.destroy();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_settings_and_unseekable_positions_do_not_reopen_the_source() {
+        struct RecordingEngine(Sender<i64>);
+        impl Engine for RecordingEngine {
+            fn start(
+                &self,
+                _: &Track,
+                position: i64,
+                _: i64,
+                _: &Object,
+            ) -> Result<Box<dyn Frames>, AudioError> {
+                self.0.send(position).unwrap();
+                Ok(Box::new(FakeFrames { left: 1000 }))
+            }
+        }
+        let (starts, opened) = channel();
+        let connection = Arc::new(FakeConnection::default());
+        let player = Player::new(
+            "1".into(),
+            "10".into(),
+            Arc::new(Deps {
+                loader: Arc::new(FakeLoader),
+                engine: Arc::new(RecordingEngine(starts)),
+                voice: Arc::new(FakeVoice { connection }),
+            }),
+            Arc::new(|_| {}),
+            Arc::new(Counters::default()),
+        );
+        let mut info = sample().metadata;
+        info.is_seekable = false;
+        let track = encode_track(&info).unwrap();
+        player
+            .update(
+                update(
+                    json!({ "track": { "token": track.token }, "voice": voice(), "paused": true }),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(opened.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+
+        player
+            .update(update(json!({ "position_ms": 5000, "volume": 100, "filters": {} })), false)
+            .await
+            .unwrap();
+        assert_eq!(player.snapshot().state.position, 0);
+        assert!(opened.recv_timeout(Duration::from_millis(200)).is_err());
+
+        let settings = json!({ "volume": 75, "filters": { "timescale": { "speed": 1.1 } } });
+        player.update(update(settings.clone()), false).await.unwrap();
+        assert_eq!(opened.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        player.update(update(settings), false).await.unwrap();
+        assert!(opened.recv_timeout(Duration::from_millis(200)).is_err());
+        player.destroy();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

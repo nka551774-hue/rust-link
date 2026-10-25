@@ -27,8 +27,9 @@ pub struct SincResampler {
     ratio: f64,
     /// Where the next output frame is read from, in input frames.
     position: f64,
-    /// Input frames that have already been consumed by the read position.
-    consumed: usize,
+    input_frames: u64,
+    output_frames: u64,
+    finished: bool,
     /// Which row of the weight table the next output frame reads.
     phase: usize,
     /// The weights of every phase, when the ratio repeats them.
@@ -44,14 +45,16 @@ impl SincResampler {
         let cutoff = if ratio > 1.0 { 1.0 / ratio } else { 1.0 };
         SincResampler {
             ratio,
-            // The first output frame needs TAPS/2 frames of history behind it,
-            // so the read position starts that far in.
+            // Zero history puts the first source sample at the first output
+            // position instead of dropping half a filter window from the song.
             position: (TAPS / 2) as f64,
-            consumed: 0,
+            input_frames: 0,
+            output_frames: 0,
+            finished: false,
             phase: 0,
             // The unity ratio has its own path that needs no weights at all.
             phases: if ratio == 1.0 { None } else { Phases::new(ratio, cutoff) },
-            buffer: Vec::new(),
+            buffer: vec![0.0; TAPS / 2 * CHANNELS],
         }
     }
 
@@ -65,22 +68,37 @@ impl SincResampler {
 
     /// Appends interleaved input.
     pub fn push(&mut self, input: &[f32]) {
+        assert!(!self.finished, "cannot push after the resampler is finished");
+        self.input_frames += (input.len() / CHANNELS) as u64;
         self.buffer.extend_from_slice(input);
+    }
+
+    /// Supplies the final lookahead without including the padding in the
+    /// output duration. Calling this twice does not append more silence.
+    pub fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.buffer.resize(self.buffer.len() + (TAPS / 2 + 1) * CHANNELS, 0.0);
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        let total = (self.input_frames as f64 / self.ratio - 1e-9).ceil().max(0.0) as u64;
+        total.saturating_sub(self.output_frames).min(usize::MAX as u64) as usize
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self.finished && self.remaining() == 0
     }
 
     /// How many whole output frames can be produced from what has been pushed.
     pub fn available(&self) -> usize {
+        if self.finished {
+            return self.remaining();
+        }
         let frames = self.buffer.len() / CHANNELS;
-        let last_needed = self.position + (TAPS / 2) as f64;
-        if last_needed + 1.0 >= frames as f64 {
-            return 0;
-        }
-        let count = ((frames as f64 - 1.0 - (TAPS / 2) as f64) - self.position) / self.ratio;
-        if count < 0.0 {
-            0
-        } else {
-            count.floor() as usize + 1
-        }
+        // floor(position) + half_window + 1 must fit in the input buffer.
+        ((frames as f64 - (TAPS / 2) as f64 - self.position) / self.ratio).ceil().max(0.0) as usize
     }
 
     /// Produces up to `limit` output frames, appending them to `out`.
@@ -88,11 +106,13 @@ impl SincResampler {
     /// Returns how many frames were produced, which is zero when the caller has
     /// not pushed enough input yet.
     pub fn produce(&mut self, limit: usize, out: &mut Vec<f32>) -> usize {
+        let limit = if self.finished { limit.min(self.remaining()) } else { limit };
         let produced = if self.ratio == 1.0 {
             self.produce_unity(limit, out)
         } else {
             self.produce_filtered(limit, out)
         };
+        self.output_frames += produced as u64;
         self.compact();
         produced
     }
@@ -195,11 +215,13 @@ impl SincResampler {
     fn compact(&mut self) {
         // Everything before the next read position's window is never read again.
         let keep_from = (self.position.floor() as usize).saturating_sub(TAPS / 2 + 1);
-        if keep_from > self.consumed + 4096 {
-            let drop = (keep_from - self.consumed) * CHANNELS;
+        // position is relative to the current buffer. Mixing an absolute
+        // consumed count into it retained progressively more audio on long runs.
+        if keep_from > 4096 {
+            let keep_from = keep_from.min(self.buffer.len() / CHANNELS);
+            let drop = keep_from * CHANNELS;
             self.buffer.drain(..drop);
-            self.position -= (keep_from - self.consumed) as f64;
-            self.consumed = keep_from;
+            self.position -= keep_from as f64;
         }
     }
 }
@@ -506,11 +528,8 @@ mod tests {
         let mut out = Vec::new();
         let produced = resampler.produce(2048, &mut out);
         assert_eq!(produced, 2048);
-        // The filter reads half a window ahead, so output frame k is input frame
-        // k + TAPS/2. The first frames sit inside the warm-up, so the check
-        // starts after it.
-        for i in 64..1024 {
-            let source = i + TAPS / 2;
+        for i in 0..1024 {
+            let source = i;
             let expected =
                 (2.0 * std::f64::consts::PI * 440.0 * source as f64 / 48_000.0).sin() as f32;
             let got = out[i * CHANNELS];
@@ -576,7 +595,49 @@ mod tests {
         resampler.push(&tone(200.0, 8192));
         let mut out = Vec::new();
         let produced = resampler.produce(8192, &mut out);
-        assert!((produced as i64 - 4088).abs() <= 2, "produced {produced}");
+        assert!((produced as i64 - 4092).abs() <= 2, "produced {produced}");
+    }
+
+    #[test]
+    fn finishing_keeps_short_sources_and_exact_output_duration() {
+        for rate in [8_000, 22_050, 44_100, 48_000, 96_000] {
+            for input_frames in [1, 4, 17, rate as usize] {
+                let ratio = rate as f64 / 48_000.0;
+                let mut resampler = SincResampler::new(ratio);
+                resampler.push(&vec![0.5; input_frames * CHANNELS]);
+                resampler.finish();
+                resampler.finish();
+                let mut out = Vec::new();
+                while resampler.produce(131, &mut out) > 0 {}
+                let expected = (input_frames as u64 * 48_000).div_ceil(rate as u64) as usize;
+                assert_eq!(out.len(), expected * CHANNELS, "rate={rate}, frames={input_frames}");
+                assert!(resampler.is_drained());
+                assert!(out.iter().any(|value| value.abs() > 0.01));
+            }
+        }
+    }
+
+    #[test]
+    fn long_chunked_resampling_keeps_a_bounded_history_and_the_same_samples() {
+        let input = tone(440.0, 240_000);
+        let mut whole = SincResampler::new(44_100.0 / 48_000.0);
+        whole.push(&input);
+        whole.finish();
+        let mut expected = Vec::new();
+        while whole.produce(1024, &mut expected) > 0 {}
+        let mut chunked = SincResampler::new(44_100.0 / 48_000.0);
+        let mut actual = Vec::new();
+        for chunk in input.chunks(512 * CHANNELS) {
+            chunked.push(chunk);
+            while chunked.produce(1024, &mut actual) > 0 {}
+            assert!(chunked.buffer.len() < 10_000, "history grew to {}", chunked.buffer.len());
+        }
+        chunked.finish();
+        while chunked.produce(1024, &mut actual) > 0 {}
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-4);
+        }
     }
 
     #[test]

@@ -201,7 +201,7 @@ impl Default for Config {
             player_update_seconds: 5,
             stats_seconds: 60,
             event_buffer: 256,
-            opus_bitrate: 128_000,
+            opus_bitrate: 192_000,
             opus_complexity: 10,
             ratelimits: RateLimit::default(),
             webhook: Webhook::default(),
@@ -312,6 +312,18 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_defaults_apply_only_when_encoding_settings_are_omitted() {
+        let defaults = parse_configuration("password: secret\n").unwrap();
+        assert_eq!(defaults.opus_bitrate, 192_000);
+        assert_eq!(defaults.opus_complexity, 10);
+        let explicit =
+            parse_configuration("password: secret\nopusBitrate: 128000\nopusComplexity: 4\n")
+                .unwrap();
+        assert_eq!(explicit.opus_bitrate, 128_000);
+        assert_eq!(explicit.opus_complexity, 4);
+    }
 
     #[test]
     fn windows_utf8_bom_and_crlf_configuration_is_accepted() {

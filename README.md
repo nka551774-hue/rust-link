@@ -49,6 +49,10 @@ FFmpeg 依使用的音訊容器選配。YouTube 若要求 PO token，需自行�
 
 YouTube 分享網址可以直接傳給 `Client::resolve`，不需要改成搜尋文字。支援一般影片、`youtu.be`、YouTube Music、Shorts 等網址；影片網址附帶 `list` 時仍載入該影片。Discord 指令接線與完整範例見 [貼 YouTube 連結播放](docs/youtube.md)。
 
+Spotify 的歌曲、專輯與播放清單連結也可直接傳給 `Client::resolve`，支援地區前綴、分享參數與嵌入連結。設定 `SPOTIFY_CLIENT_ID`／`SPOTIFY_CLIENT_SECRET` 後讀取歌曲資料，再以歌名、歌手與長度匹配完整的 YouTube 音源；不使用 Spotify 的短版預覽。詳細設定與匹配限制見 [音源文件](docs/sources.md)。
+
+新設定預設使用 **48 kHz 雙聲道、192 kbit/s Opus、complexity 10**，既有明確設定仍會保留。YouTube 優先選原始音軌與未動態壓縮版本，再比較音訊 bitrate。Rustlink 不插入片頭／中途廣告，也不將搜尋中的廣告項目當作歌曲；影片原本錄入的置入內容仍屬音源的一部分。轉碼不會增加原始音源已缺失的細節。
+
 ## Rust 機器人串接
 
 客戶端 crate 隨本專案提供，尚未發佈到 crates.io。在機器人的 `Cargo.toml` 加入本機路徑：
@@ -106,6 +110,7 @@ cargo run -p rustlink-client --example bot -- "https://youtu.be/1CXveaq_vFU"
 - [設定](docs/configuration.md)、[音源](docs/sources.md)、[第三方服務](docs/third-party.md)、[VPS 部署](docs/vps.md)。
 
 - [效能與量測](docs/performance.md)：快取、音訊與加密的改善、實測數字及重跑方法。
+- [本輪審查與驗證](docs/optimization-audit.md)：YouTube／Spotify、高音質設定、修復項目及測試限制。
 
 ## Docker／VPS
 

@@ -82,12 +82,15 @@ impl FfmpegFrames {
             .arg("-b:a")
             .arg(bitrate.to_string())
             .arg("-application")
-            .arg("audio");
-        if complexity != 10 {
-            // FFmpeg's libopus wrapper carries the same zero to ten scale, so a
-            // node told to spend less on encoding spends less on both engines.
-            command.arg("-compression_level").arg(complexity.to_string());
-        }
+            .arg("audio")
+            .arg("-compression_level")
+            .arg(complexity.to_string())
+            .arg("-vbr")
+            .arg("on")
+            .arg("-fec")
+            .arg("1")
+            .arg("-packet_loss")
+            .arg("10");
         command
             .arg("-frame_duration")
             .arg("20")

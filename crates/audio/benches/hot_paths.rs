@@ -162,7 +162,7 @@ fn main() {
         assert_eq!(count, 200_000);
     });
     let wav = wav_fixture();
-    measure("wav_48khz_stereo_opus_128k_complexity10", 500, || {
+    measure("wav_48khz_stereo_opus_128k_complexity10", 501, || {
         let engine = Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 10 };
         let track = Track::new("bench".into(), TrackInfo::default());
         let mut frames = engine
@@ -181,6 +181,6 @@ fn main() {
             black_box(&packet);
             count += 1;
         }
-        assert_eq!(count, 500);
+        assert_eq!(count, 501); // Includes the encoder's delayed final samples.
     });
 }

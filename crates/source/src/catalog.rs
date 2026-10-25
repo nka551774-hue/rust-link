@@ -157,6 +157,8 @@ pub struct Spotify<'a> {
     pub agent: &'a ureq::Agent,
     pub config: &'a Config,
     token: Arc<CredentialCache>,
+    api_endpoint: &'a str,
+    token_endpoint: &'a str,
 }
 
 impl<'a> Spotify<'a> {
@@ -165,7 +167,13 @@ impl<'a> Spotify<'a> {
     }
 
     pub fn with_state(agent: &'a ureq::Agent, config: &'a Config, state: &State) -> Self {
-        Spotify { agent, config, token: Arc::clone(&state.spotify_token) }
+        Spotify {
+            agent,
+            config,
+            token: Arc::clone(&state.spotify_token),
+            api_endpoint: "https://api.spotify.com/v1",
+            token_endpoint: "https://accounts.spotify.com/api/token",
+        }
     }
 }
 
@@ -251,7 +259,7 @@ impl Spotify<'_> {
     fn fetch_token(&self) -> Result<(String, Duration), SourceError> {
         let response = self
             .agent
-            .post("https://accounts.spotify.com/api/token")
+            .post(self.token_endpoint)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .config()
             .timeout_global(Some(deadline::timeout(Duration::from_secs(20))?))
@@ -283,8 +291,27 @@ impl Spotify<'_> {
     }
 
     fn api(&self, path: &str) -> Result<Value, SourceError> {
+        // Pagination is supplied by the remote response. Never forward our
+        // bearer token to an unrelated host or outside the catalogue API.
+        if path.starts_with("//") {
+            return Err(SourceError::Url("invalid Spotify pagination URL".into()));
+        }
+        let url = if path.starts_with('/') {
+            format!("{}{path}", self.api_endpoint)
+        } else {
+            path.to_string()
+        };
+        let base = url::Url::parse(self.api_endpoint)
+            .map_err(|error| SourceError::Url(error.to_string()))?;
+        let parsed = crate::http_url(&url)
+            .ok_or_else(|| SourceError::Url("invalid Spotify pagination URL".into()))?;
+        if parsed.origin() != base.origin()
+            || !parsed.path().starts_with(&format!("{}/", base.path().trim_end_matches('/')))
+            || parsed.fragment().is_some()
+        {
+            return Err(SourceError::Url("Spotify pagination left the catalogue API".into()));
+        }
         let token = self.token()?;
-        let url = format!("https://api.spotify.com/v1{path}");
         get_json(self.agent, &url, Some(&token))
     }
 
@@ -368,12 +395,7 @@ impl Spotify<'_> {
         let mut next = Some(path.to_string());
         let mut pages = 0;
         while let Some(path) = next.take() {
-            let answer = if path.starts_with("http") {
-                let token = self.token()?;
-                get_json(self.agent, &path, Some(&token))?
-            } else {
-                self.api(&path)?
-            };
+            let answer = self.api(&path)?;
             let page: SpotifyPage = serde_json::from_value(answer)
                 .map_err(|error| SourceError::Http(error.to_string()))?;
             for item in &page.items {
@@ -400,19 +422,33 @@ impl Spotify<'_> {
 
     /// Splits an identifier or an open.spotify.com URL into its kind and key.
     fn parse(&self, id: &str) -> Result<(String, String), SourceError> {
+        let id = crate::identifier_text(id);
+        let valid = |kind: &str, key: &str| {
+            matches!(kind, "track" | "album" | "playlist")
+                && key.len() == 22
+                && key.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        };
         if let Some(rest) = id.strip_prefix("spotify:") {
-            let parts = parts_after(rest, "");
-            if parts.len() >= 2 {
-                return Ok((parts[0].clone(), parts[1].clone()));
+            if let Some((kind, key)) = rest.split_once(':') {
+                if valid(kind, key) {
+                    return Ok((kind.to_string(), key.to_string()));
+                }
             }
         }
-        if let Some(rest) = id.strip_prefix("https://open.spotify.com/") {
-            // A shared link may carry a locale in front of the kind.
-            let parts: Vec<&str> = rest.split(['/', '?']).filter(|part| !part.is_empty()).collect();
-            let parts: Vec<&str> =
-                parts.into_iter().filter(|part| !part.starts_with("intl-")).collect();
-            if parts.len() >= 2 {
-                return Ok((parts[0].to_string(), parts[1].to_string()));
+        if let Some(url) = crate::http_url(id) {
+            if url.host_str() == Some("open.spotify.com") {
+                let mut parts = url.path().trim_matches('/').split('/');
+                let mut kind = parts.next().unwrap_or_default();
+                if kind.starts_with("intl-") {
+                    kind = parts.next().unwrap_or_default();
+                }
+                if kind == "embed" {
+                    kind = parts.next().unwrap_or_default();
+                }
+                let key = parts.next().unwrap_or_default();
+                if parts.next().is_none() && valid(kind, key) {
+                    return Ok((kind.to_string(), key.to_string()));
+                }
             }
         }
         Err(SourceError::Url(format!("{id} is not a Spotify track, album or playlist")))
@@ -1073,6 +1109,118 @@ mod tests {
         let (kind, key) =
             spotify.parse("https://open.spotify.com/intl-ja/album/1ATL5GLyefJaxhQzSPVrLX").unwrap();
         assert_eq!((kind.as_str(), key.as_str()), ("album", "1ATL5GLyefJaxhQzSPVrLX"));
+    }
+
+    #[test]
+    fn spotify_shared_embedded_and_fragment_links_keep_only_the_resource_id() {
+        let agent = netguard::agent(false);
+        let config = config();
+        let spotify = Spotify::new(&agent, &config);
+        for link in [
+            "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT#share",
+            "https://open.spotify.com/intl-zh-TW/track/4cOdK2wGLETKBW3PvgPWqT?si=share#song",
+            "https://open.spotify.com/embed/track/4cOdK2wGLETKBW3PvgPWqT?utm_source=generator",
+            "<https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT>",
+            "https://OPEN.SPOTIFY.COM:443/track/4cOdK2wGLETKBW3PvgPWqT/",
+        ] {
+            assert_eq!(crate::source_kind(link), "spotify", "{link}");
+            assert_eq!(
+                spotify.parse(link).unwrap(),
+                ("track".into(), "4cOdK2wGLETKBW3PvgPWqT".into()),
+                "{link}"
+            );
+        }
+        for link in [
+            "https://open.spotify.com.evil.example/track/4cOdK2wGLETKBW3PvgPWqT",
+            "https://user:secret@open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+            "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT/extra",
+            "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT%3Fmarket=US",
+            "spotify:track:4cOdK2wGLETKBW3PvgPWqT:extra",
+            "spotify:track:../me",
+            "spotify:episode:4cOdK2wGLETKBW3PvgPWqT",
+        ] {
+            assert!(spotify.parse(link).is_err(), "{link}");
+        }
+    }
+
+    #[test]
+    fn spotify_track_album_and_playlist_links_resolve_full_metadata() {
+        let (base, server) = crate::test_http::serve(5, |_, headers, _| {
+            assert!(headers.to_ascii_lowercase().contains("authorization: bearer test-token\r\n"));
+            let track = serde_json::json!({
+                "id":"4cOdK2wGLETKBW3PvgPWqT", "name":"A Song", "duration_ms":200000,
+                "artists":[{"name":"Someone"}], "preview_url":"https://preview.invalid/30-seconds.mp3"
+            });
+            if headers.starts_with("GET /v1/tracks/") {
+                track
+            } else if headers.contains("/tracks HTTP/") {
+                let item = if headers.starts_with("GET /v1/playlists/") {
+                    serde_json::json!({"track":track})
+                } else {
+                    track
+                };
+                serde_json::json!({"items":[item],"total":1,"next":null})
+            } else {
+                serde_json::json!({"name":"Collection"})
+            }
+        });
+        let agent = netguard::agent(true);
+        let config = Config {
+            spotify_client_id: "id".into(),
+            spotify_client_secret: "secret".into(),
+            ..config()
+        };
+        let endpoint = format!("{base}/v1");
+        let spotify = Spotify { api_endpoint: &endpoint, ..Spotify::new(&agent, &config) };
+        spotify
+            .token
+            .get_or_refresh(|| Ok(("test-token".into(), Duration::from_secs(60))))
+            .unwrap();
+        for kind in ["track", "album", "playlist"] {
+            let result = spotify.load(&format!("https://open.spotify.com/intl-zh-TW/{kind}/4cOdK2wGLETKBW3PvgPWqT?si=share#fragment")).unwrap();
+            let tracks = match &result {
+                LoadResult::Track(track) => std::slice::from_ref(track.as_ref()),
+                LoadResult::Playlist(playlist) => playlist.tracks.as_slice(),
+                other => panic!("unexpected resolution: {other:?}"),
+            };
+            assert_eq!(tracks.len(), 1);
+            assert_eq!(tracks[0].metadata.length, 200_000);
+            assert_eq!(tracks[0].metadata.author, "Someone");
+            assert_eq!(tracks[0].metadata.source_name, "spotify");
+            assert_eq!(
+                tracks[0].metadata.uri.as_deref(),
+                Some("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT")
+            );
+            assert!(!tracks[0].token.contains("preview"));
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn spotify_pagination_cannot_leak_credentials_outside_its_api() {
+        let (base, server) = crate::test_http::serve(
+            1,
+            |_, _, _| serde_json::json!({"items":[],"total":2,"next":"https://untrusted.invalid/v1/tracks"}),
+        );
+        let agent = netguard::agent(true);
+        let config = Config {
+            spotify_client_id: "id".into(),
+            spotify_client_secret: "secret".into(),
+            ..config()
+        };
+        let endpoint = format!("{base}/v1");
+        let spotify = Spotify { api_endpoint: &endpoint, ..Spotify::new(&agent, &config) };
+        spotify
+            .token
+            .get_or_refresh(|| Ok(("test-token".into(), Duration::from_secs(60))))
+            .unwrap();
+        assert!(matches!(spotify.page("/tracks"), Err(SourceError::Url(_))));
+        server.join().unwrap();
+        for path in
+            ["https://api.spotify.com/v1/tracks", "/../outside", "//outside", "/tracks#fragment"]
+        {
+            assert!(matches!(spotify.api(path), Err(SourceError::Url(_))), "{path}");
+        }
     }
 
     #[test]

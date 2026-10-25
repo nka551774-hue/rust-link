@@ -68,7 +68,7 @@ loadTimeoutSeconds: 30
 playerUpdateSeconds: 5
 statsSeconds: 60
 eventBuffer: 256
-opusBitrate: 128000                        # Opus bitrate in bit/s
+opusBitrate: 192000                        # Music-oriented Opus bitrate in bit/s; not source upscaling
 opusComplexity: 10                         # Opus encoder effort 0..10; lower spends less CPU per player
 
 # --- Ratelimits ---

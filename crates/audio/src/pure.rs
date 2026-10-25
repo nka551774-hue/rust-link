@@ -1,7 +1,7 @@
 //! The in-process engine.
 //!
 //! Decode, filter, encode, all inside the node. The pipeline is
-//! decoder → pre-filters → resample → stretch → post-filters → Opus, which is
+//! decoder → 48 kHz → pre-filters → timescale → post-filters → Opus, which is
 //! the order the FFmpeg graph applies the same settings in.
 
 use rustlink_protocol::Track;
@@ -24,6 +24,8 @@ const FLUSH_SILENCE: usize = (crate::resample::STRETCH_FRAME + 512) * crate::dsp
 
 pub struct PureFrames {
     decoder: Decoder,
+    source_resampler: Option<SincResampler>,
+    prepared: Vec<f32>,
     resampler: Option<SincResampler>,
     stretcher: Option<TimeStretcher>,
     stretch_factor: f64,
@@ -49,6 +51,8 @@ pub struct PureFrames {
     skip: u64,
     drained: bool,
     flushed: bool,
+    encoder_flushed: bool,
+    encoded_any: bool,
 }
 
 impl PureFrames {
@@ -68,7 +72,7 @@ impl PureFrames {
         let rate = decoder.rate();
         let time =
             set.time.unwrap_or(crate::filters::Timescale { speed: 1.0, pitch: 1.0, rate: 1.0 });
-        let ratio = ratio_for(rate, time.pitch, time.rate);
+        let ratio = ratio_for(48_000, time.pitch, time.rate);
         let stretch_factor = time.speed / time.pitch;
         // Each API control is bounded, but their quotient can reach 100.
         // Keep the native stretcher's documented work bound and request the
@@ -84,9 +88,15 @@ impl PureFrames {
         // that does not is not made to carry it.
         let silence = if stretcher.is_some() { vec![0.0; FLUSH_SILENCE] } else { Vec::new() };
         let encoder = Encoder::new(bitrate, complexity)?;
-        let skip = if position_ms > 0 { position_ms as u64 * rate as u64 / 1000 } else { 0 };
+        let skip = if position_ms > 0 {
+            (position_ms as u128 * rate as u128 / 1000).min(u64::MAX as u128) as u64
+        } else {
+            0
+        };
         Ok(PureFrames {
             decoder,
+            source_resampler: (rate != 48_000).then(|| SincResampler::new(rate as f64 / 48_000.0)),
+            prepared: Vec::new(),
             // A unity conversion needs neither a history window nor another
             // PCM buffer. This also preserves the first and last samples.
             resampler: (ratio != 1.0).then(|| SincResampler::new(ratio)),
@@ -104,13 +114,20 @@ impl PureFrames {
             skip,
             drained: false,
             flushed: false,
+            encoder_flushed: false,
+            encoded_any: false,
         })
     }
 
     /// Reads one step of the pipeline, reporting whether anything moved.
     fn pump(&mut self) -> Result<bool, AudioError> {
         let mut progressed = false;
-        if !self.drained {
+        // Drain the furthest downstream converter before fetching more input.
+        // Slow combined pitch/rate can expand one chunk hundreds of times;
+        // decoding another chunk on every pump would retain an entire song.
+        let time_ready = self.resampler.as_ref().is_some_and(|r| r.available() > 0);
+        let source_ready = self.source_resampler.as_ref().is_some_and(|r| r.available() > 0);
+        if !self.drained && !source_ready && !time_ready {
             self.decoded.clear();
             if self.decoder.decode(&mut self.decoded)? {
                 // A chunk that falls entirely inside the seek is still progress:
@@ -119,20 +136,44 @@ impl PureFrames {
                 progressed = true;
                 if self.skip > 0 {
                     let frames = self.decoded.len() / 2;
-                    let drop = (self.skip as usize).min(frames);
+                    let drop = self.skip.min(frames as u64) as usize;
                     self.decoded.drain(..drop * 2);
                     self.skip -= drop as u64;
                 }
-                if !self.decoded.is_empty() {
-                    self.dsp.process_pre(&mut self.decoded);
-                    match (&mut self.resampler, &mut self.stretcher) {
-                        (Some(resampler), _) => resampler.push(&self.decoded),
-                        (None, Some(stretcher)) => stretcher.push(&self.decoded),
-                        (None, None) => self.staging.extend_from_slice(&self.decoded),
-                    }
-                }
             } else {
                 self.drained = true;
+            }
+        } else {
+            self.decoded.clear();
+        }
+
+        self.prepared.clear();
+        if let Some(resampler) = &mut self.source_resampler {
+            if !self.decoded.is_empty() {
+                resampler.push(&self.decoded);
+            }
+            if self.drained {
+                resampler.finish();
+            }
+            if !time_ready {
+                progressed |= resampler.produce(PRODUCE_LIMIT, &mut self.prepared) > 0;
+            }
+        } else {
+            std::mem::swap(&mut self.prepared, &mut self.decoded);
+        }
+        if !self.prepared.is_empty() {
+            self.dsp.process_pre(&mut self.prepared);
+            match (&mut self.resampler, &mut self.stretcher) {
+                (Some(resampler), _) => resampler.push(&self.prepared),
+                (None, Some(stretcher)) => stretcher.push(&self.prepared),
+                (None, None) => self.staging.extend_from_slice(&self.prepared),
+            }
+        }
+        let source_finished =
+            self.drained && self.source_resampler.as_ref().is_none_or(SincResampler::is_drained);
+        if source_finished {
+            if let Some(resampler) = &mut self.resampler {
+                resampler.finish();
             }
         }
 
@@ -155,7 +196,10 @@ impl PureFrames {
                 if self.staging.len() > before {
                     progressed = true;
                 }
-                if self.drained && !self.flushed {
+                if source_finished
+                    && self.resampler.as_ref().is_none_or(SincResampler::is_drained)
+                    && !self.flushed
+                {
                     // The stretcher holds a frame and a search window back, so
                     // the tail of the track is still inside it. Pushing silence
                     // and producing once more flushes it.
@@ -188,6 +232,18 @@ impl Frames for PureFrames {
     fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
         while self.staging.len() - self.staging_at < FRAME_SAMPLES_STEREO {
             if !self.pump()? {
+                // RTP has no Ogg pre-skip/granule metadata. Send the encoder's
+                // delayed tail as well; otherwise a frame-aligned song loses
+                // its final 312 samples instead of merely carrying codec delay.
+                if !self.encoder_flushed {
+                    if self.encoded_any || self.staging.len() > self.staging_at {
+                        self.staging.resize(
+                            self.staging.len() + self.encoder.lookahead() as usize * 2,
+                            0.0,
+                        );
+                    }
+                    self.encoder_flushed = true;
+                }
                 break;
             }
         }
@@ -222,6 +278,7 @@ impl Frames for PureFrames {
         // transport encrypts from, so no frame is allocated at all.
         packet.clear();
         packet.extend_from_slice(self.encoder.encode(&self.pcm)?);
+        self.encoded_any = true;
         Ok(true)
     }
 }

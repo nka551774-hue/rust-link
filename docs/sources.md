@@ -76,6 +76,42 @@ through the web API. Playback searches YouTube and checks title, artist and
 duration for a close match. Spotify identifiers require configured client
 credentials, and playback also requires `youtubeNative`.
 
+Paste an `open.spotify.com/track/...`, `/album/...` or `/playlist/...` link
+directly into the same `query` field used for YouTube. Locale prefixes such as
+`/intl-zh-TW/`, `/embed/` links, share parameters, fragments and Discord's
+`<...>` link wrapper are supported. Spotify URIs such as
+`spotify:track:4cOdK2wGLETKBW3PvgPWqT` also work. Resource IDs are validated
+before any request; podcasts, local files and Spotify short redirect links
+are not treated as songs.
+
+Set `spotifyClientId` and `spotifyClientSecret` in the node configuration
+(or `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET`). A private
+or editorial playlist can additionally require `spotifyRefreshToken` with
+appropriate account permissions. API pagination stays on the Spotify API
+origin so a response cannot forward the access token to another host.
+
+Playback does not use Spotify's 30-second preview URL or decrypt Spotify's
+audio. It resolves a full-length matching recording from YouTube. Single
+character song/artist names are supported; an unrequested cover, live version,
+remix, karaoke, speed edit or preview is excluded from matching. A missing
+acceptable recording produces an error instead of playing an unrelated track.
+
+### Audio quality and advertisements
+
+YouTube selection prefers an original, non-auto-dubbed audio track and preserves
+the original dynamics instead of choosing a dynamically compressed variant
+solely for a larger bitrate. Among equivalent variants, the highest reported
+audio bitrate wins. Output quality is controlled by `opusBitrate` and
+`opusComplexity`; see [configuration](configuration.md). Transcoding cannot
+recover detail missing from the source, and Discord delivery depends on the
+voice channel's capabilities and network.
+
+Rustlink never schedules pre-roll or mid-roll advertisements. It opens the
+selected recording's audio URL, skips YouTube's promoted-result subtrees, and
+does not fetch player advertisement placements. Advertisements or sponsorships
+already recorded inside the selected video remain part of that recording;
+Rustlink does not detect and edit them out.
+
 **Deezer.** Metadata is resolved through the public API, including ISRC lookup
 with `dzisrc:`. Playback uses the same YouTube matching path as Spotify;
 Rustlink does not fetch Deezer audio or preview streams.
