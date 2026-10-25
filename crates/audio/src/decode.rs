@@ -18,7 +18,7 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use crate::engine::Body;
+use crate::engine::{detect, Body, Container};
 use crate::error::AudioError;
 use crate::ogg::OggOpusReader;
 use crate::opus_decode;
@@ -35,7 +35,16 @@ struct Unseekable {
 impl Read for Unseekable {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.inner.get_mut() {
-            Ok(body) => body.read(buf),
+            Ok(body) => body.read(buf).map_err(|error| {
+                // Symphonia uses UnexpectedEof as its normal end-of-stream
+                // sentinel. A source's explicit read failure (for example an
+                // exhausted HTTP range retry) must remain a playback failure.
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::other(error)
+                } else {
+                    error
+                }
+            }),
             Err(_) => Err(io::Error::other("the source is poisoned")),
         }
     }
@@ -247,7 +256,7 @@ impl Decoder {
 
         // Opus in Ogg is demuxed here rather than by symphonia, because
         // symphonia has no Opus decoder and libopus does.
-        if body.head().starts_with(b"OggS") {
+        if detect(body.head()) == Container::OggOpus {
             return Ok(Decoder {
                 inner: Inner::OggOpus(Box::new(OggDecoder::new(body)?)),
                 rate: 48_000,
@@ -326,6 +335,12 @@ impl Decoder {
                     Err(SymphoniaError::DecodeError(_)) => continue,
                     Err(e) => return Err(AudioError::Decode(e.to_string())),
                 };
+                // Vorbis primes its overlap state with a packet that produces
+                // no PCM. Symphonia's interleaver indexes each channel even
+                // for zero frames, which would panic on our empty buffer.
+                if audio.frames() == 0 {
+                    continue;
+                }
                 let decoded_spec = *audio.spec();
                 if decoded_spec.rate != self.rate {
                     return Err(AudioError::Decode(

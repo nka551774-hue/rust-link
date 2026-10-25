@@ -20,6 +20,7 @@ aes-gcm = "0.10"
 zeroize = "1"
 
 [dev-dependencies]
+rustlink-audio.workspace = true
 openmls = "=0.8.1"
 openmls_basic_credential = "0.5"
 openmls_rust_crypto = "0.5.1"

@@ -342,3 +342,22 @@ fn foreign_initial_commits_and_unknown_versions_are_not_accepted() {
     assert!(fresh.negotiate(2).is_err());
     assert!(fresh.encrypt_opus(OPUS).is_err());
 }
+
+#[test]
+fn transitions_before_session_description_cannot_enable_audio() {
+    for (opcode, data) in [
+        (21, json!({"protocol_version":0,"transition_id":0})),
+        (22, json!({"transition_id":0})),
+        (24, json!({"protocol_version":1,"epoch":1})),
+    ] {
+        let mut session = Session::new(ALICE, CHANNEL).unwrap();
+        assert!(
+            session.handle_json(opcode, &data).is_err(),
+            "opcode {opcode} was accepted before the selected DAVE version"
+        );
+        assert!(!session.ready());
+        assert!(session.encrypt_opus(OPUS).is_err());
+        session.negotiate(1).unwrap();
+        assert!(!session.ready(), "DAVE v1 must await its own valid transition");
+    }
+}

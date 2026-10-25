@@ -436,7 +436,7 @@ fn probe_mp3(head: &[u8], size: i64) -> Probe {
         let length = synchsafe(&head[6..10]);
         // The footer, when there is one, is another ten bytes.
         let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
-        read_id3(&head[10..(10 + length).min(head.len())], &mut out);
+        read_id3(&head[10..(10 + length).min(head.len())], head[3], &mut out);
         audio_start = 10 + length + footer;
     }
     let Some(frame) = head.get(audio_start..).filter(|rest| starts_mpeg_frame(rest)) else {
@@ -456,15 +456,20 @@ fn probe_mp3(head: &[u8], size: i64) -> Probe {
 }
 
 /// Reads the frames of an ID3v2 tag that name the track.
-fn read_id3(data: &[u8], out: &mut Probe) {
+fn read_id3(data: &[u8], version: u8, out: &mut Probe) {
     let mut at = 0usize;
     while at + 10 <= data.len() {
         let id = &data[at..at + 4];
         if !id.iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()) {
             return;
         }
-        let length =
-            u32::from_be_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]) as usize;
+        // ID3v2.4 uses seven bits per byte for frame sizes, just like the
+        // outer tag. ID3v2.3 frames retain their ordinary big-endian size.
+        let length = if version == 4 {
+            synchsafe(&data[at + 4..at + 8])
+        } else {
+            u32::from_be_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]) as usize
+        };
         let Some(body) = data.get(at + 10..at + 10 + length) else {
             return;
         };
@@ -486,7 +491,7 @@ fn decode_id3_text(body: &[u8]) -> String {
     let value = &body[1..];
     match encoding {
         // UTF-16 with a byte order mark, little or big endian.
-        1 => decode_text(value),
+        1 => decode_text(value).trim_matches('\0').trim().to_string(),
         2 => {
             let units: Vec<u16> =
                 value.as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes(*pair)).collect();

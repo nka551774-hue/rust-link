@@ -269,6 +269,51 @@ async fn missing_heartbeat_ack_ends_the_handshake() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn hello_uses_the_supplied_fractional_interval_before_the_first_heartbeat() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        send(&mut ws, json!({"op":8,"d":{"heartbeat_interval":250.5}})).await;
+        assert_eq!(next_json(&mut ws, 0).await["op"], 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ws.next()).await.is_err(),
+            "the first heartbeat was sent before the Hello interval elapsed"
+        );
+        let message = tokio::time::timeout(Duration::from_millis(300), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Text(text) = message else { panic!("expected heartbeat JSON") };
+        let heartbeat: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(heartbeat["op"], 3);
+        // Deliberately omit the ACK. The client must fail at the next exact interval.
+        while let Some(Ok(_)) = ws.next().await {}
+    });
+    let result = connect_url(
+        &url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(|_| panic!("failed handshake is not an established connection")),
+    )
+    .await;
+    assert!(matches!(result,Err(VoiceError::Gateway(ref s)) if s.contains("not acknowledged")));
+    server.await.unwrap();
+}
+
+#[test]
+fn heartbeat_intervals_reject_nonpositive_values_without_rounding_fractional_milliseconds() {
+    assert_eq!(heartbeat_interval(Some(&json!(250.5))).unwrap(), Duration::from_micros(250_500));
+    for value in [json!(0), json!(-1), json!(1e-12), Value::Null, json!("250")] {
+        assert!(heartbeat_interval(Some(&value)).is_err());
+    }
+    assert!(heartbeat_interval(None).is_err());
+}
+
 #[test]
 fn malformed_transport_keys_are_rejected() {
     for value in [json!([1, 2]), json!(vec![256; 32]), json!(vec![Value::Null; 32])] {

@@ -169,7 +169,10 @@ impl Biquad {
         let fs = SAMPLE_RATE as f64;
         let a = 10f64.powf(decibels / 40.0);
         let w0 = 2.0 * PI * f0 / fs;
-        let alpha = w0.sin() * (std::f64::consts::LN_2 / 2.0 * width_octaves).sinh();
+        // Octave bandwidth needs the bilinear transform correction. Omitting
+        // w0 / sin(w0) increasingly narrows the upper bands compared to FFmpeg.
+        let alpha =
+            w0.sin() * (std::f64::consts::LN_2 / 2.0 * width_octaves * w0 / w0.sin()).sinh();
         Biquad {
             b0: 1.0 + alpha * a,
             b1: -2.0 * w0.cos(),

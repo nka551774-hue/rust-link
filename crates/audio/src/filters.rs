@@ -440,15 +440,16 @@ fn parse_equalizer(raw: &Value) -> Result<Vec<EqBand>, FilterError> {
     let mut seen = [false; 15];
     for item in items {
         let Value::Object(map) = item else { return Err(invalid()) };
-        let mut band = 0i64;
+        let mut band = None;
         let mut gain = 0.0f64;
         for (key, value) in map {
             match key.as_str() {
-                "band" => band = value.as_i64().ok_or_else(invalid)?,
+                "band" => band = Some(value.as_i64().ok_or_else(invalid)?),
                 "gain" => gain = value.as_f64().ok_or_else(invalid)?,
                 _ => return Err(invalid()),
             }
         }
+        let band = band.ok_or_else(invalid)?;
         // An omitted gain leaves the band flat.
         if !(0..=14).contains(&band) || !(-0.25..=1.0).contains(&gain) || seen[band as usize] {
             return Err(FilterError::new("invalid or duplicate equalizer band"));
@@ -615,6 +616,7 @@ mod tests {
             "invalid or duplicate equalizer band"
         );
         assert_eq!(error(json!({"equalizer": {"band": 0}})), "invalid equalizer");
+        assert_eq!(error(json!({"equalizer": [{"gain": 0.5}]})), "invalid equalizer");
     }
 
     #[test]

@@ -61,7 +61,7 @@ fn collect(bytes: Vec<u8>, filters: serde_json::Value, position_ms: i64) -> Vec<
             &object,
             Preference::Auto,
         )
-        .expect("the pipeline should accept a wav");
+        .expect("the native pipeline should accept this audio");
     let mut out = Vec::new();
     let mut frame = Vec::new();
     while frames.next_frame(&mut frame).expect("no frame should fail") {
@@ -468,5 +468,178 @@ fn native_and_ffmpeg_music_profiles_preserve_duration_and_stereo() {
                 "{name} rate={rate}: stereo leakage, left={left}, right={right}"
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "requires RUSTLINK_TEST_FFMPEG pointing at a real FFmpeg with libopus"]
+fn ffmpeg_does_not_report_a_failed_source_read_as_a_finished_track() {
+    use rustlink_audio::{ffmpeg::FfmpegFrames, FilterSet, Frames};
+    use std::io::{self, Read};
+
+    struct InterruptedSource(std::io::Cursor<Vec<u8>>);
+    impl Read for InterruptedSource {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            let read = self.0.read(out)?;
+            if read == 0 {
+                return Err(io::Error::other("simulated media connection reset"));
+            }
+            Ok(read)
+        }
+    }
+
+    let program = std::env::var("RUSTLINK_TEST_FFMPEG").expect("RUSTLINK_TEST_FFMPEG is required");
+    let mut source = wav(48_000, 2, 2.0, 440.0);
+    source.truncate(44 + 48_000 * 4); // Header promises two seconds, connection fails after one.
+    let mut frames = FfmpegFrames::start(
+        &program,
+        Body::new(Box::new(InterruptedSource(std::io::Cursor::new(source)))),
+        0,
+        &FilterSet::default(),
+        192_000,
+        10,
+    )
+    .unwrap();
+    let mut packet = Vec::new();
+    let error = loop {
+        match frames.next_frame(&mut packet) {
+            Ok(true) => continue,
+            Ok(false) => panic!("source failure was reported as normal end of track"),
+            Err(error) => break error,
+        }
+    };
+    assert!(error.to_string().contains("simulated media connection reset"), "{error}");
+}
+
+#[test]
+#[ignore = "requires RUSTLINK_TEST_FFMPEG pointing at a real FFmpeg with libopus"]
+fn native_and_ffmpeg_equalizer_bandwidth_agree_at_high_frequencies() {
+    let program = std::env::var("RUSTLINK_TEST_FFMPEG").expect("RUSTLINK_TEST_FFMPEG is required");
+    let engine =
+        Engine { ffmpeg: Some(program), in_process: true, bitrate: 192_000, complexity: 10 };
+    for (band, frequency) in [(8, 700.0), (13, 8_000.0), (14, 12_000.0)] {
+        let filters = serde_json::json!({"equalizer": [{"band": band, "gain": 0.25}]});
+        let mut levels = Vec::new();
+        for preference in [Preference::Auto, Preference::Ffmpeg] {
+            let mut frames = engine
+                .start(
+                    &track(),
+                    Body::new(Box::new(std::io::Cursor::new(wav(48_000, 2, 1.0, frequency)))),
+                    0,
+                    100,
+                    filters.as_object().unwrap(),
+                    preference,
+                )
+                .unwrap();
+            let mut packets = Vec::new();
+            let mut packet = Vec::new();
+            while frames.next_frame(&mut packet).unwrap() {
+                packets.push(packet.clone());
+            }
+            let decoded = decode_packets(packets);
+            let settled = &decoded[12_000 * 2..36_000 * 2];
+            let energy = settled.iter().map(|sample| (*sample as f64).powi(2)).sum::<f64>();
+            levels.push((energy / settled.len() as f64).sqrt());
+        }
+        let ratio = levels[0] / levels[1];
+        assert!(
+            (0.95..=1.05).contains(&ratio),
+            "band {band}, tone {frequency} Hz: native RMS {}, FFmpeg RMS {}, ratio {ratio}",
+            levels[0],
+            levels[1]
+        );
+    }
+}
+
+#[test]
+fn native_does_not_report_a_source_unexpected_eof_as_a_finished_track() {
+    use std::io::{self, Read};
+
+    struct TruncatedSource(std::io::Cursor<Vec<u8>>);
+    impl Read for TruncatedSource {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            match self.0.read(out)? {
+                0 => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "media retries exhausted")),
+                count => Ok(count),
+            }
+        }
+    }
+
+    let mut source = wav(48_000, 2, 4.0, 440.0);
+    source.truncate(44 + 48_000 * 4 * 2);
+    let engine = Engine { ffmpeg: None, in_process: true, bitrate: 192_000, complexity: 10 };
+    let mut frames = engine
+        .start(
+            &track(),
+            Body::new(Box::new(TruncatedSource(std::io::Cursor::new(source)))),
+            0,
+            100,
+            &Default::default(),
+            Preference::Auto,
+        )
+        .unwrap();
+    let mut packet = Vec::new();
+    loop {
+        match frames.next_frame(&mut packet) {
+            Ok(true) => continue,
+            Ok(false) => panic!("native decoder reported source truncation as normal EOF"),
+            Err(error) => {
+                assert!(error.to_string().contains("media retries exhausted"), "{error}");
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires RUSTLINK_TEST_FFMPEG to generate real Ogg Vorbis/FLAC fixtures"]
+fn native_ogg_vorbis_and_flac_do_not_require_a_fallback_process() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let program = std::env::var("RUSTLINK_TEST_FFMPEG").expect("RUSTLINK_TEST_FFMPEG is required");
+    for codec in ["libvorbis", "flac"] {
+        let mut child = Command::new(&program)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "wav",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                codec,
+                "-f",
+                "ogg",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || input.write_all(&wav(48_000, 2, 1.0, 1000.0)));
+        let output = child.wait_with_output().unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let decoded = decode_packets(collect(output.stdout, serde_json::json!({}), 0));
+        assert!(
+            (48_000..=50_880).contains(&(decoded.len() / 2)),
+            "{codec}: unexpected duration {} frames",
+            decoded.len() / 2
+        );
+        let settled = &decoded[12_000 * 2..36_000 * 2];
+        let rms = (settled.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / settled.len() as f64)
+            .sqrt();
+        assert!((7000.0..10000.0).contains(&rms), "{codec}: unexpected RMS {rms}");
     }
 }

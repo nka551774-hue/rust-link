@@ -526,7 +526,13 @@ fn length_seconds(text: &str) -> Option<f64> {
     let mut total = 0f64;
     for part in parts {
         let value: f64 = part.trim().parse().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
         total = total * 60.0 + value;
+        if !total.is_finite() {
+            return None;
+        }
     }
     Some(total)
 }
@@ -942,6 +948,9 @@ mod tests {
         assert_eq!(length_seconds("1:02:03"), Some(3723.0));
         assert_eq!(length_seconds("0:07"), Some(7.0));
         assert_eq!(length_seconds("not a length"), None);
+        assert_eq!(length_seconds("-1:00"), None);
+        assert_eq!(length_seconds("NaN"), None);
+        assert_eq!(length_seconds("inf"), None);
     }
 
     #[test]

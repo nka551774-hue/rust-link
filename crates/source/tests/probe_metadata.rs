@@ -133,3 +133,57 @@ fn oversized_http_length_does_not_wrap_mp3_duration() {
     let bytes = [0xff, 0xfb, 0x90, 0x00]; // 128 kbit/s MPEG-1 Layer III.
     assert_eq!(probe(&bytes, i64::MAX).duration_ms, 576_460_752_303_423_487);
 }
+
+fn synchsafe(length: usize) -> [u8; 4] {
+    [
+        ((length >> 21) & 0x7f) as u8,
+        ((length >> 14) & 0x7f) as u8,
+        ((length >> 7) & 0x7f) as u8,
+        (length & 0x7f) as u8,
+    ]
+}
+
+fn id3(version: u8, frames: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (name, body) in frames {
+        data.extend_from_slice(*name);
+        let length =
+            if version == 4 { synchsafe(body.len()) } else { (body.len() as u32).to_be_bytes() };
+        data.extend_from_slice(&length);
+        data.extend_from_slice(&[0; 2]);
+        data.extend_from_slice(body);
+    }
+    let mut bytes = b"ID3".to_vec();
+    bytes.extend_from_slice(&[version, 0, 0]);
+    bytes.extend_from_slice(&synchsafe(data.len()));
+    bytes.extend(data);
+    bytes.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+    bytes
+}
+
+#[test]
+fn id3v24_long_frames_keep_synchsafe_lengths_and_following_artist() {
+    let title = "夜空".repeat(30);
+    let mut value = vec![3];
+    value.extend_from_slice(title.as_bytes());
+    for version in [3, 4] {
+        let bytes = id3(version, &[(b"TIT2", value.clone()), (b"TPE1", b"\x03Artist".to_vec())]);
+        let info = probe(&bytes, bytes.len() as i64);
+        assert_eq!(info.title, title, "ID3v2.{version} title");
+        assert_eq!(info.artist, "Artist", "ID3v2.{version} artist");
+    }
+}
+
+#[test]
+fn id3_utf16_bom_titles_exclude_the_text_terminator() {
+    for little_endian in [true, false] {
+        let mut value = vec![1];
+        value.extend_from_slice(if little_endian { &[0xff, 0xfe] } else { &[0xfe, 0xff] });
+        for unit in "夜空\0".encode_utf16() {
+            let bytes = if little_endian { unit.to_le_bytes() } else { unit.to_be_bytes() };
+            value.extend_from_slice(&bytes);
+        }
+        let bytes = id3(3, &[(b"TIT2", value)]);
+        assert_eq!(probe(&bytes, bytes.len() as i64).title, "夜空");
+    }
+}
