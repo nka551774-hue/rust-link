@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/client",
+    "crates/dave",
+    "crates/config",
+    "crates/audio",
+    "crates/source",
+    "crates/lyrics",
+    "crates/voice",
+    "crates/server",
+    "crates/node",
+]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+authors = ["Rustlink contributors"]
+
+[workspace.dependencies]
+rustlink-protocol = { path = "crates/protocol" }
+rustlink-config = { path = "crates/config" }
+rustlink-audio = { path = "crates/audio" }
+rustlink-source = { path = "crates/source" }
+rustlink-lyrics = { path = "crates/lyrics" }
+rustlink-voice = { path = "crates/voice" }
+rustlink-dave = { path = "crates/dave" }
+rustlink-server = { path = "crates/server" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

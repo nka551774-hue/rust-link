@@ -1,0 +1,27 @@
+Rustlink
+Copyright Rustlink contributors
+License: GPL-3.0-or-later (see LICENSE)
+
+Project provenance
+The early Rust implementation was developed with reference to the behavior and
+design of Golalink (https://github.com/Golalink-Devs/Golalink). This attribution
+records that history. The current service uses its own Rustlink API, track token
+format, Rust client, and Discord voice implementation. Historical protocol
+compatibility is not part of the current product.
+
+Discord voice and DAVE
+The Rustlink DAVE controller and Opus sender implement the published protocol:
+  https://daveprotocol.com/
+  https://github.com/discord/dave-protocol
+MLS operations are provided by OpenMLS (MIT), and cryptographic primitives by
+RustCrypto libraries under their respective licenses. No affiliation with or
+endorsement by Discord is implied.
+
+Tests use davey 0.1.5 (MIT) as an independent interoperability peer, and the sender
+ratchet test vector published with its hash_ratchet tests:
+  https://github.com/Snazzah/davey
+The davey dependency is used only for tests, not by the production service.
+
+Other dependencies and optional media tools retain their own licenses. Refer to
+Cargo.lock, package metadata, and the upstream distributions of libopus and
+FFmpeg for their attribution and distribution terms.

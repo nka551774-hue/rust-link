@@ -1,0 +1,166 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: read the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        # The binary reports the version it was built with, so a tag that
+        # disagrees with the workspace would publish a mislabelled release.
+        run: |
+          set -euo pipefail
+          declared=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$declared" ]; then
+              echo "tag ${GITHUB_REF_NAME} does not match the workspace version ${declared}"
+              exit 1
+            fi
+          fi
+          echo "version=${declared}" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            ext: ""
+            archive: tar.gz
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            ext: ""
+            archive: tar.gz
+          - name: macos-aarch64
+            os: macos-15
+            ext: ""
+            archive: tar.gz
+          - name: macos-x86_64
+            os: macos-15-intel
+            ext: ""
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            ext: ".exe"
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install libopus (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+
+      - name: install libopus (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opus pkgconf
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Windows'
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os != 'Windows'
+
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-opus
+            pkgconf
+            zip
+
+      - name: build and package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE: ${{ matrix.archive }}
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin rustlink
+          name="rustlink_${VERSION}_${PLATFORM}"
+          mkdir -p "dist/${name}"
+          cp "target/release/rustlink${EXT}" "dist/${name}/"
+          cp LICENSE NOTICE README.md config.example.yaml start.sh "dist/${name}/"
+          cp -R docs "dist/${name}/"
+          chmod +x "dist/${name}/start.sh"
+          if [ "${ARCHIVE}" = "zip" ]; then
+            (cd dist && zip -qr "${name}.zip" "${name}")
+          else
+            tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          fi
+          rm -rf "dist/${name}"
+
+      - name: build and package (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin rustlink
+          name="rustlink_${VERSION}_${PLATFORM}"
+          mkdir -p "dist/${name}"
+          cp "target/release/rustlink.exe" "dist/${name}/"
+          cp LICENSE NOTICE README.md config.example.yaml start.bat start.ps1 "dist/${name}/"
+          cp -R docs "dist/${name}/"
+          # The GNU build uses the system Opus DLL; include its runtime dependencies.
+          for dll in libopus-0.dll libgcc_s_seh-1.dll libwinpthread-1.dll libstdc++-6.dll; do
+            if [ -f "/ucrt64/bin/${dll}" ]; then cp "/ucrt64/bin/${dll}" "dist/${name}/"; fi
+          done
+          mkdir -p "dist/${name}/licenses"
+          for package in opus gcc-libs libwinpthread winpthreads; do
+            if [ -d "/ucrt64/share/licenses/${package}" ]; then
+              cp -R "/ucrt64/share/licenses/${package}" "dist/${name}/licenses/"
+            fi
+          done
+          (cd dist && zip -qr "${name}.zip" "${name}")
+          rm -rf "dist/${name}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [version, binaries]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

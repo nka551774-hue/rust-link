@@ -1,0 +1,16 @@
+[package]
+name = "rustlink-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native Rust track resolution for YouTube, SoundCloud, Spotify, Deezer and HTTP"
+
+[dependencies]
+rustlink-protocol.workspace = true
+rustlink-config.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ureq = { version = "3", features = ["json"] }
+url = "2"

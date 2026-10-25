@@ -1,0 +1,77 @@
+# Rustlink as a systemd service.
+#
+# Install it the way docs/vps.md describes:
+#
+#   install -d -o rustlink -g rustlink /opt/rustlink
+#   install -m 0755 rustlink /opt/rustlink/
+#   install -m 0644 config.yaml /opt/rustlink/
+#   install -m 0644 deploy/rustlink.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now rustlink
+
+[Unit]
+Description=Rustlink Discord audio service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustlink
+Group=rustlink
+WorkingDirectory=/opt/rustlink
+ExecStart=/opt/rustlink/rustlink
+
+# A node that stops because of a bug comes back; one that was asked to stop
+# stays stopped, because a clean shutdown exits zero.
+Restart=on-failure
+RestartSec=5
+
+# The journal names where a line came from, which is what makes `journalctl -u
+# rustlink` usable on a machine that writes to a shared journal.
+SyslogIdentifier=rustlink
+
+# When the kernel runs out of memory it kills whichever process is holding the
+# most of it, and on this unit that is a helper rather than the node. The node
+# is the one process here that cannot come back without dropping every session.
+OOMScoreAdjust=-200
+
+# glibc gives every thread its own malloc arena, and the resident memory that
+# costs is memory a small server cannot spare. The node applies this same cap
+# itself when nothing names one; the line says so and is the place to change it.
+Environment=MALLOC_ARENA_MAX=2
+
+# The journal already keeps and rotates what the node prints, so the daily files
+# are off here. Remove this line to write them under logs/ instead, where
+# logRetentionDays decides how long they stay.
+Environment=RUSTLINK_LOG_DIRECTORY=
+
+# One socket per session, one per player, and a few files per helper.
+LimitNOFILE=65535
+
+# A stop is graceful: sessions are closed and tracks end before the process
+# exits, so it is given twenty seconds rather than a signal that cuts it off.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Uncomment to keep a leak from taking the machine down with it. The node is
+# killed and restarted rather than left to swap the server to death.
+#MemoryMax=90%
+
+# The node needs one writable directory and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# The sources are reached over IPv4 and IPv6, voice over UDP, and the resolver
+# reads netlink to choose a source address. Nothing else is allowed.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/opt/rustlink
+
+[Install]
+WantedBy=multi-user.target

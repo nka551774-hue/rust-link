@@ -1,0 +1,24 @@
+[package]
+name = "rustlink-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Filter model, in-process DSP pipeline and the FFmpeg fallback engine"
+
+[dependencies]
+rustlink-protocol.workspace = true
+rustlink-config.workspace = true
+symphonia = "0.5.5"
+serde_json = "1"
+thiserror = "2"
+
+[features]
+default = ["native-opus"]
+# Link the system libopus and encode in process. Without it the node still
+# plays, but every track goes through FFmpeg.
+native-opus = []
+
+[[bench]]
+name = "hot_paths"
+harness = false
