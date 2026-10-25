@@ -562,6 +562,17 @@ pub fn collect_videos(value: &Value, out: &mut Vec<Media>) {
         Value::Object(map) => {
             for (key, child) in map {
                 match key.as_str() {
+                    // Promoted results can contain the same video renderer
+                    // shape as organic results. They are never a song search
+                    // result or a playlist entry, so skip the whole subtree.
+                    "adSlotRenderer"
+                    | "adPlacementRenderer"
+                    | "inFeedAdLayoutRenderer"
+                    | "promotedSparklesWebRenderer"
+                    | "promotedVideoRenderer"
+                    | "playerAds"
+                    | "adPlacements"
+                    | "adSlots" => continue,
                     "videoRenderer" | "compactVideoRenderer" | "playlistVideoRenderer" => {
                         if let Some(media) = video_from_renderer(child) {
                             out.push(media);
@@ -709,6 +720,32 @@ fn dedupe(videos: &mut Vec<Media>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promoted_video_subtrees_are_not_returned_as_music_results() {
+        let video = |id: &str| {
+            json!({"videoRenderer": {
+                "videoId": id, "title":{"simpleText":"A Song"},
+                "ownerText":{"simpleText":"Someone"}, "lengthText":{"simpleText":"3:20"}
+            }})
+        };
+        for key in [
+            "adSlotRenderer",
+            "adPlacementRenderer",
+            "inFeedAdLayoutRenderer",
+            "promotedSparklesWebRenderer",
+            "promotedVideoRenderer",
+            "playerAds",
+            "adPlacements",
+            "adSlots",
+        ] {
+            let answer = json!({"contents":[{(key):video("advertisemt1")},video("dQw4w9WgXcQ")]});
+            let mut videos = Vec::new();
+            collect_videos(&answer, &mut videos);
+            assert_eq!(videos.len(), 1, "{key}");
+            assert_eq!(videos[0].id, "dQw4w9WgXcQ");
+        }
+    }
 
     #[test]
     fn video_metadata_tries_another_client_after_a_refusal() {

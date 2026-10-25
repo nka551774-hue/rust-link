@@ -106,7 +106,7 @@ impl LRCLIB {
         if length > 0 {
             // The database files a track to the second, so the length is
             // rounded to the nearest one rather than truncated.
-            params.push(("duration".to_string(), ((length + 500) / 1000).to_string()));
+            params.push(("duration".to_string(), rounded_seconds(length).to_string()));
         }
         decode(&self.do_request(&url, &params)?)
     }
@@ -167,6 +167,10 @@ impl LRCLIB {
             LyricsError::Failed(format!("lyrics: lrclib sent an unreadable answer: {error}"))
         })
     }
+}
+
+fn rounded_seconds(milliseconds: i64) -> i64 {
+    milliseconds / 1000 + i64::from(milliseconds % 1000 >= 500)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, LyricsError> {
@@ -432,6 +436,15 @@ fn contains_noise(text: &str) -> bool {
 mod tests {
     use super::*;
     use rustlink_protocol::TrackInfo;
+
+    #[test]
+    fn duration_rounding_accepts_the_full_protocol_integer_range() {
+        assert_eq!(rounded_seconds(499), 0);
+        assert_eq!(rounded_seconds(500), 1);
+        assert_eq!(rounded_seconds(1499), 1);
+        assert_eq!(rounded_seconds(1500), 2);
+        assert_eq!(rounded_seconds(i64::MAX), 9_223_372_036_854_776);
+    }
 
     fn track(title: &str, author: &str) -> Track {
         Track::new(

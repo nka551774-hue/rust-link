@@ -58,8 +58,7 @@ impl Decoder {
 
     /// Decodes one packet into interleaved stereo samples.
     ///
-    /// A packet that libopus rejects is not fatal: the stream continues after
-    /// it, so the caller gets an empty result rather than an error.
+    /// Rejects malformed packets; a streaming caller may choose to skip them.
     pub fn decode(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, DecodeError> {
         let length = c_int::try_from(packet.len()).map_err(|_| DecodeError::Decode(-1))?;
         if length == 0 {

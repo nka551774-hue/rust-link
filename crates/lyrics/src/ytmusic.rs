@@ -273,7 +273,7 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
     for line in lines {
         let start = millis(line.pointer("/cueRange/startTimeMilliseconds"));
         let end = millis(line.pointer("/cueRange/endTimeMilliseconds"));
-        let duration = if end - start > 0 { Some(end - start) } else { None };
+        let duration = end.checked_sub(start).filter(|duration| *duration > 0);
         timed_lines.push(Line {
             timestamp: start,
             duration,
@@ -285,7 +285,7 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
     Some(out)
 }
 
-/// Builds the payload from the web answer, which is the whole text as one run.
+/// Builds the payload from all the text runs in the web description.
 ///
 /// An answer with no run is the catalogue saying it has nothing, such as the
 /// message it sends for a track whose lyrics are not licensed.
@@ -293,7 +293,9 @@ fn from_web(track: &Track, answer: &Value) -> Option<Lyrics> {
     let shelf =
         answer.pointer("/contents/sectionListRenderer/contents/0/musicDescriptionShelfRenderer")?;
     let runs = shelf.pointer("/description/runs").and_then(Value::as_array)?;
-    let text = runs.first()?.get("text").and_then(Value::as_str)?.trim();
+    let text: String =
+        runs.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect();
+    let text = text.trim();
     if text.is_empty() {
         return None;
     }
@@ -332,14 +334,15 @@ fn source_object(message: &str) -> Object {
 /// Reads a millisecond count the catalogue sends as a string, and reads one sent
 /// as a number just as well.
 ///
-/// A value it cannot read is zero rather than an error, because one unreadable
-/// timestamp should not cost the whole track its lyrics.
+/// A negative or unreadable value is zero rather than an error, because one
+/// unreadable timestamp should not cost the whole track its lyrics.
 fn millis(value: Option<&Value>) -> i64 {
     match value {
         Some(Value::String(text)) => text.trim().parse().unwrap_or(0),
         Some(Value::Number(number)) => number.as_i64().unwrap_or(0),
         _ => 0,
     }
+    .max(0)
 }
 
 #[cfg(test)]
@@ -366,6 +369,19 @@ mod tests {
     }
 
     #[test]
+    fn web_lyrics_keep_every_text_run() {
+        let answer = json!({
+            "contents": {"sectionListRenderer": {"contents": [{
+                "musicDescriptionShelfRenderer": {"description": {"runs": [
+                    {"text": " first line\n"}, {"text": "second "}, {"text": "line "}
+                ]}}
+            }]}}
+        });
+        let lyrics = from_web(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap();
+        assert_eq!(lyrics.text.as_deref(), Some("first line\nsecond line"));
+    }
+
+    #[test]
     fn a_timed_mobile_answer_becomes_timed_lines() {
         let answer = json!({
             "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
@@ -385,6 +401,27 @@ mod tests {
         assert_eq!(lines[0].duration, Some(1000));
         assert_eq!(lines[1].timestamp, 2000);
         assert_eq!(lyrics.plugin.get("source").and_then(Value::as_str), Some("Someone"));
+    }
+
+    #[test]
+    fn malformed_mobile_cues_do_not_overflow_or_produce_negative_timestamps() {
+        let answer = json!({
+            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
+                "timedLyricsModel": {"lyricsData": {
+                    "timedLyricsData": [
+                        {"lyricLine": "one", "cueRange": {
+                            "startTimeMilliseconds": i64::MIN.to_string(), "endTimeMilliseconds": i64::MAX}},
+                        {"lyricLine": "two", "cueRange": {
+                            "startTimeMilliseconds": i64::MAX, "endTimeMilliseconds": -1}}
+                    ]
+                }}
+            }}}}}}
+        });
+        let lines = from_mobile(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap().lines.unwrap();
+        assert_eq!(lines[0].timestamp, 0);
+        assert_eq!(lines[0].duration, Some(i64::MAX));
+        assert_eq!(lines[1].timestamp, i64::MAX);
+        assert_eq!(lines[1].duration, None);
     }
 
     #[test]

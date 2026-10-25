@@ -80,7 +80,10 @@ impl Connection for Media {
 
 struct Node(Arc<Server>);
 impl Node {
-    fn new(mut config: Config) -> Self {
+    fn new(config: Config) -> Self {
+        Self::with_engine(config, Arc::new(Media))
+    }
+    fn with_engine(mut config: Config, engine: Arc<dyn Engine>) -> Self {
         config.password = "test-secret".into();
         config.ratelimits.enable = false;
         Self(
@@ -88,7 +91,7 @@ impl Node {
                 config,
                 Dependencies {
                     loader: Arc::new(Media),
-                    engine: Arc::new(Media),
+                    engine,
                     voice: Arc::new(Media),
                     lyrics: None,
                     webhook: None,
@@ -134,6 +137,22 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.0.close();
     }
+}
+
+#[tokio::test]
+async fn closing_before_background_tasks_start_releases_the_server() {
+    let node = Node::new(Config::default());
+    let server = Arc::downgrade(&node.0);
+    // The current-thread runtime has not polled the reaper yet. Closing here
+    // must remain observable when that task gets its first turn.
+    drop(node);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.strong_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("closed server is still retained by a background task");
 }
 
 #[tokio::test]
@@ -259,9 +278,15 @@ async fn rest_session_player_lifecycle_and_patch_semantics() {
         assert_eq!(node.request("PATCH", &player, invalid).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(node.request("GET", &player, Value::Null).await.1["volume"], 75);
     }
-    let (_, preserved) =
-        node.request("PATCH", &format!("{player}?replace=false"), json!({"track": null})).await;
+    let (_, preserved) = node
+        .request(
+            "PATCH",
+            &format!("{player}?replace=false"),
+            json!({"track": null, "paused": false}),
+        )
+        .await;
     assert!(preserved["track"].is_object());
+    assert_eq!(preserved["paused"], false, "preserving a track must still apply other settings");
     let (_, stopped) = node.request("PATCH", &player, json!({"track":null, "end_ms": null})).await;
     assert!(stopped["track"].is_null());
     let (_, settings) = node.request("PATCH", &session, json!({"resume_timeout_secs":120})).await;
@@ -274,6 +299,65 @@ async fn rest_session_player_lifecycle_and_patch_semantics() {
     assert_eq!(node.request("DELETE", &session, Value::Null).await.0, StatusCode::NO_CONTENT);
     assert_eq!(node.request("GET", &session, Value::Null).await.0, StatusCode::NOT_FOUND);
     assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
+}
+
+#[tokio::test]
+async fn stats_counts_playback_and_tracks_pause_resume_and_stop() {
+    struct Stream;
+    impl Engine for Stream {
+        fn start(
+            &self,
+            _: &Track,
+            _: i64,
+            _: i64,
+            _: &Object,
+        ) -> Result<Box<dyn Frames>, AudioError> {
+            Ok(Box::new(Stream))
+        }
+    }
+    impl Frames for Stream {
+        fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
+            packet.clear();
+            packet.extend_from_slice(&[0xf8, 0xff, 0xfe]);
+            Ok(true)
+        }
+    }
+
+    let node = Node::with_engine(Config::default(), Arc::new(Stream));
+    let id = node.session().await;
+    let player = format!("/api/v1/sessions/{id}/players/456");
+    let (status, body) = node
+        .request(
+            "PATCH",
+            &player,
+            json!({
+                "track": { "token": track().token }, "paused": true,
+                "voice": { "token": "voice-token", "session_id": "voice-session",
+                    "endpoint": "test.discord.media:443", "channel_id": "789" }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while node.request("GET", &player, Value::Null).await.1["state"]["connected"] != true {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("voice connection did not become ready");
+
+    for (patch, playing) in [
+        (json!({ "paused": false }), 1),
+        (json!({ "paused": true }), 0),
+        (json!({ "paused": false }), 1),
+        (json!({ "track": null }), 0),
+    ] {
+        assert_eq!(node.request("PATCH", &player, patch).await.0, StatusCode::OK);
+        let (status, stats) = node.request("GET", "/api/v1/stats", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stats["players"], 1);
+        assert_eq!(stats["playing_players"], playing);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

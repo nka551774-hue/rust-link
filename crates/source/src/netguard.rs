@@ -55,14 +55,20 @@ fn is_public_v4(address: Ipv4Addr) -> bool {
     {
         return false;
     }
-    // Carrier grade NAT, benchmarking, and the reserved top of the space.
+    // This-network, multicast and the reserved top of the space are not
+    // public unicast destinations, even when the individual address is not
+    // classified as unspecified or broadcast by std.
+    if octets[0] == 0 || octets[0] >= 224 {
+        return false;
+    }
+    // Carrier grade NAT, benchmarking and the retired 6to4 relay prefix.
     if octets[0] == 100 && (64..128).contains(&octets[1]) {
         return false;
     }
     if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
         return false;
     }
-    if octets[0] >= 240 {
+    if octets[0] == 192 && octets[1] == 88 && octets[2] == 99 {
         return false;
     }
     // 192.0.0.0/24 and the documentation range sit inside blocks that are
@@ -74,32 +80,29 @@ fn is_public_v4(address: Ipv4Addr) -> bool {
 }
 
 fn is_public_v6(address: Ipv6Addr) -> bool {
-    if address.is_loopback() || address.is_unspecified() {
-        return false;
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_v4(mapped);
     }
     let segments = address.segments();
-    // Unique local addresses, link local addresses and the documentation range.
-    if segments[0] & 0xfe00 == 0xfc00 {
-        return false;
-    }
-    if segments[0] & 0xffc0 == 0xfe80 {
+    // Public IPv6 unicast is allocated from 2000::/3. This also excludes
+    // multicast, site/link/unique-local, translation and discard-only space.
+    if segments[0] & 0xe000 != 0x2000 {
         return false;
     }
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         return false;
     }
-    // 6to4, Teredo and the NAT64 translation prefix all stand for another
-    // address that has not been checked.
-    if segments[0] == 0x2002 || segments[0] == 0x2001 {
+    // IETF protocol assignments (including Teredo) occupy 2001::/23,
+    // not all of 2001::/16: ordinary networks such as 2001:4860::/32
+    // must remain usable. Refuse 6to4, whose embedded IPv4 is unchecked.
+    if segments[0] == 0x2002 || (segments[0] == 0x2001 && segments[1] < 0x0200) {
         return false;
     }
-    if segments[0] == 0x0064 && segments[1] == 0xff9b {
+    // The newer documentation prefix is 3fff::/20 (RFC 9637).
+    if segments[0] == 0x3fff && segments[1] & 0xf000 == 0 {
         return false;
     }
-    match address.to_ipv4_mapped() {
-        Some(mapped) => is_public_v4(mapped),
-        None => true,
-    }
+    true
 }
 
 /// A resolver that refuses to hand back an address the node will not connect
@@ -300,6 +303,36 @@ mod tests {
     #[test]
     fn an_address_on_the_public_internet_is_allowed() {
         for raw in ["1.1.1.1", "8.8.8.8", "142.250.0.1", "2606:4700::1111"] {
+            assert!(is_public(ip(raw)), "{raw} should be reachable");
+        }
+    }
+
+    #[test]
+    fn special_use_and_multicast_addresses_are_never_media_destinations() {
+        for raw in [
+            "0.1.2.3",
+            "224.0.0.1",
+            "239.255.255.250",
+            "192.88.99.1",
+            "::ffff:0.1.2.3",
+            "::ffff:224.0.0.1",
+            "::127.0.0.1",
+            "100::1",
+            "64:ff9b:1::a00:1",
+            "fec0::1",
+            "ff02::1",
+            "ff0e::1",
+            "2001:2::1",
+            "3fff::1",
+            "3fff:fff::1",
+        ] {
+            assert!(!is_public(ip(raw)), "{raw} should not be reachable");
+        }
+    }
+
+    #[test]
+    fn ordinary_global_ipv6_is_not_confused_with_teredo() {
+        for raw in ["2001:4860:4860::8888", "2001:4860::1", "2001:200::1", "2606:4700::1111"] {
             assert!(is_public(ip(raw)), "{raw} should be reachable");
         }
     }

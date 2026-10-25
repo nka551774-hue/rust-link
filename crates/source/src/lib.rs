@@ -1517,6 +1517,65 @@ mod tests {
     }
 
     #[test]
+    fn spotify_metadata_opens_the_full_matching_recording_without_ad_requests() {
+        let mut calls = 0;
+        let (base, server) = test_http::serve(3, move |base, headers, body| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert!(headers.starts_with("POST /youtubei/v1/search?"));
+                    assert_eq!(body["query"], "Someone - A Song audio");
+                    let video = |id: &str, title: &str, duration: &str| {
+                        serde_json::json!({"videoRenderer":{
+                            "videoId":id,"title":{"simpleText":title},"ownerText":{"simpleText":"Someone"},"lengthText":{"simpleText":duration}
+                        }})
+                    };
+                    serde_json::json!({"contents":[
+                        {"adSlotRenderer":video("advertisemt1", "A Song", "3:20")},
+                        video("preview0001", "A Song Preview", "0:30"),
+                        video("cover000001", "A Song Cover", "3:20"),
+                        video("dQw4w9WgXcQ", "A Song (Official Audio)", "3:21")
+                    ]})
+                }
+                2 => {
+                    assert!(headers.starts_with("POST /youtubei/v1/player?"));
+                    assert_eq!(body["videoId"], "dQw4w9WgXcQ");
+                    serde_json::json!({
+                        "playabilityStatus":{"status":"OK"},
+                        "adPlacements":[{"url":format!("{base}/advertisement")}],
+                        "streamingData":{"adaptiveFormats":[
+                            {"mimeType":"audio/webm; codecs=\"opus\"","bitrate":160000,"url":format!("{base}/recording")}
+                        ]}
+                    })
+                }
+                _ => {
+                    assert!(headers.starts_with("GET /recording "));
+                    serde_json::json!("full-recording-fixture")
+                }
+            }
+        });
+        let service = Service::new(Config {
+            youtube_endpoint: base,
+            allow_private_networks: true,
+            ..Config::default()
+        });
+        let track = rustlink_protocol::encode_track(&TrackInfo {
+            identifier: "4cOdK2wGLETKBW3PvgPWqT".into(),
+            title: "A Song".into(),
+            author: "Someone".into(),
+            length: 200_000,
+            source_name: "spotify".into(),
+            uri: Some("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut bytes = Vec::new();
+        service.open(&track).unwrap().read_to_end(&mut bytes).unwrap();
+        server.join().unwrap();
+        assert_eq!(serde_json::from_slice::<String>(&bytes).unwrap(), "full-recording-fixture");
+    }
+
+    #[test]
     fn a_pasted_video_link_opens_the_next_client_when_the_first_cdn_returns_403() {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

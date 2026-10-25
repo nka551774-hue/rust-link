@@ -26,6 +26,7 @@ const OPUS_SET_VBR_REQUEST: c_int = 4006;
 const OPUS_SET_COMPLEXITY_REQUEST: c_int = 4010;
 const OPUS_SET_INBAND_FEC_REQUEST: c_int = 4012;
 const OPUS_SET_PACKET_LOSS_PERC_REQUEST: c_int = 4014;
+const OPUS_SET_VBR_CONSTRAINT_REQUEST: c_int = 4020;
 const OPUS_SET_SIGNAL_REQUEST: c_int = 4024;
 const OPUS_GET_LOOKAHEAD_REQUEST: c_int = 4027;
 const OPUS_SET_LSB_DEPTH_REQUEST: c_int = 4036;
@@ -47,6 +48,8 @@ pub enum OpusError {
     Create(c_int),
     #[error("libopus failed to encode a frame (code {0})")]
     Encode(c_int),
+    #[error("libopus rejected encoder control {request} (code {code})")]
+    Control { request: c_int, code: c_int },
     #[error("the frame must hold exactly {FRAME_SAMPLES_STEREO} samples")]
     FrameSize,
 }
@@ -73,6 +76,7 @@ extern "C" {
 pub struct Encoder {
     state: *mut OpusEncoder,
     buffer: Vec<u8>,
+    lookahead: i32,
 }
 
 // The encoder is only ever touched from the playback task that owns it.
@@ -89,42 +93,51 @@ impl Encoder {
         if state.is_null() || error != OPUS_OK {
             return Err(OpusError::Create(error));
         }
-        let encoder = Encoder { state, buffer: vec![0u8; MAX_PACKET] };
+        let mut encoder = Encoder { state, buffer: vec![0u8; MAX_PACKET], lookahead: 0 };
         // Music, not speech, and a bitrate the operator chose. Variable bitrate
         // is what keeps a quiet passage from costing as much as a loud one.
-        encoder.control(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC);
-        encoder.control(OPUS_SET_VBR_REQUEST, 1);
-        encoder.control(OPUS_SET_BITRATE_REQUEST, bitrate);
+        encoder.control(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC)?;
+        encoder.control(OPUS_SET_VBR_REQUEST, 1)?;
+        encoder.control(OPUS_SET_VBR_CONSTRAINT_REQUEST, 0)?;
+        encoder.control(OPUS_SET_BITRATE_REQUEST, bitrate)?;
         // The samples handed in are 16-bit integers, and saying so is what lets
         // the encoder tell near-silence from detail below the quantisation
         // noise instead of spending bits on the noise.
-        encoder.control(OPUS_SET_LSB_DEPTH_REQUEST, 16);
+        encoder.control(OPUS_SET_LSB_DEPTH_REQUEST, 16)?;
         // The default is the encoder's own maximum, because a node is not short
         // of CPU the way a phone is; an operator with more players than cores
         // asks for less, and says so once for the whole node.
-        encoder.control(OPUS_SET_COMPLEXITY_REQUEST, complexity);
-        // Packets travel over UDP, where the transport recovers a lost one by
-        // decoding the packet after it, so the encoder is told to expect a little
-        // loss and to protect against it.
-        encoder.control(OPUS_SET_INBAND_FEC_REQUEST, 1);
-        encoder.control(OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
+        encoder.control(OPUS_SET_COMPLEXITY_REQUEST, complexity)?;
+        // Request the same loss allowance as the FFmpeg path. Actual in-band
+        // recovery depends on the Opus mode and the receiving decoder.
+        encoder.control(OPUS_SET_INBAND_FEC_REQUEST, 1)?;
+        encoder.control(OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10)?;
+        let code = unsafe {
+            opus_encoder_ctl(
+                encoder.state,
+                OPUS_GET_LOOKAHEAD_REQUEST,
+                &mut encoder.lookahead as *mut c_int,
+            )
+        };
+        if code != OPUS_OK {
+            return Err(OpusError::Control { request: OPUS_GET_LOOKAHEAD_REQUEST, code });
+        }
         Ok(encoder)
     }
 
-    fn control(&self, request: c_int, value: c_int) {
-        unsafe {
-            opus_encoder_ctl(self.state, request, value);
+    fn control(&self, request: c_int, value: c_int) -> Result<(), OpusError> {
+        let code = unsafe { opus_encoder_ctl(self.state, request, value) };
+        if code == OPUS_OK {
+            Ok(())
+        } else {
+            Err(OpusError::Control { request, code })
         }
     }
 
     /// How many samples the encoder holds back, which a caller needs if it is
     /// aligning output with a source position.
     pub fn lookahead(&self) -> i32 {
-        let mut value: c_int = 0;
-        unsafe {
-            opus_encoder_ctl(self.state, OPUS_GET_LOOKAHEAD_REQUEST, &mut value as *mut c_int);
-        }
-        value
+        self.lookahead
     }
 
     /// Encodes one 20 ms frame of interleaved stereo samples.
@@ -217,6 +230,12 @@ mod tests {
         for _ in 0..10 {
             assert!(!encoder.encode(&pcm).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn invalid_controls_are_reported_instead_of_silently_using_defaults() {
+        assert!(matches!(Encoder::new(192_000, 11), Err(OpusError::Control { .. })));
+        assert!(matches!(Encoder::new(0, 10), Err(OpusError::Control { .. })));
     }
 
     #[test]

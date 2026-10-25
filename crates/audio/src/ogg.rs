@@ -13,6 +13,9 @@ struct PageState {
     count: usize,
     next_segment: usize,
     offset: usize,
+    granule: u64,
+    end_of_stream: bool,
+    last_complete: usize,
 }
 
 pub struct OggOpusReader<R: Read> {
@@ -26,6 +29,8 @@ pub struct OggOpusReader<R: Read> {
     /// Signed Q8 dB gain from OpusHead, applied by the decoder.
     output_gain: i16,
     ended: bool,
+    packet_end_granule: Option<u64>,
+    packet_page_end: Option<(u64, bool)>,
 }
 
 impl<R: Read> OggOpusReader<R> {
@@ -40,6 +45,8 @@ impl<R: Read> OggOpusReader<R> {
             drop_samples: 0,
             output_gain: 0,
             ended: false,
+            packet_end_granule: None,
+            packet_page_end: None,
         }
     }
 
@@ -78,6 +85,8 @@ impl<R: Read> OggOpusReader<R> {
 
     fn next_raw_packet_into(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
         packet.clear();
+        self.packet_end_granule = None;
+        self.packet_page_end = None;
         loop {
             if self.page.is_none() {
                 if !self.have_page()? {
@@ -106,6 +115,16 @@ impl<R: Read> OggOpusReader<R> {
                 page.offset = end;
                 if size < 255 {
                     self.consumed = page.offset;
+                    // A page may finish one packet and start another. Its
+                    // granule belongs to the last completed packet, even when
+                    // that packet is not the page's final lacing segment.
+                    if page.next_segment == page.last_complete {
+                        self.packet_page_end = Some((page.granule, page.end_of_stream));
+                        self.packet_end_granule = page.end_of_stream.then_some(page.granule);
+                        if page.end_of_stream {
+                            self.ended = true;
+                        }
+                    }
                     if page.next_segment >= page.count {
                         self.page = None;
                     }
@@ -161,7 +180,27 @@ impl<R: Read> OggOpusReader<R> {
         let table = self.consumed + PAGE_HEADER;
         // No compaction takes place while a page is open, so the table can be
         // read from the input buffer without copying it into another array.
-        Ok(PageState { table, count, next_segment: 0, offset: table + count })
+        let granule = u64::from_le_bytes(
+            self.buffer[self.consumed + 6..self.consumed + 14].try_into().unwrap(),
+        );
+        let end_of_stream = self.buffer[self.consumed + 5] & 4 != 0;
+        let segments = &self.buffer[table..table + count];
+        let last_complete = segments.iter().rposition(|size| *size < 255).map_or(0, |i| i + 1);
+        if end_of_stream && segments.last() == Some(&255) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unfinished final ogg packet",
+            ));
+        }
+        Ok(PageState {
+            table,
+            count,
+            next_segment: 0,
+            offset: table + count,
+            granule,
+            end_of_stream,
+            last_complete,
+        })
     }
 
     fn compact(&mut self) {
@@ -195,6 +234,18 @@ impl<R: Read> OggOpusReader<R> {
 
     pub fn output_gain(&self) -> i16 {
         self.output_gain
+    }
+
+    /// EOS granule for the packet most recently returned. It counts decoded
+    /// 48 kHz samples including pre-skip, and can trim the final packet's padding.
+    pub fn packet_end_granule(&self) -> Option<u64> {
+        self.packet_end_granule
+    }
+
+    /// Timing metadata after the last packet completed on a page. A trailing
+    /// partial packet belongs to the later page on which it completes.
+    pub(crate) fn packet_page_end(&self) -> Option<(u64, bool)> {
+        self.packet_page_end
     }
 }
 

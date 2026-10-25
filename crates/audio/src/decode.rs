@@ -6,6 +6,7 @@
 //! probe does for the formats it covers and what the Opus path below does for
 //! the one it demuxes but cannot decode.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
@@ -74,14 +75,168 @@ enum Inner {
         spec: SignalSpec,
         mixer: Downmix,
     },
-    OggOpus {
-        reader: Box<OggOpusReader<Body>>,
-        decoder: opus_decode::Decoder,
-        skip: u32,
-        packet: Vec<u8>,
-        pending: bool,
-        gain: f32,
-    },
+    OggOpus(Box<OggDecoder>),
+}
+
+struct OggPacket {
+    offset: usize,
+    length: usize,
+    frames: usize,
+    keep: usize,
+}
+
+/// Stage compressed packets for one page so RFC 7845 end trimming can cut
+/// across any of its packets. A page has at most 255 completed packets and
+/// 65,025 payload bytes, plus the first packet's bounded continuation history.
+/// PCM storage remains one packet (at most 120 ms), not an entire decoded page.
+struct OggDecoder {
+    reader: OggOpusReader<Body>,
+    decoder: opus_decode::Decoder,
+    skip: u32,
+    gain: f32,
+    page: Vec<u8>,
+    packet: Vec<u8>,
+    packets: VecDeque<OggPacket>,
+    previous_granule: Option<u64>,
+    ended: bool,
+}
+
+extern "C" {
+    fn opus_packet_get_nb_samples(
+        data: *const u8,
+        len: std::ffi::c_int,
+        fs: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+}
+
+impl OggDecoder {
+    fn new(body: Body) -> Result<Self, AudioError> {
+        let mut decoder = Self {
+            reader: OggOpusReader::new(body),
+            decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
+            skip: 0,
+            gain: 1.0,
+            page: Vec::new(),
+            packet: Vec::new(),
+            packets: VecDeque::new(),
+            previous_granule: None,
+            ended: false,
+        };
+        // Validate the initial granule and establish cropping before playback
+        // starts, while the caller can still select its FFmpeg fallback.
+        if !decoder.read_page()? {
+            return Err(AudioError::Decode("the stream holds no audio".into()));
+        }
+        Ok(decoder)
+    }
+
+    fn read_page(&mut self) -> Result<bool, AudioError> {
+        if self.ended {
+            return Ok(false);
+        }
+        self.page.clear();
+        self.packets.clear();
+        let mut total = 0u64;
+        loop {
+            if !self.reader.next_packet_into(&mut self.packet)? {
+                return if self.packets.is_empty() {
+                    Ok(false)
+                } else {
+                    Err(AudioError::Decode("missing ogg page granule".into()))
+                };
+            }
+            let length = i32::try_from(self.packet.len())
+                .map_err(|_| AudioError::Decode("opus packet too large".into()))?;
+            let frames =
+                unsafe { opus_packet_get_nb_samples(self.packet.as_ptr(), length, 48_000) };
+            if !(1..=5760).contains(&frames) {
+                return Err(AudioError::Decode("invalid opus packet duration".into()));
+            }
+            let frames = frames as usize;
+            total += frames as u64;
+            self.packets.push_back(OggPacket {
+                offset: self.page.len(),
+                length: self.packet.len(),
+                frames,
+                keep: frames,
+            });
+            self.page.extend_from_slice(&self.packet);
+            let Some((granule, end_of_stream)) = self.reader.packet_page_end() else {
+                // The reader must delimit every page with completed packets;
+                // this guard also keeps accidental metadata loss bounded.
+                if self.packets.len() >= 255 {
+                    return Err(AudioError::Decode("too many packets on an ogg page".into()));
+                }
+                continue;
+            };
+            if granule == u64::MAX {
+                return Err(AudioError::Decode("missing ogg audio granule".into()));
+            }
+            let keep = match self.previous_granule {
+                None => {
+                    self.skip = self.reader.pre_skip();
+                    self.gain = 10.0f32.powf(self.reader.output_gain() as f32 / (20.0 * 256.0));
+                    if end_of_stream {
+                        if granule < u64::from(self.skip) {
+                            return Err(AudioError::Decode("ogg end precedes pre-skip".into()));
+                        }
+                        // A single EOS page can trim from a zero origin, or
+                        // have a nonzero origin when its granule exceeds its
+                        // complete decoded duration (RFC 7845 section 4.5).
+                        granule.min(total)
+                    } else {
+                        if granule < total {
+                            return Err(AudioError::Decode("invalid initial ogg granule".into()));
+                        }
+                        total
+                    }
+                }
+                Some(previous) => {
+                    let delta = granule
+                        .checked_sub(previous)
+                        .ok_or_else(|| AudioError::Decode("ogg granule moved backwards".into()))?;
+                    if delta > total || (!end_of_stream && delta != total) {
+                        return Err(AudioError::Decode(
+                            "ogg granule disagrees with packet duration".into(),
+                        ));
+                    }
+                    delta
+                }
+            };
+            let mut remaining = keep as usize;
+            for packet in &mut self.packets {
+                packet.keep = remaining.min(packet.frames);
+                remaining -= packet.keep;
+            }
+            self.previous_granule = Some(granule);
+            self.ended = end_of_stream;
+            return Ok(true);
+        }
+    }
+
+    fn decode(&mut self, scratch: &mut Vec<i16>, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+        if self.packets.is_empty() && !self.read_page()? {
+            return Ok(false);
+        }
+        let packet = self.packets.pop_front().expect("a nonempty audio page was loaded");
+        let drop = (self.skip as usize).min(packet.frames);
+        self.skip -= drop as u32;
+        let frames = match self
+            .decoder
+            .decode(&self.page[packet.offset..packet.offset + packet.length], scratch)
+        {
+            Ok(frames) => frames,
+            // The TOC gave a valid duration: a damaged payload still occupies
+            // its place on the page's clock and consumes the same pre-skip.
+            Err(_) => return Ok(true),
+        };
+        let end = packet.keep.min(frames);
+        let start = drop.min(end);
+        out.reserve((end - start) * 2);
+        let scale = self.gain / 32768.0;
+        out.extend(scratch[start * 2..end * 2].iter().map(|sample| *sample as f32 * scale));
+        Ok(true)
+    }
 }
 
 impl Decoder {
@@ -93,34 +248,12 @@ impl Decoder {
         // Opus in Ogg is demuxed here rather than by symphonia, because
         // symphonia has no Opus decoder and libopus does.
         if body.head().starts_with(b"OggS") {
-            let mut reader = Box::new(OggOpusReader::new(body));
-            let mut packet = Vec::new();
-            match reader.next_packet_into(&mut packet) {
-                Ok(true) => {
-                    let decoder = opus_decode::Decoder::new()
-                        .map_err(|e| AudioError::Decode(e.to_string()))?;
-                    let skip = reader.pre_skip();
-                    let gain = 10.0f32.powf(reader.output_gain() as f32 / (20.0 * 256.0));
-                    return Ok(Decoder {
-                        inner: Inner::OggOpus {
-                            reader,
-                            decoder,
-                            skip,
-                            packet,
-                            pending: true,
-                            gain,
-                        },
-                        rate: 48_000,
-                        scratch: Vec::new(),
-                        samples: SampleBuffer::new(
-                            0,
-                            SignalSpec::new(48_000, Channels::FRONT_LEFT),
-                        ),
-                    });
-                }
-                Ok(false) => return Err(AudioError::Decode("the stream holds no audio".into())),
-                Err(e) => return Err(AudioError::Decode(e.to_string())),
-            }
+            return Ok(Decoder {
+                inner: Inner::OggOpus(Box::new(OggDecoder::new(body)?)),
+                rate: 48_000,
+                scratch: Vec::new(),
+                samples: SampleBuffer::new(0, SignalSpec::new(48_000, Channels::FRONT_LEFT)),
+            });
         }
 
         let source = Unseekable { inner: Mutex::new(body) };
@@ -174,30 +307,7 @@ impl Decoder {
     /// that arrived over a lossy connection.
     pub fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         match &mut self.inner {
-            Inner::OggOpus { reader, decoder, skip, packet, pending, gain } => {
-                if !std::mem::take(pending) && !reader.next_packet_into(packet)? {
-                    return Ok(false);
-                }
-                let frames = match decoder.decode(packet, &mut self.scratch) {
-                    Ok(frames) => frames,
-                    Err(_) => {
-                        // A packet libopus will not take is one packet lost.
-                        return Ok(true);
-                    }
-                };
-                let mut start = 0usize;
-                if *skip > 0 {
-                    let drop = (*skip as usize).min(frames);
-                    *skip -= drop as u32;
-                    start = drop;
-                }
-                out.reserve((frames - start) * 2);
-                let scale = *gain / 32768.0;
-                out.extend(
-                    self.scratch[start * 2..frames * 2].iter().map(|sample| *sample as f32 * scale),
-                );
-                Ok(true)
-            }
+            Inner::OggOpus(decoder) => decoder.decode(&mut self.scratch, out),
             Inner::Symphonia { format, decoder, track_id, spec, mixer } => loop {
                 let packet = match format.next_packet() {
                     Ok(packet) => packet,
