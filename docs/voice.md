@@ -19,17 +19,25 @@ flowchart LR
 - 僅處理受信任外部 sender 的 Add／Remove 提案；驗證成員名單、重複身分、提案參照、初始 commit、welcome 群組與外部 sender。
 - Commit／Welcome 先更新待切換的金鑰；收到 Execute Transition 才切換傳送金鑰。轉換 ID 0 依協定立即生效。一般轉換期間沿用目前的 sender，避免提前換金鑰。
 - Opus frame 使用 AES-128-GCM、8-byte tag、ULEB128 nonce 與 `FA FA` 標記。每 2²⁴ frames 換下一代金鑰，nonce 溢位後仍繼續前進，不重複使用 key／nonce。
-- 外層使用 `aead_aes256_gcm_rtpsize`，或 `aead_xchacha20poly1305_rtpsize`。RTP header 經認證；32-bit 傳輸 nonce 用盡時關閉連線，要求重新建立。
+- 外層使用 `aead_aes256_gcm_rtpsize`，或 `aead_xchacha20_poly1305_rtpsize`。RTP header 經認證；32-bit 傳輸 nonce 用盡時關閉連線，要求重新建立。
 
 Discord 仍可能選擇協定版本 0。這時音訊使用傳輸加密；只有 Discord 明確協商版本 0 或執行降級轉換時才會採用。版本 1 沒有金鑰時禁止送出音訊。Rustlink 是音訊傳送服務，不提供語音錄音、影片、使用者裝置持久身分或人工指紋驗證介面。
 
 ## 連線與失敗處理
 
-Voice gateway 使用 v8 的 `seq_ack` 心跳及二進位 sequence；UDP discovery 驗證回覆來源、類型、長度與 SSRC。心跳在整個握手期間持續執行，未收到 ACK 時關閉連線。Speaking 命令與音訊經同一個有界佇列依序處理。
+Voice gateway 使用 v8 的 `seq_ack` 心跳及 sequence；JSON 訊息的 `seq` 可省略，
+有值時必須是 16-bit 無號整數，server-to-client DAVE binary 前綴亦讀取 big-endian
+`u16`。UDP discovery 驗證回覆來源、類型、長度與 SSRC。收到 Hello 後，以其
+`heartbeat_interval`（包含合法的小數毫秒）排定第一個及
+後續心跳，不額外在 Hello 當下送一次。每次排定送出前若上一個心跳仍未 ACK 就關閉
+連線；因此遺失 ACK 的偵測時間會隨伺服器給的 interval 增加。Speaking 命令與音訊經
+同一個有界佇列依序處理，第一次 Opus 封包一定排在 `Speaking(true)` 之後。
 
 完整握手最多 30 秒，包含 DAVE；IP discovery 最多 5 秒。遇到無法驗證的 Commit／Welcome，回報 Invalid Commit Welcome 並產生全新 key package；連續三次恢復仍未成功時關閉連線。原有 sender 只在等待有效轉換期間保留，初始連線沒有未加密的後備路徑。
 
-語音 WebSocket 中斷後，由機器人重新取得語音資訊並呼叫 `set_voice` 建立新連線。API session 的事件重連是另一個流程。
+語音 WebSocket 中斷後，由機器人重新取得語音資訊並呼叫 `set_voice` 建立新連線。
+目前每次都以完整 Identify 建立新 transport／金鑰與 nonce 空間，不實作 opcode 7
+Resume 或伺服器緩衝事件重播。API session 的事件重連是另一個流程。
 
 ## 驗證範圍
 

@@ -22,7 +22,9 @@ impl Mode {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "aead_aes256_gcm_rtpsize" => Some(Self::AeadAes256GcmRtpSize),
-            "aead_xchacha20poly1305_rtpsize" => Some(Self::AeadXChaCha20Poly1305RtpSize),
+            // Retain the legacy cipher as the performance baseline while accepting
+            // Discord's canonical identifier during benchmark setup.
+            "aead_xchacha20_poly1305_rtpsize" => Some(Self::AeadXChaCha20Poly1305RtpSize),
             _ => None,
         }
     }

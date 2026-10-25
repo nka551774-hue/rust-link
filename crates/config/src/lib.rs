@@ -219,7 +219,7 @@ impl Config {
     }
 
     pub fn lyrics_enabled(&self) -> bool {
-        !self.lyrics_source.eq_ignore_ascii_case("none")
+        !self.lyrics_source.trim().eq_ignore_ascii_case("none")
     }
 
     pub fn spotify_enabled(&self) -> bool {
@@ -323,6 +323,13 @@ mod tests {
                 .unwrap();
         assert_eq!(explicit.opus_bitrate, 128_000);
         assert_eq!(explicit.opus_complexity, 4);
+    }
+
+    #[test]
+    fn validated_lyrics_off_value_does_not_enable_network_providers() {
+        let config = parse_configuration("password: secret\nlyricsSource: ' NoNe '\n").unwrap();
+        validate(&config).unwrap();
+        assert!(!config.lyrics_enabled());
     }
 
     #[test]

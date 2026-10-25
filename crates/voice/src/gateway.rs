@@ -273,7 +273,7 @@ impl Gateway {
                 let nonce = now_millis();
                 self.send(json!({"op":3,"d":{"t":nonce,"seq_ack":self.sequence}})).await?;
                 self.outstanding = Some((nonce,Instant::now()));
-                self.next_heartbeat = Some(Instant::now() + self.interval);
+                self.next_heartbeat = Some(heartbeat_deadline(self.interval)?);
             }
             message = self.stream.next() => {
                 match message.ok_or_else(|| VoiceError::Gateway("voice gateway hung up".into()))?.map_err(gateway_error)? {
@@ -339,13 +339,10 @@ impl Gateway {
                     .identify
                     .take()
                     .ok_or_else(|| VoiceError::Gateway("duplicate voice hello".into()))?;
-                let interval = data
-                    .get("heartbeat_interval")
-                    .and_then(Value::as_u64)
-                    .filter(|i| *i > 0)
-                    .ok_or_else(|| VoiceError::Gateway("invalid heartbeat interval".into()))?;
-                self.interval = Duration::from_millis(interval.min(5000));
-                self.next_heartbeat = Some(Instant::now());
+                self.interval = heartbeat_interval(data.get("heartbeat_interval"))?;
+                // Follow Hello's supplied cadence so the connection does not add control traffic
+                // ahead of the server-selected schedule.
+                self.next_heartbeat = Some(heartbeat_deadline(self.interval)?);
                 self.send(identify).await?;
             }
             2 => {
@@ -460,6 +457,29 @@ fn read_key(value: Option<&Value>) -> Result<Zeroizing<[u8; 32]>, VoiceError> {
     Ok(key)
 }
 
+/// Discord normally serializes this as an integer number of milliseconds, but
+/// accepting a finite fractional JSON number costs nothing and avoids rejecting
+/// otherwise usable Hello payloads. The deadline check rejects values the local
+/// monotonic clock cannot represent instead of silently changing the interval.
+fn heartbeat_interval(value: Option<&Value>) -> Result<Duration, VoiceError> {
+    let millis = value
+        .and_then(Value::as_f64)
+        .filter(|millis| millis.is_finite() && *millis > 0.0)
+        .ok_or_else(|| VoiceError::Gateway("invalid heartbeat interval".into()))?;
+    let interval = Duration::try_from_secs_f64(millis / 1000.0)
+        .map_err(|_| VoiceError::Gateway("invalid heartbeat interval".into()))?;
+    if interval.is_zero() {
+        return Err(VoiceError::Gateway("invalid heartbeat interval".into()));
+    }
+    Ok(interval)
+}
+
+fn heartbeat_deadline(interval: Duration) -> Result<Instant, VoiceError> {
+    Instant::now()
+        .checked_add(interval)
+        .ok_or_else(|| VoiceError::Gateway("heartbeat interval is too large".into()))
+}
+
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -479,3 +499,6 @@ fn local_close() -> VoiceError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod simulation;

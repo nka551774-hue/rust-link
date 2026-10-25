@@ -33,6 +33,7 @@ pub struct FfmpegFrames {
     recycle: SyncSender<Vec<u8>>,
     child: Child,
     errors: Arc<Mutex<Vec<u8>>>,
+    input_error: Arc<Mutex<Option<std::io::Error>>>,
     finished: bool,
 }
 
@@ -112,11 +113,20 @@ impl FfmpegFrames {
 
         // The body is written on its own thread, because the reader below is
         // what the caller waits on and a slow source must not block it.
+        let input_error = Arc::new(Mutex::new(None));
+        let input_failure = Arc::clone(&input_error);
         thread::Builder::new()
             .name("rustlink-ffmpeg-in".into())
             .spawn(move || {
                 let mut body = body;
-                let _ = std::io::copy(&mut body, &mut stdin);
+                if let Err(error) = std::io::copy(&mut body, &mut stdin) {
+                    // Record the failure before closing stdin. FFmpeg can exit
+                    // successfully after decoding a truncated input, but that
+                    // must not turn a failed media connection into normal EOF.
+                    if let Ok(mut guard) = input_failure.lock() {
+                        *guard = Some(error);
+                    }
+                }
             })
             .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
 
@@ -165,7 +175,7 @@ impl FfmpegFrames {
             })
             .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
 
-        Ok(FfmpegFrames { packets, recycle, child, errors, finished: false })
+        Ok(FfmpegFrames { packets, recycle, child, errors, input_error, finished: false })
     }
 
     /// Waits for the child and turns a failure into the message FFmpeg printed.
@@ -173,6 +183,9 @@ impl FfmpegFrames {
         self.finished = true;
         let status = self.child.wait().map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
         if status.success() {
+            if let Some(error) = self.input_error.lock().ok().and_then(|mut guard| guard.take()) {
+                return Err(AudioError::Io(error));
+            }
             return Ok(());
         }
         let message = self

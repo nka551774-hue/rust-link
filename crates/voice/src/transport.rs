@@ -22,7 +22,7 @@ impl Mode {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "aead_aes256_gcm_rtpsize" => Some(Self::AeadAes256GcmRtpSize),
-            "aead_xchacha20poly1305_rtpsize" => Some(Self::AeadXChaCha20Poly1305RtpSize),
+            "aead_xchacha20_poly1305_rtpsize" => Some(Self::AeadXChaCha20Poly1305RtpSize),
             _ => None,
         }
     }
@@ -30,7 +30,7 @@ impl Mode {
     pub fn name(self) -> &'static str {
         match self {
             Self::AeadAes256GcmRtpSize => "aead_aes256_gcm_rtpsize",
-            Self::AeadXChaCha20Poly1305RtpSize => "aead_xchacha20poly1305_rtpsize",
+            Self::AeadXChaCha20Poly1305RtpSize => "aead_xchacha20_poly1305_rtpsize",
         }
     }
 
@@ -251,9 +251,16 @@ mod tests {
     #[test]
     fn negotiation_requires_supported_authenticated_modes() {
         assert_eq!(Mode::negotiate(&["plain".into()]), None);
-        for mode in [Mode::AeadAes256GcmRtpSize, Mode::AeadXChaCha20Poly1305RtpSize] {
-            assert_eq!(Mode::negotiate(&[mode.name().into()]), Some(mode));
-        }
+        assert_eq!(
+            Mode::negotiate(&["aead_aes256_gcm_rtpsize".into()]),
+            Some(Mode::AeadAes256GcmRtpSize)
+        );
+        assert_eq!(
+            Mode::negotiate(&["aead_xchacha20_poly1305_rtpsize".into()]),
+            Some(Mode::AeadXChaCha20Poly1305RtpSize)
+        );
+        assert_eq!(Mode::parse("aead_xchacha20poly1305_rtpsize"), None);
+        assert_eq!(Mode::AeadXChaCha20Poly1305RtpSize.name(), "aead_xchacha20_poly1305_rtpsize");
     }
 
     #[test]

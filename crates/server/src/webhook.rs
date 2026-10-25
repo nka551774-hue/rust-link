@@ -26,6 +26,8 @@ pub const PLAYER_STATE_TYPE: &str = "node.players";
 
 /// How many fields Discord renders in one embed.
 const MAX_EMBED_FIELDS: usize = 25;
+/// Discord also caps the combined text of all embeds in one message.
+const MAX_EMBED_TEXT: usize = 6000;
 
 /// Reports a delivery the node cannot recover from. The endpoint is
 /// configuration, so a node that cannot reach it was told to talk to something
@@ -37,6 +39,7 @@ pub type Fatal = Arc<dyn Fn(&str, &str) + Send + Sync>;
 pub struct Client {
     url: String,
     queue: SyncSender<Value>,
+    fatal: Fatal,
 }
 
 impl Client {
@@ -49,18 +52,19 @@ impl Client {
         let discord = is_discord(&target);
         let (queue, inbox) = sync_channel(QUEUE);
         let worker = target.clone();
+        let worker_fatal = Arc::clone(&fatal);
         thread::Builder::new()
             .name("webhook".into())
             .spawn(move || {
                 while let Ok(event) = inbox.recv() {
                     if let Err(error) = post(&worker, discord, &event) {
-                        fatal("webhook delivery failed", &error);
+                        worker_fatal("webhook delivery failed", &error);
                         return;
                     }
                 }
             })
             .ok()?;
-        Some(Client { url: target, queue })
+        Some(Client { url: target, queue, fatal })
     }
 
     /// The URL events are posted to.
@@ -71,10 +75,16 @@ impl Client {
     /// Queues an event for delivery. It returns immediately, so the caller is
     /// never held up by the endpoint.
     pub fn send(&self, event: Value) {
-        if let Err(TrySendError::Full(_)) = self.queue.try_send(event) {
+        match self.queue.try_send(event) {
+            Ok(()) => {}
             // A full queue means the endpoint has not kept up with what the
             // node has already produced, which no later event can repair.
-            eprintln!("webhook is not keeping up; event queue is full");
+            Err(TrySendError::Full(_)) => {
+                (self.fatal)("webhook delivery failed", "event queue is full")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                (self.fatal)("webhook delivery failed", "delivery worker stopped")
+            }
         }
     }
 }
@@ -190,7 +200,7 @@ fn discord_payload(event: &Value) -> Value {
     if !fields.is_empty() {
         embed.insert("fields".into(), Value::Array(fields));
     }
-    json!({ "embeds": [Value::Object(embed)] })
+    bounded_payload(embed)
 }
 
 /// Renders the node-wide player report as an embed. The headline says how busy
@@ -218,6 +228,46 @@ fn player_state_payload(report: &Value) -> Value {
         let fields = player_state_fields(states);
         if !fields.is_empty() {
             embed.insert("fields".into(), Value::Array(fields));
+        }
+    }
+    bounded_payload(embed)
+}
+
+/// Per-field limits alone do not keep long track metadata or a busy player
+/// report below Discord's message-wide budget. Retain the headline and then
+/// include fields in their existing order while space remains.
+fn bounded_payload(mut embed: Map<String, Value>) -> Value {
+    let mut remaining = MAX_EMBED_TEXT;
+    for (key, limit) in [("title", 256), ("description", 4096)] {
+        if let Some(text) = embed.get(key).and_then(Value::as_str) {
+            let text = truncate(text, limit.min(remaining));
+            remaining -= discord_len(&text);
+            embed.insert(key.into(), json!(text));
+        }
+    }
+    remaining = remaining.saturating_sub(
+        embed.get("footer").and_then(|footer| footer["text"].as_str()).map_or(0, discord_len),
+    );
+    if let Some(Value::Array(fields)) = embed.remove("fields") {
+        let mut bounded = Vec::new();
+        for mut field in fields.into_iter().take(MAX_EMBED_FIELDS) {
+            let name = truncate(field["name"].as_str().unwrap_or(""), 256);
+            let name_length = discord_len(&name);
+            if remaining <= name_length {
+                break;
+            }
+            let value =
+                truncate(field["value"].as_str().unwrap_or(""), 1024.min(remaining - name_length));
+            if name.is_empty() || value.is_empty() {
+                continue;
+            }
+            remaining -= name_length + discord_len(&value);
+            field["name"] = json!(name);
+            field["value"] = json!(value);
+            bounded.push(field);
+        }
+        if !bounded.is_empty() {
+            embed.insert("fields".into(), Value::Array(bounded));
         }
     }
     json!({ "embeds": [Value::Object(embed)] })
@@ -360,24 +410,41 @@ fn embed_value(value: &Value) -> String {
     }
 }
 
-/// Keeps a value inside the length Discord enforces, counting characters so a
-/// CJK title is not cut in the middle of one.
+/// Conservatively measures the same UTF-16 units JavaScript clients use. This
+/// keeps astral characters such as emoji inside the documented field budgets
+/// without ever cutting a Rust `char` or UTF-8 sequence in half.
+fn discord_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Keeps a value inside a Discord text budget and reserves one unit for an
+/// ellipsis when truncation is necessary.
 fn truncate(text: &str, limit: usize) -> String {
-    let count = text.chars().count();
-    if count <= limit {
+    if discord_len(text) <= limit {
         return text.to_string();
     }
-    if limit <= 1 {
-        return text.chars().take(limit).collect();
+    if limit == 0 {
+        return String::new();
     }
-    let mut out: String = text.chars().take(limit - 1).collect();
+    let content_limit = limit - 1;
+    let mut used = 0;
+    let mut out = String::new();
+    for character in text.chars() {
+        let width = character.len_utf16();
+        if used + width > content_limit {
+            break;
+        }
+        out.push(character);
+        used += width;
+    }
     out.push('…');
     out
 }
 
 /// Renders a track length as m:ss or h:mm:ss.
 fn format_duration(millis: i64) -> String {
-    let total = (millis.max(0) + 500) / 1000;
+    let millis = millis.max(0);
+    let total = millis / 1000 + i64::from(millis % 1000 >= 500);
     let hours = total / 3600;
     let minutes = (total % 3600) / 60;
     let seconds = total % 60;
@@ -423,6 +490,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn failed_delivery_does_not_put_the_webhook_token_in_logs() {
@@ -512,9 +580,124 @@ mod tests {
     }
 
     #[test]
+    fn emoji_are_bounded_by_utf16_units_without_splitting_utf8() {
+        let cut = truncate(&"😀".repeat(300), 256);
+        assert!(discord_len(&cut) <= 256);
+        assert!(cut.ends_with('…'));
+        assert!(cut[..cut.len() - '…'.len_utf8()].chars().all(|character| character == '😀'));
+    }
+
+    #[test]
     fn a_length_is_rendered_as_minutes_and_seconds() {
         assert_eq!(format_duration(200_000), "3:20");
         assert_eq!(format_duration(3_600_000), "1:00:00");
         assert_eq!(format_duration(500), "0:01");
+    }
+
+    fn assert_discord_embed_limits(payload: &Value) {
+        let mut total = 0;
+        for embed in payload["embeds"].as_array().unwrap() {
+            for (value, limit) in [
+                (&embed["title"], 256),
+                (&embed["description"], 4096),
+                (&embed["footer"]["text"], 2048),
+                (&embed["author"]["name"], 256),
+            ] {
+                if let Some(text) = value.as_str() {
+                    assert!(discord_len(text) <= limit);
+                    total += discord_len(text);
+                }
+            }
+            if let Some(fields) = embed["fields"].as_array() {
+                assert!(fields.len() <= 25);
+                for field in fields {
+                    for (key, limit) in [("name", 256), ("value", 1024)] {
+                        let text = field[key].as_str().unwrap();
+                        assert!(!text.is_empty());
+                        assert!(discord_len(text) <= limit);
+                        total += discord_len(text);
+                    }
+                }
+            }
+        }
+        assert!(total <= 6000, "Discord rejects {total} embed characters");
+    }
+
+    #[test]
+    fn long_track_metadata_stays_within_discord_embed_total() {
+        let payload = discord_payload(&json!({
+            "type": "track.failed", "guild_id": "1",
+            "track": {"metadata": {
+                "title": "長曲名".repeat(2000), "author": "歌手".repeat(1000),
+                "source": "youtube", "uri": format!("https://example.com/{}", "x".repeat(3000)),
+            }},
+            "reason": "失敗".repeat(1000),
+            "exception": {"message": "原因".repeat(1000), "cause": "rustlink.audio"},
+        }));
+        assert_discord_embed_limits(&payload);
+        assert_eq!(payload["embeds"][0]["title"], "Track Exception");
+        assert!(payload["embeds"][0]["description"].as_str().unwrap().starts_with("**長曲名"));
+    }
+
+    #[test]
+    fn many_players_stay_within_discord_embed_total() {
+        let states: Vec<Value> = (0..50)
+            .map(|index| {
+                json!({
+                    "guild_id": index.to_string(), "title": "曲".repeat(400),
+                    "position_ms": 30000, "duration_ms": 200000,
+                    "paused": false, "volume": 100, "connected": true, "ping_ms": 42,
+                })
+            })
+            .collect();
+        let payload = discord_payload(&json!({
+            "type": PLAYER_STATE_TYPE, "players": 50,
+            "playing_players": 50, "sessions": 1, "states": states,
+        }));
+        assert_discord_embed_limits(&payload);
+        assert_eq!(payload["embeds"][0]["description"], "50 players · 50 playing · 1 session");
+    }
+
+    #[test]
+    fn emoji_heavy_payloads_stay_inside_the_conservative_total_budget() {
+        let payload = discord_payload(&json!({
+            "type": "track.failed", "guild_id": "1",
+            "track": {"metadata": {
+                "title": "😀".repeat(3000), "author": "🎵".repeat(1500),
+                "uri": format!("https://example.com/{}", "🚀".repeat(1500)),
+            }},
+            "reason": "💥".repeat(1000),
+            "exception": {"message": "⚠️".repeat(1000)},
+        }));
+        assert_discord_embed_limits(&payload);
+    }
+
+    #[test]
+    fn queue_backpressure_and_a_stopped_worker_use_the_fatal_contract() {
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&failures);
+        let fatal: Fatal = Arc::new(move |message, error| {
+            recorded.lock().unwrap().push(format!("{message}: {error}"));
+        });
+
+        let (queue, receiver) = sync_channel(0);
+        let full =
+            Client { url: "https://example.invalid".into(), queue, fatal: Arc::clone(&fatal) };
+        full.send(json!({"type":"test"}));
+        drop(receiver);
+
+        let (queue, receiver) = sync_channel(1);
+        drop(receiver);
+        let stopped = Client { url: "https://example.invalid".into(), queue, fatal };
+        stopped.send(json!({"type":"test"}));
+
+        let failures = failures.lock().unwrap();
+        assert!(failures.iter().any(|failure| failure.contains("event queue is full")));
+        assert!(failures.iter().any(|failure| failure.contains("delivery worker stopped")));
+    }
+
+    #[test]
+    fn extreme_duration_still_formats_as_a_nonnegative_time() {
+        assert_eq!(format_duration(i64::MAX), "2562047788015:12:56");
     }
 }

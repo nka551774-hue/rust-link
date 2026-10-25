@@ -131,6 +131,9 @@ impl Session {
     }
 
     pub fn handle_json(&mut self, opcode: u8, data: &Value) -> Result<Vec<Outbound>> {
+        if matches!(opcode, 21 | 22 | 24) && self.version.is_none() {
+            return Err(Error::Protocol("DAVE transition before session description"));
+        }
         match opcode {
             11 => {
                 let ids = data

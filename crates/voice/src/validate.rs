@@ -14,14 +14,13 @@ use crate::VoiceError;
 /// so an empty or invented value is refused rather than turned into a plausible
 /// one.
 pub fn valid_id(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 20 {
+    if raw.is_empty() || raw.len() > 20 {
         return false;
     }
-    if !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
-    match trimmed.parse::<u64>() {
+    match raw.parse::<u64>() {
         Ok(value) => value != 0,
         Err(_) => false,
     }
@@ -115,6 +114,15 @@ mod tests {
         assert!(!valid_id(""));
         assert!(!valid_id("not a number"));
         assert!(!valid_id("12 34"));
+    }
+
+    #[test]
+    fn snowflakes_cannot_differ_from_the_identify_payload_by_whitespace() {
+        for id in [" 123", "123 ", "\t123", "123\n", "\u{2003}123"] {
+            assert!(!valid_id(id), "non-decimal ID was accepted: {id:?}");
+        }
+        assert!(valid_id("18446744073709551615"));
+        assert!(!valid_id("18446744073709551616"));
     }
 
     #[test]

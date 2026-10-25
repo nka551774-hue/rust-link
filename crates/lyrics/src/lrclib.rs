@@ -349,7 +349,9 @@ pub(crate) fn names(track: &Track) -> (String, String) {
 /// Cuts a title at the featured artist, which is not part of the name the
 /// database was given.
 fn strip_featured(title: &str) -> String {
-    let lower = title.to_lowercase();
+    // Credit markers are ASCII. Unicode case folding can change byte lengths
+    // (for example K -> k), so its offsets cannot slice the original title.
+    let lower = title.to_ascii_lowercase();
     let mut cut = title.len();
     for marker in FEATURED {
         if let Some(at) = lower.find(marker).filter(|at| *at > 0) {
@@ -477,6 +479,14 @@ mod tests {
     fn a_featured_credit_is_cut() {
         let (_, title) = names(&track("A Song feat. Another", "Someone"));
         assert_eq!(title, "A Song");
+    }
+
+    #[test]
+    fn a_featured_credit_keeps_unicode_byte_offsets() {
+        for title in ["K", "İİ", "Ⱥ", "夜空"] {
+            let (_, cleaned) = names(&track(&format!("{title} FeAt. Another"), "Someone"));
+            assert_eq!(cleaned, title);
+        }
     }
 
     #[test]
