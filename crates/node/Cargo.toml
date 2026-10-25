@@ -1,0 +1,33 @@
+[package]
+name = "rustlink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A standalone Discord audio service with its own Rustlink API"
+
+[[bin]]
+name = "rustlink"
+path = "src/main.rs"
+
+[dependencies]
+rustlink-protocol.workspace = true
+rustlink-config.workspace = true
+rustlink-audio.workspace = true
+rustlink-source.workspace = true
+rustlink-lyrics.workspace = true
+rustlink-voice.workspace = true
+rustlink-server.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+getrandom = "0.3"
+log = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+ureq = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# The glibc allocator the node is deployed on is tuned at startup, which is a
+# Linux-and-glibc-only thing; see src/linux.rs.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"

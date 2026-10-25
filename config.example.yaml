@@ -1,0 +1,85 @@
+# --- Node ---
+address: 0.0.0.0:2333                      # listen address; 127.0.0.1 behind a proxy
+password: ""                               # node password
+
+# --- Media tools ---
+ffmpeg: ffmpeg                             # ffmpeg executable, a path, or none
+toolsDirectory: .tools                     # helper directory
+autoDownload: false                        # download a missing helper at startup
+inProcessAudio: true                       # decode in process instead of with ffmpeg
+lyricsSource: lrclib                       # lyrics: lrclib, then YouTube Music, or none
+
+# --- Logging ---
+logLevel: info                             # debug, info, warn or error
+logFormat: text                            # text or json
+logColor: auto                             # auto, always or never
+logDirectory: logs                         # daily log file directory; empty keeps the console only
+logRetentionDays: 14                       # days of daily log files to keep; 0 keeps every file
+
+# --- YouTube ---
+youtubeNative: true                        # native InnerTube client
+youtubeEndpoint: https://youtubei.googleapis.com
+youtubeMusicEndpoint: https://music.youtube.com
+youtubeClientVersion: ""                   # empty uses the version the node ships with
+youtubePoToken: ""                         # proof-of-origin token
+youtubeVisitorData: ""
+
+# --- SoundCloud ---
+soundcloudNative: true                     # native public API client
+soundcloudApiEndpoint: https://api-v2.soundcloud.com
+soundcloudWebEndpoint: https://soundcloud.com
+soundcloudClientId: ""                     # empty scrapes and caches one
+soundcloudClientIdTtlSeconds: 21600
+
+# --- Spotify ---
+spotifyClientId: ""                        # Spotify application client id
+spotifyClientSecret: ""                    # Spotify application client secret
+spotifyRefreshToken: ""                    # user authorisation refresh token
+spotifyMarket: US                          # market country code
+
+# --- Deezer ---
+deezerApiEndpoint: https://api.deezer.com
+
+# --- Filters ---
+# A filter that is absent stays enabled; listing it as false makes a player
+# update that asks for it fail.
+filters:
+  volume: true
+  equalizer: true
+  karaoke: true
+  timescale: true
+  tremolo: true
+  vibrato: true
+  distortion: true
+  rotation: true
+  channelMix: true
+  lowPass: true
+
+# --- Capacity ---
+# Sized for a machine with 4 GB or more; docs/vps.md has the smaller rows.
+maxPlayers: 100
+maxSessions: 100
+maxConcurrentLoads: 8
+maxPlaylistTracks: 100
+searchResults: 5
+cacheEntries: 1024
+cacheTtlSeconds: 300
+loadTimeoutSeconds: 30
+playerUpdateSeconds: 5
+statsSeconds: 60
+eventBuffer: 256
+opusBitrate: 128000                        # Opus bitrate in bit/s
+opusComplexity: 10                         # Opus encoder effort 0..10; lower spends less CPU per player
+
+# --- Ratelimits ---
+ratelimits:
+  enable: true                             # per-route request throttling
+
+# --- Webhook ---
+webhook:
+  enable: false                            # post node events to an external endpoint
+  url: ""                                  # a Discord URL receives an embed, anything else the event
+  stateLatencySeconds: 5                   # seconds between whole-node player reports; 0 disables
+
+# --- Security ---
+allowPrivateNetworks: false                # allow private network sources

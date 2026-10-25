@@ -1,0 +1,29 @@
+[package]
+name = "rustlink-dave"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rustlink's Discord DAVE state machine and Opus frame protection"
+
+[dependencies]
+openmls = "=0.8.1"
+openmls_basic_credential = "0.5"
+openmls_rust_crypto = "0.5.1"
+# Cached cipher schedules and authentication keys are wiped when dropped.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = "1"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+davey = "=0.1.5"
+
+[[bench]]
+name = "media"
+harness = false

@@ -1,0 +1,30 @@
+/target/
+/dist/
+/rustlink
+/rustlink.exe
+
+# Native runtime files belong in release archives, not source commits.
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# A node reads its configuration and its downloaded helpers from the working
+# directory, and neither belongs in the repository.
+config.yaml
+config.yml
+config.json
+config.local.*
+.env
+.env.*
+!.env.example
+.envrc
+.tools/
+logs/
+*.log
+*.log.*
+
+# Local verification scripts may create Python bytecode caches.
+__pycache__/
+*.py[cod]

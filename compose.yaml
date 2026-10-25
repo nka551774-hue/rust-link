@@ -1,0 +1,33 @@
+services:
+  rustlink:
+    # Build from this checkout. A published image can be used instead once one
+    # exists for this port.
+    build: .
+    init: true
+    ports:
+      # Published on the loopback address, which is enough for a bot on this
+      # host; a bot in a container on this same network reaches
+      # `rustlink:2333` without the published port at all. A bot on another
+      # machine wants "0.0.0.0:2333:2333" and a firewall rule; docs/vps.md has
+      # both.
+      - "127.0.0.1:2333:2333"
+    environment:
+      RUSTLINK_PASSWORD: ${RUSTLINK_PASSWORD:?set RUSTLINK_PASSWORD}
+      # glibc keeps one malloc arena per thread by default, which is resident
+      # memory a small VPS cannot spare.
+      MALLOC_ARENA_MAX: "2"
+      # Docker already collects stdout, so no log files are written.
+      RUSTLINK_LOG_DIRECTORY: ""
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      SPOTIFY_REFRESH_TOKEN: ${SPOTIFY_REFRESH_TOKEN:-}
+      SPOTIFY_MARKET: ${SPOTIFY_MARKET:-US}
+    restart: unless-stopped
+    stop_grace_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

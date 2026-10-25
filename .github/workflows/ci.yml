@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: format, lints and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The in-process encoder links against the system libopus, so the headers
+      # have to be installed before anything is built.
+      - name: install libopus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The installer is only ever run by hand on a server, so this is the one
+      # chance to catch a typo in it.
+      - run: |
+          bash -n install.sh
+          bash -n start.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: bash start.sh --version
+        env:
+          RUSTLINK_SKIP_BOOTSTRAP: '1'
+
+  windows:
+    name: tests on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Windows build is exercised with the toolchain it is developed on,
+      # MSYS2 UCRT64, which is where libopus and pkg-config meet there.
+      - uses: msys2/setup-msys2@v2
+        id: msys
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-rust mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-opus pkgconf
+      - name: test
+        shell: msys2 {0}
+        run: cargo test --workspace
+      - name: launch script
+        shell: cmd
+        env:
+          RUSTLINK_SKIP_BOOTSTRAP: '1'
+          RUSTLINK_NO_PAUSE: '1'
+          RUSTLINK_MSYS2_ROOT: ${{ steps.msys.outputs.msys2-location }}
+        run: start.bat --version
