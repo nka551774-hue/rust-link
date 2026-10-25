@@ -12,4 +12,4 @@ rustlink-config.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-ureq = { version = "3", features = ["json"] }
+ureq.workspace = true

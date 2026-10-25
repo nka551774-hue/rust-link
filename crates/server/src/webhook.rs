@@ -84,6 +84,7 @@ impl Client {
 fn post(url: &str, discord: bool, event: &Value) -> Result<(), String> {
     let body = if discord { discord_payload(event) } else { event.clone() };
     let response = ureq::post(url)
+        .header("Accept-Encoding", "identity")
         .header("Content-Type", "application/json")
         .header("User-Agent", "Rustlink")
         .config()

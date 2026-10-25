@@ -201,6 +201,7 @@ fn bounded_timeout(mut timeout: NextTimeout) -> Result<NextTimeout, Error> {
 /// the caller follows it deliberately instead.
 pub fn agent(allow_private: bool) -> Agent {
     let config = Agent::config_builder()
+        .accept_encoding("identity")
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .max_redirects(0)

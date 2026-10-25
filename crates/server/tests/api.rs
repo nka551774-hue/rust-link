@@ -184,7 +184,15 @@ async fn native_auth_headers_errors_and_voice_capabilities() {
     assert_eq!(info["capabilities"]["discord_dave"], true);
     assert_eq!(info["voice"]["gateway_version"], 8);
     assert_eq!(info["voice"]["max_dave_protocol_version"], 1);
-    for path in ["/api/v1/unknown", "/api/v2/info", "/unknown"] {
+    for path in [
+        "/api/v1/unknown",
+        "/api/v2/info",
+        "/unknown",
+        "/v3/info",
+        "/v4/info",
+        "/v4/loadtracks",
+        "/loadtracks",
+    ] {
         let (status, error) = node.request("GET", path, Value::Null).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(error["error"]["path"], path);

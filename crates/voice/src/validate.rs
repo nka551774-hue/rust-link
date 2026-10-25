@@ -73,11 +73,22 @@ fn voice_host(endpoint: &str) -> Option<&str> {
         }
         None => (endpoint, None),
     };
-    if host.is_empty() {
+    // Validate DNS labels before the suffix check. An endpoint that cannot be
+    // connected must be refused before a player tears down its current voice
+    // connection, including separators and controls interpreted by URI parsers.
+    if host.len() > 253
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
         return None;
     }
     if let Some(port) = port {
-        if port.parse::<u32>().map(|value| value > 65_535).unwrap_or(true) {
+        if port.parse::<u16>().map(|value| value == 0).unwrap_or(true) {
             return None;
         }
     }
@@ -125,6 +136,24 @@ mod tests {
     #[test]
     fn a_discord_host_with_userinfo_is_refused() {
         assert!(validate(&state("user@c-iad21-1a2b3c.discord.media", Some("123"))).is_err());
+    }
+
+    #[test]
+    fn malformed_voice_hosts_are_refused_before_connecting() {
+        for endpoint in [
+            "other.example\\a.discord.media",
+            "other.example\\a.discord.gg:443",
+            "a\r.discord.media",
+            "a\n.discord.media",
+            "a%2e.discord.media",
+            ".discord.media",
+            "a..discord.media",
+            "-a.discord.media",
+            "a-.discord.media",
+            "a.discord.media:0",
+        ] {
+            assert!(validate(&state(endpoint, Some("123"))).is_err(), "{endpoint:?}");
+        }
     }
 
     #[test]
