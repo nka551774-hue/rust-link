@@ -24,7 +24,7 @@ log = "0.4"
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
-ureq = "3"
+ureq.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # The glibc allocator the node is deployed on is tuned at startup, which is a

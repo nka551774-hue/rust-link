@@ -210,6 +210,7 @@ fn copy(
 fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
+            .accept_encoding("identity")
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_global(None)
             .timeout_recv_response(Some(Duration::from_secs(60)))

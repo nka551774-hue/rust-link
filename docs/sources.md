@@ -50,7 +50,17 @@ at the next unread byte and validates the returned offset and total size;
 normal chunk boundaries neither sleep nor consume the failure retry budget.
 This avoids CDN rejections of open-ended or larger range requests. Other HTTP
 hosts retain their normal streaming requests. A bounded response without a
-known total size is rejected rather than silently truncating playback.
+known total size is rejected rather than silently truncating playback. This
+also applies to partial responses from other hosts; full 200 responses with
+an unknown length remain supported for live streams.
+
+Every partial body is checked against its declared byte span, including
+chunked transfers. A strong ETag is retained for `If-Range` and a conflicting
+ETag ends playback before replacement bytes reach the decoder. Without a
+strong ETag, offset and length validation cannot detect every same-size
+replacement. Range bodies must use identity encoding. HTTP clients request
+identity encoding and do not transparently decompress media responses; see
+the [Rust architecture](architecture.md).
 
 Playback requires a direct audio URL from a supported native client. Formats
 available only through `signatureCipher` / `cipher` or a proprietary streaming
@@ -91,10 +101,12 @@ appropriate account permissions. API pagination stays on the Spotify API
 origin so a response cannot forward the access token to another host.
 
 Playback does not use Spotify's 30-second preview URL or decrypt Spotify's
-audio. It resolves a full-length matching recording from YouTube. Single
-character song/artist names are supported; an unrequested cover, live version,
-remix, karaoke, speed edit or preview is excluded from matching. A missing
-acceptable recording produces an error instead of playing an unrelated track.
+audio. It searches YouTube for a full-length recording using title, artist
+and duration. Single-character song/artist names are supported. Candidates
+whose titles contain recognized labels for unrequested covers, live versions,
+remixes, karaoke, speed edits or previews are excluded. If no candidate meets
+the matching thresholds, resolution returns an error. Matching is based on
+metadata and cannot guarantee the identity of the recording.
 
 ### Audio quality and advertisements
 

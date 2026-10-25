@@ -482,11 +482,11 @@ impl Player {
                     }
                 }
                 if state.body.paused {
-                    drop(state);
                     if output.speaking {
                         let _ = output.connection.speaking(false);
                         output.speaking = false;
                     }
+                    drop(state);
                     self.wait(generation);
                     next = Instant::now();
                     continue;
@@ -518,11 +518,11 @@ impl Player {
                     return;
                 }
                 if state.body.paused {
-                    drop(state);
                     if output.speaking {
                         let _ = output.connection.speaking(false);
                         output.speaking = false;
                     }
+                    drop(state);
                     self.wait(generation);
                     next = Instant::now();
                     continue;
@@ -718,7 +718,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::mpsc::{channel, Receiver, Sender};
 
     use rustlink_protocol::{encode_track, TrackInfo};
@@ -781,6 +781,8 @@ mod tests {
     struct FakeConnection {
         frames: AtomicUsize,
         closed: AtomicUsize,
+        speaking: AtomicBool,
+        pause_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     }
 
     impl Connection for FakeConnection {
@@ -788,7 +790,13 @@ mod tests {
             self.frames.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
-        fn speaking(&self, _on: bool) -> Result<(), VoiceError> {
+        fn speaking(&self, on: bool) -> Result<(), VoiceError> {
+            let hook = if on { None } else { self.pause_hook.lock().unwrap().take() };
+            if let Some((entered, release)) = hook {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            self.speaking.store(on, Ordering::SeqCst);
             Ok(())
         }
         fn connected(&self) -> bool {
@@ -1046,6 +1054,53 @@ mod tests {
         assert_eq!(snapshot.state.position, 0);
         assert!(!arrives(&events, "track.started", Duration::from_millis(200)));
         player.destroy();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_stale_pause_cannot_mute_a_replacement_track() {
+        let (player, events, connection) = player(1000);
+        player
+            .update(
+                update(json!({ "track": { "token": sample().token }, "voice": voice() })),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for(&events, "track.started");
+
+        // Suspend the old pump as it sends the pause announcement. A new
+        // track must never send its speaking announcement ahead of that one.
+        let (entered, paused) = channel();
+        let (release, resume) = channel();
+        *connection.pause_hook.lock().unwrap() = Some((entered, resume));
+        player.update(update(json!({ "paused": true })), false).await.unwrap();
+        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        let replacement = Arc::clone(&player);
+        let mut change = tokio::spawn(async move {
+            replacement
+                .update(update(json!({ "track": { "token": sample().token } })), false)
+                .await
+                .unwrap();
+        });
+        let completed = tokio::time::timeout(Duration::from_millis(200), &mut change).await;
+        if let Ok(result) = completed.as_ref() {
+            result.as_ref().unwrap();
+            wait_for(&events, "track.started");
+        }
+        release.send(()).unwrap();
+        if completed.is_err() {
+            change.await.unwrap();
+            wait_for(&events, "track.started");
+        }
+        // The old pump must have observed its invalidated generation and
+        // exited before checking the final transport announcement.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&player) > 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let speaking = connection.speaking.load(Ordering::SeqCst);
+        player.destroy();
+        assert!(speaking, "an obsolete pause muted the replacement track");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

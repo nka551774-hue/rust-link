@@ -4,6 +4,8 @@
 
 機器人透過 REST 管理工作階段與播放器，透過 WebSocket 接收播放事件。音源解析、音訊解碼、濾鏡、Opus 編碼與 Discord 語音連線由 Rustlink 處理。
 
+服務不依賴 NodeLink、Lavalink 或 Golalink／GoLink，採用自己的 API 與曲目格式。FFmpeg／libopus 保留作音訊工具；Rust 模組邊界、依賴驗證與歷史歸屬見 [獨立 Rust 架構](docs/architecture.md)。
+
 ## 功能
 
 - `/api/v1` REST API、Bearer 驗證及 `rustlink-client` 非同步 Rust 客戶端。

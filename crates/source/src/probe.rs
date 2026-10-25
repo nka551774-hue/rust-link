@@ -24,6 +24,15 @@ pub struct Probe {
     pub duration_ms: i64,
 }
 
+/// Container counters and HTTP lengths can exceed i64 during scaling even
+/// when the resulting milliseconds fit. Unrepresentable durations stay unknown.
+fn milliseconds(units: u128, rate: u64) -> i64 {
+    if rate == 0 {
+        return 0;
+    }
+    i64::try_from(units * 1000 / u128::from(rate)).unwrap_or(0)
+}
+
 /// Reads what the leading bytes say about a stream.
 ///
 /// `size` is the whole length when the server declared one, and the probe uses
@@ -120,7 +129,7 @@ fn probe_mp4(head: &[u8], size: i64) -> Probe {
     if let Some(mvhd) = find_box(moov, b"mvhd") {
         if let Some((timescale, duration)) = read_mvhd(mvhd) {
             if timescale > 0 {
-                out.duration_ms = (duration as i64) * 1000 / timescale as i64;
+                out.duration_ms = milliseconds(duration as u128, timescale as u64);
             }
         }
     }
@@ -156,11 +165,13 @@ fn read_mvhd(mvhd: &[u8]) -> Option<(u32, u64)> {
         // which pushes the timescale to byte 20 and the duration to 24.
         let timescale = u32::from_be_bytes(mvhd.get(20..24)?.try_into().ok()?);
         let duration = u64::from_be_bytes(mvhd.get(24..32)?.try_into().ok()?);
-        Some((timescale, duration))
-    } else {
+        (duration != u64::MAX).then_some((timescale, duration))
+    } else if version == 0 {
         let timescale = u32::from_be_bytes(mvhd.get(12..16)?.try_into().ok()?);
         let duration = u32::from_be_bytes(mvhd.get(16..20)?.try_into().ok()?) as u64;
-        Some((timescale, duration))
+        (duration != u32::MAX as u64).then_some((timescale, duration))
+    } else {
+        None
     }
 }
 
@@ -171,7 +182,16 @@ const MP4_TAGS: [([u8; 4], &str); 3] =
 fn read_mp4_tags(moov: &[u8], out: &mut Probe) {
     let Some(ilst) = find_box(moov, b"udta")
         .and_then(|udta| find_box(udta, b"meta"))
-        .and_then(|meta| find_box(meta, b"ilst"))
+        .and_then(|meta| {
+            // QuickTime permits a meta atom with a leading handler child and
+            // no FullBox prefix; ISO MP4 puts four version/flag bytes first.
+            if meta.get(4..8) == Some(b"hdlr") {
+                Some(meta)
+            } else {
+                meta.get(4..)
+            }
+        })
+        .and_then(|children| find_box(children, b"ilst"))
     else {
         return;
     };
@@ -215,30 +235,26 @@ fn decode_text(value: &[u8]) -> String {
 
 fn probe_flac(head: &[u8]) -> Probe {
     let mut out = Probe { audio: true, ..Probe::default() };
-    // The stream info block is the first one and always the same size.
-    let Some(block) = head.get(8..) else {
-        return out;
-    };
-    if block.len() >= 18 {
-        let packed = u64::from_be_bytes([
-            block[10], block[11], block[12], block[13], block[14], block[15], block[16], block[17],
-        ]);
-        let rate = ((packed >> 44) & 0x000f_ffff) as u32;
-        let total = packed & 0x0000_000f_ffff_ffff;
-        if rate > 0 && total > 0 {
-            out.duration_ms = (total as i64) * 1000 / rate as i64;
-        }
-    }
-    // The comment block follows the stream info block, at a length the stream
-    // info block states.
-    if let Some(length) =
-        block.get(..4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    {
-        if let Some(comment) = block.get(4 + length..) {
-            if comment.starts_with(&[0x04]) || comment.starts_with(&[0x84]) {
-                read_vorbis_comment(comment.get(4..).unwrap_or_default(), &mut out);
+    let mut at = 4;
+    while let Some(header) = head.get(at..at + 4) {
+        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        let Some(block) = head.get(at + 4..at + 4 + length) else {
+            break;
+        };
+        match header[0] & 0x7f {
+            0 if block.len() == 34 => {
+                let packed = u64::from_be_bytes(block[10..18].try_into().unwrap());
+                let rate = (packed >> 44) & 0x000f_ffff;
+                let total = packed & 0x0000_000f_ffff_ffff;
+                out.duration_ms = milliseconds(total as u128, rate);
             }
+            4 => read_vorbis_comment(block, &mut out),
+            _ => {}
         }
+        if header[0] & 0x80 != 0 {
+            break;
+        }
+        at += 4 + length;
     }
     out
 }
@@ -302,17 +318,26 @@ fn probe_ogg(head: &[u8], size: i64) -> Probe {
     // The length of an Ogg stream is only stated by the granule of its last
     // page, so a duration needs the tail. A stream with an unknown length is
     // reported as live rather than guessed at.
-    if rate > 0 && size > 0 {
+    if rate > 0 && size > 0 && head.len() as i64 == size {
         if let Some(granule) = last_granule(head) {
             if granule > 0 {
-                out.duration_ms = granule * 1000 / rate;
+                let skip = if payload.starts_with(b"OpusHead") {
+                    payload
+                        .get(10..12)
+                        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as i64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                out.duration_ms =
+                    milliseconds(granule.saturating_sub(skip).max(0) as u128, rate as u64);
             }
         }
     }
     out
 }
 
-/// Reads the granule of the last complete page in the bytes held.
+/// Reads an end-of-stream granule only when its complete page is present.
 fn last_granule(data: &[u8]) -> Option<i64> {
     let mut at = 0usize;
     let mut granule = None;
@@ -330,7 +355,7 @@ fn last_granule(data: &[u8]) -> Option<i64> {
             break;
         }
         let bytes = data.get(at + 6..at + 14)?;
-        granule = Some(i64::from_le_bytes(bytes.try_into().ok()?));
+        granule = (data[at + 5] & 4 != 0).then(|| i64::from_le_bytes(bytes.try_into().unwrap()));
         at += header + body;
     }
     granule
@@ -371,7 +396,7 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
         let bytes_per_frame = (channels * bits / 8) as i64;
         let frames = if data_len > 0 { data_len } else { size.saturating_sub(44) };
         if bytes_per_frame > 0 && frames > 0 {
-            out.duration_ms = frames * 1000 / (bytes_per_frame * rate as i64);
+            out.duration_ms = milliseconds(frames as u128, bytes_per_frame as u64 * rate as u64);
         }
     }
     out
@@ -423,7 +448,7 @@ fn probe_mp3(head: &[u8], size: i64) -> Probe {
     out.audio = true;
     if let Some((bitrate, rate)) = parse_mpeg_frame(frame) {
         if bitrate > 0 && size > audio_start as i64 {
-            out.duration_ms = (size - audio_start as i64) * 8 * 1000 / bitrate as i64;
+            out.duration_ms = milliseconds((size - audio_start as i64) as u128 * 8, bitrate as u64);
         }
         let _ = rate;
     }
@@ -535,7 +560,7 @@ fn probe_adts(head: &[u8], size: i64) -> Probe {
             (((head[3] as i64) & 0x3) << 11) | ((head[4] as i64) << 3) | ((head[5] as i64) >> 5);
         if frame_len > 0 {
             let frames = size / frame_len;
-            out.duration_ms = frames * 1024 * 1000 / rate as i64;
+            out.duration_ms = milliseconds(frames as u128 * 1024, rate as u64);
         }
     }
     out
@@ -648,7 +673,7 @@ mod tests {
         let mut page = Vec::new();
         page.extend_from_slice(b"OggS");
         page.push(0);
-        page.push(0);
+        page.push(4);
         page.extend_from_slice(&48_000i64.to_le_bytes());
         page.extend_from_slice(&[1, 2, 3, 4]);
         page.extend_from_slice(&[0u8; 8]);
