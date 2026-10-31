@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 pub use rustlink_protocol::{
     Int64, LoadResult, Object, Patch, Player, PlayerUpdate, Track, TrackUpdate, VoiceState,
 };
@@ -103,7 +105,7 @@ impl Client {
         if status == StatusCode::NO_CONTENT {
             return Ok(serde_json::from_value(Value::Null)?);
         }
-        let bytes = response.bytes().await?;
+        let bytes = read_response_body(response).await?;
         if !status.is_success() {
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             return Err(Error::Api {
@@ -148,18 +150,44 @@ impl Client {
                 })),
             )
             .await?;
+        validate_session_id(&info.session_id)?;
         Ok(Session { client: self.clone(), id: info.session_id })
     }
 
     /// Recover a saved session handle. Opening `events()` within its grace
     /// period resumes it; a server restart or expired session returns HTTP 404.
     pub async fn session(&self, id: &str) -> Result<Session, Error> {
-        if id.len() != 48 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(Error::Invalid("session ID must contain 48 hexadecimal characters".into()));
-        }
+        validate_session_id(id)?;
         let info: SessionInfo = self.request(Method::GET, &format!("sessions/{id}"), None).await?;
+        validate_session_id(&info.session_id)?;
+        if info.session_id != id {
+            return Err(Error::Invalid("server returned a different session ID".into()));
+        }
         Ok(Session { client: self.clone(), id: info.session_id })
     }
+}
+
+async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, Error> {
+    if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) {
+        return Err(Error::Invalid("Rustlink response body exceeded the configured limit".into()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(Error::Invalid(
+                "Rustlink response body exceeded the configured limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn validate_session_id(id: &str) -> Result<(), Error> {
+    if id.len() != 48 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Invalid("session ID must contain 48 hexadecimal characters".into()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,5 +379,23 @@ impl Events {
     pub async fn close(&mut self) -> Result<(), Error> {
         self.socket.close(None).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ids_are_path_safe_and_fixed_length() {
+        assert!(validate_session_id(&"a".repeat(48)).is_ok());
+        assert!(validate_session_id(&"A".repeat(48)).is_ok());
+        let short = "a".repeat(47);
+        let long = "a".repeat(49);
+        let mut separator = "a".repeat(47);
+        separator.push('/');
+        for value in ["", short.as_str(), long.as_str(), separator.as_str()] {
+            assert!(validate_session_id(value).is_err(), "accepted session id {value:?}");
+        }
     }
 }

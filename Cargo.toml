@@ -11,6 +11,7 @@ members = [
     "crates/voice",
     "crates/server",
     "crates/node",
+    "crates/discord-bot",
 ]
 
 [workspace.package]

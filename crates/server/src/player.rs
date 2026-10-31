@@ -700,6 +700,9 @@ pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
         if identifier.trim().is_empty() {
             return Err(PlayerError::Invalid("query must not be empty".into()));
         }
+        if identifier.len() > 8192 {
+            return Err(PlayerError::Invalid("query must contain 1..8192 bytes".into()));
+        }
     }
     if let Some(encoded) = change.token.value() {
         decode_track(encoded).map_err(|error| PlayerError::Invalid(error.to_string()))?;
@@ -923,6 +926,14 @@ mod tests {
         })))
         .unwrap_err();
         assert_eq!(error.to_string(), "token and query are mutually exclusive");
+    }
+
+    #[test]
+    fn an_identifier_over_the_resolve_limit_is_refused() {
+        let error =
+            validate(&update(json!({ "track": { "query": "x".repeat(8193) } }))).unwrap_err();
+        assert_eq!(error.to_string(), "query must contain 1..8192 bytes");
+        assert!(validate(&update(json!({ "track": { "query": "x".repeat(8192) } }))).is_ok());
     }
 
     #[test]

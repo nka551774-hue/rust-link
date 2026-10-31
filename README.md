@@ -12,7 +12,7 @@
 - Discord voice gateway v8、DAVE v1 端到端加密、MLS 成員管理與 Opus 音訊傳送。
 - 自訂 `rlt1.` 曲目 token，使用 UTF-8 JSON 與 Base64URL，可保存中文及 emoji。
 - YouTube／YouTube Music 原生 InnerTube、SoundCloud、Spotify／Deezer 中繼資料與 HTTP 音源；音源解析由 Rust 直接處理。
-- Symphonia 解碼、自製 DSP 濾鏡、系統 libopus 編碼，FFmpeg 處理內建管線無法解碼的容器。
+- Symphonia 原生解碼（包含 AAC、MP3、ALAC、ISO-MP4、FLAC、WebM／Matroska、Ogg、WAV）、自製 DSP 濾鏡與系統 libopus 編碼；FFmpeg 僅作為內建管線無法解碼容器的選配後備。
 - 播放、停止、暫停、定位、音量、濾鏡、歌詞、斷線後恢復工作階段。
 - 容量限制、請求限流、Prometheus `/metrics`、日誌及選用 webhook。
 
@@ -133,6 +133,7 @@ RUSTLINK_PASSWORD=your-password docker compose up --build
 | `rustlink-audio` | 解碼、DSP、Opus 與 FFmpeg 後備管線 |
 | `rustlink-dave` | DAVE v1、MLS 提案／Commit／Welcome、轉換狀態與 Opus 加密 |
 | `rustlink-voice` | Discord voice gateway v8、心跳、UDP 探測與 RTP-size 傳輸加密 |
+| `rustlink-discord-bot` | Discord main Gateway v10、bot IDENTIFY/heartbeat、訊息 REST 與 voice state 配對；不把 bot token 傳給 voice transport |
 | `rustlink-lyrics` | LRCLIB／YouTube Music 歌詞 |
 | `rustlink-server` | API、工作階段、播放器及監控 |
 | `rustlink` | 伺服器執行檔 |
@@ -143,7 +144,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-API 整合測試驗證 Rust 客戶端、事件、重連、容量與狀態變更。DAVE 測試以另一個 Rust 實作作為接收端，涵蓋成員進出、金鑰切換、竄改與重播；語音測試啟動本機 WebSocket／UDP 模擬 Discord，驗證完整握手與雙層音訊加密。這些測試不需要外部帳號；目前尚未使用真實 Discord bot 驗證播放。
+API 整合測試驗證 Rust 客戶端、事件、重連、容量與狀態變更。DAVE 測試以另一個 Rust 實作作為接收端，涵蓋成員進出、金鑰切換、竄改與重播；語音測試啟動本機 WebSocket／UDP 模擬 Discord，驗證完整握手與雙層音訊加密。`rustlink-discord-bot` 另以離線測試驗證 Gateway payload 與 voice event pairing；真實 Discord bot 播放仍需操作者提供帳號、權限與語音頻道。
+
+原生 bot 的環境變數與生命週期見 [Native Rust Discord Bot](docs/native-bot.md)；外部 Lavalink/NodeLink/GoLink wire contract 不會混入核心，能力對照見 [Rust-native API matrix](docs/native-api-matrix.md)，本輪盤點與驗證證據見 [native refactor evidence](docs/native-refactor-20261101.md)。
 
 ## 授權與來源
 

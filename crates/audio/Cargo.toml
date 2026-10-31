@@ -9,7 +9,22 @@ description = "Filter model, in-process DSP pipeline and the FFmpeg fallback eng
 [dependencies]
 rustlink-protocol.workspace = true
 rustlink-config.workspace = true
-symphonia = "0.5.5"
+# Keep the common source codecs in-process.  YouTube and catalogue providers
+# frequently return AAC in ISO-MP4 or MP3; leaving those features at Symphonia's
+# small default set needlessly sends otherwise native streams to FFmpeg.
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "aac",
+    "adpcm",
+    "alac",
+    "flac",
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
 serde_json = "1"
 thiserror = "2"
 

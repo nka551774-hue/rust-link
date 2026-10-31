@@ -34,6 +34,9 @@ pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
             "voice requires token, session_id, endpoint and channel_id".into(),
         ));
     }
+    if state.token.len() > 512 || state.session_id.len() > 256 || state.endpoint.len() > 512 {
+        return Err(VoiceError::Invalid("voice credentials or endpoint are too long".into()));
+    }
     // Discord sends the voice host with an optional port, for example
     // "c-iad21-1a2b3c.discord.media:443". A port is valid; userinfo, a path, a
     // query and a fragment are not. The hostname rule below is what keeps
@@ -170,6 +173,19 @@ mod tests {
         let mut missing = state("a.discord.media", Some("123"));
         missing.token.clear();
         assert!(validate(&missing).is_err());
+    }
+
+    #[test]
+    fn oversized_voice_fields_are_refused_before_connecting() {
+        let mut oversized = state("a.discord.media", Some("123"));
+        oversized.token = "t".repeat(513);
+        assert!(validate(&oversized).is_err());
+        oversized = state("a.discord.media", Some("123"));
+        oversized.session_id = "s".repeat(257);
+        assert!(validate(&oversized).is_err());
+        oversized = state("a.discord.media", Some("123"));
+        oversized.endpoint = format!("{}.discord.media", "a".repeat(512));
+        assert!(validate(&oversized).is_err());
     }
 
     #[test]

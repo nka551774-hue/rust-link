@@ -1,7 +1,7 @@
 //! Delivering node events to an external endpoint.
 //!
 //! A Discord webhook URL receives an embed, which is what a Discord channel
-//! expects; any other endpoint receives the event itself as JSON. Delivery runs
+//! expects; any other endpoint receives a scrubbed event as JSON. Delivery runs
 //! on one background thread so a slow endpoint never blocks the player that
 //! produced the event, and a delivery that cannot be completed stops the node:
 //! a configured endpoint is part of the deployment, not an optional extra.
@@ -75,6 +75,12 @@ impl Client {
     /// Queues an event for delivery. It returns immediately, so the caller is
     /// never held up by the endpoint.
     pub fn send(&self, event: Value) {
+        // Webhooks are an external sink. Keep their copy deliberately smaller
+        // than the event sent to the authenticated session: track tokens,
+        // source URLs and client metadata can contain credentials or private
+        // request data. `Server::publish` clones the event before calling us,
+        // so this cannot change the session's own event contract.
+        let event = scrub_event(event);
         match self.queue.try_send(event) {
             Ok(()) => {}
             // A full queue means the endpoint has not kept up with what the
@@ -89,8 +95,93 @@ impl Client {
     }
 }
 
-/// Delivers one event. A Discord endpoint gets an embed built from the event;
-/// every other endpoint gets the event as it was published.
+/// Removes fields that must not cross the webhook trust boundary.
+///
+/// Events delivered through a session remain untouched; this function is only
+/// called by [`Client::send`] on the copy queued for an external endpoint. The
+/// walk is recursive so a future event shape cannot accidentally re-introduce
+/// a nested token or signed URL under a different wrapper.
+fn scrub_event(mut event: Value) -> Value {
+    scrub_value(&mut event);
+    event
+}
+
+fn scrub_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            // `identifier` is normally a source ID, but the native HTTP source
+            // also uses the caller's URL as its identifier. Removing it avoids
+            // leaking a signed query through a field that is not named `uri`.
+            for key in ["token", "uri", "artwork_url", "identifier", "extra", "user_data"] {
+                object.remove(key);
+            }
+            // Source/media failures can include the URL they were trying to
+            // open in an exception message. Keep the diagnostic text, but
+            // replace URL tokens that carry a query, fragment, or userinfo.
+            for key in ["message", "cause", "cause_stack_trace"] {
+                if let Some(Value::String(text)) = object.get_mut(key) {
+                    *text = redact_urls(text);
+                }
+            }
+            for child in object.values_mut() {
+                scrub_value(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                scrub_value(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Redacts credential-bearing HTTP(S) URLs embedded in diagnostic text while
+/// retaining the surrounding error message. A whole URL token is replaced when
+/// it has a query, fragment, or userinfo; plain host/path URLs are left useful
+/// for troubleshooting.
+fn redact_urls(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut changed = false;
+    while let Some(relative) = find_http_scheme(&text[cursor..]) {
+        let start = cursor + relative;
+        output.push_str(&text[cursor..start]);
+        let end = text[start..]
+            .find(|character: char| character.is_whitespace())
+            .map_or(text.len(), |offset| start + offset);
+        let candidate = &text[start..end];
+        if candidate.contains(['?', '#', '@']) {
+            output.push_str("<redacted-url>");
+            changed = true;
+        } else {
+            output.push_str(candidate);
+        }
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    if changed {
+        output
+    } else {
+        text.to_owned()
+    }
+}
+
+fn find_http_scheme(text: &str) -> Option<usize> {
+    text.char_indices().find_map(|(index, _)| {
+        let tail = text.get(index..)?;
+        if tail.as_bytes().get(..7).is_some_and(|bytes| bytes.eq_ignore_ascii_case(b"http://"))
+            || tail.as_bytes().get(..8).is_some_and(|bytes| bytes.eq_ignore_ascii_case(b"https://"))
+        {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+/// Delivers one scrubbed event. A Discord endpoint gets an embed built from it;
+/// every other endpoint gets the scrubbed event as JSON.
 fn post(url: &str, discord: bool, event: &Value) -> Result<(), String> {
     let body = if discord { discord_payload(event) } else { event.clone() };
     let response = ureq::post(url)
@@ -529,6 +620,78 @@ mod tests {
         assert!(fields
             .iter()
             .any(|field| field["name"] == "Source" && field["value"] == "youtube"));
+    }
+
+    #[test]
+    fn webhook_copy_scrubs_track_tokens_urls_and_private_metadata() {
+        let event = json!({
+            "type": "track.started",
+            "track": {
+                "token": "rlt1.secret-track-token",
+                "user_data": { "requester": "private-user" },
+                "extra": { "signed_url": "https://cdn.example/audio?sig=secret" },
+                "metadata": {
+                    "identifier": "https://cdn.example/audio?sig=secret",
+                    "uri": "https://cdn.example/audio?sig=secret",
+                    "artwork_url": "https://cdn.example/art?sig=secret",
+                    "title": "A Song",
+                    "source": "http"
+                }
+            }
+        });
+        let original = event.clone();
+        let scrubbed = scrub_event(event);
+
+        // The copy queued for a webhook carries useful presentation metadata,
+        // but no replayable token, signed URL, or caller-owned bag.
+        assert_eq!(scrubbed["track"]["metadata"]["title"], "A Song");
+        assert!(scrubbed["track"].get("token").is_none());
+        assert!(scrubbed["track"].get("user_data").is_none());
+        assert!(scrubbed["track"].get("extra").is_none());
+        assert!(scrubbed["track"]["metadata"].get("identifier").is_none());
+        assert!(scrubbed["track"]["metadata"].get("uri").is_none());
+        assert!(scrubbed["track"]["metadata"].get("artwork_url").is_none());
+
+        // Session consumers still own the original, complete event value.
+        assert_eq!(original["track"]["token"], "rlt1.secret-track-token");
+        assert_eq!(original["track"]["metadata"]["uri"], "https://cdn.example/audio?sig=secret");
+    }
+
+    #[test]
+    fn client_send_queues_the_scrubbed_copy() {
+        let (queue, receiver) = sync_channel(1);
+        let fatal: Fatal = Arc::new(|_, _| panic!("webhook queue unexpectedly failed"));
+        let client = Client { url: "https://example.invalid".into(), queue, fatal };
+        client.send(json!({
+            "type": "track.started",
+            "track": {
+                "token": "rlt1.secret",
+                "metadata": { "uri": "https://cdn.example/audio?sig=secret", "title": "A Song" }
+            }
+        }));
+        let queued = receiver.try_recv().expect("scrubbed event was queued");
+        assert!(queued["track"].get("token").is_none());
+        assert!(queued["track"]["metadata"].get("uri").is_none());
+        assert_eq!(queued["track"]["metadata"]["title"], "A Song");
+    }
+
+    #[test]
+    fn webhook_exception_text_redacts_signed_urls_but_keeps_diagnostics() {
+        let scrubbed = scrub_event(json!({
+            "type": "track.failed",
+            "exception": {
+                "message": "media https://cdn.example/audio?sig=secret&expires=1 failed",
+                "cause": "https://user:password@example.invalid/audio#fragment",
+                "cause_stack_trace": "plain decoder context"
+            }
+        }));
+        let exception = &scrubbed["exception"];
+        assert_eq!(exception["message"], "media <redacted-url> failed");
+        assert_eq!(exception["cause"], "<redacted-url>");
+        assert_eq!(exception["cause_stack_trace"], "plain decoder context");
+        let encoded = scrubbed.to_string();
+        assert!(!encoded.contains("sig=secret"));
+        assert!(!encoded.contains("password"));
     }
 
     #[test]

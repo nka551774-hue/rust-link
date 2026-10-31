@@ -574,8 +574,13 @@ async fn stats(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respons
     server.json(StatusCode::OK, server.stats_body())
 }
 
-async fn metrics(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
-    if let Err(response) = server.guard("metrics", &headers, "/api/v1/metrics") {
+async fn metrics(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let path = uri.path();
+    if let Err(response) = server.guard("metrics", &headers, path) {
         return response;
     }
     ([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], server.metrics_body())
@@ -710,9 +715,12 @@ async fn lyrics_for_track(
 async fn lyrics_for_player(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}/players/{guild_id}/lyrics";
+    // Keep the error path tied to this request, while excluding a query
+    // string that could carry credentials or other sensitive values.
+    let path = uri.path();
     if let Err(response) = server.guard("player_lyrics", &headers, path) {
         return response;
     }
@@ -732,9 +740,10 @@ async fn lyrics_for_player(
 async fn get_players(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(session_id): Path<String>,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}/players";
+    let path = uri.path();
     if let Err(response) = server.guard("get_players", &headers, path) {
         return response;
     }
@@ -748,9 +757,10 @@ async fn get_players(
 async fn get_player(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}/players/{guild_id}";
+    let path = uri.path();
     if let Err(response) = server.guard("get_player", &headers, path) {
         return response;
     }
@@ -767,11 +777,12 @@ async fn get_player(
 async fn update_player(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}/players/{guild_id}";
+    let path = uri.path();
     if let Err(response) = server.guard("update_player", &headers, path) {
         return response;
     }
@@ -857,9 +868,10 @@ async fn update_player(
 async fn delete_player(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}/players/{guild_id}";
+    let path = uri.path();
     if let Err(response) = server.guard("delete_player", &headers, path) {
         return response;
     }
@@ -956,9 +968,10 @@ async fn create_session(
 async fn get_session(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}";
+    let path = uri.path();
     if let Err(response) = server.guard("get_session", &headers, path) {
         return response;
     }
@@ -971,9 +984,10 @@ async fn get_session(
 async fn delete_session(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}";
+    let path = uri.path();
     if let Err(response) = server.guard("delete_session", &headers, path) {
         return response;
     }
@@ -984,10 +998,11 @@ async fn delete_session(
 async fn update_session(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}";
+    let path = uri.path();
     if let Err(response) = server.guard("update_session", &headers, path) {
         return response;
     }
@@ -1019,12 +1034,14 @@ async fn websocket(
     Path(id): Path<String>,
     request: Request,
 ) -> Response {
-    let path = "/api/v1/sessions/{session_id}/events";
     let (mut parts, _) = request.into_parts();
-    if let Err(response) = server.guard("websocket", &parts.headers, path) {
+    // Use only the path component so query parameters (which may contain
+    // credentials) are never copied into an error response.
+    let path = parts.uri.path().to_owned();
+    if let Err(response) = server.guard("websocket", &parts.headers, &path) {
         return response;
     }
-    let session = match server.session(&id, path) {
+    let session = match server.session(&id, &path) {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -1034,7 +1051,7 @@ async fn websocket(
             return server.fail(
                 StatusCode::BAD_REQUEST,
                 "the request is not a websocket upgrade",
-                path,
+                &path,
             )
         }
     };
@@ -1042,33 +1059,73 @@ async fn websocket(
         // Coordinate with expiry and deletion while claiming the only subscriber.
         let sessions = server.sessions.lock().unwrap();
         if !sessions.contains_key(&id) || session.is_closed() || session.expired() {
-            return server.fail(StatusCode::NOT_FOUND, "session not found", path);
+            return server.fail(StatusCode::NOT_FOUND, "session not found", &path);
         }
         if session.is_connected() {
             return server.fail(
                 StatusCode::CONFLICT,
                 "session already has an event subscriber",
-                path,
+                &path,
             );
         }
         let Some(inbox) = session.take_inbox() else {
-            return server.fail(StatusCode::CONFLICT, "previous subscriber is disconnecting", path);
+            return server.fail(
+                StatusCode::CONFLICT,
+                "previous subscriber is disconnecting",
+                &path,
+            );
         };
         let resumed = session.has_connected();
         session.connect();
         (inbox, resumed)
     };
-    let failed_server = Arc::clone(&server);
+    // The upgrade future runs in a background task.  Keep the receiver in a
+    // one-shot cell shared by both outcomes so a failed handshake can return
+    // it to the session instead of dropping the queue (and the players with
+    // it).  `on_upgrade` and `on_failed_upgrade` are mutually exclusive; the
+    // cell makes that ownership explicit and also protects us if an adapter
+    // invokes either callback later than expected.
+    let pending = Arc::new(Mutex::new(Some(inbox)));
+    let failed_pending = Arc::clone(&pending);
     let failed_session = Arc::clone(&session);
-    // An aborted upgrade cannot leave an immortal connected session behind.
     upgrade
         .max_message_size(64 << 10)
         .max_frame_size(64 << 10)
         .on_failed_upgrade(move |_| {
-            failed_server.remove_session(&failed_session.id);
+            // A failed upgrade is not a failed session.  Return the queued
+            // events and let the normal resume/expiry policy decide whether
+            // it should remain in the map.  In particular, removing it here
+            // would destroy a resumable player merely because a proxy dropped
+            // the HTTP upgrade before the WebSocket task started.
+            restore_failed_upgrade(&failed_session, &failed_pending, resumed);
         })
-        .on_upgrade(move |socket| server.serve(session, inbox, socket, resumed))
+        .on_upgrade(move |socket| async move {
+            let inbox = { pending.lock().unwrap().take() };
+            let Some(inbox) = inbox else {
+                // The failure callback won the one-shot cell.  Axum does not
+                // call both callbacks, so this is only a defensive guard for
+                // a custom upgrade adapter.
+                return;
+            };
+            server.serve(session, inbox, socket, resumed).await;
+        })
         .into_response()
+}
+
+/// Returns a claimed event receiver to a session when the HTTP upgrade failed
+/// before [`Server::serve`] could take ownership of it.  The session is marked
+/// disconnected first, so `resume: false` becomes immediately expired while a
+/// resumable session keeps its configured grace period.
+fn restore_failed_upgrade(
+    session: &Arc<Session>,
+    pending: &Mutex<Option<mpsc::Receiver<Value>>>,
+    had_connected: bool,
+) {
+    let Some(inbox) = pending.lock().unwrap().take() else {
+        return;
+    };
+    session.rollback_connect(had_connected);
+    session.restore_inbox(inbox);
 }
 
 impl Server {
@@ -1471,5 +1528,50 @@ async fn send_frame(sink: &mut SplitSink<WebSocket, Message>, message: Message) 
     match tokio::time::timeout(Duration::from_secs(10), sink.send(message)).await {
         Ok(Ok(())) => Ok(()),
         _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustlink_protocol::Object;
+
+    fn pending_for(session: &Arc<Session>) -> Mutex<Option<mpsc::Receiver<Value>>> {
+        Mutex::new(Some(session.take_inbox().expect("session inbox is available")))
+    }
+
+    #[test]
+    fn failed_upgrade_restores_a_resumable_session_and_its_inbox() {
+        let session = Session::new("session-id".into(), "123".into(), std::sync::Weak::new(), 4);
+        session.update(Some(true), Some(60));
+        session.connect();
+        let pending = pending_for(&session);
+        session.emit(Object::new());
+
+        restore_failed_upgrade(&session, &pending, true);
+
+        assert!(!session.is_connected());
+        assert!(session.has_connected());
+        assert!(!session.expired());
+        let mut inbox = session.take_inbox().expect("failed upgrade restored the inbox");
+        assert!(inbox.try_recv().is_ok(), "events queued during the upgrade were lost");
+        // The one-shot ownership cell is empty after the restoration.
+        restore_failed_upgrade(&session, &pending, false);
+        assert!(session.take_inbox().is_none());
+    }
+
+    #[test]
+    fn failed_upgrade_keeps_resume_false_expired_for_normal_reaping() {
+        let session = Session::new("session-id".into(), "123".into(), std::sync::Weak::new(), 4);
+        session.update(Some(false), Some(60));
+        session.connect();
+        let pending = pending_for(&session);
+
+        restore_failed_upgrade(&session, &pending, false);
+
+        assert!(!session.is_connected());
+        assert!(!session.has_connected());
+        assert!(session.expired());
+        assert!(session.take_inbox().is_some());
     }
 }
