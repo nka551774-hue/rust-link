@@ -1,6 +1,8 @@
 //! Rustlink API v1 data types. JSON numbers are strict integers; patches
 //! distinguish omitted fields from null. Unknown update fields are rejected.
 
+use std::fmt;
+
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
@@ -273,7 +275,7 @@ struct RawLoadResult {
 
 /// What a bot reports about its voice connection, which the node needs before it
 /// can open one of its own.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceState {
     #[serde(default)]
@@ -284,6 +286,18 @@ pub struct VoiceState {
     pub session_id: String,
     #[serde(default)]
     pub channel_id: Option<String>,
+}
+
+impl fmt::Debug for VoiceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceState")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .field("session_id", &self.session_id)
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
 }
 
 /// The playback position and link quality a client sees in `player.updated`.
@@ -340,8 +354,9 @@ pub struct TrackUpdate {
     #[serde(skip_serializing_if = "Patch::is_missing")]
     pub token: Patch<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<Object>,
 }
 
@@ -351,17 +366,17 @@ pub struct TrackUpdate {
 pub struct PlayerUpdate {
     #[serde(default, skip_serializing_if = "Patch::is_missing")]
     pub track: Patch<TrackUpdate>,
-    #[serde(default, rename = "position_ms")]
+    #[serde(default, rename = "position_ms", skip_serializing_if = "Option::is_none")]
     pub position: Option<Int64>,
     #[serde(default, rename = "end_ms", skip_serializing_if = "Patch::is_missing")]
     pub end_time: Patch<Int64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<Int64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<Object>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<VoiceState>,
 }
 
@@ -406,6 +421,18 @@ mod tests {
             serde_json::from_value(serde_json::to_value(PlayerUpdate::default()).unwrap()).unwrap();
         assert!(roundtrip.track.is_missing());
         assert!(roundtrip.end_time.is_missing());
+        assert_eq!(serde_json::to_value(PlayerUpdate::default()).unwrap(), json!({}));
+        let update = PlayerUpdate {
+            track: Patch::Value(TrackUpdate {
+                token: Patch::Value("rlt1.example".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            json!({"track": {"token": "rlt1.example"}})
+        );
     }
 
     #[test]
@@ -418,6 +445,19 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<PlayerUpdate>(body).is_err());
         }
+    }
+
+    #[test]
+    fn voice_state_debug_redacts_the_server_token() {
+        let voice = VoiceState {
+            token: "secret-voice-token".into(),
+            endpoint: "voice.discord.media:443".into(),
+            session_id: "session".into(),
+            channel_id: Some("123".into()),
+        };
+        let rendered = format!("{voice:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("secret-voice-token"));
     }
 
     #[test]

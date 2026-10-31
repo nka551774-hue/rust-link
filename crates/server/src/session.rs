@@ -222,6 +222,17 @@ impl Session {
         state.disconnected = Some(Instant::now());
     }
 
+    /// Rolls back a gateway claim that failed before the WebSocket task took
+    /// ownership of the connection. `had_connected` preserves the distinction
+    /// between a first connection and a genuine resume for the next READY
+    /// event.
+    pub(crate) fn rollback_connect(&self, had_connected: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.connected = false;
+        state.has_connected = had_connected;
+        state.disconnected = Some(Instant::now());
+    }
+
     /// How long the session has been waiting to be resumed.
     pub fn disconnected_for(&self) -> Option<std::time::Duration> {
         self.state.lock().unwrap().disconnected.map(|at| at.elapsed())
