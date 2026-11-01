@@ -10,7 +10,7 @@ mod linux;
 mod logging;
 mod tools;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use log::LevelFilter;
@@ -164,26 +164,7 @@ fn run() -> Result<(), String> {
         resolver.close();
         return Ok(());
     }
-    log::info!(
-        "Rustlink starting version={} apiVersion={} config={} sources={} toolsDirectory={} autoDownload={} maxPlayers={} maxSessions={} maxConcurrentLoads={} cacheEntries={} loadTimeoutSeconds={} eventBuffer={} opusBitrate={} opusComplexity={} allowPrivateNetworks={} ratelimits={} webhook={}",
-        rustlink_server::VERSION,
-        rustlink_server::APIVERSION,
-        path.map(|path| path.display().to_string()).unwrap_or_else(|| "defaults".into()),
-        source_summary(&config),
-        config.tools_directory,
-        config.auto_download,
-        config.max_players,
-        config.max_sessions,
-        config.max_concurrent_loads,
-        config.cache_entries,
-        config.load_timeout_seconds,
-        config.event_buffer,
-        config.opus_bitrate,
-        config.opus_complexity,
-        config.allow_private_networks,
-        config.ratelimits.enable,
-        config.webhook.enable,
-    );
+    log_startup(&config, path.as_deref());
     let sources = Arc::new(rustlink_source::Service::new(config.clone()));
     let engine = rustlink_audio::Engine {
         ffmpeg: Some(config.ffmpeg.clone()).filter(|program| !program.trim().is_empty()),
@@ -346,7 +327,42 @@ fn resolve_ffmpeg(resolver: &tools::Resolver, config: &Config) -> Result<Option<
     }
 }
 
-/// Which source paths are active, for the startup line.
+/// Writes the startup summary one setting per log record so text, JSON and
+/// daily file output all remain valid one-line records.
+fn log_startup(config: &Config, path: Option<&Path>) {
+    log::info!("Rustlink starting");
+    for field in startup_fields(config, path) {
+        log::info!("  {field}");
+    }
+}
+
+/// The startup settings in a stable order for operators and log collectors.
+fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
+    vec![
+        format!("version={}", rustlink_server::VERSION),
+        format!("apiVersion={}", rustlink_server::APIVERSION),
+        format!(
+            "config={}",
+            path.map(|path| path.display().to_string()).unwrap_or_else(|| "defaults".into())
+        ),
+        format!("sources={}", source_summary(config)),
+        format!("toolsDirectory={}", config.tools_directory),
+        format!("autoDownload={}", config.auto_download),
+        format!("maxPlayers={}", config.max_players),
+        format!("maxSessions={}", config.max_sessions),
+        format!("maxConcurrentLoads={}", config.max_concurrent_loads),
+        format!("cacheEntries={}", config.cache_entries),
+        format!("loadTimeoutSeconds={}", config.load_timeout_seconds),
+        format!("eventBuffer={}", config.event_buffer),
+        format!("opusBitrate={}", config.opus_bitrate),
+        format!("opusComplexity={}", config.opus_complexity),
+        format!("allowPrivateNetworks={}", config.allow_private_networks),
+        format!("ratelimits={}", config.ratelimits.enable),
+        format!("webhook={}", config.webhook.enable),
+    ]
+}
+
+/// Which source paths are active, for the startup summary.
 fn source_summary(config: &Config) -> String {
     let mut active = Vec::new();
     if config.youtube_native {
@@ -436,12 +452,27 @@ mod tests {
     }
 
     #[test]
-    fn the_startup_line_names_the_sources_that_are_on() {
+    fn the_startup_summary_names_the_sources_that_are_on() {
         let config = Config::default();
         let summary = source_summary(&config);
         assert!(summary.contains("youtube(native)"));
         assert!(summary.contains("soundcloud(native)"));
         assert!(summary.ends_with("deezer,http"));
+    }
+
+    #[test]
+    fn startup_fields_are_one_setting_per_line_in_a_stable_order() {
+        let config = Config::default();
+        let fields = startup_fields(&config, Some(Path::new("config.yaml")));
+        assert_eq!(fields.len(), 17);
+        assert_eq!(fields[0], format!("version={}", rustlink_server::VERSION));
+        assert_eq!(fields[1], format!("apiVersion={}", rustlink_server::APIVERSION));
+        assert_eq!(fields[2], "config=config.yaml");
+        assert_eq!(fields[3], format!("sources={}", source_summary(&config)));
+        assert_eq!(fields.last().unwrap(), &format!("webhook={}", config.webhook.enable));
+        assert!(fields
+            .iter()
+            .all(|field| !field.chars().any(|character| character == '\r' || character == '\n')));
     }
 
     #[test]

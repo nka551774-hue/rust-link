@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_name_of_the_day_is_the_one_the_startup_line_reports() {
+    fn the_file_name_of_the_day_is_the_one_the_startup_summary_reports() {
         let directory =
             std::env::temp_dir().join(format!("rustlink-log-test-{}", std::process::id()));
         let files = Files::open(&directory.display().to_string(), 14).unwrap();

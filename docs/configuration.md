@@ -30,7 +30,7 @@ configured without mounting one.
 | `lyricsSource` | `lrclib` | `lrclib` asks the database and then YouTube Music for timed lines; `none` switches lyrics off and stops the node calling anything. |
 
 FFmpeg is only needed for the containers the in-process pipeline declines, so a
-node without it still plays the supported formats. The startup line reports
+node without it still plays the supported formats. The startup summary reports
 whether FFmpeg is available.
 
 ## Logging
@@ -39,6 +39,10 @@ whether FFmpeg is available.
 | --- | --- | --- |
 | `logLevel` | `info` | `debug`, `info`, `warn` or `error`. |
 | `logFormat` | `text` | `text` for a person, `json` for a collector. The wordmark is left out of a JSON stream. |
+
+The normal startup summary begins with `Rustlink starting`, then writes one
+`INFO` record per setting. This keeps console, text-file and JSON output easy
+to scan without turning any record into a multiline value.
 | `logColor` | `auto` | `auto` colours a terminal and leaves a redirected stream alone, `always` and `never` override that. `NO_COLOR` in the environment is honoured. |
 | `logDirectory` | `logs` | Daily files named `rustlink-YYYY-MM-DD.log`, reopened when the date changes. Empty keeps the console as the only output. Records in a file are never coloured. |
 | `logRetentionDays` | `14` | How many days of those files are kept: anything older is deleted at startup and when the date changes, so a node left running does not fill the disk. `0` keeps every file, for a node whose logs are rotated and collected elsewhere. Only files this node writes are touched. |
