@@ -115,7 +115,7 @@ cargo run -p rustlink-client --example bot -- "https://youtu.be/dQw4w9WgXcQ"
 
 辨認分享 URL、取得曲目中繼資料、實際取得音訊串流，是不同步驟。原生 YouTube 播放需要 InnerTube 客戶端取得直接音訊 URL；要求播放器腳本還原簽章、特殊串流協定、有效 PO token 或受到帳戶／地區／平台限制時，仍可能失敗。
 
-`youtubePoToken` 只把你提供的 token 帶入 player request，不會自動產生或更新 token，也不保證其他串流端點接受它。`youtubeNative: false` 會停用 YouTube。來源解析失敗由 API 回覆錯誤；媒體下載或解碼的後續錯誤由 `track.failed` 事件回報。
+`youtubePoToken` 會把你提供的 token 帶入 player request，並以 `pot` 參數附加到 googlevideo 音訊 URL（不會送往其他主機）。YouTube 不信任的網路在沒有 token 時，只能取得前約 768 KiB（約 1 分鐘）音訊，之後 googlevideo 回 403，播放會中途停止。Rustlink 不會自動產生或更新 token，也不保證其他串流端點接受它。`youtubeNative: false` 會停用 YouTube。來源解析失敗由 API 回覆錯誤；媒體下載或解碼的後續錯誤由 `track.failed` 事件回報。
 
 Googlevideo 音訊使用 128 KiB 分段下載，避免此次實測遇到的無結束位置或較大 Range 請求遭 403 拒絕。後續段落會檢查位移與檔案總長並連續交給解碼器；正常換段不會等待重試。選取音軌時優先非自動配音、原音及未套用動態壓縮的版本，再比較位元率。
 

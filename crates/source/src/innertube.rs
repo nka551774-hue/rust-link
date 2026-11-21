@@ -306,7 +306,8 @@ impl Catalog<'_> {
                     let mut headers = format.headers;
                     headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
                     headers.insert("User-Agent".into(), client.user_agent.to_string());
-                    match open(format.url, headers) {
+                    let url = with_po_token(format.url, &self.config.youtube_po_token);
+                    match open(url, headers) {
                         Ok(stream) => return Ok(stream),
                         Err(error) if error.retryable() => {
                             if stream_error.is_none() {
@@ -443,6 +444,22 @@ impl Media {
         // and an empty encoding is what a client reads as a broken track.
         encode_track(&info).unwrap_or_else(|_| Track::new(String::new(), info))
     }
+}
+
+/// Adds the configured proof-of-origin token to a Google video URL. Without it
+/// the CDN answers only the first ~768 KiB of audio and then refuses with 403.
+/// Other hosts never receive the token.
+fn with_po_token(url: String, token: &str) -> String {
+    let token = token.trim();
+    let Some(mut parsed) = crate::http_url(&url) else { return url };
+    if token.is_empty()
+        || !parsed.host_str().is_some_and(|host| crate::host_matches(host, "googlevideo.com"))
+        || parsed.query_pairs().any(|(name, _)| name == "pot")
+    {
+        return url;
+    }
+    parsed.query_pairs_mut().append_pair("pot", token);
+    parsed.into()
 }
 
 /// Converts an external duration to protocol milliseconds without allowing
@@ -918,6 +935,21 @@ mod tests {
             });
         server.join().unwrap();
         assert!(matches!(result, Err(SourceError::Url(_))));
+    }
+
+    #[test]
+    fn the_po_token_reaches_google_video_urls_only() {
+        let audio = "https://rr1---sn-x.googlevideo.com/videoplayback?itag=251&c=ANDROID";
+        assert_eq!(
+            with_po_token(audio.into(), " a+b/c= "),
+            format!("{audio}&pot=a%2Bb%2Fc%3D"),
+            "appended once, trimmed and encoded"
+        );
+        assert_eq!(with_po_token(audio.into(), ""), audio, "no token leaves the URL alone");
+        let tokened = format!("{audio}&pot=existing");
+        assert_eq!(with_po_token(tokened.clone(), "new"), tokened, "an existing pot is kept");
+        let other = "https://cdn.example/audio?id=1";
+        assert_eq!(with_po_token(other.into(), "secret"), other, "other hosts never see it");
     }
 
     #[test]

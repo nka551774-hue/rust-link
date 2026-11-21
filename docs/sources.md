@@ -69,10 +69,13 @@ restrictions can also reject a request; the API returns the source error.
 Native resolution does not guarantee playback of every YouTube video.
 
 **PO tokens.** YouTube asks for a proof-of-origin token for some clients.
-`youtubePoToken` supplies a token in the native player request;
-`youtubeVisitorData` supplies its visitor data. Rustlink does not generate or
-refresh these credentials automatically. A client that demands an unavailable
-or expired token may reject playback.
+`youtubePoToken` supplies a token in the native player request and as the
+`pot` parameter of googlevideo audio URLs; `youtubeVisitorData` supplies its
+visitor data. Without a token, networks YouTube distrusts receive only the first
+~768 KiB of audio (about a minute) before googlevideo answers 403, so playback
+stops partway. Rustlink does not generate or refresh these credentials
+automatically. A client that demands an unavailable or expired token may reject
+playback.
 
 **SoundCloud.** The public API with a client id. An empty `soundcloudClientId`
 means the id is scraped from the site and cached for

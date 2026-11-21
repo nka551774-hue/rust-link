@@ -21,7 +21,7 @@ youtubeNative: true                        # native InnerTube client
 youtubeEndpoint: https://youtubei.googleapis.com
 youtubeMusicEndpoint: https://music.youtube.com
 youtubeClientVersion: ""                   # empty uses the version the node ships with
-youtubePoToken: ""                         # proof-of-origin token
+youtubePoToken: ""                         # proof-of-origin token; without it some networks stop after ~1 minute
 youtubeVisitorData: ""
 
 # --- SoundCloud ---
