@@ -197,6 +197,7 @@ pub struct SessionInfo {
     pub connected: bool,
     pub resume: bool,
     pub resume_timeout_secs: u32,
+    #[serde(default)]
     pub event_url: String,
 }
 
@@ -338,6 +339,8 @@ impl Session {
     /// `session.ready`, containing current players and the `resumed` flag.
     /// Call `next()` continuously so WebSocket pings are answered.
     pub async fn events(&self) -> Result<Events, Error> {
+        // The server's `event_url` is root-absolute, so it would drop a base
+        // path such as a reverse-proxy prefix; the client builds its own.
         let mut url = self.client.endpoint(&format!("{}/events", self.path()))?;
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
         url.set_scheme(scheme).map_err(|_| Error::Invalid("invalid WebSocket scheme".into()))?;
@@ -385,6 +388,8 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn session_ids_are_path_safe_and_fixed_length() {
@@ -397,5 +402,62 @@ mod tests {
         for value in ["", short.as_str(), long.as_str(), separator.as_str()] {
             assert!(validate_session_id(value).is_err(), "accepted session id {value:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn events_keep_the_base_path_whatever_event_url_the_server_returns() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut http, _) = listener.accept().unwrap();
+            http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = http.read(&mut buffer).unwrap();
+                assert!(read > 0, "HTTP request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = format!(
+                "{{\"session_id\":\"{}\",\"bot_id\":\"123\",\"connected\":false,\"resume\":true,\"resume_timeout_secs\":60,\"event_url\":\"/custom-events\"}}",
+                "a".repeat(48)
+            );
+            write!(
+                http,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            http.flush().unwrap();
+
+            let (socket, _) = listener.accept().unwrap();
+            let mut path = None;
+            // Tungstenite's external `Callback` trait fixes this closure's
+            // error type to the full HTTP error response.
+            #[allow(clippy::result_large_err)]
+            let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                            response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                path = Some(request.uri().path().to_owned());
+                Ok(response)
+            };
+            let mut websocket =
+                tokio_tungstenite::tungstenite::accept_hdr(socket, callback).unwrap();
+            websocket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    r#"{"type":"session.ready"}"#.into(),
+                ))
+                .unwrap();
+            path.unwrap()
+        });
+
+        let client = Client::new(&format!("http://{address}/base"), "test-secret").unwrap();
+        let session = client.create_session("123", 60).await.unwrap();
+        let mut events = session.events().await.unwrap();
+        assert_eq!(events.next().await.unwrap().unwrap()["type"], "session.ready");
+        assert_eq!(
+            server.await.unwrap(),
+            format!("/base/api/v1/sessions/{}/events", "a".repeat(48))
+        );
     }
 }

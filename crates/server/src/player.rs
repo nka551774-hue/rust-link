@@ -89,6 +89,9 @@ struct State {
     /// Whether a join has been announced and no leave has been announced for
     /// it yet, so a dead connection is reported once.
     voice_up: bool,
+    /// The handshake in flight, aborted when it is superseded or the player
+    /// is destroyed so a stale join does not finish connecting to Discord.
+    connecting: Option<tokio::task::AbortHandle>,
 }
 
 pub struct Player {
@@ -131,6 +134,7 @@ impl Player {
                 connection: None,
                 voice_generation: 0,
                 voice_up: false,
+                connecting: None,
             }),
             wake: Condvar::new(),
             updates: tokio::sync::Mutex::new(()),
@@ -279,6 +283,9 @@ impl Player {
                 if let Some(connection) = state.connection.take() {
                     connection.close();
                 }
+                if let Some(task) = state.connecting.take() {
+                    task.abort();
+                }
                 if state.voice_up {
                     state.voice_up = false;
                     self.event("voice.disconnected", voice_fields(left.as_deref(), "replaced"));
@@ -320,10 +327,16 @@ impl Player {
         });
         let future = self.deps.voice.connect(self.user.clone(), self.guild.clone(), voice, handler);
         let player = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = future.await;
             player.connected(generation, result);
         });
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.voice_generation != generation {
+            task.abort();
+        } else {
+            state.connecting = Some(task.abort_handle());
+        }
     }
 
     fn connected(
@@ -628,6 +641,9 @@ impl Player {
             self.event("track.ended", json!({ "track": track, "reason": "cleanup" }));
         }
         let connection = state.connection.take();
+        if let Some(task) = state.connecting.take() {
+            task.abort();
+        }
         if state.voice_up {
             state.voice_up = false;
             let channel = state.body.voice.channel_id.clone();
@@ -1141,6 +1157,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(weak.strong_count(), 0, "the parked playback thread retained its player");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroying_a_player_aborts_its_pending_voice_handshake() {
+        struct Dropped(Sender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        struct HangingVoice(Mutex<Option<Sender<()>>>);
+        impl Factory for HangingVoice {
+            fn connect(
+                &self,
+                _user: String,
+                _guild: String,
+                _state: VoiceState,
+                _on_close: rustlink_voice::CloseHandler,
+            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
+            {
+                let guard = Dropped(self.0.lock().unwrap().take().unwrap());
+                Box::pin(async move {
+                    let _guard = guard;
+                    std::future::pending().await
+                })
+            }
+        }
+        let (dropped, aborted) = channel();
+        let player = Player::new(
+            "1".into(),
+            "10".into(),
+            Arc::new(Deps {
+                loader: Arc::new(FakeLoader),
+                engine: Arc::new(FakeEngine { frames: 1 }),
+                voice: Arc::new(HangingVoice(Mutex::new(Some(dropped)))),
+            }),
+            Arc::new(|_| {}),
+            Arc::new(Counters::default()),
+        );
+        player.update(update(json!({ "voice": voice() })), false).await.unwrap();
+        assert!(aborted.try_recv().is_err());
+        player.destroy();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while aborted.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "the voice handshake outlived its player");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[test]

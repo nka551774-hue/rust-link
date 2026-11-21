@@ -267,20 +267,28 @@ impl Decoder {
 
         let source = Unseekable { inner: Mutex::new(body) };
         let stream = MediaSourceStream::new(Box::new(source), Default::default());
-        let probed = symphonia::default::get_probe()
-            .format(
+        // symphonia's demuxers panic on some malformed headers (a WAV with a
+        // zero sample rate builds a zero TimeBase); untrusted bytes must decline.
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            symphonia::default::get_probe().format(
                 &Hint::new(),
                 stream,
                 &FormatOptions { enable_gapless: true, ..Default::default() },
                 &MetadataOptions::default(),
             )
-            .map_err(|e| AudioError::Decode(e.to_string()))?;
+        }))
+        .map_err(|_| AudioError::Decode("the stream header is malformed".into()))?
+        .map_err(|e| AudioError::Decode(e.to_string()))?;
         let format = probed.format;
         let track = format
             .default_track()
             .ok_or_else(|| AudioError::Decode("the stream holds no playable track".into()))?;
         let track_id = track.id;
         let rate = track.codec_params.sample_rate.unwrap_or(48_000);
+        if rate == 0 {
+            // A zero rate would make the resampler expand every frame ~10^6 times.
+            return Err(AudioError::Decode("the stream has a zero sample rate".into()));
+        }
         let channels =
             track.codec_params.channels.unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
         if track.codec_params.codec == CODEC_TYPE_OPUS {
@@ -315,6 +323,15 @@ impl Decoder {
     /// than ending the track, which is what a listener expects from a stream
     /// that arrived over a lossy connection.
     pub fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+        // As in `new`: a symphonia panic on malformed packets ends the track
+        // with an error instead of unwinding through the player.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.decode_next(out)))
+            .unwrap_or_else(|_| {
+                Err(AudioError::Decode("the decoder panicked on the stream".into()))
+            })
+    }
+
+    fn decode_next(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         match &mut self.inner {
             Inner::OggOpus(decoder) => decoder.decode(&mut self.scratch, out),
             Inner::Symphonia { format, decoder, track_id, spec, mixer } => loop {
@@ -366,13 +383,14 @@ impl Decoder {
     }
 }
 
-/// Folds whatever the decoder produced into stereo, using the coefficients
-/// FFmpeg's own stereo downmix uses.
-///
-/// The matrix is normalised the way FFmpeg normalises it, which is what keeps a
-/// 5.1 track as loud as the stereo track next to it instead of clipping.
+/// Copies single-channel content to both sides at unity gain, regardless of its
+/// position label. Multichannel content uses conventional centre/surround
+/// weights, normalised per output to keep full-scale input from clipping.
+/// This is not a bit-identical FFmpeg rematrix.
 struct Downmix {
     count: usize,
+    stereo_layout: bool,
+    fallback_mix: bool,
     left: Vec<(usize, f32)>,
     right: Vec<(usize, f32)>,
     left_gain: f32,
@@ -384,27 +402,57 @@ impl Downmix {
     /// normalising two vectors for every decoded packet.
     fn new(channels: Channels) -> Self {
         let count = channels.count();
+        let stereo_layout = channels == (Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
         let mut left = Vec::new();
         let mut right = Vec::new();
-        if count > 2 {
+        if !stereo_layout {
             for (index, channel) in channels.iter().enumerate() {
-                if channel == Channels::FRONT_LEFT {
-                    left.push((index, 1.0));
-                } else if channel == Channels::FRONT_RIGHT {
-                    right.push((index, 1.0));
-                } else if channel == Channels::FRONT_CENTRE {
+                if channel == Channels::TOP_CENTRE
+                    || channel == Channels::TOP_REAR_CENTRE
+                    || channel == Channels::REAR_CENTRE
+                {
+                    // Split rear/overhead centre contributions at half level.
+                    left.push((index, 0.5));
+                    right.push((index, 0.5));
+                } else if channel == Channels::FRONT_CENTRE
+                    || channel == Channels::TOP_FRONT_CENTRE
+                    || channel == Channels::FRONT_CENTRE_HIGH
+                {
                     left.push((index, 0.707));
                     right.push((index, 0.707));
-                } else if channel == Channels::REAR_LEFT || channel == Channels::SIDE_LEFT {
+                } else if channel == Channels::FRONT_LEFT
+                    || channel == Channels::FRONT_LEFT_CENTRE
+                    || channel == Channels::TOP_FRONT_LEFT
+                    || channel == Channels::FRONT_LEFT_WIDE
+                    || channel == Channels::FRONT_LEFT_HIGH
+                {
+                    left.push((index, 1.0));
+                } else if channel == Channels::FRONT_RIGHT
+                    || channel == Channels::FRONT_RIGHT_CENTRE
+                    || channel == Channels::TOP_FRONT_RIGHT
+                    || channel == Channels::FRONT_RIGHT_WIDE
+                    || channel == Channels::FRONT_RIGHT_HIGH
+                {
+                    right.push((index, 1.0));
+                } else if channel == Channels::REAR_LEFT
+                    || channel == Channels::SIDE_LEFT
+                    || channel == Channels::TOP_REAR_LEFT
+                    || channel == Channels::REAR_LEFT_CENTRE
+                {
                     left.push((index, 0.707));
-                } else if channel == Channels::REAR_RIGHT || channel == Channels::SIDE_RIGHT {
+                } else if channel == Channels::REAR_RIGHT
+                    || channel == Channels::SIDE_RIGHT
+                    || channel == Channels::TOP_REAR_RIGHT
+                    || channel == Channels::REAR_RIGHT_CENTRE
+                {
                     right.push((index, 0.707));
                 }
             }
         }
         let left_gain = left.iter().map(|(_, weight)| weight).sum::<f32>().max(1.0);
         let right_gain = right.iter().map(|(_, weight)| weight).sum::<f32>().max(1.0);
-        Self { count, left, right, left_gain, right_gain }
+        let fallback_mix = !stereo_layout && left.is_empty() && right.is_empty();
+        Self { count, stereo_layout, fallback_mix, left, right, left_gain, right_gain }
     }
 
     fn process(&self, samples: &[f32], out: &mut Vec<f32>) {
@@ -415,12 +463,20 @@ impl Downmix {
         out.reserve(frames * 2);
         match self.count {
             1 => {
+                // A lone channel is mono content, not a positioned surround bed.
                 for sample in samples {
                     out.push(*sample);
                     out.push(*sample);
                 }
             }
-            2 => out.extend_from_slice(&samples[..frames * 2]),
+            2 if self.stereo_layout => out.extend_from_slice(&samples[..frames * 2]),
+            _ if self.fallback_mix => {
+                for frame in samples.chunks_exact(self.count) {
+                    let mono = frame.iter().copied().sum::<f32>() / self.count as f32;
+                    out.push(mono);
+                    out.push(mono);
+                }
+            }
             _ => {
                 for frame in samples.chunks_exact(self.count) {
                     let mut l = 0.0;
@@ -453,9 +509,18 @@ mod tests {
 
     #[test]
     fn mono_is_copied_to_both_sides() {
-        let mut out = Vec::new();
-        downmix(&[1.0, 0.5], &spec(Channels::FRONT_LEFT), &mut out);
-        assert_eq!(out, vec![1.0, 1.0, 0.5, 0.5]);
+        for channel in [
+            Channels::FRONT_LEFT,
+            Channels::FRONT_CENTRE,
+            Channels::TOP_CENTRE,
+            Channels::TOP_FRONT_CENTRE,
+            Channels::TOP_REAR_CENTRE,
+            Channels::REAR_CENTRE,
+        ] {
+            let mut out = Vec::new();
+            downmix(&[1.0, 0.5], &spec(channel), &mut out);
+            assert_eq!(out, vec![1.0, 1.0, 0.5, 0.5], "channel={channel:?}");
+        }
     }
 
     #[test]
@@ -467,6 +532,63 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, vec![1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_nonstereo_two_channel_layout_is_not_passed_through_as_left_right() {
+        let mut out = Vec::new();
+        downmix(&[1.0, 0.75], &spec(Channels::FRONT_CENTRE | Channels::LFE1), &mut out);
+        assert!((out[0] - 0.707).abs() < 1e-6, "out={out:?}");
+        assert!((out[1] - 0.707).abs() < 1e-6, "out={out:?}");
+    }
+
+    #[test]
+    fn left_and_right_centre_channels_are_not_silenced() {
+        let mut out = Vec::new();
+        downmix(
+            &[1.0, 0.75],
+            &spec(Channels::FRONT_LEFT_CENTRE | Channels::FRONT_RIGHT_CENTRE),
+            &mut out,
+        );
+        assert!((out[0] - 1.0).abs() < 1e-6, "out={out:?}");
+        assert!((out[1] - 0.75).abs() < 1e-6, "out={out:?}");
+    }
+
+    #[test]
+    fn top_front_left_and_right_channels_are_not_silenced() {
+        let mut out = Vec::new();
+        downmix(
+            &[1.0, 0.75],
+            &spec(Channels::TOP_FRONT_LEFT | Channels::TOP_FRONT_RIGHT),
+            &mut out,
+        );
+        assert!((out[0] - 1.0).abs() < 1e-6, "out={out:?}");
+        assert!((out[1] - 0.75).abs() < 1e-6, "out={out:?}");
+    }
+
+    #[test]
+    fn multichannel_overhead_centre_uses_the_half_level_stereo_matrix() {
+        let mut out = Vec::new();
+        downmix(&[0.0, 1.0], &spec(Channels::TOP_CENTRE | Channels::LFE1), &mut out);
+        assert_eq!(out, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn multichannel_rear_centre_is_half_level_but_front_height_centre_is_not() {
+        let mut rear = Vec::new();
+        downmix(&[0.0, 1.0], &spec(Channels::LFE1 | Channels::REAR_CENTRE), &mut rear);
+        assert_eq!(rear, vec![0.5, 0.5]);
+        let mut front = Vec::new();
+        downmix(&[0.0, 1.0], &spec(Channels::LFE1 | Channels::TOP_FRONT_CENTRE), &mut front);
+        assert_eq!(front, vec![0.707, 0.707]);
+    }
+
+    #[test]
+    fn a_layout_without_known_positions_falls_back_to_audible_mono() {
+        let mut out = Vec::new();
+        downmix(&[1.0, 0.5], &spec(Channels::LFE1 | Channels::LFE2), &mut out);
+        assert!((out[0] - 0.75).abs() < 1e-6, "out={out:?}");
+        assert!((out[1] - 0.75).abs() < 1e-6, "out={out:?}");
     }
 
     #[test]

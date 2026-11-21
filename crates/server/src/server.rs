@@ -119,7 +119,7 @@ pub struct Server {
     counters: Arc<Counters>,
     /// What every player on the node is built with.
     player_deps: Arc<Deps>,
-    cpu: Cpu,
+    cpu: Arc<Cpu>,
     limits: Limits,
     /// Carries one pending request for a node-wide player report. A burst of
     /// activity asks for the same one report.
@@ -152,7 +152,7 @@ impl Server {
             requests: AtomicU64::new(0),
             counters: Arc::new(Counters::default()),
             player_deps,
-            cpu: Cpu::new(),
+            cpu: Arc::new(Cpu::new()),
             limits: Limits::new(),
             reports,
             last_report: Mutex::new(None),
@@ -774,6 +774,27 @@ async fn get_player(
     server.json(StatusCode::OK, player.snapshot())
 }
 
+/// Roll back a first update on both error and future cancellation. This guard
+/// must be dropped before the request releases its per-guild update gate.
+struct PlayerCreation<'a> {
+    session: &'a Session,
+    server: &'a Server,
+    player: &'a Arc<Player>,
+    pending: bool,
+}
+
+impl Drop for PlayerCreation<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            if let Some(player) = self.session.remove_if_same(self.player.guild(), self.player) {
+                player.destroy();
+                self.server.player_destroyed();
+                self.server.request_report();
+            }
+        }
+    }
+}
+
 async fn update_player(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
@@ -834,7 +855,9 @@ async fn update_player(
             path,
         );
     }
-    let player = match session.get_or_insert(&guild_id, || {
+    let gate = session.update_gate(&guild_id);
+    let _serialized = gate.lock().await;
+    let (player, created) = match session.get_or_insert(&guild_id, || {
         if !server.reserve_player() {
             return Err(());
         }
@@ -859,8 +882,13 @@ async fn update_player(
             return server.fail(StatusCode::SERVICE_UNAVAILABLE, "player capacity reached", path)
         }
     };
+    let mut creation =
+        PlayerCreation { session: &session, server: &server, player: &player, pending: created };
     match player.update(update, no_replace).await {
-        Ok(body) => server.json(StatusCode::OK, body),
+        Ok(body) => {
+            creation.pending = false;
+            server.json(StatusCode::OK, body)
+        }
         Err(error) => server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path),
     }
 }
@@ -879,6 +907,8 @@ async fn delete_player(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let gate = session.update_gate(&guild_id);
+    let _serialized = gate.lock().await;
     if let Some(player) = session.remove(&guild_id) {
         player.destroy();
         server.player_destroyed();
@@ -1272,7 +1302,7 @@ impl Server {
             "uptime_ms": self.started.elapsed().as_millis() as i64,
             "memory": { "process_bytes": used, "system_total_bytes": total },
             "cpu": {
-                "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+                "cores": self.cpu.cores(),
                 "system_load": system_load,
                 "process_load": process_load,
             },
@@ -1336,13 +1366,17 @@ impl Server {
     /// which is what keeps a node that is left running from filling up with
     /// sessions nobody is coming back for.
     async fn reap(self: Arc<Self>) {
-        self.cpu.sample();
+        if !self.sample_cpu().await {
+            return;
+        }
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = self.shutdown_requested() => return,
                 _ = ticker.tick() => {
-                    self.cpu.sample();
+                    if !self.sample_cpu().await {
+                        return;
+                    }
                     let expired: Vec<Arc<Session>> = {
                         let mut sessions = self.sessions.lock().unwrap();
                         let ids: Vec<String> = sessions.values().filter(|session| session.expired()).map(|session| session.id.clone()).collect();
@@ -1361,6 +1395,17 @@ impl Server {
                     }
                 }
             }
+        }
+    }
+
+    /// Sampling reads the process table, which is blocking system work (the
+    /// first sample takes seconds on Windows) that must not stall a runtime
+    /// worker. Returns false when the node shut down meanwhile.
+    async fn sample_cpu(&self) -> bool {
+        let cpu = Arc::clone(&self.cpu);
+        tokio::select! {
+            _ = self.shutdown_requested() => false,
+            _ = tokio::task::spawn_blocking(move || cpu.sample()) => true,
         }
     }
 

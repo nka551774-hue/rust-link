@@ -419,6 +419,52 @@ async fn local_close_is_idempotent_and_fresh_connect_uses_a_new_transport_key() 
 }
 
 #[tokio::test]
+async fn an_unreachable_udp_peer_does_not_close_the_voice_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (received, mut deliveries) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
+        peer.describe(0).await;
+        assert_eq!(peer.packet(0).await, SILENCE);
+        // Closing the media port makes later frames draw ICMP port unreachable.
+        peer.udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        received.send(()).unwrap();
+        loop {
+            let message = peer.message().await;
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+            peer.handle(message).await;
+        }
+    });
+    let (close, mut closed) = mpsc::unbounded_channel();
+    let connection = connect_url(
+        &url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(move |event| {
+            close.send(event).unwrap();
+        }),
+    )
+    .await
+    .unwrap();
+    connection.speaking(true).unwrap();
+    connection.write(SILENCE).unwrap();
+    tokio::time::timeout(LIMIT, deliveries.recv()).await.unwrap().unwrap();
+    for _ in 0..5 {
+        connection.write(SILENCE).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(connection.connected(), "closed: {:?}", closed.try_recv());
+    connection.close();
+    let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
+    assert!(!event.by_remote);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn premature_dave_downgrade_fails_the_loopback_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());

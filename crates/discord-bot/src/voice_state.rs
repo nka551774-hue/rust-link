@@ -93,12 +93,23 @@ impl VoiceStatePairer {
                 // when Discord reallocates voice. Never combine the new
                 // server token with the old session/channel pair. Identical
                 // duplicate server events are harmless and remain deduped.
+                // Discord reports an unavailable server with a null endpoint
+                // while it reallocates one. Preserve the current voice state
+                // across that null event and the first usable endpoint after
+                // it, because failover does not guarantee another state event.
+                let reallocating = update.endpoint.is_none() || pending.endpoint.is_none();
                 let changed_server = pending.emitted.is_some()
+                    && !reallocating
                     && (pending.token.as_deref() != Some(update.token.as_str())
                         || pending.endpoint.as_ref() != update.endpoint.as_ref());
                 if changed_server {
                     pending.session_id = None;
                     pending.channel_id = None;
+                    pending.emitted = None;
+                }
+                if update.endpoint.is_none() {
+                    // An unavailable server invalidates the active connection,
+                    // even when its replacement reuses the exact same fields.
                     pending.emitted = None;
                 }
                 pending.token = Some(update.token.clone());
@@ -284,5 +295,50 @@ mod tests {
         assert_eq!(voice.channel_id.as_deref(), Some("301"));
         assert_eq!(voice.token, "new-token");
         assert_eq!(voice.endpoint, "voice2.discord.media:443");
+    }
+
+    #[test]
+    fn a_server_failover_reuses_the_current_voice_state() {
+        let mut pairer = VoiceStatePairer::new("100").unwrap();
+        assert!(pairer.observe(&state()).unwrap().is_none());
+        assert!(pairer.observe(&server()).unwrap().is_some());
+
+        let unavailable = BotEvent::VoiceServerUpdate(VoiceServerUpdate {
+            guild_id: "200".into(),
+            token: "token".into(),
+            endpoint: None,
+        });
+        assert!(pairer.observe(&unavailable).unwrap().is_none());
+
+        let reallocated = BotEvent::VoiceServerUpdate(VoiceServerUpdate {
+            guild_id: "200".into(),
+            token: "new-token".into(),
+            endpoint: Some("voice2.discord.media:443".into()),
+        });
+        let voice = pairer.observe(&reallocated).unwrap().unwrap();
+        assert_eq!(voice.session_id, "session");
+        assert_eq!(voice.channel_id.as_deref(), Some("300"));
+        assert_eq!(voice.token, "new-token");
+        assert_eq!(voice.endpoint, "voice2.discord.media:443");
+    }
+
+    #[test]
+    fn a_server_reallocated_with_the_same_fields_is_emitted_after_unavailability() {
+        let mut pairer = VoiceStatePairer::new("100").unwrap();
+        assert!(pairer.observe(&state()).unwrap().is_none());
+        assert!(pairer.observe(&server()).unwrap().is_some());
+
+        let unavailable = BotEvent::VoiceServerUpdate(VoiceServerUpdate {
+            guild_id: "200".into(),
+            token: "token".into(),
+            endpoint: None,
+        });
+        assert!(pairer.observe(&unavailable).unwrap().is_none());
+
+        let voice = pairer.observe(&server()).unwrap().unwrap();
+        assert_eq!(voice.session_id, "session");
+        assert_eq!(voice.channel_id.as_deref(), Some("300"));
+        assert_eq!(voice.token, "token");
+        assert_eq!(voice.endpoint, "voice.discord.media:443");
     }
 }

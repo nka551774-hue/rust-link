@@ -12,6 +12,8 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 /// flag that says whether a sample has been taken yet.
 pub struct Cpu {
     inner: Mutex<Inner>,
+    /// Read once: on Linux each query walks the cgroup files.
+    cores: usize,
 }
 
 struct Inner {
@@ -39,6 +41,7 @@ impl Cpu {
                 memory_used: 0,
                 memory_total: 0,
             }),
+            cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
 
@@ -53,7 +56,7 @@ impl Cpu {
         inner.system.refresh_memory();
         let pid = Pid::from_u32(std::process::id());
         inner.system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+        let cores = self.cores as f64;
         let system_load = inner.system.global_cpu_usage() as f64 / 100.0;
         let process_load = inner
             .system
@@ -76,6 +79,11 @@ impl Cpu {
     pub fn values(&self) -> (f64, f64, bool) {
         let inner = self.inner.lock().unwrap();
         (inner.system_load, inner.process_load, inner.available)
+    }
+
+    /// The logical cores the process may run on.
+    pub fn cores(&self) -> usize {
+        self.cores
     }
 
     /// The memory this process holds and the machine has, as of the last sample.

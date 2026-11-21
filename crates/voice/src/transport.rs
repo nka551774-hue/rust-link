@@ -146,15 +146,19 @@ struct State {
 pub struct Transport {
     socket: Arc<tokio::net::UdpSocket>,
     remote: SocketAddr,
+    // BSD/macOS reject sendto with an address on a connected UDP socket (EISCONN).
+    connected: bool,
     ssrc: u32,
     state: Mutex<State>,
 }
 
 impl Transport {
     pub fn new(socket: Arc<tokio::net::UdpSocket>, remote: SocketAddr, ssrc: u32) -> Self {
+        let connected = socket.peer_addr().ok() == Some(remote);
         Self {
             socket,
             remote,
+            connected,
             ssrc,
             state: Mutex::new(State {
                 cipher: None,
@@ -192,9 +196,23 @@ impl Transport {
         state.counter += 1;
         state.sequence = state.sequence.wrapping_add(1);
         state.timestamp = state.timestamp.wrapping_add(FRAME_SAMPLES);
-        self.socket.try_send_to(&state.packet, self.remote)?;
-        Ok(())
+        let sent = if self.connected {
+            self.socket.try_send(&state.packet)
+        } else {
+            self.socket.try_send_to(&state.packet, self.remote)
+        };
+        match sent {
+            // UDP is lossy: a full send buffer or a stale ICMP error drops one frame, not the session.
+            Err(error) if transient_udp_error(&error) => Ok(()),
+            result => result.map(drop).map_err(VoiceError::from),
+        }
     }
+}
+
+/// Errors a voice UDP socket reports for one lost datagram rather than a dead socket.
+pub(crate) fn transient_udp_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, ConnectionReset, WouldBlock};
+    matches!(error.kind(), WouldBlock | ConnectionRefused | ConnectionReset)
 }
 
 #[cfg(test)]
@@ -288,5 +306,35 @@ mod tests {
         assert!(transport.describe(mode, [1; 32]).is_err());
         transport.state.lock().unwrap().counter = u32::MAX as u64 + 1;
         assert!(matches!(transport.write(b"opus"), Err(VoiceError::Crypto(_))));
+    }
+
+    #[tokio::test]
+    async fn connected_transport_reaches_its_peer_and_survives_an_unreachable_one() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let remote = receiver.local_addr().unwrap();
+        socket.connect(remote).await.unwrap();
+        // A fresh socket reports WouldBlock until the reactor marks it writable,
+        // and write() now drops that frame silently.
+        socket.writable().await.unwrap();
+        let transport = Transport::new(socket, remote, 9);
+        assert!(transport.connected);
+        transport.describe(Mode::AeadAes256GcmRtpSize, [1; 32]).unwrap();
+        transport.write(b"opus").unwrap();
+        let mut bytes = [0u8; 64];
+        let size =
+            tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv(&mut bytes))
+                .await
+                .expect("the frame never reached its peer")
+                .unwrap();
+        assert_eq!(&bytes[8..12], &9u32.to_be_bytes());
+        assert_eq!(size, HEADER_LEN + 4 + 16 + 4);
+        // With the peer gone, ICMP unreachable surfaces as a socket error on later sends.
+        drop(receiver);
+        for _ in 0..5 {
+            transport.write(b"opus").unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(transient_udp_error(&std::io::ErrorKind::WouldBlock.into()));
     }
 }

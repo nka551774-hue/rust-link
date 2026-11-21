@@ -83,14 +83,17 @@ impl Node {
     fn new(config: Config) -> Self {
         Self::with_engine(config, Arc::new(Media))
     }
-    fn with_engine(mut config: Config, engine: Arc<dyn Engine>) -> Self {
+    fn with_engine(config: Config, engine: Arc<dyn Engine>) -> Self {
+        Self::with_media(config, Arc::new(Media), engine)
+    }
+    fn with_media(mut config: Config, loader: Arc<dyn Loader>, engine: Arc<dyn Engine>) -> Self {
         config.password = "test-secret".into();
         config.ratelimits.enable = false;
         Self(
             Server::new(
                 config,
                 Dependencies {
-                    loader: Arc::new(Media),
+                    loader,
                     engine,
                     voice: Arc::new(Media),
                     lyrics: None,
@@ -389,6 +392,157 @@ async fn concurrent_player_creation_obeys_capacity_and_reuses_the_player() {
         StatusCode::SERVICE_UNAVAILABLE
     );
     node.request("DELETE", &format!("/api/v1/sessions/{id}"), Value::Null).await;
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
+}
+
+#[tokio::test]
+async fn a_failed_first_player_update_does_not_reserve_a_player_slot() {
+    let node = Node::new(Config { max_players: 1, ..Config::default() });
+    let id = node.session().await;
+    let player = format!("/api/v1/sessions/{id}/players/456");
+
+    let (status, error) =
+        node.request("PATCH", &player, json!({ "track": { "query": "failure" } })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
+    assert!(node.request("GET", &format!("/api/v1/sessions/{id}/players"), Value::Null).await.1
+        ["players"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (status, _) = node.request("PATCH", &player, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+struct BlockingLoader {
+    entered: tokio::sync::Notify,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl Loader for BlockingLoader {
+    fn load(&self, _: &str) -> Result<LoadResult, SourceError> {
+        self.entered.notify_one();
+        self.release.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+        Ok(LoadResult::from_error("provider unavailable"))
+    }
+    fn open(&self, track: &Track) -> Result<Box<dyn std::io::Read + Send>, SourceError> {
+        Media.open(track)
+    }
+}
+
+fn blocking_player_node(
+    max_players: u32,
+) -> (Arc<Node>, Arc<BlockingLoader>, std::sync::mpsc::Sender<()>) {
+    let (release, receiver) = std::sync::mpsc::channel();
+    let loader = Arc::new(BlockingLoader {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(receiver),
+    });
+    let node = Arc::new(Node::with_media(
+        Config { max_players, ..Config::default() },
+        loader.clone(),
+        Arc::new(Media),
+    ));
+    (node, loader, release)
+}
+
+#[tokio::test]
+async fn cancelling_the_first_player_update_releases_capacity() {
+    let (node, loader, release) = blocking_player_node(1);
+    let id = node.session().await;
+    let path = format!("/api/v1/sessions/{id}/players/456");
+    let request = tokio::spawn({
+        let node = node.clone();
+        let path = path.clone();
+        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
+    assert_eq!(node.request("GET", &path, Value::Null).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(node.request("PATCH", &path, json!({"volume":42})).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_destruction_and_creation_cancellation_release_capacity_only_once() {
+    let (node, loader, release) = blocking_player_node(1);
+    let id = node.session().await;
+    let session_path = format!("/api/v1/sessions/{id}");
+    let path = format!("{session_path}/players/456");
+    let request = tokio::spawn({
+        let node = node.clone();
+        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+
+    assert_eq!(node.request("DELETE", &session_path, Value::Null).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
+
+    let replacement = node.session().await;
+    let path = format!("/api/v1/sessions/{replacement}/players/456");
+    assert_eq!(node.request("PATCH", &path, json!({})).await.0, StatusCode::OK);
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 1);
+}
+
+#[tokio::test]
+async fn a_failed_creation_preserves_a_queued_update_and_other_guilds_make_progress() {
+    let (node, loader, release) = blocking_player_node(2);
+    let id = node.session().await;
+    let path = format!("/api/v1/sessions/{id}/players/456");
+    let first = tokio::spawn({
+        let node = node.clone();
+        let path = path.clone();
+        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    let mut queued = Box::pin(node.request("PATCH", &path, json!({"volume":42})));
+    // Poll the queued request before releasing the loader. It must not commit
+    // while the first request still owns this guild's creation transaction.
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(queued.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    // An unrelated guild must not queue behind the slow source lookup.
+    let other = format!("/api/v1/sessions/{id}/players/789");
+    let response =
+        tokio::time::timeout(Duration::from_secs(2), node.request("PATCH", &other, json!({})))
+            .await
+            .unwrap();
+    assert_eq!(response.0, StatusCode::OK);
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap().0, StatusCode::BAD_REQUEST);
+    assert_eq!(queued.await.0, StatusCode::OK);
+    assert_eq!(node.request("GET", &path, Value::Null).await.1["volume"], 42);
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 2);
+}
+
+#[tokio::test]
+async fn deleting_a_player_waits_for_an_inflight_update_on_the_same_guild() {
+    let (node, loader, release) = blocking_player_node(1);
+    let id = node.session().await;
+    let path = format!("/api/v1/sessions/{id}/players/456");
+    let update = tokio::spawn({
+        let node = node.clone();
+        let path = path.clone();
+        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    let mut delete = Box::pin(node.request("DELETE", &path, Value::Null));
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(delete.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    release.send(()).unwrap();
+    assert_eq!(update.await.unwrap().0, StatusCode::BAD_REQUEST);
+    assert_eq!(delete.await.0, StatusCode::NO_CONTENT);
     assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
 }
 

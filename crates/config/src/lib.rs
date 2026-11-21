@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Everything tunable about a node.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Everything tunable about a node. `Debug` redacts credentials.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
     /// Where the node listens. Every interface by default, because the client
@@ -117,8 +117,9 @@ impl Default for RateLimit {
 }
 
 /// Where node events are posted. A Discord webhook URL is sent an embed; any
-/// other endpoint is sent the event itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// other endpoint is sent the event itself. `Debug` redacts the URL, because a
+/// Discord webhook URL carries its token.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Webhook {
     pub enable: bool,
@@ -131,6 +132,48 @@ pub struct Webhook {
 impl Default for Webhook {
     fn default() -> Self {
         Webhook { enable: false, url: String::new(), state_latency_seconds: 5 }
+    }
+}
+
+impl std::fmt::Debug for Webhook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Webhook")
+            .field("enable", &self.enable)
+            .field("url", &redacted(&self.url))
+            .field("state_latency_seconds", &self.state_latency_seconds)
+            .finish()
+    }
+}
+
+/// Fields that hold credentials, by their serialized name.
+const SECRET_FIELDS: [&str; 5] = [
+    "password",
+    "youtubePoToken",
+    "soundcloudClientId",
+    "spotifyClientSecret",
+    "spotifyRefreshToken",
+];
+
+fn redacted(value: &str) -> &'static str {
+    if value.is_empty() {
+        ""
+    } else {
+        "<redacted>"
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut value = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
+        for name in SECRET_FIELDS {
+            if let Some(field) = value.get_mut(name) {
+                *field = redacted(field.as_str().unwrap_or("")).into();
+            }
+        }
+        if let Some(url) = value.pointer_mut("/webhook/url") {
+            *url = redacted(url.as_str().unwrap_or("")).into();
+        }
+        write!(f, "Config {value:#}")
     }
 }
 
@@ -363,6 +406,32 @@ mod tests {
     #[test]
     fn the_starter_file_is_one_discovery_looks_for() {
         assert!(CANDIDATES.contains(&STARTER_FILE));
+    }
+
+    #[test]
+    fn debug_output_redacts_credentials() {
+        let mut config = Config {
+            password: "hunter2-pass".into(),
+            spotify_client_secret: "spotify-secret".into(),
+            spotify_refresh_token: "refresh-secret".into(),
+            youtube_po_token: "po-secret".into(),
+            soundcloud_client_id: "sc-secret".into(),
+            ..Default::default()
+        };
+        config.webhook.url = "https://discord.com/api/webhooks/1/hook-secret".into();
+        for rendered in [format!("{config:?}"), format!("{:?}", config.webhook)] {
+            for secret in [
+                "hunter2",
+                "spotify-secret",
+                "refresh-secret",
+                "po-secret",
+                "sc-secret",
+                "hook-secret",
+            ] {
+                assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+            }
+        }
+        assert!(format!("{config:?}").contains("0.0.0.0:2333"));
     }
 
     #[test]

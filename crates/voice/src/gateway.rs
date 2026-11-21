@@ -327,7 +327,11 @@ impl Gateway {
                     Some(Command::Close) | None => return Err(local_close()),
                 }
             }
-            result = async { match &self.socket { Some(socket) => socket.recv(&mut udp_buffer).await, None => pending().await } } => { result?; }
+            result = async { match &self.socket { Some(socket) => socket.recv(&mut udp_buffer).await, None => pending().await } } => {
+                // Connected UDP reports ICMP unreachable (WSAECONNRESET on Windows) on recv; one
+                // lost datagram must not end the voice session.
+                if let Err(error) = result { if !transport::transient_udp_error(&error) { return Err(error.into()); } }
+            }
         }
         Ok(())
     }

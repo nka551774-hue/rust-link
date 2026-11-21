@@ -65,8 +65,8 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
         ("RUSTLINK_WEBHOOK_ENABLED", |c| &mut c.webhook.enable),
     ];
     for (name, field) in flags {
-        if let Some(value) = lookup(name) {
-            *field(config) = truthy(&value);
+        if let Some(value) = lookup(name).as_deref().and_then(switch) {
+            *field(config) = value;
         }
     }
 
@@ -99,9 +99,15 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
     }
 }
 
-/// Reads a switch. Anything other than `0` or `false` counts as on.
-fn truthy(value: &str) -> bool {
-    !(value == "0" || value.eq_ignore_ascii_case("false"))
+/// Reads a switch. An unrecognised value is ignored like an unreadable number,
+/// so `no`, `off` or an empty value never switches a guard such as
+/// `RUSTLINK_PRIVATE_NETWORKS` on.
+fn switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -123,7 +129,7 @@ mod tests {
 
     #[test]
     fn switches_treat_zero_and_false_as_off() {
-        for value in ["0", "false", "FALSE"] {
+        for value in ["0", "false", "FALSE", "no", "off", " false "] {
             let mut config = Config::default();
             let pairs = [("RUSTLINK_YOUTUBE_NATIVE", value)];
             apply_env_with(&mut config, |name| lookup(&pairs, name));
@@ -133,6 +139,9 @@ mod tests {
         let pairs = [("RUSTLINK_YOUTUBE_NATIVE", "1")];
         apply_env_with(&mut config, |name| lookup(&pairs, name));
         assert!(config.youtube_native);
+        let pairs = [("RUSTLINK_PRIVATE_NETWORKS", "")];
+        apply_env_with(&mut config, |name| lookup(&pairs, name));
+        assert!(!config.allow_private_networks, "an unrecognised value leaves the guard alone");
     }
 
     #[test]

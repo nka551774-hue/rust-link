@@ -24,6 +24,8 @@ use crate::ogg::OggOpusReader;
 const STALL: Duration = Duration::from_secs(10);
 /// How much of FFmpeg's diagnostics to keep for an error message.
 const STDERR_LIMIT: usize = 32 << 10;
+/// Do not let shutdown wait forever for a broken stderr reader.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Bound decode-ahead to 160 ms. Backpressure reaches FFmpeg's pipe, including
 /// while paused, so a long track cannot accumulate in an unbounded channel.
 const PACKET_QUEUE: usize = 8;
@@ -32,9 +34,113 @@ pub struct FfmpegFrames {
     packets: Receiver<Result<Vec<u8>, AudioError>>,
     recycle: SyncSender<Vec<u8>>,
     child: Child,
-    errors: Arc<Mutex<Vec<u8>>>,
+    stderr: StderrCollector,
     input_error: Arc<Mutex<Option<std::io::Error>>>,
     finished: bool,
+}
+
+/// Owns the stderr reader and its bounded shutdown signal.
+///
+/// The reader is deliberately not joined after a timeout: a platform pipe can
+/// remain blocked even after the child has been reaped, and joining here would
+/// turn an error path into an unbounded wait. Dropping the handle detaches the
+/// reader; its `Arc` keeps the diagnostic buffer alive until the reader exits.
+struct StderrCollector {
+    errors: Arc<Mutex<Vec<u8>>>,
+    done: Receiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl StderrCollector {
+    fn spawn(
+        stderr: impl Read + Send + 'static,
+        errors: Arc<Mutex<Vec<u8>>>,
+    ) -> Result<Self, AudioError> {
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let collected = Arc::clone(&errors);
+        let worker = thread::Builder::new()
+            .name("rustlink-ffmpeg-err".into())
+            .spawn(move || collect_stderr(stderr, collected, done_tx))
+            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
+        Ok(Self { errors, done, worker: Some(worker) })
+    }
+
+    /// Wait for the reader only for a bounded interval, then detach it.
+    fn finish(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        match self.done.recv_timeout(STDERR_DRAIN_TIMEOUT) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Dropping JoinHandle detaches the reader. Never join an
+                // untrusted pipe reader on the lifecycle/error path.
+                drop(self.worker.take());
+            }
+        }
+    }
+
+    fn message(&self) -> String {
+        self.errors
+            .lock()
+            .map(|guard| String::from_utf8_lossy(&guard).trim().to_string())
+            .unwrap_or_default()
+    }
+}
+
+fn collect_stderr<R: Read>(mut stderr: R, errors: Arc<Mutex<Vec<u8>>>, done: SyncSender<()>) {
+    let mut chunk = [0u8; 4096];
+    while let Ok(read) = stderr.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        if let Ok(mut guard) = errors.lock() {
+            // Keep the invariant true even if a test or future caller seeded
+            // the shared buffer before collection began.
+            guard.truncate(STDERR_LIMIT);
+            let remaining = STDERR_LIMIT.saturating_sub(guard.len());
+            if remaining > 0 {
+                guard.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+    }
+    let _ = done.send(());
+}
+
+/// Owns a spawned FFmpeg child until all worker threads have been created.
+///
+/// The guard is intentionally kept separate from `FfmpegFrames`: setup has
+/// several fallible thread-spawn points, and an early return must not leave a
+/// process running after its pipes have been detached.
+struct StartupChild {
+    child: Option<Child>,
+}
+
+impl StartupChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("startup child already committed")
+    }
+
+    fn commit(mut self) -> Child {
+        self.child.take().expect("startup child already committed")
+    }
+}
+
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl FfmpegFrames {
@@ -106,50 +212,16 @@ impl FfmpegFrames {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let mut stderr = child.stderr.take().expect("stderr was piped");
-
-        // The body is written on its own thread, because the reader below is
-        // what the caller waits on and a slow source must not block it.
-        let input_error = Arc::new(Mutex::new(None));
-        let input_failure = Arc::clone(&input_error);
-        thread::Builder::new()
-            .name("rustlink-ffmpeg-in".into())
-            .spawn(move || {
-                let mut body = body;
-                if let Err(error) = std::io::copy(&mut body, &mut stdin) {
-                    // Record the failure before closing stdin. FFmpeg can exit
-                    // successfully after decoding a truncated input, but that
-                    // must not turn a failed media connection into normal EOF.
-                    if let Ok(mut guard) = input_failure.lock() {
-                        *guard = Some(error);
-                    }
-                }
-            })
-            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
-
+        let mut startup =
+            StartupChild::new(command.spawn().map_err(|e| AudioError::Ffmpeg(e.to_string()))?);
+        let mut stdin = startup.child_mut().stdin.take().expect("stdin was piped");
+        let stdout = startup.child_mut().stdout.take().expect("stdout was piped");
+        let stderr = startup.child_mut().stderr.take().expect("stderr was piped");
         let errors = Arc::new(Mutex::new(Vec::new()));
-        let collected = Arc::clone(&errors);
-        thread::Builder::new()
-            .name("rustlink-ffmpeg-err".into())
-            .spawn(move || {
-                let mut buffer = Vec::new();
-                let mut chunk = [0u8; 4096];
-                while let Ok(read) = stderr.read(&mut chunk) {
-                    if read == 0 {
-                        break;
-                    }
-                    if buffer.len() < STDERR_LIMIT {
-                        buffer.extend_from_slice(&chunk[..read]);
-                    }
-                }
-                if let Ok(mut guard) = collected.lock() {
-                    *guard = buffer;
-                }
-            })
-            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
+        // Start pipe readers before the body writer. If a later thread spawn
+        // fails, StartupChild can kill the process and these readers exit on
+        // EOF instead of leaving an unobserved pipe blocked.
+        let stderr = StderrCollector::spawn(stderr, Arc::clone(&errors))?;
 
         let (sender, packets) = mpsc::sync_channel(PACKET_QUEUE);
         let (recycle, recycled) = mpsc::sync_channel(PACKET_QUEUE + 2);
@@ -175,29 +247,69 @@ impl FfmpegFrames {
             })
             .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
 
-        Ok(FfmpegFrames { packets, recycle, child, errors, input_error, finished: false })
+        // The body is written on its own thread, because the reader below is
+        // what the caller waits on and a slow source must not block it.
+        let input_error = Arc::new(Mutex::new(None));
+        let input_failure = Arc::clone(&input_error);
+        thread::Builder::new()
+            .name("rustlink-ffmpeg-in".into())
+            .spawn(move || {
+                let mut body = body;
+                if let Err(error) = std::io::copy(&mut body, &mut stdin) {
+                    // Record the failure before closing stdin. FFmpeg can exit
+                    // successfully after decoding a truncated input, but that
+                    // must not turn a failed media connection into normal EOF.
+                    if let Ok(mut guard) = input_failure.lock() {
+                        *guard = Some(error);
+                    }
+                }
+            })
+            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
+
+        let child = startup.commit();
+        Ok(FfmpegFrames { packets, recycle, child, stderr, input_error, finished: false })
     }
 
     /// Waits for the child and turns a failure into the message FFmpeg printed.
     fn finish(&mut self) -> Result<(), AudioError> {
+        self.finish_with_wait(Child::wait)
+    }
+
+    fn finish_with_wait(
+        &mut self,
+        wait: impl FnOnce(&mut Child) -> std::io::Result<std::process::ExitStatus>,
+    ) -> Result<(), AudioError> {
+        let status = match wait(&mut self.child) {
+            Ok(status) => status,
+            Err(error) => {
+                self.stderr.finish();
+                return Err(AudioError::Ffmpeg(error.to_string()));
+            }
+        };
         self.finished = true;
-        let status = self.child.wait().map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
+        self.stderr.finish();
         if status.success() {
             if let Some(error) = self.input_error.lock().ok().and_then(|mut guard| guard.take()) {
                 return Err(AudioError::Io(error));
             }
             return Ok(());
         }
-        let message = self
-            .errors
-            .lock()
-            .map(|guard| String::from_utf8_lossy(&guard).trim().to_string())
-            .unwrap_or_default();
+        let message = self.stderr.message();
         Err(AudioError::Ffmpeg(if message.is_empty() {
             format!("ffmpeg exited with {status}")
         } else {
             message
         }))
+    }
+
+    /// Stop FFmpeg and drain diagnostics without making cleanup unbounded.
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let wait_result = self.child.wait();
+        if wait_result.is_ok() {
+            self.finished = true;
+        }
+        self.stderr.finish();
     }
 }
 
@@ -215,18 +327,14 @@ impl Frames for FfmpegFrames {
                 Ok(true)
             }
             Ok(Err(error)) => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                self.finished = true;
+                self.terminate();
                 Err(error)
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Nothing for ten seconds. The decoder is not coming back, so it
                 // is killed and the track is reported as stuck, which is the
                 // event a client shows for it.
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                self.finished = true;
+                self.terminate();
                 Err(AudioError::Stuck)
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -240,9 +348,325 @@ impl Frames for FfmpegFrames {
 impl Drop for FfmpegFrames {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.finished = true;
+            self.terminate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn marker_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("rustlink-{label}-{}-{nonce}.marker", std::process::id()))
+    }
+
+    #[cfg(windows)]
+    fn gated_marker(started: &Path, release: &Path, survived: &Path) -> Child {
+        let started = started.to_string_lossy().replace('\'', "''");
+        let release = release.to_string_lossy().replace('\'', "''");
+        let survived = survived.to_string_lossy().replace('\'', "''");
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$deadline=[DateTime]::UtcNow.AddSeconds(5); [IO.File]::WriteAllText('{started}','started'); while (-not [IO.File]::Exists('{release}') -and [DateTime]::UtcNow -lt $deadline) {{ Start-Sleep -Milliseconds 10 }}; if ([IO.File]::Exists('{release}')) {{ [IO.File]::WriteAllText('{survived}','survived') }}; exit 23"
+                ),
+            ])
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(not(windows))]
+    fn gated_marker(started: &Path, release: &Path, survived: &Path) -> Child {
+        fn quote(path: &Path) -> String {
+            format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+        }
+        Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "printf started > {}; i=0; while [ ! -e {} ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done; if [ -e {} ]; then printf survived > {}; fi; exit 23",
+                    quote(started),
+                    quote(release),
+                    quote(release),
+                    quote(survived)
+                ),
+            ])
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn gated_stderr_child(started: &Path, release: &Path, marker: &str) -> Child {
+        let started = started.to_string_lossy().replace('\'', "''");
+        let release = release.to_string_lossy().replace('\'', "''");
+        let marker = marker.replace('\'', "''");
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$deadline=[DateTime]::UtcNow.AddSeconds(5); [IO.File]::WriteAllText('{started}','started'); while (-not [IO.File]::Exists('{release}') -and [DateTime]::UtcNow -lt $deadline) {{ Start-Sleep -Milliseconds 10 }}; [Console]::Error.WriteLine('{marker}'); exit 23"
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(not(windows))]
+    fn gated_stderr_child(started: &Path, release: &Path, marker: &str) -> Child {
+        fn quote(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "'\\''"))
+        }
+        Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "printf started > {}; i=0; while [ ! -e {} ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done; printf '%s\\n' {} >&2; exit 23",
+                    quote(&started.to_string_lossy()),
+                    quote(&release.to_string_lossy()),
+                    quote(marker)
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for(path: &Path) {
+        assert!(appears_within(path, Duration::from_secs(5)), "helper process did not start");
+    }
+
+    fn appears_within(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn failed_child() -> Child {
+        Command::new("cmd.exe")
+            .args(["/d", "/c", "exit /b 23"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(not(windows))]
+    fn failed_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "exit 23"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn empty_stderr_collector(errors: Arc<Mutex<Vec<u8>>>) -> StderrCollector {
+        let (done_tx, done) = mpsc::sync_channel(1);
+        done_tx.send(()).unwrap();
+        StderrCollector { errors, done, worker: None }
+    }
+
+    fn frames_for_child(child: Child, stderr: StderrCollector) -> FfmpegFrames {
+        let (packet_sender, packets) = mpsc::sync_channel(1);
+        drop(packet_sender);
+        let (recycle, recycled) = mpsc::sync_channel(1);
+        drop(recycled);
+        FfmpegFrames {
+            packets,
+            recycle,
+            child,
+            stderr,
+            input_error: Arc::new(Mutex::new(None)),
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn finish_remains_unfinished_when_wait_fails() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = frames_for_child(failed_child(), empty_stderr_collector(errors));
+        let error = frames
+            .finish_with_wait(|_| Err(std::io::Error::other("injected wait failure")))
+            .expect_err("an injected wait failure must be returned");
+        let finished = frames.finished;
+        // Preserve the observed value but allow the red case to clean up the
+        // real helper instead of suppressing Drop a second time.
+        frames.finished = false;
+        drop(frames);
+
+        assert!(matches!(error, AudioError::Ffmpeg(_)));
+        assert!(error.to_string().contains("injected wait failure"));
+        assert!(!finished, "a failed wait suppressed Drop cleanup");
+    }
+
+    #[test]
+    fn finish_waits_for_a_ready_stderr_collector() {
+        const MARKER: &str = "rustlink-ffmpeg-delayed-stderr";
+
+        let child_started = marker_path("ffmpeg-error-started");
+        let child_release = marker_path("ffmpeg-error-release");
+        let mut child = gated_stderr_child(&child_started, &child_release, MARKER);
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+        wait_for(&child_started);
+
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&errors);
+        let (collector_read_tx, collector_read_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let collector = thread::spawn(move || {
+            let mut buffer = Vec::new();
+            stderr.read_to_end(&mut buffer).unwrap();
+            collector_read_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            *collected.lock().unwrap() = buffer;
+            done_tx.send(()).unwrap();
+        });
+
+        let stderr = StderrCollector { errors, done, worker: Some(collector) };
+        let frames = frames_for_child(child, stderr);
+        let (finisher_ready_tx, finisher_ready_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let finisher = thread::spawn(move || {
+            let mut frames = frames;
+            finisher_ready_tx.send(()).unwrap();
+            result_tx.send(frames.finish()).unwrap();
+        });
+        finisher_ready_rx.recv().unwrap();
+        std::fs::write(&child_release, b"release").unwrap();
+        collector_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = match result_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                release_tx.send(()).unwrap();
+                result
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                release_tx.send(()).unwrap();
+                result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("finish worker disconnected"),
+        };
+        finisher.join().unwrap();
+
+        let _ = std::fs::remove_file(child_started);
+        let _ = std::fs::remove_file(child_release);
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(MARKER), "lost FFmpeg stderr: {error}");
+    }
+
+    struct ChunkedReader {
+        data: Vec<u8>,
+        offset: usize,
+        chunk: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == self.data.len() {
+                return Ok(0);
+            }
+            let count = self.chunk.min(target.len()).min(self.data.len() - self.offset);
+            target[..count].copy_from_slice(&self.data[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn stderr_collector_clamps_each_chunk_to_the_limit() {
+        let data: Vec<u8> = (0..(STDERR_LIMIT + 3001)).map(|index| (index % 251) as u8).collect();
+        let expected = data[..STDERR_LIMIT].to_vec();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+
+        collect_stderr(
+            ChunkedReader { data, offset: 0, chunk: 3001 },
+            Arc::clone(&errors),
+            done_tx,
+        );
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let actual = errors.lock().unwrap().clone();
+        assert_eq!(actual.len(), STDERR_LIMIT);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stderr_collector_wait_is_bounded() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (exited_tx, exited_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            exited_tx.send(()).unwrap();
+            drop(done_tx);
+        });
+        let mut collector = StderrCollector { errors, done: done_rx, worker: Some(worker) };
+
+        let started = Instant::now();
+        collector.finish();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stderr cleanup waited beyond its bounded timeout"
+        );
+
+        release_tx.send(()).unwrap();
+        exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn startup_guard_actively_kills_instead_of_only_waiting() {
+        let started = marker_path("ffmpeg-started");
+        let release = marker_path("ffmpeg-release");
+        let survived = marker_path("ffmpeg-survived");
+        let guard = StartupChild::new(gated_marker(&started, &release, &survived));
+        wait_for(&started);
+
+        let (drop_done_tx, drop_done_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(guard);
+            let _ = drop_done_tx.send(());
+        });
+        let completed_before_release = match drop_done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => panic!("guard drop worker disconnected"),
+        };
+        std::fs::write(&release, b"release").unwrap();
+        let child_survived = appears_within(&survived, Duration::from_secs(1));
+        if !completed_before_release {
+            drop_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        dropper.join().unwrap();
+
+        let _ = std::fs::remove_file(started);
+        let _ = std::fs::remove_file(release);
+        let _ = std::fs::remove_file(survived);
+        assert!(completed_before_release, "startup guard waited instead of killing the child");
+        assert!(!child_survived, "child survived failed FFmpeg setup");
     }
 }

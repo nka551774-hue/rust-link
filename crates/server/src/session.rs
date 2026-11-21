@@ -21,6 +21,7 @@ const DEFAULT_TIMEOUT: u32 = 60;
 
 struct State {
     players: HashMap<String, Arc<Player>>,
+    updates: HashMap<String, Weak<tokio::sync::Mutex<()>>>,
     /// Whether the client asked for its session to survive a disconnect.
     resuming: bool,
     /// How long the session is kept after a disconnect, in seconds.
@@ -53,6 +54,34 @@ pub struct Session {
     stop: Notify,
 }
 
+/// Keeps creation, update and rollback in one per-guild transaction. Weak map
+/// entries do not retain a gate after its final request (including cancellation).
+pub(crate) struct PlayerUpdateGate<'a> {
+    session: &'a Session,
+    guild: String,
+    /// Always `Some` until drop, which releases it under the session lock.
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl PlayerUpdateGate<'_> {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lock.as_ref().expect("gate is live until dropped").lock().await
+    }
+}
+
+impl Drop for PlayerUpdateGate<'_> {
+    fn drop(&mut self) {
+        // The borrowed mutex guard is already gone. Under the session lock no
+        // new caller can upgrade this weak entry while its last owner retires.
+        // The reference is released under that lock too: otherwise two gates
+        // dropping together can each see the other alive and leave a dead entry.
+        let mut state = self.session.state.lock().unwrap();
+        if self.lock.take().is_some_and(|lock| Arc::strong_count(&lock) == 1) {
+            state.updates.remove(&self.guild);
+        }
+    }
+}
+
 impl Session {
     /// Builds a session around the queue its socket will drain. The receiving
     /// half stays inside the session, so a client that resumes can pick up the
@@ -65,6 +94,7 @@ impl Session {
             server,
             state: Mutex::new(State {
                 players: HashMap::new(),
+                updates: HashMap::new(),
                 resuming: true,
                 timeout: DEFAULT_TIMEOUT,
                 connected: false,
@@ -146,23 +176,45 @@ impl Session {
         self.state.lock().unwrap().players.get(guild).cloned()
     }
 
+    pub(crate) fn update_gate(&self, guild: &str) -> PlayerUpdateGate<'_> {
+        let mut state = self.state.lock().unwrap();
+        let lock = state.updates.get(guild).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            state.updates.insert(guild.to_owned(), Arc::downgrade(&lock));
+            lock
+        });
+        PlayerUpdateGate { session: self, guild: guild.to_owned(), lock: Some(lock) }
+    }
+
     /// Serializes creation against other requests and session destruction.
     /// `None` means the session was destroyed while the request was in flight.
     pub fn get_or_insert<E>(
         &self,
         guild: &str,
         create: impl FnOnce() -> Result<Arc<Player>, E>,
-    ) -> Result<Option<Arc<Player>>, E> {
+    ) -> Result<Option<(Arc<Player>, bool)>, E> {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return Ok(None);
         }
         if let Some(player) = state.players.get(guild) {
-            return Ok(Some(Arc::clone(player)));
+            return Ok(Some((Arc::clone(player), false)));
         }
         let player = create()?;
         state.players.insert(guild.to_owned(), Arc::clone(&player));
-        Ok(Some(player))
+        Ok(Some((player, true)))
+    }
+
+    /// Rolls back an uncommitted creation. The caller holds the guild's update
+    /// gate, so no successful update can race this rollback. Readers may retain
+    /// snapshots without retaining a player slot.
+    pub fn remove_if_same(&self, guild: &str, expected: &Arc<Player>) -> Option<Arc<Player>> {
+        let mut state = self.state.lock().unwrap();
+        let current = state.players.get(guild)?;
+        if !Arc::ptr_eq(current, expected) {
+            return None;
+        }
+        state.players.remove(guild)
     }
 
     /// Removes a player and reports whether there was one.
@@ -282,5 +334,29 @@ impl Session {
     /// Waits until the session is destroyed.
     pub async fn stopped(&self) {
         self.stop.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn guild_update_gates_serialize_waiters_without_blocking_other_guilds() {
+        let session = Session::new("session".into(), "1".into(), Weak::new(), 4);
+        let first = session.update_gate("10");
+        let first_lock = first.lock().await;
+        let waiting = session.update_gate("10");
+        assert!(waiting.lock.as_ref().unwrap().try_lock().is_err());
+        let other = session.update_gate("20");
+        assert!(other.lock.as_ref().unwrap().try_lock().is_ok());
+        drop(other);
+        drop(first_lock);
+        drop(first);
+        assert_eq!(session.state.lock().unwrap().updates.len(), 1);
+        let next_lock = waiting.lock().await;
+        drop(next_lock);
+        drop(waiting);
+        assert!(session.state.lock().unwrap().updates.is_empty());
     }
 }

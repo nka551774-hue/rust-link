@@ -154,6 +154,26 @@ fn an_unknown_container_is_declined_so_the_caller_can_use_ffmpeg() {
     assert!(error.needs_ffmpeg(), "the caller should be told to retry with ffmpeg: {error}");
 }
 
+#[test]
+fn a_zero_sample_rate_is_declined_instead_of_expanded_without_bound() {
+    let mut bytes = wav(48_000, 2, 0.1, 440.0);
+    // Sample rate and byte rate fields of the fmt chunk.
+    bytes[24..32].fill(0);
+    let engine = Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 10 };
+    let error = engine
+        .start(
+            &track(),
+            Body::new(Box::new(std::io::Cursor::new(bytes))),
+            0,
+            100,
+            &Default::default(),
+            Preference::Auto,
+        )
+        .err()
+        .expect("a stream without a sample rate should not play natively");
+    assert!(error.needs_ffmpeg(), "{error}");
+}
+
 fn ogg_opus(pre_skip: u16, output_gain: i16) -> Vec<u8> {
     ogg_opus_with_end(pre_skip, output_gain, None)
 }
@@ -469,6 +489,29 @@ fn native_and_ffmpeg_music_profiles_preserve_duration_and_stereo() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires RUSTLINK_TEST_FFMPEG pointing at a real FFmpeg with libopus"]
+fn ffmpeg_reports_real_diagnostics_for_an_invalid_media_stream() {
+    use rustlink_audio::{ffmpeg::FfmpegFrames, AudioError, FilterSet, Frames};
+
+    let program = std::env::var("RUSTLINK_TEST_FFMPEG").expect("RUSTLINK_TEST_FFMPEG is required");
+    let mut frames = FfmpegFrames::start(
+        &program,
+        Body::new(Box::new(std::io::Cursor::new(Vec::<u8>::new()))),
+        0,
+        &FilterSet::default(),
+        192_000,
+        10,
+    )
+    .unwrap();
+    let error = frames.next_frame(&mut Vec::new()).unwrap_err();
+    let AudioError::Ffmpeg(message) = error else {
+        panic!("expected FFmpeg's own diagnostics, got {error}");
+    };
+    assert!(!message.starts_with("ffmpeg exited with"), "lost FFmpeg diagnostics: {message}");
+    assert!(message.to_ascii_lowercase().contains("invalid"), "{message}");
 }
 
 #[test]

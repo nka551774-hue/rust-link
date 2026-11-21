@@ -331,9 +331,7 @@ impl Spotify<'_> {
                 .map(|items| {
                     items
                         .iter()
-                        .filter_map(|item| {
-                            serde_json::from_value::<SpotifyTrack>(item.clone()).ok()
-                        })
+                        .filter_map(|item| SpotifyTrack::deserialize(item).ok())
                         .filter_map(|track| self.track(&track))
                         .collect()
                 })
@@ -401,8 +399,8 @@ impl Spotify<'_> {
             for item in &page.items {
                 // A playlist entry wraps its track, and a local file has no id
                 // to play.
-                let value = item.get("track").cloned().unwrap_or_else(|| item.clone());
-                if let Ok(track) = serde_json::from_value::<SpotifyTrack>(value) {
+                let value = item.get("track").unwrap_or(item);
+                if let Ok(track) = SpotifyTrack::deserialize(value) {
                     if let Some(track) = self.track(&track) {
                         tracks.push(track);
                     }
@@ -596,7 +594,7 @@ impl Deezer<'_> {
         Ok(list
             .data
             .iter()
-            .filter_map(|item| serde_json::from_value::<DeezerTrack>(item.clone()).ok())
+            .filter_map(|item| DeezerTrack::deserialize(item).ok())
             .filter_map(|entry| self.track(&entry))
             .collect())
     }
@@ -607,12 +605,16 @@ impl Deezer<'_> {
         let mut next = Some(path.to_string());
         let mut pages = 0;
         while let Some(path) = next.take() {
-            let answer = if path.starts_with("http") {
-                netguard::validate_url(&path)?;
-                get_json(self.agent, &path, None)?
-            } else {
-                self.api(&path)?
+            // The next link comes from the response; never follow it off the API.
+            let base = self.config.deezer_api_endpoint.trim_end_matches('/');
+            let path = match path.strip_prefix(base) {
+                Some(rest) if rest.starts_with('/') => rest.to_string(),
+                _ if path.starts_with('/') => path,
+                _ => {
+                    return Err(SourceError::Url("Deezer pagination left the catalogue API".into()))
+                }
             };
+            let answer = self.api(&path)?;
             next = answer.get("next").and_then(Value::as_str).map(str::to_string);
             tracks.extend(self.list_tracks(answer)?);
             pages += 1;
@@ -625,17 +627,30 @@ impl Deezer<'_> {
     }
 
     fn parse(&self, id: &str) -> Result<(String, String), SourceError> {
+        // The key is spliced into an API path, so only Deezer's numeric ids pass.
+        let valid = |kind: &str, key: &str| {
+            matches!(kind, "track" | "album" | "playlist")
+                && !key.is_empty()
+                && key.bytes().all(|byte| byte.is_ascii_digit())
+        };
         if let Some(rest) = id.strip_prefix("deezer:") {
             let parts = parts_after(rest, "");
-            if parts.len() >= 2 {
+            if parts.len() >= 2 && valid(&parts[0], &parts[1]) {
                 return Ok((parts[0].clone(), parts[1].clone()));
             }
         }
-        if let Some(rest) = id.strip_prefix("https://www.deezer.com/") {
-            let parts: Vec<&str> = rest.split(['/', '?']).filter(|part| !part.is_empty()).collect();
-            let parts: Vec<&str> = parts.into_iter().filter(|part| *part != "en").collect();
-            if parts.len() >= 2 {
-                return Ok((parts[0].to_string(), parts[1].to_string()));
+        if let Some(url) = crate::http_url(id) {
+            if url.host_str().is_some_and(|host| crate::host_matches(host, "deezer.com")) {
+                // Share links carry any locale first, such as /fr/ or /us/.
+                let parts: Vec<&str> =
+                    url.path_segments().into_iter().flatten().filter(|p| !p.is_empty()).collect();
+                let parts = match parts.as_slice() {
+                    [kind, key] | [_, kind, key] => Some((*kind, *key)),
+                    _ => None,
+                };
+                if let Some((kind, key)) = parts.filter(|(kind, key)| valid(kind, key)) {
+                    return Ok((kind.to_string(), key.to_string()));
+                }
             }
         }
         Err(SourceError::Url(format!("{id} is not a Deezer track, album or playlist")))
@@ -786,9 +801,7 @@ impl SoundCloud<'_> {
                 .map(|entries| {
                     entries
                         .iter()
-                        .filter_map(|entry| {
-                            serde_json::from_value::<SoundCloudTrack>(entry.clone()).ok()
-                        })
+                        .filter_map(|entry| SoundCloudTrack::deserialize(entry).ok())
                         .filter_map(|entry| self.track(&entry))
                         .take(self.config.max_playlist_tracks as usize)
                         .collect()
@@ -1229,6 +1242,51 @@ mod tests {
         let deezer = Deezer { agent: &agent, config: &config() };
         let (kind, key) = deezer.parse("deezer:track:3135556").unwrap();
         assert_eq!((kind.as_str(), key.as_str()), ("track", "3135556"));
+    }
+
+    #[test]
+    fn deezer_links_with_any_locale_parse_and_keys_must_be_numeric() {
+        let agent = netguard::agent(false);
+        let deezer = Deezer { agent: &agent, config: &config() };
+        for link in [
+            "https://www.deezer.com/track/3135556",
+            "https://www.deezer.com/en/track/3135556",
+            "https://www.deezer.com/fr/track/3135556?utm=share",
+            "http://deezer.com/us/track/3135556/",
+        ] {
+            assert_eq!(crate::source_kind(link), "deezer", "{link}");
+            assert_eq!(deezer.parse(link).unwrap(), ("track".into(), "3135556".into()), "{link}");
+        }
+        for bad in [
+            "deezer:track:1/../../user/me",
+            "deezer:artist:27",
+            "https://www.deezer.com/track/abc",
+            "https://www.deezer.com/fr/artist/27",
+            "https://evil.example/track/1",
+        ] {
+            assert!(deezer.parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn deezer_pagination_stays_on_the_catalogue_api() {
+        let track = |id: u64| serde_json::json!({"id": id, "title": "A Song"});
+        let mut requests = 0;
+        let (base, server) = crate::test_http::serve(2, move |base, headers, _| {
+            requests += 1;
+            if requests == 1 {
+                assert!(headers.starts_with("GET /playlist/1/tracks "));
+                serde_json::json!({"data":[track(1)], "next": format!("{base}/playlist/1/tracks?index=1")})
+            } else {
+                assert!(headers.starts_with("GET /playlist/1/tracks?index=1 "));
+                serde_json::json!({"data":[track(2)], "next": "https://evil.example/next"})
+            }
+        });
+        let config = Config { deezer_api_endpoint: base, ..config() };
+        let agent = netguard::agent(true);
+        let result = Deezer { agent: &agent, config: &config }.paged("/playlist/1/tracks");
+        server.join().unwrap();
+        assert!(matches!(result, Err(SourceError::Url(_))));
     }
 
     #[test]

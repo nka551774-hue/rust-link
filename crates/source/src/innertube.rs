@@ -424,11 +424,14 @@ impl Media {
     fn track(&self, source: &str) -> Track {
         let author =
             if self.author.is_empty() { "Unknown artist".to_string() } else { self.author.clone() };
+        let length = duration_millis(self.seconds);
         let info = TrackInfo {
             identifier: self.id.clone(),
             title: self.title.clone(),
             author,
-            length: (self.seconds * 1000.0) as i64,
+            length,
+            // Search and playlist items often omit their length, so an unknown
+            // length is still a video: only the live flag makes a stream.
             is_stream: self.live,
             is_seekable: !self.live,
             uri: Some(format!("https://www.youtube.com/watch?v={}", self.id)),
@@ -440,6 +443,20 @@ impl Media {
         // and an empty encoding is what a client reads as a broken track.
         encode_track(&info).unwrap_or_else(|_| Track::new(String::new(), info))
     }
+}
+
+/// Converts an external duration to protocol milliseconds without allowing
+/// non-finite, negative, or unrepresentable values to become metadata. A zero
+/// result means that the source did not provide a usable duration.
+fn duration_millis(seconds: f64) -> i64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    let milliseconds = seconds * 1000.0;
+    if !milliseconds.is_finite() || milliseconds <= 0.0 || milliseconds >= i64::MAX as f64 {
+        return 0;
+    }
+    milliseconds as i64
 }
 
 /// Picks the best audio-only stream out of a player answer.
@@ -951,6 +968,39 @@ mod tests {
         assert_eq!(length_seconds("-1:00"), None);
         assert_eq!(length_seconds("NaN"), None);
         assert_eq!(length_seconds("inf"), None);
+    }
+
+    #[test]
+    fn missing_or_invalid_media_durations_become_unknown_but_stay_seekable_videos() {
+        // 0.0 is what a search or playlist item without `lengthText` carries.
+        for seconds in [0.0, f64::NAN, -1.0, f64::INFINITY, f64::MAX] {
+            let track = Media {
+                id: "dQw4w9WgXcQ".into(),
+                title: "A Song".into(),
+                author: "Someone".into(),
+                seconds,
+                ..Default::default()
+            }
+            .track("youtube");
+            assert_eq!(track.metadata.length, 0, "seconds={seconds:?}");
+            assert!(!track.metadata.is_stream, "seconds={seconds:?}");
+            assert!(track.metadata.is_seekable, "seconds={seconds:?}");
+        }
+    }
+
+    #[test]
+    fn a_valid_media_duration_remains_seekable() {
+        let track = Media {
+            id: "dQw4w9WgXcQ".into(),
+            title: "A Song".into(),
+            author: "Someone".into(),
+            seconds: 180.0,
+            ..Default::default()
+        }
+        .track("youtube");
+        assert_eq!(track.metadata.length, 180_000);
+        assert!(!track.metadata.is_stream);
+        assert!(track.metadata.is_seekable);
     }
 
     #[test]

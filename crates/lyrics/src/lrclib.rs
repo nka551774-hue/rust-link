@@ -63,10 +63,14 @@ impl Provider for LRCLIB {
         // The exact lookup needs the same artist, title and length the database
         // was given, which a video title rarely matches. It is tried first
         // because it is the one that cannot pick the wrong recording.
-        match self.get(&artist, &title, track.metadata.length) {
-            Ok(entry) => return build(track, &entry),
-            Err(LyricsError::NotFound) => {}
-            Err(error) => last = Some(error),
+        // Without an artist the exact lookup cannot match, and the service's
+        // refusal would turn a plain miss into an uncached failure.
+        if !artist.is_empty() {
+            match self.get(&artist, &title, track.metadata.length) {
+                Ok(entry) => return build(track, &entry),
+                Err(LyricsError::NotFound) => {}
+                Err(error) => last = Some(error),
+            }
         }
         // The name a video credits is often not the name the database filed the
         // track under, and an artist that matches nothing drags a combined query
@@ -207,10 +211,12 @@ fn build(track: &Track, entry: &Entry) -> Result<Lyrics, LyricsError> {
 /// song's own name in brackets after the artist, where the name on its own is
 /// what the database knows it by.
 fn queries(track: &Track, artist: &str, title: &str) -> Vec<String> {
-    let mut queries = vec![format!("{artist} {title}").trim().to_string(), title.to_string()];
-    let extra = bracketed(&track.metadata.title);
-    if !extra.is_empty() && extra != title {
-        queries.push(extra);
+    let mut queries = vec![format!("{artist} {title}").trim().to_string()];
+    // With no artist the combined query is the title, so it is not sent twice.
+    for query in [title.to_string(), bracketed(&track.metadata.title)] {
+        if !query.is_empty() && !queries.contains(&query) {
+            queries.push(query);
+        }
     }
     queries
 }
@@ -255,14 +261,11 @@ fn best(found: &[Entry], length: i64) -> Option<&Entry> {
         if !entry.synced_lyrics.trim().is_empty() {
             score += 2;
         }
-        if length > 0 && entry.duration > 0.0 {
-            let offset = ((entry.duration * 1000.0) as i64 - length).abs();
-            if offset <= 2000 {
-                score += 4;
-            } else if offset <= SLACK {
-                score += 1;
-            } else {
-                score -= 4;
+        if length > 0 && entry.duration != 0.0 {
+            match duration_offset(entry.duration, length) {
+                Some(offset) if offset <= 2000 => score += 4,
+                Some(offset) if offset <= i128::from(SLACK) => score += 1,
+                Some(_) | None => score -= 4,
             }
         }
         if score > best_score {
@@ -271,6 +274,26 @@ fn best(found: &[Entry], length: i64) -> Option<&Entry> {
         }
     }
     best
+}
+
+/// Returns the absolute duration difference in milliseconds when both values
+/// can be represented without lossy float-to-integer saturation.
+///
+/// LRCLIB supplies a floating-point duration while the protocol carries an
+/// integer number of milliseconds. Converting an overflowing float directly to
+/// `i64` can saturate it to `i64::MAX`, making a malformed enormous duration
+/// look like an exact match for an equally extreme track length. Keep the
+/// conversion bounded and do the subtraction in a wider integer type so the
+/// difference itself cannot overflow.
+fn duration_offset(duration: f64, length: i64) -> Option<i128> {
+    if length <= 0 || !duration.is_finite() || duration <= 0.0 {
+        return None;
+    }
+    let milliseconds = duration * 1000.0;
+    if !milliseconds.is_finite() || milliseconds <= 0.0 || milliseconds >= i64::MAX as f64 {
+        return None;
+    }
+    Some((milliseconds as i128 - i128::from(length)).abs())
 }
 
 /// The words that describe a video rather than a song, so a bracketed part of a
@@ -527,6 +550,29 @@ mod tests {
     }
 
     #[test]
+    fn a_track_without_an_artist_skips_the_exact_lookup_and_duplicate_queries() {
+        use std::io::{Read, Write};
+        assert_eq!(queries(&track("A Song", ""), "", "A Song"), ["A Song"]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/api", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let read = socket.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                .unwrap();
+            request
+        });
+        let provider = LRCLIB { agent: ureq::Agent::new_with_defaults(), base };
+        let result = provider.fetch(&track("A Song", ""));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /api/search?q=A"), "{request}");
+        assert!(matches!(result, Err(LyricsError::NotFound)));
+    }
+
+    #[test]
     fn a_bracketed_credit_is_not_offered_as_a_query() {
         let found = queries(&track("A Song 【Official】", "Someone"), "Someone", "A Song");
         assert_eq!(found.len(), 2);
@@ -540,6 +586,26 @@ mod tests {
         ];
         let picked = best(&found, 200_000).unwrap();
         assert_eq!(picked.duration, 200.0);
+    }
+
+    #[test]
+    fn an_unrepresentable_duration_cannot_be_scored_as_an_exact_match() {
+        let found = vec![
+            Entry { synced_lyrics: "timed".into(), ..Default::default() },
+            Entry { duration: f64::MAX, plain_lyrics: "plain".into(), ..Default::default() },
+        ];
+        let picked = best(&found, i64::MAX).unwrap();
+        assert_eq!(picked.synced_lyrics, "timed");
+    }
+
+    #[test]
+    fn an_invalid_duration_is_worse_than_a_nearby_valid_duration() {
+        let found = vec![
+            Entry { duration: f64::NAN, synced_lyrics: "invalid".into(), ..Default::default() },
+            Entry { duration: 202.5, plain_lyrics: "nearby".into(), ..Default::default() },
+        ];
+        let picked = best(&found, 200_000).unwrap();
+        assert_eq!(picked.plain_lyrics, "nearby");
     }
 
     #[test]
