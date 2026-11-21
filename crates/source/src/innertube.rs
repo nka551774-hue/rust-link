@@ -35,7 +35,7 @@ pub fn clients(config: &Config) -> Vec<Client> {
     } else {
         config.youtube_client_version.trim().to_string()
     };
-    vec![
+    let mut clients = vec![
         Client {
             name: "ANDROID",
             // This version still returns directly usable audio for videos
@@ -71,8 +71,26 @@ pub fn clients(config: &Config) -> Vec<Client> {
             os_name: Some("iPhone"),
             os_version: Some("18.3.2.22D82"),
         },
-    ]
+    ];
+    // The TV client only answers a signed-in request, so it is the last resort
+    // and only offered once the operator has signed in.
+    if crate::oauth::signed_in() {
+        clients.push(Client {
+            name: TV_CLIENT,
+            version: "7.20261118.19.00".into(),
+            user_agent: Cow::Borrowed("Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)"),
+            sdk: None,
+            device_make: None,
+            device_model: None,
+            os_name: None,
+            os_version: None,
+        });
+    }
+    clients
 }
+
+/// The client that signs in with the operator's Google account.
+const TV_CLIENT: &str = "TVHTML5";
 
 /// The client the catalogue is searched with. It needs no player script because
 /// a search result carries a plain video id.
@@ -156,6 +174,11 @@ fn call(
         .header("Accept-Language", "en-US,en;q=0.9");
     if !visitor_data.trim().is_empty() {
         request = request.header("X-Goog-Visitor-Id", visitor_data.trim());
+    }
+    if client.name == TV_CLIENT {
+        if let Some(token) = crate::oauth::bearer() {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
     }
     let response = request
         .config()

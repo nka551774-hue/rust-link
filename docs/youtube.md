@@ -115,6 +115,16 @@ cargo run -p rustlink-client --example bot -- "https://youtu.be/dQw4w9WgXcQ"
 
 辨認分享 URL、取得曲目中繼資料、實際取得音訊串流，是不同步驟。原生 YouTube 播放需要 InnerTube 客戶端取得直接音訊 URL；要求播放器腳本還原簽章、特殊串流協定、有效 PO token 或受到帳戶／地區／平台限制時，仍可能失敗。
 
+## YouTube 帳號授權（OAuth）
+
+`youtubeOauth: true`（預設）時，節點每次啟動都會檢查 `toolsDirectory/youtube-oauth.json`：
+
+- 沒有授權，或 Google 拒絕已存的 token（失效、被撤銷）時，終端機會顯示醒目的授權框，內含 `https://www.google.com/device` 與授權碼；授權碼 30 分鐘內有效，過期會自動換新。
+- 已存的 token 有效時直接使用，不會再要求授權；網路暫時無法連線時保留 token，不會重新要求授權。
+- 檔案只保存 refresh token，位於已被 `.gitignore` 排除的工具目錄；請使用分身帳號。
+
+授權後，TV client 會以該帳號作為最後的備援來源。目前實測 YouTube 對已授權的 TV client 仍回應 `UNPLAYABLE`，因此授權本身尚不能解決無 PO token 時約 1 分鐘中斷的問題；`youtubeOauth: false` 可停用。
+
 `youtubePoToken` 會把你提供的 token 帶入 player request，並以 `pot` 參數附加到 googlevideo 音訊 URL（不會送往其他主機）。YouTube 不信任的網路在沒有 token 時，只能取得前約 768 KiB（約 1 分鐘）音訊，之後 googlevideo 回 403，播放會中途停止。Rustlink 不會自動產生或更新 token，也不保證其他串流端點接受它。`youtubeNative: false` 會停用 YouTube。來源解析失敗由 API 回覆錯誤；媒體下載或解碼的後續錯誤由 `track.failed` 事件回報。
 
 Googlevideo 音訊使用 128 KiB 分段下載，避免此次實測遇到的無結束位置或較大 Range 請求遭 403 拒絕。後續段落會檢查位移與檔案總長並連續交給解碼器；正常換段不會等待重試。選取音軌時優先非自動配音、原音及未套用動態壓縮的版本，再比較位元率。

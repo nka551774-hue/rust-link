@@ -57,6 +57,7 @@ to scan without turning any record into a multiline value.
 | `youtubeClientVersion` | *(empty)* | Override the Android client version and its matching User-Agent. Empty currently uses `20.10.38`; Android VR and iOS retain their own versions. |
 | `youtubePoToken` | *(empty)* | A proof-of-origin token, sent in the player request and as `pot` on googlevideo audio URLs. Without one, networks YouTube distrusts stop after ~1 minute of audio. |
 | `youtubeVisitorData` | *(empty)* | Visitor data to send with it. |
+| `youtubeOauth` | `true` | Sign the TV client in with a Google account. A start without a valid sign-in prints a code to enter at google.com/device; the refresh token is kept in `toolsDirectory/youtube-oauth.json`. Use a secondary account. |
 | `soundcloudNative` | `true` | Resolve SoundCloud with the public API. |
 | `soundcloudApiEndpoint` | `https://api-v2.soundcloud.com` | The API endpoint. |
 | `soundcloudWebEndpoint` | `https://soundcloud.com` | The site a client id is scraped from. |
