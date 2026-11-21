@@ -35,8 +35,46 @@ pub struct GatewayInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
     pub user_id: String,
+    /// The application that owns the bot, needed to register slash commands.
+    /// Empty when Discord omits it.
+    pub application_id: String,
     pub session_id: String,
     pub resume_gateway_url: String,
+}
+
+/// A slash-command invocation (`INTERACTION_CREATE` of type 2).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Interaction {
+    pub id: String,
+    /// Short-lived credential for answering this interaction.
+    pub token: String,
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub user_id: String,
+    pub command: String,
+    /// Top-level string options as `(name, value)`.
+    pub options: Vec<(String, String)>,
+}
+
+impl Interaction {
+    pub fn option(&self, name: &str) -> Option<&str> {
+        self.options.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+}
+
+impl std::fmt::Debug for Interaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Interaction")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .field("user_id", &self.user_id)
+            .field("command", &self.command)
+            .field("options", &self.options)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +118,7 @@ pub enum BotEvent {
     VoiceStateUpdate(VoiceStateUpdate),
     VoiceServerUpdate(VoiceServerUpdate),
     MessageCreate(MessageCreate),
+    Interaction(Interaction),
     Other { name: String, data: Value },
 }
 
@@ -364,6 +403,10 @@ fn dispatch(payload: &Value) -> Result<Option<BotEvent>, BotError> {
             let ready: RawReady = serde_json::from_value(data)?;
             Some(BotEvent::Ready(Ready {
                 user_id: ready.user.id,
+                application_id: ready
+                    .application
+                    .map(|application| application.id)
+                    .unwrap_or_default(),
                 session_id: ready.session_id,
                 resume_gateway_url: ready.resume_gateway_url,
             }))
@@ -395,6 +438,34 @@ fn dispatch(payload: &Value) -> Result<Option<BotEvent>, BotError> {
                 content: message.content,
             }))
         }
+        // Type 2 is an application (slash) command; buttons and the rest stay `Other`.
+        "INTERACTION_CREATE" if data.get("type").and_then(Value::as_u64) == Some(2) => {
+            let raw: RawInteraction = serde_json::from_value(data)?;
+            let user_id = raw
+                .member
+                .and_then(|member| member.user)
+                .or(raw.user)
+                .ok_or_else(|| BotError::Protocol("interaction has no user".into()))?
+                .id;
+            let options = raw
+                .data
+                .options
+                .into_iter()
+                .filter_map(|option| match option.value {
+                    Value::String(value) => Some((option.name, value)),
+                    _ => None,
+                })
+                .collect();
+            Some(BotEvent::Interaction(Interaction {
+                id: raw.id,
+                token: raw.token,
+                guild_id: raw.guild_id,
+                channel_id: raw.channel_id,
+                user_id,
+                command: raw.data.name,
+                options,
+            }))
+        }
         _ if name.is_empty() => None,
         _ => Some(BotEvent::Other { name: name.into(), data }),
     };
@@ -404,6 +475,8 @@ fn dispatch(payload: &Value) -> Result<Option<BotEvent>, BotError> {
 #[derive(Debug, Deserialize)]
 struct RawReady {
     user: RawUser,
+    #[serde(default)]
+    application: Option<RawUser>,
     session_id: String,
     #[serde(default = "default_resume_url")]
     resume_gateway_url: String,
@@ -416,6 +489,41 @@ fn default_resume_url() -> String {
 #[derive(Debug, Deserialize)]
 struct RawUser {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct RawInteraction {
+    id: String,
+    token: String,
+    #[serde(default)]
+    guild_id: Option<String>,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    member: Option<RawMember>,
+    #[serde(default)]
+    user: Option<RawUser>,
+    data: RawCommand,
+}
+
+#[derive(Deserialize)]
+struct RawMember {
+    #[serde(default)]
+    user: Option<RawUser>,
+}
+
+#[derive(Deserialize)]
+struct RawCommand {
+    name: String,
+    #[serde(default)]
+    options: Vec<RawOption>,
+}
+
+#[derive(Deserialize)]
+struct RawOption {
+    name: String,
+    #[serde(default)]
+    value: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -468,6 +576,36 @@ mod tests {
         let debug = format!("{event:?}");
         assert!(!debug.contains("voice-secret"));
         assert!(!debug.contains("bot-token"));
+    }
+
+    #[test]
+    fn slash_commands_and_the_application_id_are_decoded() {
+        let ready = json!({"op": 0, "t": "READY", "d": {
+            "user": {"id": "100"}, "application": {"id": "900"}, "session_id": "s"
+        }});
+        let Some(BotEvent::Ready(ready)) = dispatch(&ready).unwrap() else { panic!() };
+        assert_eq!(ready.application_id, "900");
+
+        let interaction = json!({"op": 0, "t": "INTERACTION_CREATE", "d": {
+            "id": "1", "type": 2, "token": "secret-interaction-token",
+            "guild_id": "200", "channel_id": "300", "member": {"user": {"id": "400"}},
+            "data": {"name": "play", "options": [
+                {"name": "url", "type": 3, "value": "https://youtu.be/dQw4w9WgXcQ"},
+                {"name": "volume", "type": 4, "value": 50}
+            ]}
+        }});
+        let Some(BotEvent::Interaction(interaction)) = dispatch(&interaction).unwrap() else {
+            panic!()
+        };
+        assert_eq!(interaction.user_id, "400");
+        assert_eq!(interaction.command, "play");
+        assert_eq!(interaction.option("url"), Some("https://youtu.be/dQw4w9WgXcQ"));
+        assert_eq!(interaction.option("volume"), None, "only string options are kept");
+        assert!(!format!("{interaction:?}").contains("secret-interaction-token"));
+
+        // A button click (type 3) is not a slash command.
+        let button = json!({"op": 0, "t": "INTERACTION_CREATE", "d": {"type": 3}});
+        assert!(matches!(dispatch(&button).unwrap(), Some(BotEvent::Other { .. })));
     }
 
     #[test]

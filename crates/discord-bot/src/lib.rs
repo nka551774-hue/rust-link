@@ -10,8 +10,8 @@ mod rest;
 mod voice_state;
 
 pub use gateway::{
-    BotEvent, Gateway, GatewayInfo, MessageCreate, Ready, VoiceServerUpdate, VoiceStateUpdate,
-    GUILDS, GUILD_MESSAGES, GUILD_VOICE_STATES, MESSAGE_CONTENT,
+    BotEvent, Gateway, GatewayInfo, Interaction, MessageCreate, Ready, VoiceServerUpdate,
+    VoiceStateUpdate, GUILDS, GUILD_MESSAGES, GUILD_VOICE_STATES, MESSAGE_CONTENT,
 };
 pub use rest::{DiscordRest, SentMessage};
 pub use voice_state::VoiceStatePairer;

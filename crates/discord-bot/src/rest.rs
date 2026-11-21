@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::redirect::Policy;
+use reqwest::Method;
 use serde::Deserialize;
 use serde_json::json;
 use url::Url;
@@ -72,9 +73,67 @@ impl DiscordRest {
     ) -> Result<SentMessage, BotError> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_content(content)?;
+        let body = self
+            .call(
+                Method::POST,
+                &format!("channels/{channel_id}/messages"),
+                &json!({ "content": content }),
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(BotError::from)
+    }
+
+    /// Replaces this application's slash commands in one guild. Guild commands
+    /// appear immediately, unlike global ones.
+    pub async fn set_guild_commands(
+        &self,
+        application_id: &str,
+        guild_id: &str,
+        commands: &serde_json::Value,
+    ) -> Result<(), BotError> {
+        validate_snowflake(application_id, "application_id")?;
+        validate_snowflake(guild_id, "guild_id")?;
+        let path = format!("applications/{application_id}/guilds/{guild_id}/commands");
+        self.call(Method::PUT, &path, commands).await.map(drop)
+    }
+
+    /// Acknowledges a slash command within Discord's 3-second window and shows
+    /// "thinking…" until the response is edited.
+    pub async fn defer_interaction(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+    ) -> Result<(), BotError> {
+        validate_snowflake(interaction_id, "interaction_id")?;
+        validate_interaction_token(interaction_token)?;
+        let path = format!("interactions/{interaction_id}/{interaction_token}/callback");
+        self.call(Method::POST, &path, &json!({ "type": 5 })).await.map(drop)
+    }
+
+    /// Replaces the text of a deferred interaction response.
+    pub async fn edit_interaction_response(
+        &self,
+        application_id: &str,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), BotError> {
+        validate_snowflake(application_id, "application_id")?;
+        validate_interaction_token(interaction_token)?;
+        validate_content(content)?;
+        let path = format!("webhooks/{application_id}/{interaction_token}/messages/@original");
+        self.call(Method::PATCH, &path, &json!({ "content": content })).await.map(drop)
+    }
+
+    /// Sends one authenticated JSON request and returns the success body.
+    async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<Vec<u8>, BotError> {
         let endpoint = self
             .base
-            .join(&format!("channels/{channel_id}/messages"))
+            .join(path)
             .map_err(|error| BotError::Invalid(format!("invalid Discord endpoint: {error}")))?;
         let authorization = HeaderValue::from_str(&format!("Bot {}", self.token.as_str()))
             .map_err(|_| {
@@ -82,11 +141,11 @@ impl DiscordRest {
             })?;
         let response = self
             .client
-            .post(endpoint)
+            .request(method, endpoint)
             .header(AUTHORIZATION, authorization)
             .header(CONTENT_TYPE, "application/json")
             .header(USER_AGENT, "rustlink-discord-bot/0.1")
-            .json(&json!({ "content": content }))
+            .json(body)
             .send()
             .await
             .map_err(BotError::from)?;
@@ -104,8 +163,21 @@ impl DiscordRest {
                 message: redact(&discord_error_message(&body), self.token.as_str()),
             });
         }
-        serde_json::from_slice(&body).map_err(BotError::from)
+        Ok(body)
     }
+}
+
+/// Interaction tokens are spliced into URL paths, so only URL-safe characters pass.
+fn validate_interaction_token(token: &str) -> Result<(), BotError> {
+    if token.is_empty()
+        || token.len() > 512
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(BotError::Invalid("interaction token is malformed".into()));
+    }
+    Ok(())
 }
 
 async fn read_response_body(
@@ -254,6 +326,14 @@ mod tests {
             .block_on(rest.send_text("123", &"x".repeat(MAX_CONTENT_CHARS + 1)))
             .unwrap_err();
         assert!(matches!(error, BotError::Invalid(_)));
+    }
+
+    #[test]
+    fn interaction_tokens_cannot_escape_their_url_path() {
+        assert!(validate_interaction_token("aW50ZXJhY3Rpb24.abc-DEF_123").is_ok());
+        for bad in ["", "a/../b", "a?b", "a b", "a%2Fb"] {
+            assert!(validate_interaction_token(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
