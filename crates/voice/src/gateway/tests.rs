@@ -146,10 +146,8 @@ async fn v8_handshake_waits_for_dave_and_sends_interoperable_encrypted_audio() {
             panic!("expected key package");
         };
         assert_eq!(bytes[0], 26);
-        let package = MlsMessageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
-        let MlsMessageBodyIn::KeyPackage(package) = package.extract() else {
-            panic!("key package needs MLSMessage framing");
-        };
+        // Discord takes a bare KeyPackage on op 26, as libdave sends it.
+        let package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
         let provider = OpenMlsRustCrypto::default();
         let package = package.validate(provider.crypto(), ProtocolVersion::Mls10).unwrap();
         assert_eq!(package.leaf_node().credential().serialized_content(), &USER.to_be_bytes());

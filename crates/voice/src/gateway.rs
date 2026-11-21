@@ -158,9 +158,11 @@ async fn connect_url(
         let config = WebSocketConfig::default()
             .max_message_size(Some(1024 * 1024))
             .max_frame_size(Some(1024 * 1024));
+        log::debug!("voice gateway connecting to {url}");
         let (stream, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
             .await
             .map_err(gateway_error)?;
+        log::debug!("voice gateway connected");
         let user_id =
             user.trim().parse().map_err(|_| VoiceError::Invalid("invalid user ID".into()))?;
         let channel = state
@@ -207,6 +209,7 @@ async fn connect_url(
     let gateway = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await.map_err(|_| {
         VoiceError::Gateway("voice handshake timed out (including DAVE negotiation)".into())
     })??;
+    log::debug!("voice handshake finished (DAVE version {:?})", gateway.dave.active_version());
     let connection = gateway.connection.clone();
     tokio::spawn(gateway.run(on_close));
     Ok(connection)
@@ -252,6 +255,14 @@ impl Gateway {
 
     async fn outbound(&mut self, messages: Vec<Outbound>) -> Result<(), VoiceError> {
         for message in messages {
+            match &message {
+                Outbound::Json(value) => log::debug!("voice gateway sent op {}", value["op"]),
+                Outbound::Binary(bytes) => log::debug!(
+                    "voice gateway sent binary op {} ({} bytes)",
+                    bytes.first().copied().unwrap_or_default(),
+                    bytes.len()
+                ),
+            }
             match message {
                 Outbound::Json(value) => self.send(value).await?,
                 Outbound::Binary(bytes) => self.send_message(Message::Binary(bytes.into())).await?,
@@ -285,11 +296,18 @@ impl Gateway {
                         }
                         let op = value.get("op").and_then(Value::as_u64).and_then(|n| u8::try_from(n).ok())
                             .ok_or_else(|| VoiceError::Gateway("missing gateway opcode".into()))?;
+                        // Op 2 and 4 carry the address and transport key; log only their opcode.
+                        if matches!(op, 2 | 4) {
+                            log::debug!("voice gateway received op {op} dave={}", value["d"]["dave_protocol_version"]);
+                        } else {
+                            log::debug!("voice gateway received op {op} {}", value["d"]);
+                        }
                         self.json(op,&value["d"]).await?;
                     }
                     Message::Binary(bytes) => {
                         if bytes.len() < 3 { return Err(VoiceError::Gateway("truncated binary gateway message".into())); }
                         self.sequence = u16::from_be_bytes([bytes[0],bytes[1]]) as i64;
+                        log::debug!("voice gateway received binary op {} ({} bytes)", bytes[2], bytes.len());
                         let outgoing = self.dave.handle_binary(bytes[2],&bytes[3..]).map_err(dave_error)?;
                         self.outbound(outgoing).await?;
                     }
@@ -304,6 +322,7 @@ impl Gateway {
             result = async { match &mut self.probe { Some(probe) => probe.await, None => pending().await } } => {
                 self.probe = None;
                 let discovered = result?;
+                log::debug!("voice IP discovery finished");
                 let mode = self.mode.ok_or_else(|| VoiceError::Gateway("no selected transport mode".into()))?;
                 self.transport = Some(Transport::new(discovered.socket.clone(),discovered.remote,self.ssrc.unwrap()));
                 self.socket = Some(discovered.socket);

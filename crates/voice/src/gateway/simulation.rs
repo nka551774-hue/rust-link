@@ -136,10 +136,8 @@ impl Peer {
             let message = self.message().await;
             if let Message::Binary(bytes) = &message {
                 assert_eq!(bytes[0], 26);
-                let message = MlsMessageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
-                let MlsMessageBodyIn::KeyPackage(package) = message.extract() else {
-                    panic!("expected key package")
-                };
+                // Discord takes a bare KeyPackage on op 26, as libdave sends it.
+                let package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
                 break package;
             }
             self.handle(message).await;

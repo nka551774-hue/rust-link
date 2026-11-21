@@ -97,6 +97,11 @@ impl Session {
             Ok(vec![])
         } else {
             self.reset_group()?;
+            // Discord's voice server only acts on a key package that follows its
+            // external sender (op 25); until then the package is held back.
+            if self.external.is_none() {
+                return Ok(vec![]);
+            }
             Ok(vec![self.key_package()?])
         }
     }
@@ -206,6 +211,8 @@ impl Session {
                 self.external = Some(external);
                 if self.version == Some(1) && self.group.is_none() {
                     self.create_group()?;
+                    // The key package negotiate() held back until the external sender arrived.
+                    return Ok(vec![self.key_package()?]);
                 }
                 Ok(vec![])
             }
@@ -323,8 +330,12 @@ impl Session {
                 .build(SUITE, &self.provider, &self.signer, self.credential.clone()),
             "key package creation failed",
         )?;
-        let message = MlsMessageOut::from(bundle.key_package().clone());
-        Ok(binary(26, check(message.tls_serialize_detached(), "key package serialization failed")?))
+        // A bare KeyPackage, as libdave and davey send it (the clients Discord ships).
+        let bytes = check(
+            bundle.key_package().tls_serialize_detached(),
+            "key package serialization failed",
+        )?;
+        Ok(binary(26, bytes))
     }
 
     fn proposals(&mut self, data: &[u8]) -> Result<Vec<Outbound>> {

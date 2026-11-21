@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 aes-gcm = "0.10"
 zeroize = "1"
+log = "0.4"
 
 [dev-dependencies]
 rustlink-audio.workspace = true

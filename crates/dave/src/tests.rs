@@ -81,14 +81,6 @@ fn take_binary(messages: Vec<Outbound>, opcode: u8) -> Vec<u8> {
     }
 }
 
-fn raw_key_package(message: &[u8]) -> Vec<u8> {
-    let message = MlsMessageIn::tls_deserialize_exact_bytes(message).unwrap();
-    let MlsMessageBodyIn::KeyPackage(kp) = message.extract() else {
-        panic!("key package must be an MLSMessage");
-    };
-    kp.tls_serialize_detached().unwrap()
-}
-
 fn append(session: &mut Session, proposals: &[u8]) -> Vec<u8> {
     let mut payload = vec![0];
     payload.extend(proposals);
@@ -127,7 +119,9 @@ fn established() -> (Host, Session, DaveSession) {
 fn own_initial_commit_is_interoperable_and_waits_for_execute() {
     let host = Host::new();
     let (mut session, key_package) = host.session(ALICE);
-    assert!(!raw_key_package(&key_package).is_empty());
+    // Op 26 is a bare KeyPackage, the form libdave and davey send and Discord answers.
+    assert!(KeyPackageIn::tls_deserialize_exact_bytes(&key_package).is_ok());
+    assert!(MlsMessageIn::tls_deserialize_exact_bytes(&key_package).is_err());
     let mut peer = host.peer(BOB);
     let proposal = host.add(0, &peer.create_key_package().unwrap());
     let payload = append(&mut session, &proposal);
@@ -150,7 +144,7 @@ fn independent_peer_can_welcome_our_sender() {
     let host = Host::new();
     let (mut session, kp) = host.session(ALICE);
     let mut peer = host.peer(BOB);
-    let proposal = host.add(0, &raw_key_package(&kp));
+    let proposal = host.add(0, &kp);
     let produced = peer
         .process_proposals(ProposalsOperationType::APPEND, &proposal, Some(&[ALICE, BOB]))
         .unwrap()
@@ -280,7 +274,7 @@ fn welcome_validates_channel_external_sender_and_roster() {
         let host = Host::new();
         let (mut session, kp) = host.session(ALICE);
         let mut peer = host.peer(BOB);
-        let proposal = host.add(0, &raw_key_package(&kp));
+        let proposal = host.add(0, &kp);
         let produced = peer
             .process_proposals(ProposalsOperationType::APPEND, &proposal, None)
             .unwrap()
@@ -360,4 +354,17 @@ fn transitions_before_session_description_cannot_enable_audio() {
         session.negotiate(1).unwrap();
         assert!(!session.ready(), "DAVE v1 must await its own valid transition");
     }
+}
+
+#[test]
+fn the_key_package_waits_for_the_external_sender() {
+    // Discord sends Session Description (op 4) before the external sender (op 25) and
+    // ignores a key package that arrives ahead of it.
+    let host = Host::new();
+    let mut session = Session::new(ALICE, CHANNEL).unwrap();
+    assert!(session.negotiate(1).unwrap().is_empty());
+    let key_package = take_binary(session.handle_binary(25, &host.external).unwrap(), 26);
+    assert!(KeyPackageIn::tls_deserialize_exact_bytes(&key_package).is_ok());
+    // A repeated external sender does not send a second key package.
+    assert!(session.handle_binary(25, &host.external).unwrap().is_empty());
 }
