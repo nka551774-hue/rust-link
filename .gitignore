@@ -28,3 +28,6 @@ logs/
 # Local verification scripts may create Python bytecode caches.
 __pycache__/
 *.py[cod]
+
+# Settings and secrets written by the quickstart scripts.
+/quickstart/data/

@@ -49,6 +49,17 @@ cargo run -p rustlink-discord-bot --example slash
 
 > **YouTube 在你的網路上可能要求登入。** 對它不信任的網路位址，YouTube 會回應「Sign in to confirm you're not a bot」，或只給前約 900 KiB（約一分鐘）的音訊。節點因此先試不需要 token 的 `IOS_PRODUCER` 用戶端；仍然被擋時，在設定裡填 `youtubeProxy`，讓 YouTube 的流量改走代理。細節見 [YouTube](docs/youtube.md)。
 
+## 一鍵部署節點＋音樂機器人
+
+`quickstart/` 的腳本會詢問節點密碼（留空自動產生）、Discord bot token 與埠號，接著建置、啟動節點，再啟動音樂機器人；按 Ctrl+C 兩者一起停止。
+
+| 系統 | 執行 |
+| --- | --- |
+| Windows | 雙擊 `quickstart\start.bat`（或 `powershell -ExecutionPolicy Bypass -File quickstart\start.ps1`） |
+| Linux／macOS | `./quickstart/start.sh` |
+
+設定存在 `quickstart/data/`（已被 git 忽略，內含 token，請勿外流）；之後再執行會問要不要沿用。節點只聽 `127.0.0.1`，第一次啟動會下載 FFmpeg。機器人被 Discord 斷線時會自動重啟。需要先安裝 [Rust](https://rustup.rs)；Linux 另需 `pkg-config` 與 libopus（見 `install.sh`）。
+
 ## 音樂機器人範例（`.env` 設定）
 
 `crates/discord-bot/examples/music/` 是專為連接 Rustlink 寫的音樂機器人：有佇列、跳過、暫停、音量，閒置時自動離開語音頻道。設定放在 `.env`：
