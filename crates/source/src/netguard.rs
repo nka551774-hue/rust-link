@@ -115,7 +115,9 @@ fn is_public_v6(address: Ipv6Addr) -> bool {
 struct GuardedResolver {
     allow_private: bool,
     /// The operator's own proxy, which is exempt because it usually listens
-    /// on this machine; the hosts reached through it are still checked.
+    /// on this machine. A proxy that resolves names itself (http, socks5h)
+    /// also resolves the targets, which this guard cannot see; socks5 leaves
+    /// that resolution here, so targets are still checked.
     proxy: Option<ureq::http::uri::Authority>,
 }
 

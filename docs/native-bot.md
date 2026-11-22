@@ -1,127 +1,76 @@
-# Native Rust Discord Bot
+# 原生 Rust Discord 機器人
 
-這份文件定義 Rustlink 自帶 Discord bot 的邊界與播放流程。它是 Rustlink
-自己的 bot/gateway 設計，不是 NodeLink、Lavalink 或 GolangLavalink 的
-相容層，也不會啟動 `yt-dlp`、Node.js、Java 或 Go 音訊服務。
+`rustlink-discord-bot` 是 Rustlink 自帶的機器人函式庫：在 Rust 內登入 Discord、處理斜線指令、配對語音事件，再把 `VoiceState` 交給 Rustlink。它不是 NodeLink、Lavalink 或 GoLink 的相容層，也不啟動 yt-dlp、Node.js、Java 或 Go 程序。
 
-目前 `rustlink-voice` 已經能處理 Discord voice gateway、UDP/RTP、DAVE 與
-Opus 傳送；`rustlink-discord-bot` 則在 Rust 內完成主 Gateway v10 登入、REST
-發訊息與兩種 voice event 配對，再把 `VoiceState` 交給 Rustlink。舊的
-`rustlink-client/examples/bot.rs` 仍保留為「外部程式已登入 Discord」的低階
-客戶端範例；真正的原生登入橋接見 `crates/discord-bot/examples/play.rs`。
+## 提供什麼
+
+| 部分 | 內容 |
+| --- | --- |
+| `Gateway` | Discord 主 Gateway v10：HELLO、IDENTIFY、heartbeat、READY、dispatch、opcode 4 語音狀態；收到 reconnect／invalid-session 或遠端關閉時交還呼叫端 |
+| `DiscordRest` | REST v10：發訊息、註冊 guild 斜線指令、回應與編輯互動（deferred response） |
+| `VoiceStatePairer` | 把機器人自己的 `VOICE_STATE_UPDATE` 與 `VOICE_SERVER_UPDATE` 依 guild 配對成 `VoiceState`；可鎖定單一 guild |
+| `Interaction`、`BotEvent` | 事件與互動資料；`Interaction::option` 讀指令參數 |
+
+三個可執行範例：
+
+| 範例 | 說明 |
+| --- | --- |
+| `crates/client/examples/bot.rs` | 只示範客戶端，voice 資料從環境變數讀入，不登入 Discord |
+| `crates/discord-bot/examples/play.rs` | 登入、加入指定頻道、播放一個查詢（`DISCORD_BOT_TOKEN`、`DISCORD_GUILD_ID`、`DISCORD_CHANNEL_ID`、`RUSTLINK_URL`、`RUSTLINK_PASSWORD`） |
+| `crates/discord-bot/examples/slash.rs` | `/play url:<連結或關鍵字>` 斜線指令機器人（`DISCORD_BOT_TOKEN`、`RUSTLINK_PASSWORD`，可選 `RUSTLINK_URL`） |
+
+`slash.rs` 在每個 `GUILD_CREATE` 為該伺服器註冊指令，追蹤各使用者所在的語音頻道，收到 `/play` 後先回覆「處理中」，透過 Rustlink 解析並播放第一首可播的曲目，再編輯回應；機器人尚未在使用者的頻道時，會先加入，等語音配對完成再播放。它沒有佇列，新的 `/play` 會替換正在播放的曲目。
 
 ## 生命週期
 
-Bot 必須把 Discord bot gateway 與 Rustlink session 視為兩條不同的連線：
+機器人要把 Discord Gateway 與 Rustlink session 視為兩條獨立的連線：
 
 ```text
-Discord Gateway (bot token)
-        │  READY
-        │  VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE
+Discord Gateway（bot token）
+        │ READY
+        │ VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE
         ▼
-Rust bot gateway adapter
-        │  VoiceState { session_id, channel_id, token, endpoint }
+VoiceStatePairer
+        │ VoiceState { session_id, channel_id, token, endpoint }
         ▼
 Rustlink Session::set_voice()
-        │
         ├── Client::resolve(query)
         └── Session::play(guild_id, track_token)
 ```
 
-建議的最小流程如下：
+1. 從環境變數讀 bot token、Rustlink 網址與密碼；token 不可寫進 log、錯誤訊息、事件內容或檔案。
+2. 連線 Gateway、處理 HELLO、依 interval 送 heartbeat 並 IDENTIFY。播放只需要 `GUILDS | GUILD_VOICE_STATES`；只有要讀訊息指令時才另外要求 `GUILD_MESSAGES | MESSAGE_CONTENT`，且要先在 Developer Portal 開啟該 privileged intent。
+3. 收到 `READY` 後記住機器人的 user ID 與 application ID。要加入頻道時送同一個 guild 的語音狀態更新（預設 `self_mute=false`、`self_deaf=false`，要其他值用 `set_voice_state_with_flags`）。
+4. 配對同一個 guild、同一個機器人的 `VOICE_STATE_UPDATE.session_id` 與 `VOICE_SERVER_UPDATE.token`／`endpoint`。兩者都到齊之前不可呼叫 Rustlink。
+5. 建立 Rustlink session，先開事件 WebSocket，收到 `session.ready` 後呼叫 `Session::set_voice`。這裡的 `voice.token` 是 Discord 語音伺服器的 token，不是 bot token。
+6. `Client::resolve` 後，從 `LoadResult` 挑曲目，用 `Session::play` 傳入 `rlt1.` token。
+7. 同時維持 Discord heartbeat、Rustlink 事件 WebSocket 與語音傳輸。被移動頻道、重新分配或斷線時，丟掉舊的配對，重新收齊兩個事件，再更新 `set_voice`。
+8. 收到 SIGINT／SIGTERM 時，先停止播放、銷毀 Rustlink session，再關閉 Gateway。
 
-1. 從環境變數讀取 bot token、guild ID、voice channel ID、Rustlink URL 與
-   Rustlink password。token 不得寫入 log、錯誤訊息、事件 payload 或持久化檔案。
-2. 連線 Discord Gateway，處理 `HELLO`，依 heartbeat interval 發送 heartbeat，
-   再以 `IDENTIFY` 登入。播放範例只要求 `GUILDS | GUILD_VOICE_STATES`；
-   只有真的要讀取訊息指令時才另外啟用 `GUILD_MESSAGES | MESSAGE_CONTENT`，
-   並先在 Developer Portal 開啟對應 privileged intent。
-3. 收到 `READY` 後，記住 bot user ID。發送同一 guild 的 voice state update，
-   `channel_id` 指定目標語音頻道。`Gateway::set_voice_state` 預設送出
-   `self_mute=false`、`self_deaf=false`；需要其他設定時使用
-   `set_voice_state_with_flags`。
-4. 配對同一 guild、同一 bot user 的 `VOICE_STATE_UPDATE.session_id`，以及
-   `VOICE_SERVER_UPDATE.token/endpoint`。兩者都收到前不得呼叫 Rustlink。
-5. 建立 Rustlink session 並先開啟事件 WebSocket；收到 `session.ready` 後呼叫
-   `Session::set_voice`。這裡的 `voice.token` 是 Discord voice server token，
-   不是 bot token。
-6. 呼叫 `Client::resolve`，從 `LoadResult::Track`、搜尋結果或播放清單選出曲目，
-   再以 `Session::play` 傳入 Rustlink 的 `rlt1.` track token。
-7. 同時維持 Discord gateway heartbeat、Rustlink events WebSocket 與 voice
-   transport。收到 Discord 語音重新分配、移頻道或斷線時，丟棄舊配對並重新收集
-   完整的兩個 voice event，再更新 `Session::set_voice`。
-8. 收到 SIGINT/SIGTERM 時，先停止播放、銷毀 Rustlink session，再關閉 gateway。
-   `Gateway::next_event` 會把 Discord 的 reconnect/invalid-session opcode，或
-   遠端關閉（回傳 `None`）交回呼叫端；生產 bot 必須以退避迴圈重新建立
-   Gateway，並在需要時重新取得 voice state，不能把一次 WebSocket 物件當成
-   永久連線。現行 crate 提供 fresh IDENTIFY；RESUME/backoff 由部署層
-   supervisor 保存 READY 資訊後實作。
+`Gateway::next_event` 會把 Discord 的 reconnect、invalid-session 或遠端關閉（回傳 `None`）交回呼叫端。正式的機器人必須用退避迴圈重建 Gateway 並重新取得語音狀態，不能把一次 WebSocket 物件當成永久連線。本函式庫只提供全新的 IDENTIFY，沒有自動 RESUME 與退避。
 
-## 連線與安全邊界
+## 連線與安全界線
 
-- Gateway reconnect、heartbeat timeout、sequence number 與（若部署需要）
-  RESUME 必須由 bot adapter/supervisor 管理；Rustlink voice layer 不應取得
-  bot token。
-- `VOICE_STATE_UPDATE` 必須檢查 `guild_id`、`user_id` 與目前欲加入的
-  `channel_id`，避免把另一個 bot 或另一個 guild 的 session 綁進播放器。
-  固定單一 guild 的 bot 應使用 `VoiceStatePairer::for_guild`；未綁定的
-  pairer 才適合由呼叫端自行依 guild 分派結果。
-- `VOICE_SERVER_UPDATE.endpoint` 為空或不符合 Discord voice host 規則時，應拒絕
-  連線並保留可重試錯誤；不可退回未加密音訊。
-- Rustlink API password 只放在 Bearer header；Discord bot token 只放在 Gateway
-  Identify payload。兩種憑證不可互換，也不可互相寫入 telemetry 或 webhook。
-- 事件佇列、heartbeat 與 reconnect 都要有上限與 deadline。不可用無界 channel
-  或無限重試把斷線 bot 留在背景。
+- `VOICE_STATE_UPDATE` 要檢查 `guild_id`、`user_id` 與預期的 `channel_id`，避免別的機器人或別的 guild 的 session 綁進播放器。固定單一 guild 的機器人用 `VoiceStatePairer::for_guild`。
+- `VOICE_SERVER_UPDATE.endpoint` 為空或不符合 Discord 語音主機規則時要拒絕，保留可重試的錯誤；不可退回明文音訊。
+- Rustlink 的 API password 只放在 Bearer 標頭，Discord bot token 只放在 Gateway IDENTIFY 與 REST 的授權標頭；兩者不可互換，也不可寫進 telemetry 或 webhook。語音傳輸層不會拿到 bot token。
+- `DiscordRest` 禁止 redirect、網址裡的認證資訊與無界的回應 body；自訂 base 只允許 Discord 主機或 loopback；bot token 以 `Zeroizing` 保存，`Debug` 輸出會遮蔽。
+- 事件佇列、heartbeat 與重連都要有上限與期限，不可用無界的 channel 或無限重試。
 
-## 播放品質
+## 播放品質與來源
 
-Rustlink 的預設音訊設定是 48 kHz、雙聲道、192 kbit/s Opus、complexity 10。
-來源層優先挑選原始、非自動配音且 bitrate 較高的音軌；DSP、重採樣與 Opus
-封包都在 Rustlink 播放 pipeline 中完成。輸出品質仍受來源本身、Discord voice
-能力與網路狀況限制；轉碼不能補回來源已遺失的細節。
+預設輸出是 48 kHz 雙聲道、192 kbit/s Opus、複雜度 10；來源層優先選原始、非自動配音、位元率較高的音軌。輸出仍受來源、Discord 語音頻道與網路限制，轉碼無法補回來源缺少的細節。
 
-Bot 指令應把播放查詢交給 `Client::resolve`，不要在 bot 層自己下載檔案、解析
-短效 CDN URL 或呼叫外部下載器。track token 只攜帶中繼資料，Rustlink 會在實際
-播放時重新解析並驗證短效媒體 URL。
+機器人應把查詢交給 `Client::resolve`，不要自己下載檔案、解析短效的 CDN 網址或呼叫外部下載器。曲目 token 只含中繼資料，Rustlink 在實際播放時才重新解析並驗證網址。YouTube 的用戶端、代理與限制見 [YouTube](youtube.md)。
 
-## 廣告與來源限制
+Rustlink 不排程或插入廣告，並略過搜尋結果裡的推廣項目；但已錄在影片裡的贊助或置入不會被剪掉，不要向使用者承諾「絕對沒有廣告」。來源服務的條款與可用性由操作者負責。
 
-Rustlink 不排程或插入 pre-roll/mid-roll 廣告，且 source resolver 會略過搜尋
-回應中的 promoted/ad renderer，不會主動請求播放器廣告 placement。這不等於
-能移除影片原本已錄入的贊助、置入或其他內容；Bot 不應對使用者承諾「所有內容
-絕對無廣告」。來源服務的條款與可用性仍由操作者負責。
+## Codec 與 FFmpeg
 
-## Codec 與 FFmpeg 邊界
+常見的 AAC、MP3、ALAC、FLAC、ISO-MP4、Matroska、Ogg、WAV 由 Symphonia 原生解碼；不支援的容器與部分 timescale 組合才選擇性交給 FFmpeg。FFmpeg 是選配的外部音訊工具，不是相容層，也不是機器人登入的依賴。設定 `ffmpeg: none` 只代表不使用後備，不代表所有格式都能播。
 
-目前 Rustlink 的常見音訊路徑是 Rust Symphonia、原生 DSP 與 Opus pipeline；
-AAC、MP3、ALAC、FLAC、ISO-MP4、Matroska、Ogg、WAV 等常見 codec/container
-已啟用 Symphonia 原生 feature。不支援的容器或 timescale 仍會選擇性地交給
-FFmpeg fallback。FFmpeg 是可選的
-外部音訊工具，不是 Lavalink/NodeLink/GolangLavalink adapter，也不是 bot
-登入依賴。
+## 測試範圍
 
-若要宣稱「完全不依賴 FFmpeg」，必須先完成並驗證：
+離線測試涵蓋：Gateway 的 HELLO／IDENTIFY／heartbeat／READY 狀態機；延遲或亂序的兩個語音事件仍只在完整配對後產生一個 `VoiceState`；錯的 guild／user、空 endpoint、重複事件與重連不污染現有 session；bot token 不出現在 log；`voice.token` 與 Rustlink password 不互相替代。
 
-- Symphonia AAC、MP3、ALAC、ISO-MP4 等 codec/container 的明確 feature 與
-  fixture 測試。
-- 非 Ogg Opus（例如 WebM/Matroska）的 demux、seek、錯誤與尾端封包處理。
-- 原生 pipeline 對未知容器、長串流、range 續傳、backpressure、timescale 與
-  damaged input 的等價行為。
-- 在沒有 FFmpeg 的環境跑完整 workspace、音訊 fixture、Discord voice simulator
-  與高音質回歸。未完成前，設定 `ffmpeg: none` 只代表不使用 fallback，並不代表
-  所有格式都能播放。
-
-## Native bot 驗收條件
-
-`crates/discord-bot/examples/play.rs` 已提供最小可編譯橋接範例；在填入真實
-credentials 前，離線測試必須涵蓋：
-
-1. HELLO/IDENTIFY/heartbeat/READY 的 gateway 狀態機。
-2. 延遲或亂序的兩個 voice event 仍只在完整配對後產生一個 `VoiceState`。
-3. 錯 guild、錯 user、空 endpoint、重複事件與 reconnect 不會污染現有 session。
-4. Bot token 永不出現在 log；`voice.token` 與 Rustlink password 不會互相替代。
-5. 本機 gateway/UDP simulator 能完成 DAVE、Opus、pause/resume、換曲與關閉。
-6. 來源解析、無廣告過濾與 codec fallback 的結果可由 Rustlink 現有 tests 重現。
-
-完成上述測試後，example 才應接入真正的 Discord credentials；離線 simulator
-通過不等於已用真實 bot 帳號或真實語音頻道驗證。
+`slash.rs` 已用真實的 Discord 機器人帳號與語音頻道執行過：機器人一個人在頻道裡完整播完一首 YouTube 歌曲（2026-11-22）。離線模擬本身不等於真實帳號驗證。

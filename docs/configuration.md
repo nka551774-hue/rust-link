@@ -1,166 +1,117 @@
-# Configuration
+# 設定
 
-A node reads `config.yaml`, `config.yml` or `config.json` from the working
-directory, or the file named by `--config` / `-c`. Field names are matched strictly: a
-misspelled option stops startup and names the field, because a typo that is
-silently ignored is harder to find than a startup error.
+節點依序讀取工作目錄下的 `config.yaml`、`config.yml`、`config.json`，或 `--config`／`-c` 指定的檔案。欄位名稱嚴格比對：拼錯的選項會讓啟動失敗並指出欄位名，比靜默忽略更容易發現問題。
 
-A node that finds no file, and no password in the environment, writes
-`config.yaml` with a generated password rather than refusing to start, which is
-what makes the binary runnable by double-clicking it.
+找不到設定檔、環境變數也沒有密碼時，節點會寫出含隨機密碼的 `config.yaml` 再啟動，所以執行檔可以直接雙擊。環境變數優先於設定檔，容器因此不必掛載設定檔。`config.example.yaml` 是含註解的完整範本；`config.yaml` 已被 `.gitignore` 排除，不會進入版本庫。
 
-Environment variables are applied on top of the file, so a container can be
-configured without mounting one.
+## 節點
 
-## Node
-
-| Option | Default | What it does |
+| 選項 | 預設 | 說明 |
 | --- | --- | --- |
-| `address` | `0.0.0.0:2333` | Where the node listens. Every interface by default, which is what a bot on another machine needs; `127.0.0.1:2333` is for a node behind a proxy that terminates TLS. |
-| `password` | *(empty)* | The password every client sends as `Authorization: Bearer <password>`. Startup fails without one. |
+| `address` | `0.0.0.0:2333` | 監聽位址。預設開放所有介面，讓其他機器上的機器人可以連入；放在會終止 TLS 的反向代理後面時用 `127.0.0.1:2333`。 |
+| `password` | 空 | 客戶端以 `Authorization: Bearer <password>` 傳送的密碼；沒有密碼無法啟動。 |
 
-## Media tools
+## 媒體工具
 
-| Option | Default | What it does |
+| 選項 | 預設 | 說明 |
 | --- | --- | --- |
-| `ffmpeg` | `ffmpeg` | The FFmpeg executable: a bare name, a path, or `none`. A bare name means a file inside `toolsDirectory` and is never looked up on `PATH`, so every node runs the build it was given. `none` switches FFmpeg off entirely. |
-| `toolsDirectory` | `.tools` | Where downloaded helpers live. |
-| `autoDownload` | `false` | Install a helper that is neither in `toolsDirectory` nor named by an explicit path. |
-| `inProcessAudio` | `true` | Decode, filter and encode in process. Turning it off sends everything through FFmpeg. The engines use different decoder and DSP implementations; CPU cost and filter output can differ. |
-| `lyricsSource` | `lrclib` | `lrclib` asks the database and then YouTube Music for timed lines; `none` switches lyrics off and stops the node calling anything. |
+| `ffmpeg` | `ffmpeg` | FFmpeg 執行檔：裸名稱、路徑或 `none`。裸名稱代表 `toolsDirectory` 內的檔案，**不會**到 `PATH` 找，確保每個節點用的是給它的那一版。`none` 完全關閉 FFmpeg。 |
+| `toolsDirectory` | `.tools` | 下載的輔助工具存放處。 |
+| `autoDownload` | `false` | 缺少輔助工具（既不在 `toolsDirectory`，也沒有明確路徑）時自動安裝。 |
+| `inProcessAudio` | `true` | 在行程內解碼、濾鏡與編碼。關閉後全部交給 FFmpeg；兩種引擎的解碼器與 DSP 實作不同，CPU 成本與濾鏡輸出可能有差異。 |
+| `lyricsSource` | `lrclib` | `lrclib` 先查資料庫、再查 YouTube Music；`none` 關閉歌詞，節點不會對外連線。 |
 
-FFmpeg is only needed for the containers the in-process pipeline declines, so a
-node without it still plays the supported formats. The startup summary reports
-whether FFmpeg is available.
+FFmpeg 只在內建管線不處理的容器才需要；沒有 FFmpeg 的節點仍能播放支援的格式。啟動摘要會回報 FFmpeg 是否可用。
 
-## Logging
+## 日誌
 
-| Option | Default | What it does |
+| 選項 | 預設 | 說明 |
 | --- | --- | --- |
-| `logLevel` | `info` | `debug`, `info`, `warn` or `error`. |
-| `logFormat` | `text` | `text` for a person, `json` for a collector. The wordmark is left out of a JSON stream. |
+| `logLevel` | `info` | `debug`、`info`、`warn`、`error`。 |
+| `logFormat` | `text` | `text` 給人看，`json` 給收集器；JSON 不輸出字樣 logo。 |
+| `logColor` | `auto` | `auto` 在終端機上著色、重導向時不著色；`always`、`never` 強制指定。遵守環境變數 `NO_COLOR`。 |
+| `logDirectory` | `logs` | 每日檔案 `rustlink-YYYY-MM-DD.log`，日期變動時換檔；空字串表示只輸出到主控台。檔案內容不著色。 |
+| `logRetentionDays` | `14` | 保留幾天的檔案，啟動與換日時刪除更舊的；`0` 全部保留（日誌由外部輪替時使用）。只會動這個節點寫的檔案。 |
 
-The normal startup summary begins with `Rustlink starting`, then writes one
-`INFO` record per setting. This keeps console, text-file and JSON output easy
-to scan without turning any record into a multiline value.
-| `logColor` | `auto` | `auto` colours a terminal and leaves a redirected stream alone, `always` and `never` override that. `NO_COLOR` in the environment is honoured. |
-| `logDirectory` | `logs` | Daily files named `rustlink-YYYY-MM-DD.log`, reopened when the date changes. Empty keeps the console as the only output. Records in a file are never coloured. |
-| `logRetentionDays` | `14` | How many days of those files are kept: anything older is deleted at startup and when the date changes, so a node left running does not fill the disk. `0` keeps every file, for a node whose logs are rotated and collected elsewhere. Only files this node writes are touched. |
+啟動摘要以 `Rustlink starting` 開頭，每項設定一筆 `INFO`，不產生多行單筆記錄，方便主控台、文字檔與 JSON 都能逐行檢視。
 
-## Sources
+## 音源
 
-| Option | Default | What it does |
+| 選項 | 預設 | 說明 |
 | --- | --- | --- |
-| `youtubeNative` | `true` | Resolve YouTube with the native InnerTube clients. |
-| `youtubeEndpoint` | `https://youtubei.googleapis.com` | The InnerTube endpoint. |
-| `youtubeMusicEndpoint` | `https://music.youtube.com` | The endpoint the YouTube Music client and the lyrics catalogue use. |
-| `youtubeClientVersion` | *(empty)* | Override the Android client version and its matching User-Agent. Empty currently uses `20.10.38`; Android VR and iOS retain their own versions. |
-| `youtubePoToken` | *(empty)* | A proof-of-origin token, sent in the player request and as `pot` on googlevideo audio URLs. Without one, networks YouTube distrusts stop after ~1 minute of audio. |
-| `youtubeVisitorData` | *(empty)* | Visitor data to send with it. |
-| `youtubeProxy` | *(empty)* | Send every YouTube request, API and audio alike, through this proxy: `http://`, `socks4://`, `socks5://` or `socks5h://`, with optional `user:password@`. Use it when YouTube answers this node's address with "Sign in to confirm you're not a bot". A proxy that cannot be used fails YouTube loads instead of connecting directly. Other sources are not proxied. |
-| `soundcloudNative` | `true` | Resolve SoundCloud with the public API. |
-| `soundcloudApiEndpoint` | `https://api-v2.soundcloud.com` | The API endpoint. |
-| `soundcloudWebEndpoint` | `https://soundcloud.com` | The site a client id is scraped from. |
-| `soundcloudClientId` | *(empty)* | A client id, or empty to scrape and cache one. |
-| `soundcloudClientIdTtlSeconds` | `21600` | How long a scraped client id is kept. |
-| `spotifyClientId` | *(empty)* | A Spotify application client id. Without it, `spsearch:` is refused rather than silently answered with something else. |
-| `spotifyClientSecret` | *(empty)* | The matching secret. |
-| `spotifyRefreshToken` | *(empty)* | A user refresh token, which is what makes a listener's own playlists resolvable. |
-| `spotifyMarket` | `US` | The market country code sent with catalogue requests. |
-| `deezerApiEndpoint` | `https://api.deezer.com` | The Deezer API endpoint. |
-| `allowPrivateNetworks` | `false` | Allow a source on a private or special-use address. Off keeps a client from pointing the node at the network it runs in. |
+| `youtubeNative` | `true` | 用原生 InnerTube 用戶端解析 YouTube；關閉會停用 YouTube 解析與播放。 |
+| `youtubeEndpoint` | `https://youtubei.googleapis.com` | InnerTube 端點。 |
+| `youtubeMusicEndpoint` | `https://music.youtube.com` | YouTube Music 用戶端與歌詞資料庫使用的端點。 |
+| `youtubeClientVersion` | 空 | 覆寫 `ANDROID` 用戶端的版本與對應的 User-Agent；空字串使用內建的 `20.10.38`。其他用戶端保留各自的版本。 |
+| `youtubePoToken` | 空 | 你提供的 proof-of-origin token：放進 player 請求，並以 `pot` 參數附在 googlevideo 音訊網址上。 |
+| `youtubeVisitorData` | 空 | 搭配 token 的 visitor data。 |
+| `youtubeProxy` | 空 | 讓所有 YouTube 請求（API 與音訊）改走代理：`http://`、`socks4://`、`socks5://`、`socks5h://`，可含 `使用者:密碼@`。YouTube 對節點的位址回應「Sign in to confirm you're not a bot」時使用。代理無法使用時，YouTube 載入直接失敗，不會改為直連；其他音源不經代理。 |
+| `soundcloudNative` | `true` | 用公開 API 解析 SoundCloud。 |
+| `soundcloudApiEndpoint` | `https://api-v2.soundcloud.com` | API 端點。 |
+| `soundcloudWebEndpoint` | `https://soundcloud.com` | 抓取 client id 的網站。 |
+| `soundcloudClientId` | 空 | client id；空字串表示抓取並快取。 |
+| `soundcloudClientIdTtlSeconds` | `21600` | 抓到的 client id 保留多久。 |
+| `spotifyClientId`、`spotifyClientSecret` | 空 | Spotify 應用程式憑證。沒有 client id 時，`spsearch:` 會被明確拒絕，不會偷偷換成別的結果。 |
+| `spotifyRefreshToken` | 空 | 使用者 refresh token，讀取私人或編輯精選播放清單時需要。 |
+| `spotifyMarket` | `US` | 目錄請求的市場國碼。 |
+| `deezerApiEndpoint` | `https://api.deezer.com` | Deezer API 端點。 |
+| `allowPrivateNetworks` | `false` | 允許來源連到私有或特殊用途位址。關閉可避免客戶端讓節點去連它所在的內網。`youtubeProxy` 本身不受此限（通常在本機）；但由代理自己解析網域的 `http://`、`socks5h://`，目標位址是代理解析的，節點無法檢查。 |
 
-## Filters
+## 濾鏡
 
-`filters` maps a filter name to whether clients may use it. A name that is
-absent stays enabled; listing
-one as `false` makes a player update that asks for it fail with
-`Following filters are disabled in the config: ...`. The names are `volume`,
-`equalizer`, `karaoke`, `timescale`, `tremolo`, `vibrato`, `rotation`,
-`distortion`, `channelMix` and `lowPass`.
+`filters` 把濾鏡名稱對應到「客戶端是否可使用」。沒列出的濾鏡預設啟用；設為 `false` 後，要求該濾鏡的播放器更新會以 `Following filters are disabled in the config: ...` 失敗。名稱：`volume`、`equalizer`、`karaoke`、`timescale`、`tremolo`、`vibrato`、`rotation`、`distortion`、`channelMix`、`lowPass`。
 
-## Capacity
+## 容量
 
-| Option | Default | What it does |
+| 選項 | 預設 | 說明 |
 | --- | --- | --- |
-| `maxPlayers` | `100` | Players across the whole node. |
-| `maxSessions` | `100` | Sessions across the whole node. |
-| `maxConcurrentLoads` | `8` | Loads resolved at once; waiting for capacity consumes the same `loadTimeoutSeconds` budget as the provider requests. |
-| `maxPlaylistTracks` | `100` | Tracks taken from one playlist or album. |
-| `searchResults` | `5` | Results in one search answer. |
-| `cacheEntries` | `1024` | Resolved loads kept. |
-| `cacheTtlSeconds` | `300` | How long one is reused. |
-| `loadTimeoutSeconds` | `30` | How long a load may take before it is given up on. |
-| `playerUpdateSeconds` | `5` | How often a session reports the position of its players. |
-| `statsSeconds` | `60` | How often the machine is sampled for `/api/v1/stats`. |
-| `eventBuffer` | `256` | Events that may wait for a socket. A client that stops reading fills it and is then closed, because a node that drops events silently leaves a client showing something that is not happening. |
-| `opusBitrate` | `192000` | Music-oriented Opus target bitrate in bits per second, from `16000` to `256000`. Higher targets use more network bandwidth. |
-| `opusComplexity` | `10` | How hard the Opus encoder works, on its own scale of zero to ten. Lowering it spends less CPU on every frame of every track, which is the knob for a node that carries more players than it has cores; the in-process pipeline and the FFmpeg fallback both follow it. |
+| `maxPlayers` | `100` | 全節點的播放器上限。 |
+| `maxSessions` | `100` | 全節點的工作階段上限。 |
+| `maxConcurrentLoads` | `8` | 同時進行的解析數；等待名額也計入 `loadTimeoutSeconds`。 |
+| `maxPlaylistTracks` | `100` | 一份播放清單或專輯最多取幾首。 |
+| `searchResults` | `5` | 一次搜尋回傳幾筆。 |
+| `cacheEntries` | `1024` | 解析結果快取筆數。 |
+| `cacheTtlSeconds` | `300` | 快取保留秒數。 |
+| `loadTimeoutSeconds` | `30` | 一次解析的時限。 |
+| `playerUpdateSeconds` | `5` | 工作階段回報播放位置的間隔。 |
+| `statsSeconds` | `60` | 取樣 `/api/v1/stats` 的間隔。 |
+| `eventBuffer` | `256` | 等待 WebSocket 的事件數。客戶端停止讀取時，佇列滿了就會被關閉；節點不會靜默丟事件，以免客戶端顯示的狀態和實際不符。 |
+| `opusBitrate` | `192000` | Opus 目標位元率（bit/s），範圍 `16000`–`256000`。越高占用的網路頻寬越多。 |
+| `opusComplexity` | `10` | 編碼器複雜度 0–10。降低可減少每個播放器每個 frame 的 CPU 成本，適合播放器數多於核心數的節點；內建管線與 FFmpeg 後備都遵循。 |
 
-The default music profile is 48 kHz stereo Opus, 20 ms packets, a 192 kbit/s
-variable-bitrate target and complexity 10. Both engines explicitly apply the
-bitrate, complexity, VBR, audio application and packet-loss/FEC settings. FEC
-availability depends on the Opus coding mode and receiver; it is not a promise
-that every lost packet will be recovered.
+預設輸出是 48 kHz 雙聲道 Opus、20 ms 封包、192 kbit/s 可變位元率、複雜度 10。兩種引擎都會明確設定位元率、複雜度、VBR、應用類型與封包遺失／FEC；FEC 能否生效取決於 Opus 編碼模式與接收端，不保證補回每一個遺失的封包。
 
-Only omitted settings use the new default. An existing `opusBitrate: 128000`
-or `RUSTLINK_OPUS_BITRATE` override keeps its value. A higher encoding target
-reduces the need for additional compression; transcoding cannot restore detail
-missing from the original source. Source selection, its original encoding,
-filters, Discord's voice channel and the listener's connection still affect
-what is heard. This profile is lossy, not a lossless or quality guarantee.
+只有**省略**的設定會用新預設值；既有的 `opusBitrate: 128000` 或 `RUSTLINK_OPUS_BITRATE` 會保留。提高位元率只減少額外的壓縮損失，轉碼無法補回原始音源已缺少的細節；最終聽感仍受來源、濾鏡、Discord 語音頻道與聽者網路影響。這是有損編碼，不是無損或品質保證。
 
-The native pipeline converts source audio to 48 kHz before applying the
-frequency-dependent filters. Resampling preserves the beginning and flushes
-the end of the source; Ogg Opus pre-skip, output gain and end granule are applied
-when decoding. The encoder's delayed samples are flushed too. RTP uses complete
-20 ms packets and carries no Ogg trimming metadata, so an extra final packet
-can contain codec delay and silence padding. The two engines are not expected
-to produce identical encoded bytes or identical DSP samples.
+原生管線在套用頻率相關濾鏡前先轉成 48 kHz。重採樣會保留開頭並沖出結尾；Ogg Opus 的 pre-skip、輸出增益與結尾 granule 在解碼時處理，編碼器延遲的樣本也會沖出。RTP 一律使用完整 20 ms 封包，不帶 Ogg 的裁切資訊，所以最後可能多一個含編碼延遲與靜音填充的封包。兩種引擎不保證產生相同的編碼位元組或相同的 DSP 樣本。
 
-## Rate limits
+## 限流
 
-`ratelimits.enable` turns per-route token buckets on or off. Each route has its
-own bucket, so a client that hammers one route does not spend the allowance of
-another. The limiter runs before authentication, so a throttled request is
-refused before the password check and a rejected one still spends a token.
+`ratelimits.enable` 開關各路由的 token bucket。每個路由有自己的 bucket，狂打一個路由不會用掉別的路由的額度。限流器在驗證**之前**執行：被限流的請求在密碼檢查前就被拒絕，而被拒絕的請求仍會消耗一個 token。
 
 ## Webhook
 
-| Option | Default | What it does |
+| 選項 | 預設 | 說明 |
 | --- | --- | --- |
-| `webhook.enable` | `false` | Post node events to an endpoint. |
-| `webhook.url` | *(empty)* | A Discord webhook URL receives an embed; any other endpoint receives the event itself as JSON. |
-| `webhook.stateLatencySeconds` | `5` | How long the node waits between whole-node player state reports. Zero leaves the endpoint carrying only events. |
+| `webhook.enable` | `false` | 把節點事件送到外部端點。 |
+| `webhook.url` | 空 | Discord webhook 網址收到 embed；其他端點收到事件本身的 JSON。 |
+| `webhook.stateLatencySeconds` | `5` | 整個節點播放器狀態報告的間隔；`0` 表示端點只收事件。 |
 
-Delivery runs on one background thread, so a slow endpoint never blocks the
-player that produced the event. A delivery that cannot be completed stops the
-node: a configured endpoint is part of the deployment, not an optional extra.
+投遞在單一背景執行緒進行，慢的端點不會卡住產生事件的播放器。投遞失敗會讓節點停止：設定了的端點被視為部署的一部分，而不是可有可無的附加功能。
 
-## Environment variables
+## 環境變數
 
-The following environment overrides are supported; use these exact names:
-`RUSTLINK_ADDRESS`, `RUSTLINK_PASSWORD`,
-`RUSTLINK_FFMPEG`, `RUSTLINK_TOOLS_DIRECTORY`, `RUSTLINK_AUTO_DOWNLOAD`,
-`RUSTLINK_IN_PROCESS_AUDIO`, `RUSTLINK_LYRICS_SOURCE`, `RUSTLINK_LOG_LEVEL`,
-`RUSTLINK_LOG_FORMAT`, `RUSTLINK_LOG_COLOR`, `RUSTLINK_LOG_DIRECTORY`,
-`RUSTLINK_LOG_RETENTION_DAYS`,
-`RUSTLINK_YOUTUBE_NATIVE`,
-`RUSTLINK_YOUTUBE_ENDPOINT`, `RUSTLINK_YOUTUBE_MUSIC_ENDPOINT`,
-`RUSTLINK_YOUTUBE_CLIENT_VERSION`, `RUSTLINK_YOUTUBE_PO_TOKEN`,
-`RUSTLINK_YOUTUBE_VISITOR_DATA`, `RUSTLINK_YOUTUBE_PROXY`, `RUSTLINK_SOUNDCLOUD`,
-`RUSTLINK_SOUNDCLOUD_API_ENDPOINT`, `RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT`,
-`RUSTLINK_SOUNDCLOUD_CLIENT_ID`, `RUSTLINK_DEEZER_API_ENDPOINT`,
-`RUSTLINK_PRIVATE_NETWORKS`, `RUSTLINK_MAX_PLAYERS`, `RUSTLINK_MAX_SESSIONS`,
-`RUSTLINK_MAX_CONCURRENT_LOADS`, `RUSTLINK_MAX_PLAYLIST_TRACKS`,
-`RUSTLINK_SEARCH_RESULTS`, `RUSTLINK_CACHE_ENTRIES`, `RUSTLINK_CACHE_TTL_SECONDS`,
-`RUSTLINK_LOAD_TIMEOUT_SECONDS`, `RUSTLINK_PLAYER_UPDATE_SECONDS`,
-`RUSTLINK_STATS_SECONDS`, `RUSTLINK_EVENT_BUFFER`, `RUSTLINK_OPUS_BITRATE`,
-`RUSTLINK_OPUS_COMPLEXITY`, `RUSTLINK_RATELIMITS_ENABLE`,
-`RUSTLINK_WEBHOOK_ENABLED`, `RUSTLINK_WEBHOOK_URL`
-and `RUSTLINK_WEBHOOK_STATE_LATENCY_SECONDS`.
+環境變數覆寫設定檔，名稱如下：
 
-Spotify settings use `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`,
-`SPOTIFY_REFRESH_TOKEN` and `SPOTIFY_MARKET`, without a `RUSTLINK_` prefix.
-These override the corresponding configuration fields, just like the
-`RUSTLINK_*` variables above.
+- 節點與工具：`RUSTLINK_ADDRESS`、`RUSTLINK_PASSWORD`、`RUSTLINK_FFMPEG`、`RUSTLINK_TOOLS_DIRECTORY`、`RUSTLINK_AUTO_DOWNLOAD`、`RUSTLINK_IN_PROCESS_AUDIO`、`RUSTLINK_LYRICS_SOURCE`
+- 日誌：`RUSTLINK_LOG_LEVEL`、`RUSTLINK_LOG_FORMAT`、`RUSTLINK_LOG_COLOR`、`RUSTLINK_LOG_DIRECTORY`、`RUSTLINK_LOG_RETENTION_DAYS`
+- YouTube：`RUSTLINK_YOUTUBE_NATIVE`、`RUSTLINK_YOUTUBE_ENDPOINT`、`RUSTLINK_YOUTUBE_MUSIC_ENDPOINT`、`RUSTLINK_YOUTUBE_CLIENT_VERSION`、`RUSTLINK_YOUTUBE_PO_TOKEN`、`RUSTLINK_YOUTUBE_VISITOR_DATA`、`RUSTLINK_YOUTUBE_PROXY`
+- 其他音源：`RUSTLINK_SOUNDCLOUD`、`RUSTLINK_SOUNDCLOUD_API_ENDPOINT`、`RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT`、`RUSTLINK_SOUNDCLOUD_CLIENT_ID`、`RUSTLINK_DEEZER_API_ENDPOINT`、`RUSTLINK_PRIVATE_NETWORKS`
+- 容量：`RUSTLINK_MAX_PLAYERS`、`RUSTLINK_MAX_SESSIONS`、`RUSTLINK_MAX_CONCURRENT_LOADS`、`RUSTLINK_MAX_PLAYLIST_TRACKS`、`RUSTLINK_SEARCH_RESULTS`、`RUSTLINK_CACHE_ENTRIES`、`RUSTLINK_CACHE_TTL_SECONDS`、`RUSTLINK_LOAD_TIMEOUT_SECONDS`、`RUSTLINK_PLAYER_UPDATE_SECONDS`、`RUSTLINK_STATS_SECONDS`、`RUSTLINK_EVENT_BUFFER`、`RUSTLINK_OPUS_BITRATE`、`RUSTLINK_OPUS_COMPLEXITY`
+- 限流與 webhook：`RUSTLINK_RATELIMITS_ENABLE`、`RUSTLINK_WEBHOOK_ENABLED`、`RUSTLINK_WEBHOOK_URL`、`RUSTLINK_WEBHOOK_STATE_LATENCY_SECONDS`
+
+開關型變數接受 `1/true/yes/on` 與 `0/false/no/off`；無法辨識的值（包含空字串）會被忽略，因此不會意外打開 `RUSTLINK_PRIVATE_NETWORKS` 這類防護。無法解析的數字同樣被忽略，但範圍檢查仍會擋下超出範圍的值。
+
+Spotify 設定沿用 Spotify 儀表板發出的名稱，沒有 `RUSTLINK_` 前綴：`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_MARKET`。
+
+密碼、`youtubePoToken`、`youtubeProxy`（可能含帳密）、SoundCloud client id、Spotify 憑證與 webhook 網址，在 `Debug` 輸出中都會被遮蔽。

@@ -1,66 +1,41 @@
-# Third-party services
+# 第三方服務
 
-This node is a client of services it does not own. Nothing here is affiliated
-with, endorsed by or supported by any of them, and an operator is the one who
-answers to their terms.
+節點是它並不擁有的服務的客戶端。這裡的任何服務都與本專案無隸屬、背書或支援關係，其條款由操作者自己負責。
 
 ## Discord
 
-The node speaks the voice gateway with the credentials a bot already has. It
-does not connect to the Discord API otherwise: the bot that owns the session
-sends the voice state, and the node acts on it. Nothing is stored beyond the
-token for as long as the connection lives.
+節點用機器人已有的憑證連接語音 gateway，其餘不連 Discord API：擁有 session 的機器人送來語音狀態，節點依此行動。除了連線存續期間的 voice token 之外，不保存任何東西。（`rustlink-discord-bot` 是另一個函式庫，由機器人行程使用，不在節點內。）
 
 ## YouTube
 
-Track metadata and audio are read from YouTube through its internal API using
-Rust clients. This interface can change without notice. An operator who runs
-a node at scale is the one who has to consider what YouTube's terms say about it.
+曲目中繼資料與音訊透過 YouTube 的內部 API，以 Rust 用戶端讀取。這個介面可能不預警地改變；大規模運行節點的操作者，需要自己考慮 YouTube 的條款怎麼說。若設定了 `youtubeProxy`，YouTube 的所有請求（含音訊）都會經過該代理，代理的營運者看得到這些流量。
 
-Visitor data and proof-of-origin tokens, when supplied in the configuration,
-are sent to the configured YouTube endpoints. Rustlink does not generate them.
+設定檔提供的 visitor data 與 proof-of-origin token 會送到設定的 YouTube 端點，Rustlink 不產生它們。
 
 ## SoundCloud
 
-Metadata and audio come from the public API. A client id that the configuration
-does not supply is scraped from the site and cached, which is what a browser
-does; a supplied one is used as it is.
+中繼資料與音訊來自公開 API。設定沒有提供的 client id 會從網站抓取並快取，這與瀏覽器的做法相同；設定提供的則原樣使用。
 
 ## Spotify
 
-Only metadata is read, through the web API with an application client id and,
-optionally, a user refresh token. Audio is not fetched from Spotify, because it
-is not fetchable. Each entry is matched to a video on another service by
-searching for its title and artist, so what a listener hears is that service's
-copy. A node without a client id refuses Spotify identifiers instead of guessing.
+只讀取中繼資料：用應用程式 client id，可選的使用者 refresh token，透過網頁 API。不從 Spotify 取得音訊，因為取不到。每個項目以標題與歌手在別的服務找對應的影片，所以聽者聽到的是那個服務的版本。沒有 client id 的節點會拒絕 Spotify 識別字串，不會亂猜。
 
 ## Deezer
 
-Metadata comes from the public API. Playback uses a YouTube match selected by
-title, artist and duration; Deezer audio and preview streams are not fetched.
+中繼資料來自公開 API。播放用 YouTube 的比對結果（以標題、歌手與長度挑選）；不取得 Deezer 的音訊或預覽串流。
 
 ## LRCLIB
 
-Lyrics are read from `lrclib.net`, a free and public database. The node sends the
-track title, artist, album and duration, and caches what comes back for as long
-as the entry lives.
+歌詞讀自免費公開的資料庫 `lrclib.net`。節點送出曲目的標題、歌手、專輯與長度，並在項目存續期間快取回傳的內容。
 
 ## YouTube Music
 
-When the database has nothing for a track, timed lyrics are read from YouTube
-Music through the same InnerTube client the source layer uses, so the catalogue
-request carries the same visitor data.
+資料庫沒有某首曲目的歌詞時，用音源層同一個 InnerTube 用戶端讀取 YouTube Music 的同步歌詞，所以這個目錄請求帶有相同的 visitor data。
 
 ## FFmpeg
 
-FFmpeg is a separate program with its own licences, installed by the operator
-or by `autoDownload`. The builds this node installs are GPL builds with libopus,
-because the encoder needs it; the archive also holds `ffprobe`, which this node
-does not use. Its licences and terms are those of its upstream distributors.
+FFmpeg 是另一個有自己授權的程式，由操作者安裝，或由 `autoDownload` 安裝。節點安裝的是附 libopus 的 GPL 建置，因為編碼器需要它；壓縮檔裡也有 `ffprobe`，節點不使用。授權與條款以其上游發佈者為準。
 
-## What the node sends
+## 節點送出什麼
 
-Nothing about a node or its listeners leaves it except the requests above. There
-is no telemetry, no update check and no central service: a webhook is only
-called when the operator configures one, and its URL is the only place events
-go.
+除了上面列出的請求，沒有任何關於節點或聽者的資料離開節點：沒有遙測、沒有檢查更新，也沒有中央服務。只有操作者設定了 webhook，才會呼叫它，事件也只會送到那個網址。
