@@ -8,12 +8,19 @@ use rustlink_client::Track;
 pub struct Guild {
     queue: VecDeque<Track>,
     current: Option<Track>,
+    /// Tracks in a row that could not be loaded; a working one resets it.
+    failures: u32,
     pub volume: i64,
 }
 
+/// How many tracks in a row may fail before the queue is given up on. When
+/// every track fails (YouTube refusing the host, say), playing on through a
+/// playlist only fills the log with the same error.
+pub const MAX_FAILURES_IN_A_ROW: u32 = 3;
+
 impl Guild {
     pub fn new(volume: i64) -> Guild {
-        Guild { queue: VecDeque::new(), current: None, volume }
+        Guild { queue: VecDeque::new(), current: None, failures: 0, volume }
     }
 
     /// Adds tracks up to `max` waiting, and returns how many were accepted.
@@ -39,6 +46,19 @@ impl Guild {
     pub fn clear(&mut self) {
         self.queue.clear();
         self.current = None;
+    }
+
+    /// Records how the current track ended. Returns true once
+    /// [`MAX_FAILURES_IN_A_ROW`] have failed in a row, when the queue is
+    /// cleared rather than tried further.
+    pub fn record(&mut self, loaded: bool) -> bool {
+        self.failures = if loaded { 0 } else { self.failures + 1 };
+        if self.failures < MAX_FAILURES_IN_A_ROW {
+            return false;
+        }
+        self.failures = 0;
+        self.clear();
+        true
     }
 
     pub fn playing(&self) -> bool {
@@ -142,6 +162,18 @@ mod tests {
         assert_eq!(guild.advance().unwrap().metadata.title, "b");
         assert_eq!(guild.advance().unwrap().metadata.title, "c");
         assert!(guild.advance().is_none() && !guild.busy(), "an empty queue ends the playback");
+    }
+
+    #[test]
+    fn a_run_of_failed_tracks_gives_up_on_the_queue() {
+        let mut guild = Guild::new(100);
+        guild.enqueue((0..10).map(|n| track(&n.to_string())).collect(), 20);
+        guild.advance();
+        assert!(!guild.record(false) && !guild.record(false), "two failures are tolerated");
+        assert!(!guild.record(true), "a track that plays resets the count");
+        assert!(!guild.record(false) && !guild.record(false));
+        assert!(guild.record(false), "the third in a row stops the queue");
+        assert!(!guild.busy(), "nothing is left to fail");
     }
 
     #[test]

@@ -69,6 +69,21 @@ if ($reuse) {
         Fail 'the port must be a number between 1 and 65535'
     }
 
+    # YouTube refuses many server addresses ("Sign in to confirm you're not a
+    # bot"); a proxy such as Cloudflare WARP gives it another one. A WARP proxy
+    # already listening on its default port is offered as the default.
+    $warp = ''
+    try {
+        $probe = New-Object Net.Sockets.TcpClient
+        if ($probe.ConnectAsync('127.0.0.1', 40000).Wait(500)) { $warp = 'socks5://127.0.0.1:40000' }
+        $probe.Close()
+    } catch { }
+    $Proxy = (Read-Host "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]").Trim()
+    if (-not $Proxy) { $Proxy = $warp }
+    if ($Proxy -match '["\\\s]') { Fail 'the proxy cannot contain quotes, backslashes or spaces' }
+    if ($Proxy -and $Proxy -notmatch '^(https?|socks4|socks5h?)://') { Fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' }
+    $proxyLine = if ($Proxy) { 'youtubeProxy: "' + $Proxy + '"' } else { '' }
+
     New-Item -ItemType Directory -Force -Path $Data | Out-Null
     $utf8 = New-Object Text.UTF8Encoding $false
     [IO.File]::WriteAllText($ConfigFile, @"
@@ -79,6 +94,7 @@ logLevel: info
 logDirectory: logs
 toolsDirectory: .tools
 autoDownload: true
+$proxyLine
 "@, $utf8)
     [IO.File]::WriteAllText($EnvFile, @"
 # Written by quickstart\start.ps1. Keep this file private.

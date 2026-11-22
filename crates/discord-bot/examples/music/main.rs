@@ -276,6 +276,14 @@ impl Bot {
                     return;
                 }
                 state.finish();
+                if state.record(event["reason"] == "finished") {
+                    eprintln!(
+                        "stopped the queue in guild {guild}: {} tracks in a row could not be                          loaded (see the error above)",
+                        state::MAX_FAILURES_IN_A_ROW
+                    );
+                    self.idle_since.insert(guild.clone(), Instant::now());
+                    return;
+                }
                 self.start_next(&guild).await;
             }
             Some("track.failed") => {

@@ -49,6 +49,18 @@ else
     case $PORT in '' | *[!0-9]*) fail 'the port must be a number' ;; esac
     [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fail 'the port must be between 1 and 65535'
 
+    # YouTube refuses many server addresses ("Sign in to confirm you're not a
+    # bot"); a proxy such as Cloudflare WARP gives it another one. A WARP proxy
+    # already listening on its default port is offered as the default.
+    warp=
+    if (exec 3<>/dev/tcp/127.0.0.1/40000) 2>/dev/null; then warp=socks5://127.0.0.1:40000; fi
+    read -r -p "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]: " PROXY
+    PROXY=${PROXY:-$warp}
+    case $PROXY in *[\"\\]* | *[[:space:]]*) fail 'the proxy cannot contain quotes, backslashes or spaces' ;; esac
+    case $PROXY in '' | http://* | https://* | socks4://* | socks5://* | socks5h://*) ;;
+        *) fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' ;; esac
+    PROXY_LINE=${PROXY:+"youtubeProxy: \"$PROXY\""}
+
     mkdir -p "$DATA"
     umask 077
     cat > "$CONFIG" <<EOF
@@ -59,6 +71,7 @@ logLevel: info
 logDirectory: logs
 toolsDirectory: .tools
 autoDownload: true
+$PROXY_LINE
 EOF
     cat > "$ENV_FILE" <<EOF
 # Written by quickstart/start.sh. Keep this file private.
