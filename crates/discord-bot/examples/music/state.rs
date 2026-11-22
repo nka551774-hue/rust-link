@@ -1,0 +1,198 @@
+//! The per-guild queue and the small pure helpers the commands rely on.
+
+use std::collections::VecDeque;
+
+use rustlink_client::Track;
+
+/// What one guild is playing and what is waiting.
+pub struct Guild {
+    queue: VecDeque<Track>,
+    current: Option<Track>,
+    pub volume: i64,
+}
+
+impl Guild {
+    pub fn new(volume: i64) -> Guild {
+        Guild { queue: VecDeque::new(), current: None, volume }
+    }
+
+    /// Adds tracks up to `max` waiting, and returns how many were accepted.
+    pub fn enqueue(&mut self, tracks: Vec<Track>, max: usize) -> usize {
+        let room = max.saturating_sub(self.queue.len());
+        let accepted = tracks.len().min(room);
+        self.queue.extend(tracks.into_iter().take(accepted));
+        accepted
+    }
+
+    /// Moves the next waiting track into `current` and returns it.
+    pub fn advance(&mut self) -> Option<Track> {
+        self.current = self.queue.pop_front();
+        self.current.clone()
+    }
+
+    /// The current track is over (finished, failed or skipped).
+    pub fn finish(&mut self) {
+        self.current = None;
+    }
+
+    /// Forgets everything, as `/stop` and being removed from the channel do.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.current = None;
+    }
+
+    pub fn playing(&self) -> bool {
+        self.current.is_some()
+    }
+
+    /// Anything playing or waiting, which is what keeps the bot in the channel.
+    pub fn busy(&self) -> bool {
+        self.current.is_some() || !self.queue.is_empty()
+    }
+
+    pub fn current(&self) -> Option<&Track> {
+        self.current.as_ref()
+    }
+
+    pub fn waiting(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn upcoming(&self, limit: usize) -> impl Iterator<Item = &Track> {
+        self.queue.iter().take(limit)
+    }
+}
+
+/// Turns what a person typed into something Rustlink can resolve. A link, a
+/// video ID or a source prefix is passed through; plain words become a YouTube
+/// search, because Rustlink answers `empty` to text it cannot route.
+pub fn normalize_query(text: &str) -> String {
+    let text = text.trim();
+    const PREFIXES: [&str; 9] = [
+        "ytsearch:",
+        "ytmsearch:",
+        "scsearch:",
+        "spsearch:",
+        "dzsearch:",
+        "dzisrc:",
+        "spotify:",
+        "deezer:",
+        "youtube:playlist:",
+    ];
+    let is_video_id = text.len() == 11
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if text.is_empty()
+        || text.contains("://")
+        || text.starts_with("<http")
+        || is_video_id
+        || PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+    {
+        text.to_string()
+    } else {
+        format!("ytsearch:{text}")
+    }
+}
+
+/// `3:45` or `1:02:03`; a stream and an unknown length are named instead.
+pub fn format_length(milliseconds: i64, stream: bool) -> String {
+    if stream {
+        return "直播".into();
+    }
+    if milliseconds <= 0 {
+        return "未知長度".into();
+    }
+    let seconds = milliseconds / 1000;
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// Reads the `/volume` argument, which Discord delivers as text.
+pub fn parse_volume(text: &str) -> Option<i64> {
+    text.trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse()
+        .ok()
+        .filter(|volume| (0..=200).contains(volume))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustlink_protocol::TrackInfo;
+
+    fn track(name: &str) -> Track {
+        Track::new(format!("rlt1.{name}"), TrackInfo { title: name.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn tracks_play_in_the_order_they_were_added() {
+        let mut guild = Guild::new(100);
+        assert!(!guild.busy());
+        assert_eq!(guild.enqueue(vec![track("a"), track("b"), track("c")], 10), 3);
+        assert!(guild.busy() && !guild.playing());
+        assert_eq!(guild.advance().unwrap().metadata.title, "a");
+        assert!(guild.playing() && guild.waiting() == 2);
+        assert_eq!(guild.upcoming(1).next().unwrap().metadata.title, "b");
+        guild.finish();
+        assert_eq!(guild.advance().unwrap().metadata.title, "b");
+        assert_eq!(guild.advance().unwrap().metadata.title, "c");
+        assert!(guild.advance().is_none() && !guild.busy(), "an empty queue ends the playback");
+    }
+
+    #[test]
+    fn the_queue_never_grows_past_its_limit() {
+        let mut guild = Guild::new(100);
+        assert_eq!(guild.enqueue(vec![track("a"), track("b"), track("c")], 2), 2);
+        assert_eq!(guild.enqueue(vec![track("d")], 2), 0, "full");
+        guild.advance();
+        assert_eq!(
+            guild.enqueue(vec![track("e"), track("f")], 2),
+            1,
+            "the playing track is not waiting"
+        );
+        guild.clear();
+        assert!(!guild.busy() && guild.waiting() == 0);
+    }
+
+    #[test]
+    fn plain_words_become_a_search_and_everything_else_is_left_alone() {
+        assert_eq!(normalize_query("  lofi hip hop "), "ytsearch:lofi hip hop");
+        for same in [
+            "https://youtu.be/dQw4w9WgXcQ",
+            "<https://www.youtube.com/watch?v=dQw4w9WgXcQ>",
+            "dQw4w9WgXcQ",
+            "ytsearch:already",
+            "scsearch:cloud",
+            "spotify:track:4cOdK2wGLETKBW3PvgPWqT",
+            "youtube:playlist:PL123",
+        ] {
+            assert_eq!(normalize_query(same), same);
+        }
+        assert_eq!(
+            normalize_query("hello-worl"),
+            "ytsearch:hello-worl",
+            "10 characters is not a video ID"
+        );
+        // Rustlink itself routes any 11 characters of [A-Za-z0-9_-] to YouTube as a video ID.
+        assert_eq!(normalize_query("hello-world"), "hello-world");
+        assert_eq!(normalize_query(""), "");
+    }
+
+    #[test]
+    fn lengths_and_volumes_read_naturally() {
+        assert_eq!(format_length(225_000, false), "3:45");
+        assert_eq!(format_length(3_723_000, false), "1:02:03");
+        assert_eq!(format_length(0, false), "未知長度");
+        assert_eq!(format_length(5, true), "直播");
+        assert_eq!(parse_volume(" 80% "), Some(80));
+        assert_eq!(parse_volume("0"), Some(0));
+        assert_eq!(parse_volume("201"), None);
+        assert_eq!(parse_volume("-1"), None);
+        assert_eq!(parse_volume("loud"), None);
+    }
+}

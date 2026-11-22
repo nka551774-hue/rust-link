@@ -49,6 +49,17 @@ cargo run -p rustlink-discord-bot --example slash
 
 > **YouTube 在你的網路上可能要求登入。** 對它不信任的網路位址，YouTube 會回應「Sign in to confirm you're not a bot」，或只給前約 900 KiB（約一分鐘）的音訊。節點因此先試不需要 token 的 `IOS_PRODUCER` 用戶端；仍然被擋時，在設定裡填 `youtubeProxy`，讓 YouTube 的流量改走代理。細節見 [YouTube](docs/youtube.md)。
 
+## 音樂機器人範例（`.env` 設定）
+
+`crates/discord-bot/examples/music/` 是專為連接 Rustlink 寫的音樂機器人：有佇列、跳過、暫停、音量，閒置時自動離開語音頻道。設定放在 `.env`：
+
+```sh
+cp .env.example .env        # 填入 DISCORD_BOT_TOKEN 與 RUSTLINK_PASSWORD（.env 已被 git 忽略）
+cargo run -p rustlink-discord-bot --example music
+```
+
+指令：`/play`（連結或關鍵字，播放清單會整份加入）、`/skip`、`/pause`、`/resume`、`/stop`、`/queue`、`/nowplaying`、`/volume`。其他設定項與環境變數覆寫見 [`.env.example`](.env.example) 與[原生機器人](docs/native-bot.md)。同一個 bot token 一次只能跑一個機器人範例，否則兩個程式會回應同一個指令。
+
 ## 自己的 Rust 機器人
 
 客戶端 crate 隨專案提供，尚未發佈到 crates.io：
@@ -88,13 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-三個可執行範例，由簡到完整：
+四個可執行範例，由簡到完整：
 
 | 範例 | 用途 |
 | --- | --- |
 | `crates/client/examples/bot.rs` | 只示範客戶端；voice 資料從環境變數讀入，不登入 Discord |
 | `crates/discord-bot/examples/play.rs` | 登入 Discord，加入指定頻道並播放一個查詢 |
-| `crates/discord-bot/examples/slash.rs` | `/play` 斜線指令機器人 |
+| `crates/discord-bot/examples/slash.rs` | 只有 `/play` 的最小斜線指令機器人 |
+| `crates/discord-bot/examples/music/` | 完整的音樂機器人：佇列與八個指令，用 `.env` 設定 |
 
 ## Docker 與 VPS
 

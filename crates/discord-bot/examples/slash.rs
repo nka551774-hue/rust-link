@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "options": [{
             "type": 3,
             "name": "url",
-            "description": "YouTube 連結或搜尋關鍵字",
+            "description": "YouTube 連結",
             "required": true
         }]
     }]);

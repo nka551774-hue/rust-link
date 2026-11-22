@@ -11,15 +11,51 @@
 | `VoiceStatePairer` | 把機器人自己的 `VOICE_STATE_UPDATE` 與 `VOICE_SERVER_UPDATE` 依 guild 配對成 `VoiceState`；可鎖定單一 guild |
 | `Interaction`、`BotEvent` | 事件與互動資料；`Interaction::option` 讀指令參數 |
 
-三個可執行範例：
+四個可執行範例：
 
 | 範例 | 說明 |
 | --- | --- |
 | `crates/client/examples/bot.rs` | 只示範客戶端，voice 資料從環境變數讀入，不登入 Discord |
 | `crates/discord-bot/examples/play.rs` | 登入、加入指定頻道、播放一個查詢（`DISCORD_BOT_TOKEN`、`DISCORD_GUILD_ID`、`DISCORD_CHANNEL_ID`、`RUSTLINK_URL`、`RUSTLINK_PASSWORD`） |
-| `crates/discord-bot/examples/slash.rs` | `/play url:<連結或關鍵字>` 斜線指令機器人（`DISCORD_BOT_TOKEN`、`RUSTLINK_PASSWORD`，可選 `RUSTLINK_URL`） |
+| `crates/discord-bot/examples/slash.rs` | `/play url:<YouTube 連結>` 斜線指令機器人（`DISCORD_BOT_TOKEN`、`RUSTLINK_PASSWORD`，可選 `RUSTLINK_URL`） |
+| `crates/discord-bot/examples/music/` | 完整的音樂機器人，用 `.env` 設定（見下） |
 
 `slash.rs` 在每個 `GUILD_CREATE` 為該伺服器註冊指令，追蹤各使用者所在的語音頻道，收到 `/play` 後先回覆「處理中」，透過 Rustlink 解析並播放第一首可播的曲目，再編輯回應；機器人尚未在使用者的頻道時，會先加入，等語音配對完成再播放。它沒有佇列，新的 `/play` 會替換正在播放的曲目。
+
+## 音樂機器人（`music` 範例）
+
+```sh
+cp .env.example .env     # 填入兩個必要值；.env 已被 git 忽略
+cargo run -p rustlink-discord-bot --example music            # 讀 ./.env
+cargo run -p rustlink-discord-bot --example music -- my.env  # 指定別的檔案
+```
+
+啟動時先連 Rustlink 確認可用，連不上就直接報錯結束，不等到第一個指令才失敗。真正的環境變數優先於 `.env` 的同名項目，所以容器或 shell 可以單獨覆寫一個值；缺少 `.env` 時，只要環境變數有必要的值也能啟動。
+
+| 變數 | 預設 | 說明 |
+| --- | --- | --- |
+| `DISCORD_BOT_TOKEN` | 必填 | 機器人 token；只要求 `Guilds` 與 `Voice States` intent，不需要 privileged intent |
+| `RUSTLINK_PASSWORD` | 必填 | 節點設定檔的 `password` |
+| `RUSTLINK_URL` | `http://127.0.0.1:2333` | 節點位址 |
+| `DISCORD_GUILD_IDS` | 空 | 只在這些伺服器註冊指令（逗號分隔）；空表示機器人所在的每個伺服器 |
+| `BOT_DEFAULT_VOLUME` | `100` | 起始音量 0–200 |
+| `BOT_MAX_QUEUE` | `100` | 每個伺服器佇列上限 1–1000 |
+| `BOT_IDLE_LEAVE_SECONDS` | `120` | 沒有歌可播多久後離開語音頻道；`0` 表示留到 `/stop` |
+
+| 指令 | 行為 |
+| --- | --- |
+| `/play query` | 連結、影片 ID 或關鍵字。普通文字會自動變成 `ytsearch:`（Rustlink 對無法分類的文字回 `empty`），搜尋只加入最相符的一首；播放清單整份加入，超過佇列上限的部分略過並告知 |
+| `/skip`、`/pause`、`/resume`、`/stop` | 控制播放；`/stop` 清空佇列並離開頻道。這些指令要求使用者與機器人在同一個語音頻道 |
+| `/queue`、`/nowplaying` | 顯示佇列（前 10 首）與目前曲目的播放位置 |
+| `/volume level` | 0–200，同樣要求與機器人在同一個語音頻道；Discord 傳來的選項只保留字串，所以 `level` 以文字讀入並驗證 |
+
+設計上值得注意的幾點：
+
+- **自動接歌**：收到 `track.ended` 且原因是 `finished` 或 `load_failed` 才換下一首，而且曲目必須與目前播放的相同；被 `/skip` 取代（`replaced`）或 `/stop` 的曲目不會重複推進佇列。無法開始播放的曲目會被略過，繼續下一首。
+- **換頻道**：機器人正在別的頻道播放時，`/play` 會拒絕；閒置時才會被叫到新的頻道。
+- **被移出頻道**：收到機器人自己的語音狀態變成沒有頻道（被人踢出或 Discord 以 4014 關閉）時，清空該伺服器的佇列並釋放 Rustlink 的播放器，下一次 `/play` 會重新加入。
+- **上次留下的語音狀態**：啟動時若發現機器人還待在某個語音頻道（上次沒有正常結束），會先送出離開，避免 Rustlink 沒有對應的語音連線。
+- **同一個 token 只能跑一個**：兩個程式用同一個 bot token 時，會同時回應同一個指令；此外 `set_guild_commands` 會**取代**該伺服器的整組指令。
 
 ## 生命週期
 
