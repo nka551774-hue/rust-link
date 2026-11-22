@@ -2377,7 +2377,6 @@ dependencies = [
 name = "rustlink-source"
 version = "0.5.0"
 dependencies = [
- "log",
  "rustlink-config",
  "rustlink-protocol",
  "serde",

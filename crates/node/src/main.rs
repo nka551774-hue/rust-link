@@ -166,21 +166,6 @@ fn run() -> Result<(), String> {
     }
     log_startup(&config, path.as_deref());
     let sources = Arc::new(rustlink_source::Service::new(config.clone()));
-    if config.youtube_native && config.youtube_oauth {
-        // Checked on every start: a valid stored sign-in is used silently, and
-        // a missing or revoked one shows a new code.
-        let path = std::path::Path::new(&config.tools_directory).join("youtube-oauth.json");
-        let colored = color.allowed() && format != logging::Format::Json;
-        rustlink_source::oauth::start(sources.agent().clone(), path, move |prompt| {
-            print!("{}", sign_in_banner(prompt, colored));
-            log::warn!(
-                "youtube sign-in needed: open {} and enter {} within {} minutes",
-                prompt.url,
-                prompt.code,
-                prompt.expires_in.as_secs() / 60
-            );
-        });
-    }
     let engine = rustlink_audio::Engine {
         ffmpeg: Some(config.ffmpeg.clone()).filter(|program| !program.trim().is_empty()),
         in_process: config.in_process_audio,
@@ -399,25 +384,6 @@ fn source_summary(config: &Config) -> String {
 
 /// Reads the configured level. The configuration is validated when it is
 /// loaded, so anything unexpected falls back to info.
-/// A box that stands out from the log lines around it, because the operator
-/// has to act on it. Text is kept ASCII-width so the frame lines up.
-fn sign_in_banner(prompt: &rustlink_source::oauth::Prompt, colored: bool) -> String {
-    let (on, code_on, off) =
-        if colored { ("\x1b[1;33m", "\x1b[1;30;43m", "\x1b[0m") } else { ("", "", "") };
-    let rule = "=".repeat(62);
-    format!(
-        "\n{on}{rule}\n  YouTube sign-in required / YouTube 需要授權\n{rule}{off}\n\
-         \n  1. Open   / 開啟:  {on}{url}{off}\n\
-         \n  2. Enter  / 輸入:  {code_on} {code} {off}\n\
-         \n  Use a secondary Google account. The code expires in {minutes} minutes.\n\
-         \x20 建議使用分身帳號，授權碼 {minutes} 分鐘內有效，過期會自動換新。\n\
-         \n{on}{rule}{off}\n\n",
-        url = prompt.url,
-        code = prompt.code,
-        minutes = prompt.expires_in.as_secs() / 60,
-    )
-}
-
 fn level(name: &str) -> LevelFilter {
     match name.trim().to_ascii_lowercase().as_str() {
         "debug" => LevelFilter::Debug,

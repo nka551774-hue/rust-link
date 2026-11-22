@@ -23,7 +23,6 @@ youtubeMusicEndpoint: https://music.youtube.com
 youtubeClientVersion: ""                   # empty uses the version the node ships with
 youtubePoToken: ""                         # proof-of-origin token; without it some networks stop after ~1 minute
 youtubeVisitorData: ""
-youtubeOauth: true                         # sign the TV client in; the first start shows a code to enter at google.com/device
 
 # --- SoundCloud ---
 soundcloudNative: true                     # native public API client

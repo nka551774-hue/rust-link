@@ -55,9 +55,8 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
         }
     }
 
-    let flags: [(&str, FlagField); 8] = [
+    let flags: [(&str, FlagField); 7] = [
         ("RUSTLINK_YOUTUBE_NATIVE", |c| &mut c.youtube_native),
-        ("RUSTLINK_YOUTUBE_OAUTH", |c| &mut c.youtube_oauth),
         ("RUSTLINK_SOUNDCLOUD", |c| &mut c.soundcloud_native),
         ("RUSTLINK_AUTO_DOWNLOAD", |c| &mut c.auto_download),
         ("RUSTLINK_IN_PROCESS_AUDIO", |c| &mut c.in_process_audio),

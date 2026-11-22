@@ -61,9 +61,6 @@ pub struct Config {
     pub youtube_client_version: String,
     pub youtube_po_token: String,
     pub youtube_visitor_data: String,
-    /// Sign the TV client in with a Google account through a device code the
-    /// node shows at startup. The refresh token is kept in `tools_directory`.
-    pub youtube_oauth: bool,
 
     pub soundcloud_native: bool,
     pub soundcloud_api_endpoint: String,
@@ -224,7 +221,6 @@ impl Default for Config {
             youtube_client_version: String::new(),
             youtube_po_token: String::new(),
             youtube_visitor_data: String::new(),
-            youtube_oauth: true,
             soundcloud_native: true,
             soundcloud_api_endpoint: "https://api-v2.soundcloud.com".into(),
             soundcloud_web_endpoint: "https://soundcloud.com".into(),

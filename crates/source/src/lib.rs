@@ -16,7 +16,6 @@ pub mod innertube;
 pub mod matching;
 mod media;
 pub mod netguard;
-pub mod oauth;
 pub mod probe;
 #[cfg(test)]
 mod test_http;
