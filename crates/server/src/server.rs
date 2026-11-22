@@ -165,7 +165,9 @@ fn session_key(path: &str) -> &str {
     path.split_once("/sessions/")
         .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
         .filter(|id| !id.is_empty())
-        .map_or("node", |id| &id[..id.len().min(64)])
+        // Cut on a character boundary: a raw multi-byte character in the path
+        // would make a byte cut panic.
+        .map_or("node", |id| id.char_indices().nth(64).map_or(id, |(end, _)| &id[..end]))
 }
 
 pub struct Server {
@@ -1658,6 +1660,8 @@ mod tests {
         assert_eq!(session_key("/api/v1/sessions/"), "node");
         let long = format!("/api/v1/sessions/{}/players/1", "x".repeat(500));
         assert_eq!(session_key(&long).len(), 64, "an invented key stays short");
+        let wide = format!("/api/v1/sessions/{}é/players/1", "a".repeat(63));
+        assert_eq!(session_key(&wide), format!("{}é", "a".repeat(63)), "cut by characters");
     }
 
     #[test]
