@@ -202,6 +202,13 @@ impl FilterSet {
         names
     }
 
+    /// How many seconds of source go into one second of output: above one the
+    /// track plays faster, below one slower. Pitch does not appear because the
+    /// graph undoes its effect on length, so only speed and rate count.
+    pub fn tempo_factor(&self) -> f64 {
+        self.time.map_or(1.0, |time| time.speed * time.rate)
+    }
+
     /// Renders the FFmpeg filter graph.
     ///
     /// The node order is fixed, so the same request always produces the same
@@ -631,6 +638,17 @@ mod tests {
         assert_eq!(filters.tempo(), 1.5);
         assert!(filters.render_ffmpeg().contains("asetrate=72000.00000000"));
         assert!(filters.render_ffmpeg().contains("atempo=1.00000000"));
+    }
+
+    #[test]
+    fn the_tempo_factor_is_speed_times_rate_and_ignores_pitch() {
+        assert_eq!(set(json!({})).tempo_factor(), 1.0);
+        assert_eq!(set(json!({"timescale": {"speed": 2.0}})).tempo_factor(), 2.0);
+        assert_eq!(
+            set(json!({"timescale": {"speed": 1.5, "pitch": 3.0, "rate": 2.0}})).tempo_factor(),
+            3.0
+        );
+        assert_eq!(set(json!({"timescale": {"pitch": 1.5}})).tempo_factor(), 1.0);
     }
 
     #[test]

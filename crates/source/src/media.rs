@@ -66,14 +66,16 @@ struct Response {
     validator: Option<String>,
 }
 
-fn request_media(
+/// Sends one request, without following a redirect.
+fn send_once(
     agent: &ureq::Agent,
     url: &str,
     headers: &std::collections::BTreeMap<String, String>,
+    provider_headers: bool,
     offset: Option<i64>,
     range: MediaRange,
     validator: Option<&str>,
-) -> Result<Response, SourceError> {
+) -> Result<ureq::http::Response<ureq::Body>, SourceError> {
     netguard::validate_url(url)?;
     // Ureq appends headers instead of replacing them. Select the provider's
     // identity once so CDN requests cannot carry both Rustlink and client UAs.
@@ -94,6 +96,11 @@ fn request_media(
             continue;
         }
         if name.eq_ignore_ascii_case("User-Agent") {
+            continue;
+        }
+        // What a provider supplied (a cookie, an authorization) was meant for
+        // the host it named, not for wherever a redirect leads.
+        if !provider_headers {
             continue;
         }
         // Playback owns the requested offset. Provider headers must not pin a
@@ -136,10 +143,78 @@ fn request_media(
     } else {
         config.timeout_global(Some(budget))
     };
-    let response = config
+    config
         .build()
         .call()
-        .map_err(|error| SourceError::Http(format!("{url} could not be reached: {error}")))?;
+        .map_err(|error| SourceError::Http(format!("{url} {UNREACHABLE}: {error}")))
+}
+
+/// How many redirects one request follows before giving up.
+const MAX_REDIRECTS: usize = 5;
+
+/// What the error for a request that got no answer says. It is the one `Http`
+/// failure worth asking again about, which [`transient`] looks for.
+const UNREACHABLE: &str = "could not be reached";
+
+/// Whether asking again for the same bytes could work: a rate limit, a server
+/// fault, or a server that could not be reached at all. An expired URL (403,
+/// 404, 410) will not recover by repeating the request.
+fn transient(error: &SourceError) -> bool {
+    match error {
+        SourceError::Media { status } => *status == 429 || *status >= 500,
+        SourceError::Http(message) => message.contains(UNREACHABLE),
+        _ => false,
+    }
+}
+
+fn request_media(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    offset: Option<i64>,
+    range: MediaRange,
+    validator: Option<&str>,
+) -> Result<Response, SourceError> {
+    let mut current = url.to_string();
+    let mut provider_headers = true;
+    let mut hops = 0;
+    // Podcasts, file hosts and short links answer with a redirect to the real
+    // file. The agent does not follow them itself, because each hop is a new URL
+    // that has to be checked: it must still be HTTP(S) without credentials, must
+    // not step down from HTTPS, and its addresses go through the same guarded
+    // resolver as the first.
+    let response = loop {
+        let response =
+            send_once(agent, &current, headers, provider_headers, offset, range, validator)?;
+        let status = response.status().as_u16();
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            break response;
+        }
+        hops += 1;
+        if hops > MAX_REDIRECTS {
+            return Err(SourceError::Http("media URL redirected too many times".into()));
+        }
+        let location = response
+            .headers()
+            .get("Location")
+            .and_then(|value| value.to_str().ok())
+            .ok_or(SourceError::Media { status })?;
+        let base =
+            url::Url::parse(&current).map_err(|error| SourceError::Url(error.to_string()))?;
+        let next = base
+            .join(location)
+            .map_err(|_| SourceError::Url("media redirect names an invalid URL".into()))?;
+        netguard::validate_url(next.as_str())?;
+        if base.scheme() == "https" && next.scheme() != "https" {
+            return Err(SourceError::Http("media redirect would step down to plain HTTP".into()));
+        }
+        if (next.host_str(), next.port_or_known_default())
+            != (base.host_str(), base.port_or_known_default())
+        {
+            provider_headers = false;
+        }
+        current = next.to_string();
+    };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(SourceError::Media { status });
@@ -356,6 +431,24 @@ impl MediaBody {
         self.response_start = self.offset;
         Ok(())
     }
+
+    /// Resumes, asking again when the failure is one a repeat can cure. A song
+    /// read in 128 KiB pieces makes some thirty requests, and a single 503 or
+    /// dropped connection among them must cost a short wait, not the track. The
+    /// budget is the one a stalled read already draws on, and it refills with
+    /// every byte delivered.
+    fn resume_with_retries(&mut self) -> Result<(), SourceError> {
+        loop {
+            match self.resume() {
+                Ok(()) => return Ok(()),
+                Err(error) if transient(&error) && self.attempts > 0 => {
+                    self.attempts -= 1;
+                    std::thread::sleep(RESUME_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 impl Read for MediaBody {
@@ -399,7 +492,7 @@ impl Read for MediaBody {
                 self.attempts -= 1;
                 std::thread::sleep(RESUME_DELAY);
             }
-            if let Err(resume_error) = self.resume() {
+            if let Err(resume_error) = self.resume_with_retries() {
                 return Err(io::Error::other(resume_error));
             }
         }

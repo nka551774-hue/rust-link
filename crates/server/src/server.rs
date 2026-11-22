@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use crate::cpu::Cpu;
 use crate::player::{Deps, Player};
-use crate::ratelimit::Limiter;
+use crate::ratelimit::Keyed;
 use crate::session::Session;
 use crate::webhook::{self, Client};
 use crate::{Counters, APIVERSION, VERSION};
@@ -60,49 +60,112 @@ pub struct Dependencies {
     pub webhook: Option<Client>,
 }
 
-/// One token bucket per route, so a client that hammers one route does not
-/// spend the allowance of another.
-struct Limits {
-    buckets: HashMap<&'static str, Limiter>,
-}
+/// How many distinct sessions or addresses each limiter tracks. The keys can be
+/// invented by a caller, so the table is bounded.
+const MAX_KEYS: usize = 10_000;
 
-/// Per-route request budgets, shared across authenticated clients.
-const ROUTE_LIMITS: &[(&str, f64, usize)] = &[
-    ("version", 2.0, 5),
-    ("healthz", 5.0, 10),
-    ("info", 2.0, 5),
-    ("stats", 1.0, 3),
-    ("metrics", 1.0, 2),
+/// Budgets for authenticated requests as `(route, requests per second, burst)`.
+/// Each session spends its own bucket for each route, so one busy bot cannot
+/// starve another and an outsider cannot spend either. The player routes are the
+/// ones a bot in many servers calls constantly, so their budgets are generous;
+/// the limit is there to stop a runaway client, not to ration a healthy one.
+const AUTHENTICATED_LIMITS: &[(&str, f64, usize)] = &[
+    ("info", 5.0, 10),
+    ("stats", 2.0, 5),
+    ("metrics", 2.0, 4),
     ("websocket", 1.0, 3),
-    ("resolve_tracks", 2.0, 4),
-    ("inspect_track", 5.0, 10),
-    ("inspect_tracks", 1.0, 2),
-    ("lyrics", 2.0, 4),
-    ("player_lyrics", 2.0, 4),
+    ("resolve_tracks", 10.0, 20),
+    ("inspect_track", 20.0, 40),
+    ("inspect_tracks", 5.0, 10),
+    ("lyrics", 5.0, 10),
+    ("player_lyrics", 5.0, 10),
     ("update_session", 5.0, 10),
-    ("get_players", 10.0, 15),
-    ("get_player", 10.0, 15),
-    ("update_player", 5.0, 10),
-    ("delete_player", 3.0, 5),
-    ("create_session", 2.0, 5),
-    ("get_session", 10.0, 15),
-    ("delete_session", 3.0, 5),
+    ("get_players", 20.0, 40),
+    ("get_player", 20.0, 40),
+    ("update_player", 50.0, 100),
+    ("delete_player", 20.0, 40),
+    ("create_session", 5.0, 10),
+    ("get_session", 20.0, 40),
+    ("delete_session", 10.0, 20),
     ("root", 2.0, 5),
 ];
 
+/// Budgets for the routes that need no password, per remote address.
+const PUBLIC_LIMITS: &[(&str, f64, usize)] = &[("version", 2.0, 5), ("healthz", 5.0, 10)];
+
+/// Failed password checks per remote address. A wrong password is the only thing
+/// an outsider can send that reaches the limiter, so this is what slows a guess
+/// without touching anyone's real allowance.
+const FAILED_LOGINS: (f64, usize) = (2.0, 10);
+
+/// The request limits. Authentication comes first: a request is only counted
+/// against a session's budget once it has proved it may be, so nobody without
+/// the password can use up what a legitimate bot depends on.
+struct Limits {
+    authenticated: HashMap<&'static str, Keyed>,
+    public: HashMap<&'static str, Keyed>,
+    failed_logins: Keyed,
+}
+
 impl Limits {
     fn new() -> Limits {
-        let mut buckets = HashMap::new();
-        for &(name, rate, burst) in ROUTE_LIMITS {
-            buckets.insert(name, Limiter::new(rate, burst));
+        let table = |limits: &[(&'static str, f64, usize)]| {
+            limits
+                .iter()
+                .map(|&(route, rate, burst)| (route, Keyed::new(rate, burst, MAX_KEYS)))
+                .collect()
+        };
+        Limits {
+            authenticated: table(AUTHENTICATED_LIMITS),
+            public: table(PUBLIC_LIMITS),
+            failed_logins: Keyed::new(FAILED_LOGINS.0, FAILED_LOGINS.1, MAX_KEYS),
         }
-        Limits { buckets }
     }
 
-    /// Spends a token for a route, or reports that the route is throttled.
-    fn allow(&self, route: &str) -> bool {
-        self.buckets.get(route).map(|limit| limit.allow()).unwrap_or(true)
+    /// Spends a token of `session`'s budget for a route that needs the password.
+    fn allow_authenticated(&self, route: &str, session: &str) -> bool {
+        self.authenticated.get(route).is_none_or(|limit| limit.allow(session))
     }
+
+    /// Spends a token of the caller's address for a route open to everyone.
+    fn allow_public(&self, route: &str, remote: &str) -> bool {
+        self.public.get(route).is_none_or(|limit| limit.allow(remote))
+    }
+
+    /// Records a wrong password from `remote`, and reports whether it may try again.
+    fn allow_failed_login(&self, remote: &str) -> bool {
+        self.failed_logins.allow(remote)
+    }
+}
+
+tokio::task_local! {
+    /// The address the request being handled arrived from, set around every
+    /// request so the guards can key a limit on it without every handler
+    /// passing it along.
+    static REMOTE: Option<std::net::IpAddr>;
+}
+
+/// The limit key for the caller: its address, with an IPv6 address reduced to
+/// its /64, because one host usually controls the whole prefix.
+fn remote_key() -> String {
+    match REMOTE.try_with(|remote| *remote).ok().flatten() {
+        Some(std::net::IpAddr::V4(address)) => address.to_string(),
+        Some(std::net::IpAddr::V6(address)) => {
+            let segments = address.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", segments[0], segments[1], segments[2], segments[3])
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+/// The key a session's budget is kept under: the session ID in the path, or
+/// `node` for a route that is not about one session. Only a caller that has
+/// already authenticated can choose it, and the table is bounded either way.
+fn session_key(path: &str) -> &str {
+    path.split_once("/sessions/")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .filter(|id| !id.is_empty())
+        .map_or("node", |id| &id[..id.len().min(64)])
 }
 
 pub struct Server {
@@ -349,7 +412,7 @@ async fn log_request(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip());
     let start = Instant::now();
-    let mut response = next.run(request).await;
+    let mut response = REMOTE.scope(remote, next.run(request)).await;
     if (response.status().is_client_error() || response.status().is_server_error())
         && response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok())
             != Some("application/json")
@@ -388,17 +451,15 @@ impl std::fmt::Display for Remote {
 }
 
 impl Server {
-    /// The rate limit and the password check every protected route starts with.
-    /// The limiter runs first, so a throttled request is refused before
-    /// authentication and a rejected one still spends a token.
+    /// The password check every protected route starts with, and then the rate
+    /// limit. The password comes first, so a request that cannot prove who it is
+    /// never spends a session's allowance: a wrong password is counted against
+    /// the sender's address instead, which is what slows guessing down.
     // A refusal is a whole response, which the lint counts as a large error.
     // Boxing it would only move that cost onto every route that uses `?`, and
     // the response is the type axum handlers already return.
     #[allow(clippy::result_large_err)]
     fn guard(&self, route: &str, headers: &HeaderMap, path: &str) -> Result<(), Response> {
-        if self.config.ratelimits.enable && !self.limits.allow(route) {
-            return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
-        }
         let given = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -406,8 +467,15 @@ impl Server {
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
             .map(|(_, token)| token)
             .unwrap_or("");
+        let limited = self.config.ratelimits.enable;
         if !same(given.as_bytes(), self.config.password.as_bytes()) {
+            if limited && !self.limits.allow_failed_login(&remote_key()) {
+                return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
+            }
             return Err(self.fail(StatusCode::UNAUTHORIZED, "invalid authorization", path));
+        }
+        if limited && !self.limits.allow_authenticated(route, session_key(path)) {
+            return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
         }
         Ok(())
     }
@@ -416,7 +484,7 @@ impl Server {
     /// the password.
     #[allow(clippy::result_large_err)]
     fn guard_public(&self, route: &str, path: &str) -> Result<(), Response> {
-        if self.config.ratelimits.enable && !self.limits.allow(route) {
+        if self.config.ratelimits.enable && !self.limits.allow_public(route, &remote_key()) {
             return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
         }
         Ok(())
@@ -1580,6 +1648,52 @@ async fn send_frame(sink: &mut SplitSink<WebSocket, Message>, message: Message) 
 mod tests {
     use super::*;
     use rustlink_protocol::Object;
+
+    #[test]
+    fn a_session_budget_is_keyed_by_the_session_in_the_path() {
+        assert_eq!(session_key("/api/v1/sessions/abc123/players/42"), "abc123");
+        assert_eq!(session_key("/api/v1/sessions/abc123"), "abc123");
+        assert_eq!(session_key("/api/v1/sessions"), "node", "creating a session has none yet");
+        assert_eq!(session_key("/api/v1/stats"), "node");
+        assert_eq!(session_key("/api/v1/sessions/"), "node");
+        let long = format!("/api/v1/sessions/{}/players/1", "x".repeat(500));
+        assert_eq!(session_key(&long).len(), 64, "an invented key stays short");
+    }
+
+    #[test]
+    fn the_caller_is_keyed_by_its_address_with_ipv6_reduced_to_its_prefix() {
+        let key = |address: &str| {
+            let address: std::net::IpAddr = address.parse().unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(REMOTE.scope(Some(address), async { remote_key() }))
+        };
+        assert_eq!(key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), key("2001:db8:1:2::1"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        // Outside a request there is no address to key on.
+        assert_eq!(remote_key(), "unknown");
+    }
+
+    #[test]
+    fn budgets_are_spent_per_session_and_failed_logins_have_their_own() {
+        let limits = Limits::new();
+        let burst = AUTHENTICATED_LIMITS.iter().find(|(route, ..)| *route == "stats").unwrap().2;
+        for _ in 0..burst {
+            assert!(limits.allow_authenticated("stats", "session-a"));
+        }
+        assert!(!limits.allow_authenticated("stats", "session-a"), "session-a is spent");
+        assert!(limits.allow_authenticated("stats", "session-b"), "session-b is not");
+        assert!(limits.allow_authenticated("update_player", "session-a"), "another route is not");
+        // Wrong passwords draw on a separate table, so they never touched the above.
+        for _ in 0..FAILED_LOGINS.1 {
+            assert!(limits.allow_failed_login("198.51.100.1"));
+        }
+        assert!(!limits.allow_failed_login("198.51.100.1"));
+        assert!(limits.allow_failed_login("198.51.100.2"));
+        assert!(limits.allow_public("healthz", "198.51.100.1"));
+    }
 
     fn pending_for(session: &Arc<Session>) -> Mutex<Option<mpsc::Receiver<Value>>> {
         Mutex::new(Some(session.take_inbox().expect("session inbox is available")))

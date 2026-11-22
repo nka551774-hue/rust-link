@@ -2,7 +2,7 @@
 use std::future::{pending, Future};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const ALONE_GRACE: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_CAPACITY: usize = 32;
+/// Slots of the command queue that audio frames never take. Speaking and Close
+/// always find room there, however far behind the gateway task is.
+const CONTROL_RESERVE: usize = 4;
 const MAX_RETAINED_PACKET: usize = 4096;
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Probe = Pin<Box<dyn Future<Output = Result<Discovered, VoiceError>> + Send>>;
@@ -35,6 +38,8 @@ pub struct DiscordConnection {
     closed: AtomicBool,
     ping: AtomicI64,
     audio_buffers: Mutex<Vec<Vec<u8>>>,
+    /// Audio frames dropped because the gateway task was behind.
+    dropped_frames: AtomicU64,
 }
 
 enum Command {
@@ -48,12 +53,44 @@ impl DiscordConnection {
         if !self.connected() {
             return Err(VoiceError::NotReady);
         }
-        self.commands.try_send(command).map_err(|error| {
-            if let Command::Audio(packet) = error.into_inner() {
-                self.recycle(packet);
+        let Command::Audio(packet) = command else {
+            // Speaking and Close take the reserved slots, so they only fail when
+            // the gateway task is gone.
+            return self
+                .commands
+                .try_send(command)
+                .map_err(|_| VoiceError::Gateway("voice command queue unavailable".into()));
+        };
+        // A gateway task that is held up (a heartbeat waiting on a stalled TCP
+        // write, say) must cost a few frames, not the track: the frame is
+        // dropped and the player carries on. A task that is really gone shows
+        // as a closed queue below, and a dead connection stops answering its
+        // heartbeat and is closed by the gateway itself.
+        if self.commands.capacity() <= CONTROL_RESERVE {
+            self.drop_frame(packet);
+            return Ok(());
+        }
+        match self.commands.try_send(Command::Audio(packet)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(Command::Audio(packet))) => {
+                self.drop_frame(packet);
+                Ok(())
             }
-            VoiceError::Gateway("voice command queue unavailable".into())
-        })
+            Err(error) => {
+                if let Command::Audio(packet) = error.into_inner() {
+                    self.recycle(packet);
+                }
+                Err(VoiceError::Gateway("voice command queue unavailable".into()))
+            }
+        }
+    }
+
+    fn drop_frame(&self, packet: Vec<u8>) {
+        self.recycle(packet);
+        let dropped = self.dropped_frames.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(500) {
+            log::warn!("voice gateway is behind; audio frames dropped={dropped}");
+        }
     }
 
     fn packet(&self, payload: &[u8]) -> Vec<u8> {
@@ -184,6 +221,7 @@ async fn connect_url(
             closed: AtomicBool::new(false),
             ping: AtomicI64::new(-1),
             audio_buffers: Mutex::new(Vec::with_capacity(COMMAND_CAPACITY)),
+            dropped_frames: AtomicU64::new(0),
         });
         let mut gateway = Gateway {
             stream,

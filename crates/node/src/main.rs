@@ -181,10 +181,7 @@ fn run() -> Result<(), String> {
         rustlink_lyrics::Manager::from_config(&config, sources.agent().clone()).map(Arc::new);
     // A configured webhook gets its worker before the server starts, so it is
     // ready for the first event.
-    let webhook = rustlink_server::webhook::Client::new(
-        &config.webhook,
-        Arc::new(|message: &str, error: &str| logging::fatal(message, error)),
-    );
+    let webhook = rustlink_server::webhook::Client::new(&config.webhook);
     let deps = Dependencies {
         loader: Arc::clone(&sources) as Arc<dyn Loader>,
         engine: playback,

@@ -136,10 +136,68 @@ impl Node {
         session["session_id"].as_str().unwrap().to_owned()
     }
 }
+impl Node {
+    /// A node that keeps its rate limits, which the other tests switch off.
+    fn limited() -> Self {
+        let mut config = Config { password: "test-secret".into(), ..Config::default() };
+        config.ratelimits.enable = true;
+        Self(
+            Server::new(
+                config,
+                Dependencies {
+                    loader: Arc::new(Media),
+                    engine: Arc::new(Media),
+                    voice: Arc::new(Media),
+                    lyrics: None,
+                    webhook: None,
+                },
+            )
+            .unwrap(),
+        )
+    }
+}
 impl Drop for Node {
     fn drop(&mut self) {
         self.0.close();
     }
+}
+
+#[tokio::test]
+async fn wrong_passwords_cannot_spend_the_allowance_of_a_legitimate_client() {
+    let node = Node::limited();
+    // Someone with no password hammers a route the bot also uses.
+    let mut refused = 0;
+    for _ in 0..40 {
+        let (status, _, _) = node.raw("GET", "/api/v1/stats", "Bearer wrong", String::new()).await;
+        match status {
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => assert_eq!(other, StatusCode::UNAUTHORIZED),
+        }
+    }
+    assert!(refused > 0, "guessing the password is slowed down");
+    // The bot's own budget for that route was never touched.
+    let (status, _) = node.request("GET", "/api/v1/stats", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn each_session_has_its_own_request_budget() {
+    let node = Node::limited();
+    let busy = node.session().await;
+    let quiet = node.session().await;
+    let mut stopped = false;
+    for _ in 0..80 {
+        let (status, _) =
+            node.request("GET", &format!("/api/v1/sessions/{busy}/players/1"), Value::Null).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "a runaway session is stopped");
+    let (status, _) =
+        node.request("GET", &format!("/api/v1/sessions/{quiet}/players/1"), Value::Null).await;
+    assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "another session is not affected");
 }
 
 #[tokio::test]

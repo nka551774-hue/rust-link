@@ -412,21 +412,35 @@ impl Service {
         let (mut body, size) = self.fetch(identifier, &Default::default())?;
         let mut head = Vec::new();
         let mut chunk = vec![0u8; probe::FIRST_PROBE];
+        // Only a file with a declared length can be read on for its index: a
+        // live stream has none and never ends, so the first window is all it
+        // gets. A file can keep its index at the end (an M4A written without
+        // "fast start") or give the length of an Ogg only on its last page, and
+        // both are found by reading on, up to MAX_PROBE.
+        // shortcut: a file whose index lies past MAX_PROBE is still not found;
+        // upgrade by asking for its tail with a Range request.
+        let sized = size > 0;
+        // The buffer is probed again only once it has doubled, so a long read
+        // does not parse the same leading bytes thousands of times.
+        let mut next_probe = probe::FIRST_PROBE;
         while head.len() < probe::MAX_PROBE {
             let read =
                 body.read(&mut chunk).map_err(|error| SourceError::Http(error.to_string()))?;
-            if read == 0 {
-                break;
-            }
+            let ended = read == 0;
             head.extend_from_slice(&chunk[..read]);
-            // A container whose index sits at the end states nothing in its
-            // head, so a little more is read before giving up on it. Reading
-            // past what a header needs would waste the listener's time.
+            if !ended && head.len() > probe::FIRST_PROBE && head.len() < next_probe {
+                continue;
+            }
             let found = probe::probe(&head, size);
+            next_probe = head.len().saturating_mul(2);
             if found.audio && (!found.title.is_empty() || found.duration_ms > 0) {
                 break;
             }
-            if head.len() >= probe::FIRST_PROBE {
+            if ended {
+                break;
+            }
+            let may_have_more = sized && (found.audio || probe::may_index_later(&head));
+            if head.len() >= probe::FIRST_PROBE && !may_have_more {
                 break;
             }
         }

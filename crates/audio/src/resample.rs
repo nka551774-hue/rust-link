@@ -12,9 +12,17 @@
 
 use crate::dsp::CHANNELS;
 
-/// Taps on each side of the interpolation point. Sixteen is enough that the
-/// error sits below the noise floor of the Opus encoder that follows.
+/// Taps of the window when the rate is not being lowered. Sixteen is enough that
+/// the error sits below the noise floor of the Opus encoder that follows.
 const TAPS: usize = 16;
+
+/// The widest half-window a resampler may use. Lowering the rate narrows the
+/// filter's cutoff, and a narrower cutoff needs proportionally more taps to keep
+/// its stopband; this bounds that at a ratio of 32 to 1.
+const MAX_HALF: usize = 256;
+
+/// The bytes a weight table may take, which bounds how many phases it holds.
+const MAX_TABLE_BYTES: usize = 128 * 1024;
 
 /// The longest period a weight table may repeat over. A table is 128 bytes per
 /// phase, so this bounds one resampler at 128 KiB.
@@ -30,6 +38,13 @@ pub struct SincResampler {
     input_frames: u64,
     output_frames: u64,
     finished: bool,
+    /// Half the window, in input frames. It is `TAPS / 2` until the rate is
+    /// lowered, and then grows with the ratio so that the filter keeps the same
+    /// number of sinc lobes after its cutoff has been narrowed.
+    half: usize,
+    /// The weights of the frame being produced, kept between frames so that
+    /// producing one does not allocate.
+    scratch: Vec<f64>,
     /// Which row of the weight table the next output frame reads.
     phase: usize,
     /// The weights of every phase, when the ratio repeats them.
@@ -43,18 +58,21 @@ impl SincResampler {
     pub fn new(ratio: f64) -> Self {
         let ratio = ratio.max(1e-6);
         let cutoff = if ratio > 1.0 { 1.0 / ratio } else { 1.0 };
+        let half = half_window(cutoff);
         SincResampler {
             ratio,
+            half,
+            scratch: Vec::new(),
             // Zero history puts the first source sample at the first output
             // position instead of dropping half a filter window from the song.
-            position: (TAPS / 2) as f64,
+            position: half as f64,
             input_frames: 0,
             output_frames: 0,
             finished: false,
             phase: 0,
             // The unity ratio has its own path that needs no weights at all.
-            phases: if ratio == 1.0 { None } else { Phases::new(ratio, cutoff) },
-            buffer: vec![0.0; TAPS / 2 * CHANNELS],
+            phases: if ratio == 1.0 { None } else { Phases::new(ratio, cutoff, half) },
+            buffer: vec![0.0; half * CHANNELS],
         }
     }
 
@@ -78,7 +96,7 @@ impl SincResampler {
     pub fn finish(&mut self) {
         if !self.finished {
             self.finished = true;
-            self.buffer.resize(self.buffer.len() + (TAPS / 2 + 1) * CHANNELS, 0.0);
+            self.buffer.resize(self.buffer.len() + (self.half + 1) * CHANNELS, 0.0);
         }
     }
 
@@ -98,7 +116,7 @@ impl SincResampler {
         }
         let frames = self.buffer.len() / CHANNELS;
         // floor(position) + half_window + 1 must fit in the input buffer.
-        ((frames as f64 - (TAPS / 2) as f64 - self.position) / self.ratio).ceil().max(0.0) as usize
+        ((frames as f64 - self.half as f64 - self.position) / self.ratio).ceil().max(0.0) as usize
     }
 
     /// Produces up to `limit` output frames, appending them to `out`.
@@ -125,9 +143,9 @@ impl SincResampler {
         let frames = self.buffer.len() / CHANNELS;
         // The same window rule the filtered path uses, so both report the same
         // number of frames for the same input: the last frame that can be
-        // produced has TAPS/2 frames ahead of it.
+        // produced has half a window of frames ahead of it.
         let centre = self.position as usize;
-        let count = limit.min(frames.saturating_sub(TAPS / 2).saturating_sub(centre));
+        let count = limit.min(frames.saturating_sub(self.half).saturating_sub(centre));
         if count == 0 {
             return 0;
         }
@@ -146,18 +164,18 @@ impl SincResampler {
         // Downsampling needs the filter narrowed to the new Nyquist, or the
         // content above it folds back as aliasing.
         let cutoff = if self.ratio > 1.0 { 1.0 / self.ratio } else { 1.0 };
+        let mut weights = std::mem::take(&mut self.scratch);
         while produced < limit {
             let centre = self.position.floor() as usize;
-            let start = centre + 1 - TAPS / 2;
-            let end = centre + TAPS / 2 + 1;
+            let start = centre + 1 - self.half;
+            let end = centre + self.half + 1;
             if end > frames {
                 break;
             }
             // The filter weights depend on the read position, not on the
-            // channel, so they are worked out once and used for both. The
-            // window is exactly TAPS wide, which is what lets them live in an
-            // array.
-            let mut weights = [0.0f64; TAPS];
+            // channel, so they are worked out once and used for both.
+            let width = 2 * self.half;
+            weights.resize(width, 0.0);
             let fraction = self.position.fract();
             // The table's rows are indexed by the phase the read position is
             // expected to be on, and a ratio that repeats is what keeps a
@@ -172,14 +190,14 @@ impl SincResampler {
                 .filter(|phases| (fraction - phases.fractions[self.phase]).abs() < 1e-3);
             let weight = match row {
                 Some(phases) => {
-                    let base = self.phase * TAPS;
-                    weights.copy_from_slice(&phases.weights[base..base + TAPS]);
+                    let base = self.phase * width;
+                    weights.copy_from_slice(&phases.weights[base..base + width]);
                     phases.sums[self.phase]
                 }
                 None => {
                     let mut weight = 0.0f64;
                     for (tap_index, w) in weights.iter_mut().enumerate() {
-                        *w = tap(fraction, tap_offset(tap_index), cutoff);
+                        *w = tap(fraction, tap_offset(tap_index, self.half), cutoff);
                         weight += *w;
                     }
                     weight
@@ -207,6 +225,7 @@ impl SincResampler {
             self.position += self.ratio;
             produced += 1;
         }
+        self.scratch = weights;
         produced
     }
 
@@ -214,7 +233,7 @@ impl SincResampler {
     /// again because the filter only looks half a window back.
     fn compact(&mut self) {
         // Everything before the next read position's window is never read again.
-        let keep_from = (self.position.floor() as usize).saturating_sub(TAPS / 2 + 1);
+        let keep_from = (self.position.floor() as usize).saturating_sub(self.half + 1);
         // position is relative to the current buffer. Mixing an absolute
         // consumed count into it retained progressively more audio on long runs.
         if keep_from > 4096 {
@@ -241,7 +260,7 @@ struct Phases {
     /// The fractional read position of each row, which is what says whether a
     /// row still matches the position it is being read for.
     fractions: Vec<f64>,
-    /// `period` sets of `TAPS` weights, in the order the taps are summed.
+    /// `period` sets of `2 * half` weights, in the order the taps are summed.
     weights: Vec<f64>,
     /// The sum of each set, which normalises it.
     sums: Vec<f64>,
@@ -250,20 +269,23 @@ struct Phases {
 impl Phases {
     /// Builds the table for `ratio`, or nothing when the fractional positions
     /// do not come round within a period worth tabulating.
-    fn new(ratio: f64, cutoff: f64) -> Option<Phases> {
-        let period = (1..=MAX_PHASES).find(|period| {
+    fn new(ratio: f64, cutoff: f64, half: usize) -> Option<Phases> {
+        let width = 2 * half;
+        // A wider window means a bigger row, so fewer rows fit in the budget.
+        let max_phases = (MAX_TABLE_BYTES / (width * 8)).clamp(1, MAX_PHASES);
+        let period = (1..=max_phases).find(|period| {
             let turns = ratio * *period as f64;
             (turns - turns.round()).abs() < 1e-9
         })?;
         let mut fractions = Vec::with_capacity(period);
-        let mut weights = Vec::with_capacity(period * TAPS);
+        let mut weights = Vec::with_capacity(period * width);
         let mut sums = Vec::with_capacity(period);
         for phase in 0..period {
             let fraction = (phase as f64 * ratio).fract();
             fractions.push(fraction);
             let mut sum = 0.0f64;
-            for tap_index in 0..TAPS {
-                let w = tap(fraction, tap_offset(tap_index), cutoff);
+            for tap_index in 0..width {
+                let w = tap(fraction, tap_offset(tap_index, half), cutoff);
                 weights.push(w);
                 sum += w;
             }
@@ -296,8 +318,17 @@ fn window(x: f64) -> f64 {
 /// Where the tap at `tap_index` sits relative to the read position, in input
 /// frames. The taps run from half a window behind the read position to half a
 /// window ahead of it.
-fn tap_offset(tap_index: usize) -> i64 {
-    tap_index as i64 + 1 - (TAPS / 2) as i64
+fn tap_offset(tap_index: usize, half: usize) -> i64 {
+    tap_index as i64 + 1 - half as i64
+}
+
+/// Half the window for a filter whose cutoff is `cutoff` of the input's Nyquist
+/// frequency. The window is `TAPS / 2` input frames while the rate is not being
+/// lowered, and `1 / cutoff` times that when it is: narrowing the cutoff
+/// stretches every sinc lobe by the same factor, so a fixed number of taps would
+/// hold fewer lobes and let the content above the new Nyquist frequency through.
+fn half_window(cutoff: f64) -> usize {
+    (((TAPS / 2) as f64 / cutoff).ceil() as usize).clamp(TAPS / 2, MAX_HALF)
 }
 
 /// One tap of the windowed sinc: the weight of the input frame `offset` frames
@@ -511,6 +542,54 @@ pub fn ratio_for(input_rate: u32, pitch: f64, rate: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// The level of a tone after resampling, relative to what went in. `ratio`
+    /// is input frames per output frame; the tone is `hertz` at `input_rate`.
+    fn tone_gain(input_rate: f64, ratio: f64, hertz: f64) -> f64 {
+        let frames = 48_000;
+        let mut input = Vec::with_capacity(frames * CHANNELS);
+        for n in 0..frames {
+            let value = (2.0 * std::f64::consts::PI * hertz * n as f64 / input_rate).sin() as f32;
+            input.extend([0.5 * value; CHANNELS]);
+        }
+        let mut resampler = SincResampler::new(ratio);
+        resampler.push(&input);
+        resampler.finish();
+        let mut out = Vec::new();
+        while !resampler.is_drained() && resampler.produce(4096, &mut out) > 0 {}
+        let rms = |samples: &[f32]| {
+            (samples.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / samples.len() as f64)
+                .sqrt()
+        };
+        // The ends hold the filter's start-up and tail, which say nothing about it.
+        let margin = 2000 * CHANNELS;
+        rms(&out[margin..out.len() - margin]) / rms(&input[margin..input.len() - margin])
+    }
+
+    #[test]
+    fn lowering_the_rate_removes_what_lies_above_the_new_nyquist_frequency() {
+        // 192 kHz down to 48 kHz: a 40 kHz tone is far above the 24 kHz limit and
+        // would fold down to 8 kHz if it got through. A filter that kept the
+        // same sixteen taps after narrowing its cutoff let a good part of it by.
+        let stopband = tone_gain(192_000.0, 4.0, 40_000.0);
+        assert!(stopband < 0.001, "40 kHz came through at {stopband:.4} (-60 dB is 0.001)");
+        let passband = tone_gain(192_000.0, 4.0, 1_000.0);
+        assert!((0.94..1.06).contains(&passband), "1 kHz changed level to {passband:.4}");
+        // The common 96 kHz source. A window this short has a wide transition
+        // band, so the tone is placed well past it rather than just above 24 kHz.
+        let stopband = tone_gain(96_000.0, 2.0, 44_000.0);
+        assert!(stopband < 0.001, "44 kHz came through at {stopband:.4}");
+        let passband = tone_gain(96_000.0, 2.0, 10_000.0);
+        assert!((0.94..1.06).contains(&passband), "10 kHz changed level to {passband:.4}");
+    }
+
+    #[test]
+    fn the_window_grows_with_the_ratio_and_stays_bounded() {
+        assert_eq!(half_window(1.0), TAPS / 2, "not lowering the rate keeps the window");
+        assert_eq!(half_window(0.5), TAPS, "twice the ratio, twice the window");
+        assert_eq!(half_window(0.25), TAPS * 2);
+        assert_eq!(half_window(1e-6), MAX_HALF, "an extreme ratio cannot grow it without bound");
+    }
+
     fn tone(rate: f64, samples: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(samples * CHANNELS);
         for i in 0..samples {
@@ -562,7 +641,7 @@ mod tests {
         // 44.1 kHz is the rate the table exists for: its fractional read
         // positions come round every 160 output frames.
         let ratio = 44_100.0 / 48_000.0;
-        let table = Phases::new(ratio, 1.0).expect("44100 is a ratio of whole numbers");
+        let table = Phases::new(ratio, 1.0, TAPS / 2).expect("44100 is a ratio of whole numbers");
         assert_eq!(table.period, 160);
 
         let mut tabled = SincResampler::new(ratio);
@@ -586,7 +665,7 @@ mod tests {
     fn a_ratio_with_no_short_period_has_no_weight_table() {
         // 0.9173 is 9173/10000, whose period is far longer than a table is
         // worth, so its weights are worked out frame by frame.
-        assert!(Phases::new(0.9173, 1.0).is_none());
+        assert!(Phases::new(0.9173, 1.0, TAPS / 2).is_none());
     }
 
     #[test]
@@ -595,7 +674,10 @@ mod tests {
         resampler.push(&tone(200.0, 8192));
         let mut out = Vec::new();
         let produced = resampler.produce(8192, &mut out);
-        assert!((produced as i64 - 4092).abs() <= 2, "produced {produced}");
+        // Half of each side of the window is held back as lookahead until the
+        // stream ends: 16 input frames at this ratio, so 8 fewer output frames
+        // than the whole of the input would give.
+        assert!((produced as i64 - 4088).abs() <= 2, "produced {produced}");
     }
 
     #[test]

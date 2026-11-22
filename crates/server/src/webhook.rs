@@ -3,9 +3,15 @@
 //! A Discord webhook URL receives an embed, which is what a Discord channel
 //! expects; any other endpoint receives a scrubbed event as JSON. Delivery runs
 //! on one background thread so a slow endpoint never blocks the player that
-//! produced the event, and a delivery that cannot be completed stops the node:
-//! a configured endpoint is part of the deployment, not an optional extra.
+//! produced the event.
+//!
+//! The webhook is a side channel for an operator, so it must never be able to
+//! take playback down with it. An endpoint that refuses or rate-limits a post
+//! (Discord answers 429 under load) gets the event retried with a back-off, and
+//! an event that still cannot be delivered, or that finds the queue full, is
+//! dropped with a warning and counted.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -14,12 +20,19 @@ use std::time::Duration;
 use rustlink_config::Webhook as Settings;
 use serde_json::{json, Map, Value};
 
-/// How many events may wait for delivery. An endpoint that cannot keep up is a
-/// failure like any other, so a full queue is fatal rather than a silent drop.
+/// How many events may wait for delivery. Past this the newest are dropped: an
+/// endpoint that has not kept up with what is already queued will not be helped
+/// by waiting for more.
 const QUEUE: usize = 128;
 
 /// How long one delivery attempt may take.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many times one event is posted before it is given up on.
+const MAX_ATTEMPTS: u32 = 4;
+
+/// The longest the worker waits before retrying, whatever the endpoint asks for.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
 /// Periodic node-wide report, rendered as a dedicated Discord embed.
 pub const PLAYER_STATE_TYPE: &str = "node.players";
@@ -29,22 +42,18 @@ const MAX_EMBED_FIELDS: usize = 25;
 /// Discord also caps the combined text of all embeds in one message.
 const MAX_EMBED_TEXT: usize = 6000;
 
-/// Reports a delivery the node cannot recover from. The endpoint is
-/// configuration, so a node that cannot reach it was told to talk to something
-/// that is not listening.
-pub type Fatal = Arc<dyn Fn(&str, &str) + Send + Sync>;
-
 /// Posts events to a single URL. A disabled configuration yields no client at
 /// all, so a caller never has to check whether one is configured.
 pub struct Client {
     url: String,
     queue: SyncSender<Value>,
-    fatal: Fatal,
+    /// Events given up on, whether the queue was full or the endpoint refused.
+    dropped: Arc<AtomicU64>,
 }
 
 impl Client {
     /// Builds a client for the configuration, or none when the webhook is off.
-    pub fn new(settings: &Settings, fatal: Fatal) -> Option<Client> {
+    pub fn new(settings: &Settings) -> Option<Client> {
         let target = settings.url.trim().to_string();
         if !settings.enable || target.is_empty() {
             return None;
@@ -52,24 +61,30 @@ impl Client {
         let discord = is_discord(&target);
         let (queue, inbox) = sync_channel(QUEUE);
         let worker = target.clone();
-        let worker_fatal = Arc::clone(&fatal);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped);
         thread::Builder::new()
             .name("webhook".into())
             .spawn(move || {
                 while let Ok(event) = inbox.recv() {
-                    if let Err(error) = post(&worker, discord, &event) {
-                        worker_fatal("webhook delivery failed", &error);
-                        return;
+                    if let Err(error) = deliver(|| post(&worker, discord, &event), thread::sleep) {
+                        let count = worker_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                        log::warn!("webhook event dropped after {MAX_ATTEMPTS} attempts: {error} dropped={count}");
                     }
                 }
             })
             .ok()?;
-        Some(Client { url: target, queue, fatal })
+        Some(Client { url: target, queue, dropped })
     }
 
     /// The URL events are posted to.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// How many events were given up on so far.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Queues an event for delivery. It returns immediately, so the caller is
@@ -81,18 +96,60 @@ impl Client {
         // request data. `Server::publish` clones the event before calling us,
         // so this cannot change the session's own event contract.
         let event = scrub_event(event);
-        match self.queue.try_send(event) {
-            Ok(()) => {}
+        let reason = match self.queue.try_send(event) {
+            Ok(()) => return,
             // A full queue means the endpoint has not kept up with what the
-            // node has already produced, which no later event can repair.
-            Err(TrySendError::Full(_)) => {
-                (self.fatal)("webhook delivery failed", "event queue is full")
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                (self.fatal)("webhook delivery failed", "delivery worker stopped")
+            // node has already produced; the newest event is the one dropped.
+            Err(TrySendError::Full(_)) => "event queue is full",
+            Err(TrySendError::Disconnected(_)) => "delivery worker stopped",
+        };
+        let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        // One line for the first drop and then one per hundred, so a stalled
+        // endpoint is reported without filling the log.
+        if count == 1 || count.is_multiple_of(100) {
+            log::warn!("webhook event dropped: {reason} dropped={count}");
+        }
+    }
+}
+
+/// Why one post did not go through, and whether posting again could help.
+struct Failure {
+    message: String,
+    retryable: bool,
+    /// How long the endpoint asked to wait, from a 429's `Retry-After`.
+    retry_after: Option<Duration>,
+}
+
+/// How long to wait before attempt `attempt + 1`: what the endpoint asked for,
+/// or 1 s, 2 s, 4 s when it did not, never more than a minute and never zero.
+fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after
+        .unwrap_or_else(|| Duration::from_secs(1u64 << attempt.min(6)))
+        .clamp(Duration::from_millis(250), MAX_RETRY_WAIT)
+}
+
+/// Runs `attempt` until it succeeds, fails for good, or [`MAX_ATTEMPTS`] is
+/// used up. `sleep` is a parameter so the schedule can be tested without waiting.
+fn deliver(
+    mut attempt: impl FnMut() -> Result<(), Failure>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), String> {
+    let mut last = String::new();
+    for tries in 0..MAX_ATTEMPTS {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(failure) => {
+                last = failure.message;
+                if !failure.retryable {
+                    break;
+                }
+                if tries + 1 < MAX_ATTEMPTS {
+                    sleep(backoff(tries, failure.retry_after));
+                }
             }
         }
     }
+    Err(last)
 }
 
 /// Removes fields that must not cross the webhook trust boundary.
@@ -182,7 +239,7 @@ fn find_http_scheme(text: &str) -> Option<usize> {
 
 /// Delivers one scrubbed event. A Discord endpoint gets an embed built from it;
 /// every other endpoint gets the scrubbed event as JSON.
-fn post(url: &str, discord: bool, event: &Value) -> Result<(), String> {
+fn post(url: &str, discord: bool, event: &Value) -> Result<(), Failure> {
     let body = if discord { discord_payload(event) } else { event.clone() };
     let response = ureq::post(url)
         .header("Accept-Encoding", "identity")
@@ -195,13 +252,30 @@ fn post(url: &str, discord: bool, event: &Value) -> Result<(), String> {
         .send_json(&body)
         .map_err(|error| {
             let detail = error.to_string().replace(url, "<redacted webhook URL>");
-            format!("webhook endpoint could not be reached: {detail}")
+            Failure {
+                message: format!("webhook endpoint could not be reached: {detail}"),
+                retryable: true,
+                retry_after: None,
+            }
         })?;
     let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(format!("webhook answered {status}"));
+    if (200..300).contains(&status) {
+        return Ok(());
     }
-    Ok(())
+    // A rate limit and a server fault may pass; any other refusal (a deleted
+    // webhook, a bad payload) will be refused again, so it is not retried.
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| Duration::from_secs_f64(seconds.min(MAX_RETRY_WAIT.as_secs_f64())));
+    Err(Failure {
+        message: format!("webhook answered {status}"),
+        retryable: status == 429 || status >= 500,
+        retry_after,
+    })
 }
 
 /// Whether a URL points at a Discord webhook, which is served an embed instead
@@ -581,13 +655,12 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[test]
     fn failed_delivery_does_not_put_the_webhook_token_in_logs() {
         // An invalid authority fails before any network request is attempted.
         let target = "http://bad host/api/webhooks/123/private-webhook-token?key=private-key";
-        let error = post(target, false, &json!({ "type": "test" })).unwrap_err();
+        let error = post(target, false, &json!({ "type": "test" })).unwrap_err().message;
         assert!(error.contains("could not be reached"));
         assert!(!error.contains("private-webhook-token"));
         assert!(!error.contains("private-key"));
@@ -660,8 +733,11 @@ mod tests {
     #[test]
     fn client_send_queues_the_scrubbed_copy() {
         let (queue, receiver) = sync_channel(1);
-        let fatal: Fatal = Arc::new(|_, _| panic!("webhook queue unexpectedly failed"));
-        let client = Client { url: "https://example.invalid".into(), queue, fatal };
+        let client = Client {
+            url: "https://example.invalid".into(),
+            queue,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
         client.send(json!({
             "type": "track.started",
             "track": {
@@ -673,6 +749,87 @@ mod tests {
         assert!(queued["track"].get("token").is_none());
         assert!(queued["track"]["metadata"].get("uri").is_none());
         assert_eq!(queued["track"]["metadata"]["title"], "A Song");
+        assert_eq!(client.dropped(), 0);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_newest_event_instead_of_stopping_the_node() {
+        let (queue, receiver) = sync_channel(1);
+        let client = Client {
+            url: "https://example.invalid".into(),
+            queue,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        // Nothing reads the queue, as when the endpoint has stalled the worker.
+        client.send(json!({ "type": "track.started" }));
+        client.send(json!({ "type": "track.ended" }));
+        client.send(json!({ "type": "track.ended" }));
+        assert_eq!(client.dropped(), 2, "the two that did not fit are counted, not fatal");
+        assert_eq!(receiver.try_recv().unwrap()["type"], "track.started", "the oldest is kept");
+        drop(receiver);
+        client.send(json!({ "type": "track.started" }));
+        assert_eq!(client.dropped(), 3, "a stopped worker drops too");
+    }
+
+    fn refused(retryable: bool, retry_after: Option<Duration>) -> Failure {
+        Failure { message: "webhook answered 429".into(), retryable, retry_after }
+    }
+
+    #[test]
+    fn a_rate_limited_post_is_retried_after_the_wait_the_endpoint_asked_for() {
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let result = deliver(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(refused(true, Some(Duration::from_secs(7))))
+                } else {
+                    Ok(())
+                }
+            },
+            |wait| waits.push(wait),
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+        assert_eq!(waits, [Duration::from_secs(7), Duration::from_secs(7)]);
+    }
+
+    #[test]
+    fn retries_back_off_and_end_after_the_attempt_limit() {
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let result = deliver(
+            || {
+                calls += 1;
+                Err(refused(true, None))
+            },
+            |wait| waits.push(wait),
+        );
+        assert_eq!(result.unwrap_err(), "webhook answered 429");
+        assert_eq!(calls, MAX_ATTEMPTS);
+        assert_eq!(
+            waits,
+            [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)],
+            "no wait after the last attempt"
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_will_repeat_is_not_retried_and_waits_are_bounded() {
+        let mut calls = 0;
+        let result = deliver(
+            || {
+                calls += 1;
+                Err(refused(false, None))
+            },
+            |_| panic!("a permanent refusal must not wait"),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(backoff(0, Some(Duration::from_secs(3600))), MAX_RETRY_WAIT);
+        assert_eq!(backoff(0, Some(Duration::ZERO)), Duration::from_millis(250));
+        assert_eq!(backoff(40, None), MAX_RETRY_WAIT, "the shift cannot overflow");
     }
 
     #[test]
@@ -833,30 +990,6 @@ mod tests {
             "exception": {"message": "⚠️".repeat(1000)},
         }));
         assert_discord_embed_limits(&payload);
-    }
-
-    #[test]
-    fn queue_backpressure_and_a_stopped_worker_use_the_fatal_contract() {
-        let failures = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&failures);
-        let fatal: Fatal = Arc::new(move |message, error| {
-            recorded.lock().unwrap().push(format!("{message}: {error}"));
-        });
-
-        let (queue, receiver) = sync_channel(0);
-        let full =
-            Client { url: "https://example.invalid".into(), queue, fatal: Arc::clone(&fatal) };
-        full.send(json!({"type":"test"}));
-        drop(receiver);
-
-        let (queue, receiver) = sync_channel(1);
-        drop(receiver);
-        let stopped = Client { url: "https://example.invalid".into(), queue, fatal };
-        stopped.send(json!({"type":"test"}));
-
-        let failures = failures.lock().unwrap();
-        assert!(failures.iter().any(|failure| failure.contains("event queue is full")));
-        assert!(failures.iter().any(|failure| failure.contains("delivery worker stopped")));
     }
 
     #[test]

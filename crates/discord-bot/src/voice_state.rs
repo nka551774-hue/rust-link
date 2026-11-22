@@ -13,6 +13,9 @@ struct Pending {
     token: Option<String>,
     endpoint: Option<String>,
     emitted: Option<(String, String, String, String)>,
+    /// A different server arrived after a pairing was emitted. The next state
+    /// change belongs with that server, not with the one it replaced.
+    late_server: bool,
 }
 
 /// Correlates `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE` for one bot user.
@@ -71,9 +74,15 @@ impl VoiceStatePairer {
                     != Some(update.session_id.as_str())
                     || pending.channel_id.as_ref() != update.channel_id.as_ref();
                 if (pending.session_id.is_some() || pending.channel_id.is_some()) && state_changed {
-                    pending.token = None;
-                    pending.endpoint = None;
+                    // The token on hand belongs to the previous channel, unless
+                    // a newer server arrived first and is the one this state
+                    // was waiting for.
+                    if !pending.late_server {
+                        pending.token = None;
+                        pending.endpoint = None;
+                    }
                     pending.emitted = None;
+                    pending.late_server = false;
                 }
                 pending.session_id = Some(update.session_id.clone());
                 pending.channel_id = update.channel_id.clone();
@@ -89,10 +98,6 @@ impl VoiceStatePairer {
                     return Ok(None);
                 }
                 let pending = self.pending.entry(guild_id.clone()).or_default();
-                // A server update can arrive before the matching state update
-                // when Discord reallocates voice. Never combine the new
-                // server token with the old session/channel pair. Identical
-                // duplicate server events are harmless and remain deduped.
                 // Discord reports an unavailable server with a null endpoint
                 // while it reallocates one. Preserve the current voice state
                 // across that null event and the first usable endpoint after
@@ -103,9 +108,15 @@ impl VoiceStatePairer {
                     && (pending.token.as_deref() != Some(update.token.as_str())
                         || pending.endpoint.as_ref() != update.endpoint.as_ref());
                 if changed_server {
-                    pending.session_id = None;
-                    pending.channel_id = None;
+                    // A server migration (a region change, say) sends a new
+                    // token and endpoint and nothing else: the voice session
+                    // and channel are still the ones in use, so they are kept
+                    // and the connection is rebuilt on the new server. Waiting
+                    // for a state update here would wait forever. If a state
+                    // update for a different channel does follow, it pairs with
+                    // this server (see `late_server`).
                     pending.emitted = None;
+                    pending.late_server = true;
                 }
                 if update.endpoint.is_none() {
                     // An unavailable server invalidates the active connection,
@@ -114,9 +125,6 @@ impl VoiceStatePairer {
                 }
                 pending.token = Some(update.token.clone());
                 pending.endpoint = update.endpoint.clone();
-                if changed_server {
-                    return Ok(None);
-                }
                 self.ready(&guild_id)
             }
             _ => Ok(None),
@@ -272,17 +280,38 @@ mod tests {
     }
 
     #[test]
-    fn a_new_server_event_never_pairs_with_the_previous_voice_session() {
+    fn a_server_migration_keeps_the_voice_session_and_channel() {
         let mut pairer = VoiceStatePairer::new("100").unwrap();
         assert!(pairer.observe(&state()).unwrap().is_none());
         assert!(pairer.observe(&server()).unwrap().is_some());
 
+        // Changing the region sends a new server and no state update at all.
+        let migrated = BotEvent::VoiceServerUpdate(VoiceServerUpdate {
+            guild_id: "200".into(),
+            token: "new-token".into(),
+            endpoint: Some("voice2.discord.media:443".into()),
+        });
+        let voice = pairer.observe(&migrated).unwrap().expect("the connection is rebuilt");
+        assert_eq!(voice.session_id, "session");
+        assert_eq!(voice.channel_id.as_deref(), Some("300"));
+        assert_eq!(voice.token, "new-token");
+        assert_eq!(voice.endpoint, "voice2.discord.media:443");
+        assert!(pairer.observe(&migrated).unwrap().is_none(), "a repeat is not a second rebuild");
+    }
+
+    #[test]
+    fn a_state_that_follows_a_new_server_pairs_with_it_not_with_the_old_one() {
+        let mut pairer = VoiceStatePairer::new("100").unwrap();
+        assert!(pairer.observe(&state()).unwrap().is_none());
+        assert!(pairer.observe(&server()).unwrap().is_some());
+
+        // A move can send the server first and the state second.
         let refreshed = BotEvent::VoiceServerUpdate(VoiceServerUpdate {
             guild_id: "200".into(),
             token: "new-token".into(),
             endpoint: Some("voice2.discord.media:443".into()),
         });
-        assert!(pairer.observe(&refreshed).unwrap().is_none());
+        assert!(pairer.observe(&refreshed).unwrap().is_some());
 
         let refreshed_state = BotEvent::VoiceStateUpdate(VoiceStateUpdate {
             guild_id: Some("200".into()),
@@ -293,8 +322,17 @@ mod tests {
         let voice = pairer.observe(&refreshed_state).unwrap().unwrap();
         assert_eq!(voice.session_id, "new-session");
         assert_eq!(voice.channel_id.as_deref(), Some("301"));
-        assert_eq!(voice.token, "new-token");
+        assert_eq!(voice.token, "new-token", "the server that arrived first is the one kept");
         assert_eq!(voice.endpoint, "voice2.discord.media:443");
+
+        // A later move whose server has not arrived yet must not borrow that token.
+        let moved_again = BotEvent::VoiceStateUpdate(VoiceStateUpdate {
+            guild_id: Some("200".into()),
+            user_id: "100".into(),
+            channel_id: Some("302".into()),
+            session_id: "newer-session".into(),
+        });
+        assert!(pairer.observe(&moved_again).unwrap().is_none());
     }
 
     #[test]

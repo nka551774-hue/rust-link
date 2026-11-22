@@ -37,6 +37,22 @@ pub struct FfmpegFrames {
     stderr: StderrCollector,
     input_error: Arc<Mutex<Option<std::io::Error>>>,
     finished: bool,
+    /// How long the next packet may take. It is wider than [`STALL`] for the
+    /// first packet of a seek, and `STALL` from then on.
+    wait: Duration,
+}
+
+/// How long the first packet may take after a seek to `position_ms`. A pipe
+/// cannot be seeked, so FFmpeg decodes and throws away everything before the
+/// target, and a position two hours in produces nothing for a long while that is
+/// not a hang. The allowance assumes the skipped audio goes by at twenty times
+/// real time, which a source over a modest connection manages, and is capped so
+/// that a decoder that really is stuck is still found.
+fn first_packet_wait(position_ms: i64) -> Duration {
+    const SKIP_SPEED: f64 = 20.0;
+    const LONGEST: Duration = Duration::from_secs(600);
+    let skipped = Duration::from_secs_f64(position_ms.max(0) as f64 / 1000.0 / SKIP_SPEED);
+    (STALL + skipped).min(LONGEST)
 }
 
 /// Owns the stderr reader and its bounded shutdown signal.
@@ -143,6 +159,16 @@ impl Drop for StartupChild {
     }
 }
 
+/// The `-ss` value for a source position. Placed after `-i` it counts output
+/// time, which the filters have already sped up or slowed down, so a source
+/// position is divided by the tempo factor: at speed 2, a seek to 60 s of the
+/// source is 30 s of output. The pure engine seeks in source time, and this
+/// keeps the two engines on the same sample.
+fn output_seek_seconds(position_ms: i64, set: &FilterSet) -> String {
+    let factor = set.tempo_factor().max(f64::MIN_POSITIVE);
+    format!("{:.3}", position_ms as f64 / 1000.0 / factor)
+}
+
 impl FfmpegFrames {
     pub fn start(
         program: &str,
@@ -170,7 +196,7 @@ impl FfmpegFrames {
             .arg("pipe:0");
         if position_ms > 0 {
             // Seeking a pipe requires decoding and discarding earlier samples.
-            command.arg("-ss").arg(format!("{:.3}", position_ms as f64 / 1000.0));
+            command.arg("-ss").arg(output_seek_seconds(position_ms, set));
         }
         command
             .arg("-map")
@@ -267,7 +293,15 @@ impl FfmpegFrames {
             .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
 
         let child = startup.commit();
-        Ok(FfmpegFrames { packets, recycle, child, stderr, input_error, finished: false })
+        Ok(FfmpegFrames {
+            packets,
+            recycle,
+            child,
+            stderr,
+            input_error,
+            finished: false,
+            wait: first_packet_wait(position_ms),
+        })
     }
 
     /// Waits for the child and turns a failure into the message FFmpeg printed.
@@ -318,8 +352,10 @@ impl Frames for FfmpegFrames {
         if self.finished {
             return Ok(false);
         }
-        match self.packets.recv_timeout(STALL) {
+        match self.packets.recv_timeout(self.wait) {
             Ok(Ok(mut next)) => {
+                // Audio is flowing, so the seek is over and a stall is a stall.
+                self.wait = STALL;
                 std::mem::swap(packet, &mut next);
                 // Return the caller's previous buffer without blocking playback.
                 // After the small queue warms up, packets reuse its allocations.
@@ -358,6 +394,38 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_long_seek_is_given_time_to_skip_and_a_short_one_is_not() {
+        assert_eq!(first_packet_wait(0), STALL, "no seek, no extra time");
+        assert_eq!(first_packet_wait(-5), STALL);
+        // Two hours in at twenty times real time is six minutes of skipping.
+        assert_eq!(first_packet_wait(7_200_000), STALL + Duration::from_secs(360));
+        assert!(first_packet_wait(60_000) < STALL + Duration::from_secs(4));
+        assert_eq!(first_packet_wait(i64::MAX), Duration::from_secs(600), "and it is capped");
+    }
+
+    #[test]
+    fn a_seek_is_made_in_source_time_whatever_the_speed() {
+        let set = |filters: serde_json::Value| {
+            let serde_json::Value::Object(filters) = filters else { panic!("not an object") };
+            crate::filters::parse(&filters, 100).unwrap()
+        };
+        let plain = set(serde_json::json!({}));
+        assert_eq!(output_seek_seconds(60_000, &plain), "60.000");
+        // At twice the speed one second of output holds two of source, so the
+        // 60th second of the source is the 30th of the output. Passing 60 as the
+        // old code did starts at the 120th second of the source.
+        let fast = set(serde_json::json!({"timescale": {"speed": 2.0}}));
+        assert_eq!(output_seek_seconds(60_000, &fast), "30.000");
+        let slow = set(serde_json::json!({"timescale": {"speed": 0.5}}));
+        assert_eq!(output_seek_seconds(10_000, &slow), "20.000");
+        // Pitch alone leaves the length alone; rate scales it like speed does.
+        let pitched = set(serde_json::json!({"timescale": {"pitch": 1.5}}));
+        assert_eq!(output_seek_seconds(60_000, &pitched), "60.000");
+        let rated = set(serde_json::json!({"timescale": {"rate": 1.5}}));
+        assert_eq!(output_seek_seconds(60_000, &rated), "40.000");
+    }
 
     fn marker_path(label: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -500,6 +568,7 @@ mod tests {
             stderr,
             input_error: Arc::new(Mutex::new(None)),
             finished: false,
+            wait: STALL,
         }
     }
 

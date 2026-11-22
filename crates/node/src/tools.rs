@@ -27,13 +27,24 @@ struct Source {
     tool: &'static str,
     /// Tried in order; the first that answers is used.
     urls: Vec<String>,
-    /// A `<sha256>  <file>` listing covering the asset, or none when the
-    /// provider publishes no checksums.
-    sums: Option<String>,
+    /// Where the checksum of the asset is published.
+    sums: Sums,
     /// The file name used by the checksum listing and staged download.
     asset: String,
     /// The base name to pull out of the zip archive.
     member: String,
+}
+
+/// How a download is checked. Either way the checksum comes from the same
+/// provider as the file, so it catches a corrupt or truncated transfer and a
+/// bad mirror, not a provider that is itself compromised.
+enum Sums {
+    /// A `<sha256>  <file>` listing at this URL.
+    List(String),
+    /// A `<sha256>  <file>` file named `<file>.sha256`, next to wherever the
+    /// download landed. A "latest" URL redirects to a numbered build, and the
+    /// checksum belongs to that build, not to the redirecting address.
+    Beside,
 }
 
 /// Locates the media helpers and installs the ones that are missing.
@@ -149,6 +160,8 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
     if status != 200 {
         return Err(format!("{url} returned HTTP {status}"));
     }
+    // Where the download ended up, which is not `url` when that redirected.
+    let landed = ureq::ResponseExt::get_uri(&response).to_string();
     let total = response.body().content_length();
     let name = if source.asset.is_empty() { "download.bin" } else { source.asset.as_str() };
     let file = directory.join(name);
@@ -168,11 +181,15 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
         let _ = fs::remove_file(&file);
         return Err(format!("{url} returned only {written} bytes"));
     }
-    if let Some(sums) = &source.sums {
-        if let Err(error) = verify(&agent, sums, &source.asset, &file) {
-            let _ = fs::remove_file(&file);
-            return Err(error);
+    let sums_url = match &source.sums {
+        Sums::List(list) => list.clone(),
+        Sums::Beside => {
+            format!("{}.sha256", landed.split(['?', '#']).next().unwrap_or(&landed))
         }
+    };
+    if let Err(error) = verify(&agent, &sums_url, &source.asset, &file) {
+        let _ = fs::remove_file(&file);
+        return Err(error);
     }
     Ok(file)
 }
@@ -405,7 +422,7 @@ fn ffmpeg_source(name: &str) -> Result<Source, String> {
             Ok(Source {
                 tool: "ffmpeg",
                 urls: vec![format!("{base}{asset}")],
-                sums: Some(format!("{base}checksums.sha256")),
+                sums: Sums::List(format!("{base}checksums.sha256")),
                 asset,
                 member: format!("{name}.exe"),
             })
@@ -424,7 +441,8 @@ fn ffmpeg_source(name: &str) -> Result<Source, String> {
                     format!("{base}release/{name}.zip"),
                     format!("{base}snapshot/{name}.zip"),
                 ],
-                sums: None,
+                // martin-riedl.de publishes `ffmpeg.zip.sha256` beside each build.
+                sums: Sums::Beside,
                 asset: format!("{name}.zip"),
                 member: name.to_string(),
             })
@@ -452,6 +470,119 @@ fn posix_arch() -> Result<&'static str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves `routes` as `(path, full response)`, one connection each, in the
+    /// order they are asked for, and reports the paths that were requested.
+    fn serve(
+        routes: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for _ in 0..routes.len() {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let line = String::from_utf8_lossy(&request);
+                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                let (_, response) =
+                    routes.iter().find(|(route, _)| *route == path).expect("an expected path");
+                socket.write_all(response).unwrap();
+                asked.push(path);
+            }
+            asked
+        });
+        (base, worker)
+    }
+
+    fn reply(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn beside_source() -> Source {
+        Source {
+            tool: "ffmpeg",
+            urls: Vec::new(),
+            sums: Sums::Beside,
+            asset: "ffmpeg.zip".into(),
+            member: "ffmpeg".into(),
+        }
+    }
+
+    fn work_dir(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir()
+            .join(format!("rustlink-tools-test-{label}-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn a_download_is_checked_against_the_checksum_beside_the_build_it_redirected_to() {
+        let body = vec![7u8; MIN_SIZE as usize + 100];
+        let sum = format!("{:x}  ffmpeg.zip\n", Sha256::digest(&body));
+        let (base, server) = serve(vec![
+            ("/latest/ffmpeg.zip", reply("302 Found", "Location: /build/1/ffmpeg.zip\r\n", b"")),
+            ("/build/1/ffmpeg.zip", reply("200 OK", "", &body)),
+            ("/build/1/ffmpeg.zip.sha256", reply("200 OK", "", sum.as_bytes())),
+        ]);
+        let directory = work_dir("good");
+        let file = download(&format!("{base}/latest/ffmpeg.zip"), &directory, &beside_source())
+            .expect("a matching checksum passes");
+        assert!(file.is_file());
+        // The checksum asked for is the one for the numbered build, not for the
+        // address that redirected to it, which publishes none.
+        assert_eq!(
+            server.join().unwrap(),
+            ["/latest/ffmpeg.zip", "/build/1/ffmpeg.zip", "/build/1/ffmpeg.zip.sha256"]
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_download_that_does_not_match_its_checksum_is_refused_and_removed() {
+        let body = vec![7u8; MIN_SIZE as usize + 100];
+        let wrong = format!("{}  ffmpeg.zip\n", "0".repeat(64));
+        let (base, server) = serve(vec![
+            ("/ffmpeg.zip", reply("200 OK", "", &body)),
+            ("/ffmpeg.zip.sha256", reply("200 OK", "", wrong.as_bytes())),
+        ]);
+        let directory = work_dir("bad");
+        let error = download(&format!("{base}/ffmpeg.zip"), &directory, &beside_source())
+            .expect_err("a different hash must not install");
+        server.join().unwrap();
+        assert!(error.contains("checksum mismatch"), "{error}");
+        assert!(!directory.join("ffmpeg.zip").exists(), "the unchecked file is not left behind");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_missing_checksum_is_a_failure_and_not_a_pass() {
+        let body = vec![7u8; MIN_SIZE as usize + 100];
+        let (base, server) = serve(vec![
+            ("/ffmpeg.zip", reply("200 OK", "", &body)),
+            ("/ffmpeg.zip.sha256", reply("404 Not Found", "", b"gone")),
+        ]);
+        let directory = work_dir("missing");
+        let error = download(&format!("{base}/ffmpeg.zip"), &directory, &beside_source())
+            .expect_err("no checksum means no install");
+        server.join().unwrap();
+        assert!(error.contains("no entry for ffmpeg.zip") || error.contains("checksum"), "{error}");
+        assert!(!directory.join("ffmpeg.zip").exists());
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn a_listing_yields_the_hash_of_the_named_file() {

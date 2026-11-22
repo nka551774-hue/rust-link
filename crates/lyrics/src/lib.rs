@@ -98,6 +98,14 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 /// ever played.
 const CACHE_LIMIT: usize = 256;
 
+/// Bounds what the cache holds in bytes as well, because a count alone says
+/// nothing about size: one answer can be megabytes of lines.
+const CACHE_BYTES: usize = 8 << 20;
+
+/// An answer larger than this is returned but not kept, so that one track with
+/// an enormous lyric cannot push everything else out of the cache.
+const MAX_ENTRY_BYTES: usize = 1 << 20;
+
 /// Asks the configured providers in order and remembers what they said.
 pub struct Manager {
     providers: Vec<Box<dyn Provider>>,
@@ -110,11 +118,45 @@ pub struct Manager {
 struct Cache {
     entries: HashMap<String, Entry>,
     order: Vec<String>,
+    /// The sum of every entry's weight.
+    bytes: usize,
 }
 
 struct Entry {
     lyrics: Option<Lyrics>,
     at: Instant,
+    /// What this entry counts against [`CACHE_BYTES`], key included.
+    weight: usize,
+}
+
+/// What an answer costs the cache: its text, its lines and the key it is kept
+/// under, with a little for the structure around them.
+fn weight(key: &str, lyrics: &Option<Lyrics>) -> usize {
+    let Some(lyrics) = lyrics else { return key.len() + 64 };
+    let lines: usize = lyrics
+        .lines
+        .iter()
+        .flatten()
+        .map(|line| line.line.len() + std::mem::size_of::<Line>())
+        .sum();
+    key.len()
+        + lyrics.source_name.len()
+        + lyrics.provider.len()
+        + lyrics.text.as_ref().map_or(0, String::len)
+        + lines
+        + 64
+}
+
+/// What a lookup depends on. The providers search by title, author and length,
+/// so the key has to say all of them: a key of only the source and identifier
+/// would let a track token that names a real video but carries other metadata
+/// leave its lyrics in the cache for everyone who asks about the real one.
+fn cache_key(track: &Track) -> String {
+    let info = &track.metadata;
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+        info.source_name, info.identifier, info.title, info.author, info.length
+    )
 }
 
 impl Manager {
@@ -165,7 +207,7 @@ impl Manager {
         if !self.enabled() {
             return Err(LyricsError::NotFound);
         }
-        let key = format!("{}\u{0}{}", track.metadata.source_name, track.metadata.identifier);
+        let key = cache_key(track);
         if let Some(cached) = self.cached(&key) {
             return cached.ok_or(LyricsError::NotFound);
         }
@@ -196,7 +238,9 @@ impl Manager {
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         let entry = cache.entries.get(key)?;
         if entry.at.elapsed() > self.ttl {
-            cache.entries.remove(key);
+            if let Some(expired) = cache.entries.remove(key) {
+                cache.bytes -= expired.weight;
+            }
             cache.order.retain(|held| held != key);
             return None;
         }
@@ -209,15 +253,31 @@ impl Manager {
     /// Entries leave in the order they arrived, which is enough to keep the map
     /// bounded.
     fn remember(&self, key: &str, lyrics: Option<Lyrics>) {
+        let weight = weight(key, &lyrics);
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-        if !cache.entries.contains_key(key) {
-            if cache.order.len() >= self.limit {
-                let oldest = cache.order.remove(0);
-                cache.entries.remove(&oldest);
+        // An answer this large is not worth what it would push out.
+        if weight > MAX_ENTRY_BYTES {
+            if let Some(stale) = cache.entries.remove(key) {
+                cache.bytes -= stale.weight;
+                cache.order.retain(|held| held != key);
             }
+            return;
+        }
+        if let Some(previous) = cache.entries.remove(key) {
+            cache.bytes -= previous.weight;
+        } else {
             cache.order.push(key.to_string());
         }
-        cache.entries.insert(key.to_string(), Entry { lyrics, at: Instant::now() });
+        // Oldest first, until both the count and the bytes are within bounds.
+        while cache.order.len() > self.limit || cache.bytes + weight > CACHE_BYTES {
+            let Some(oldest) = cache.order.iter().position(|held| held != key) else { break };
+            let oldest = cache.order.remove(oldest);
+            if let Some(evicted) = cache.entries.remove(&oldest) {
+                cache.bytes -= evicted.weight;
+            }
+        }
+        cache.bytes += weight;
+        cache.entries.insert(key.to_string(), Entry { lyrics, at: Instant::now(), weight });
     }
 }
 
@@ -331,6 +391,85 @@ mod tests {
         manager.fetch(&track("youtube", "abc")).unwrap();
         manager.fetch(&track("youtube", "xyz")).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    fn titled(identifier: &str, title: &str) -> Track {
+        let mut track = track("youtube", identifier);
+        track.metadata.title = title.into();
+        track
+    }
+
+    fn lyrics_of(bytes: usize) -> Result<Lyrics, LyricsError> {
+        let mut lyrics = found("big");
+        lyrics.text = Some("x".repeat(bytes));
+        Ok(lyrics)
+    }
+
+    #[test]
+    fn a_track_with_other_metadata_is_not_served_the_lyrics_of_the_real_one() {
+        let (provider, calls) = scripted("db", || Ok(found("db")));
+        let manager = Manager::new(vec![provider]);
+        manager.fetch(&titled("abc", "the real song")).unwrap();
+        manager.fetch(&titled("abc", "the real song")).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the same track is answered from the cache");
+        // A hand-made token with the same video ID and another title is a
+        // different question, so it is asked rather than answered from the cache.
+        manager.fetch(&titled("abc", "something forged")).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        // And the length and the author are part of the question too.
+        let mut longer = titled("abc", "the real song");
+        longer.metadata.length = 99_000;
+        manager.fetch(&longer).unwrap();
+        let mut other = titled("abc", "the real song");
+        other.metadata.author = "another".into();
+        manager.fetch(&other).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn the_cache_is_bounded_in_bytes_and_not_only_in_entries() {
+        let (provider, calls) = scripted("db", || lyrics_of(600 << 10));
+        let manager = Manager::new(vec![provider]);
+        for number in 0..40 {
+            manager.fetch(&titled(&format!("track{number}"), "song")).unwrap();
+        }
+        let held = manager.cache.lock().unwrap().bytes;
+        assert!(held <= CACHE_BYTES, "{held} bytes held against a budget of {CACHE_BYTES}");
+        assert!(manager.cache.lock().unwrap().entries.len() < 40, "the oldest were pushed out");
+        let before = calls.load(Ordering::Relaxed);
+        manager.fetch(&titled("track0", "song")).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), before + 1, "the first track was evicted");
+        manager.fetch(&titled("track39", "song")).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), before + 1, "the latest is still cached");
+    }
+
+    #[test]
+    fn an_answer_too_large_to_keep_is_returned_but_not_cached() {
+        let (provider, calls) = scripted("db", || lyrics_of(2 << 20));
+        let manager = Manager::new(vec![provider]);
+        assert!(manager.fetch(&titled("huge", "song")).is_ok());
+        assert!(manager.fetch(&titled("huge", "song")).is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "an enormous answer is asked for again");
+        let cache = manager.cache.lock().unwrap();
+        assert_eq!((cache.bytes, cache.entries.len()), (0, 0));
+    }
+
+    #[test]
+    fn byte_accounting_survives_replacement_and_expiry() {
+        let (provider, _) = scripted("db", || lyrics_of(1000));
+        let mut manager = Manager::new(vec![provider]);
+        manager.ttl = Duration::from_millis(10);
+        let track = titled("abc", "song");
+        manager.fetch(&track).unwrap();
+        let once = manager.cache.lock().unwrap().bytes;
+        assert!(once > 1000);
+        std::thread::sleep(Duration::from_millis(30));
+        manager.fetch(&track).unwrap();
+        assert_eq!(
+            manager.cache.lock().unwrap().bytes,
+            once,
+            "an expired entry is not counted twice"
+        );
     }
 
     #[test]

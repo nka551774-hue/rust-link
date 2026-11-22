@@ -12,6 +12,13 @@ pub const MAX_PROBE: usize = 8 << 20;
 /// How much is read before deciding whether more is worth reading.
 pub const FIRST_PROBE: usize = 16 << 10;
 
+/// Whether the head is a container whose index may sit further on, so that a
+/// file which says nothing yet is worth reading on. An MP4 or M4A written
+/// without "fast start" keeps its `moov` box after the audio data.
+pub fn may_index_later(head: &[u8]) -> bool {
+    head.get(4..8) == Some(b"ftyp")
+}
+
 /// What the header said.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probe {

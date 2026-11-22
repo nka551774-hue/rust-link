@@ -6,8 +6,9 @@
 //! finds none is refused rather than queued. Queueing a burst would turn abuse
 //! into latency, which hides it instead of reporting it.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A token bucket, with the rate in tokens per second and the ceiling in
 /// tokens.
@@ -48,12 +49,112 @@ impl Limiter {
             false
         }
     }
+
+    /// Whether the bucket has refilled completely, which is when forgetting it
+    /// changes nothing for the client it belonged to.
+    fn idle(&self) -> bool {
+        let bucket = self.inner.lock().unwrap();
+        let elapsed = Instant::now().saturating_duration_since(bucket.at).as_secs_f64();
+        bucket.tokens + elapsed * self.rate >= self.burst
+    }
+}
+
+/// One token bucket per key, such as a session or a remote address, so a client
+/// can only spend its own allowance.
+///
+/// The number of keys is bounded, because the keys can come from someone who
+/// pays nothing to invent them: at the bound the buckets that have refilled are
+/// forgotten, and when none can be, the rest of the keys share one bucket
+/// instead of growing the table.
+pub struct Keyed {
+    rate: f64,
+    burst: usize,
+    max_keys: usize,
+    table: Mutex<Table>,
+    overflow: Limiter,
+}
+
+struct Table {
+    buckets: HashMap<String, Limiter>,
+    /// When refilled buckets were last forgotten, so a table that stays full
+    /// of busy keys is not swept on every request.
+    swept: Instant,
+}
+
+impl Keyed {
+    pub fn new(rate: f64, burst: usize, max_keys: usize) -> Keyed {
+        Keyed {
+            rate,
+            burst,
+            max_keys: max_keys.max(1),
+            table: Mutex::new(Table { buckets: HashMap::new(), swept: Instant::now() }),
+            overflow: Limiter::new(rate, burst),
+        }
+    }
+
+    /// Spends a token from `key`'s bucket, creating it full on first use.
+    pub fn allow(&self, key: &str) -> bool {
+        let mut table = self.table.lock().unwrap();
+        if let Some(limiter) = table.buckets.get(key) {
+            return limiter.allow();
+        }
+        if table.buckets.len() >= self.max_keys && table.swept.elapsed() >= Duration::from_secs(1) {
+            table.buckets.retain(|_, limiter| !limiter.idle());
+            table.swept = Instant::now();
+        }
+        if table.buckets.len() >= self.max_keys {
+            return self.overflow.allow();
+        }
+        let limiter = Limiter::new(self.rate, self.burst);
+        let allowed = limiter.allow();
+        table.buckets.insert(key.to_string(), limiter);
+        allowed
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> usize {
+        self.table.lock().unwrap().buckets.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Limiter;
+    use super::{Keyed, Limiter};
     use std::time::Duration;
+
+    #[test]
+    fn each_key_spends_only_its_own_bucket() {
+        let keyed = Keyed::new(0.0, 2, 10);
+        assert!(keyed.allow("a") && keyed.allow("a"));
+        assert!(!keyed.allow("a"), "a is spent");
+        assert!(keyed.allow("b") && keyed.allow("b"), "b has its own");
+        assert_eq!(keyed.keys(), 2);
+    }
+
+    #[test]
+    fn inventing_keys_cannot_grow_the_table_or_buy_more_requests() {
+        let keyed = Keyed::new(0.0, 1, 3);
+        for key in ["a", "b", "c"] {
+            assert!(keyed.allow(key));
+        }
+        // The table is full of spent buckets, so new keys share one overflow
+        // bucket: the first of them passes, the rest are refused.
+        assert!(keyed.allow("d"));
+        for key in ["e", "f", "g", "h"] {
+            assert!(!keyed.allow(key), "{key} must not get a bucket of its own");
+        }
+        assert_eq!(keyed.keys(), 3, "the table never passes its bound");
+    }
+
+    #[test]
+    fn refilled_buckets_are_forgotten_to_make_room() {
+        let keyed = Keyed::new(1000.0, 1, 2);
+        assert!(keyed.allow("a") && keyed.allow("b"));
+        std::thread::sleep(Duration::from_millis(1100));
+        // Both buckets have refilled, so they are swept and "c" gets its own.
+        assert!(keyed.allow("c"));
+        assert_eq!(keyed.keys(), 1);
+    }
 
     #[test]
     fn a_bucket_starts_full_and_then_refuses() {

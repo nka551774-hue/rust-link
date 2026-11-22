@@ -19,20 +19,30 @@ const SSRC: u32 = 77;
 const KEY: [u8; 32] = [29; 32];
 const OPUS: &[u8] = &[0xf8, 0x11, 0x22, 0x33, 0x44];
 
-#[test]
-fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
-    let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
+fn connection_with_queue(capacity: usize) -> (DiscordConnection, mpsc::Receiver<Command>) {
+    let (commands, receiver) = mpsc::channel(capacity);
     let connection = DiscordConnection {
         commands,
         ready: AtomicBool::new(true),
         closed: AtomicBool::new(false),
         ping: AtomicI64::new(-1),
         audio_buffers: Mutex::new(Vec::with_capacity(COMMAND_CAPACITY)),
+        dropped_frames: AtomicU64::new(0),
     };
-    for _ in 0..COMMAND_CAPACITY {
+    (connection, receiver)
+}
+
+#[test]
+fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
+    let (connection, mut receiver) = connection_with_queue(COMMAND_CAPACITY);
+    let room = COMMAND_CAPACITY - CONTROL_RESERVE;
+    for _ in 0..room {
         connection.write(OPUS).unwrap();
     }
-    assert!(connection.write(OPUS).is_err());
+    // A gateway that is behind costs frames, not the track: the late frame is
+    // dropped, counted and its buffer is recycled, and the caller sees no error.
+    connection.write(OPUS).expect("a full queue drops the frame without failing the player");
+    assert_eq!(connection.dropped_frames.load(Ordering::Relaxed), 1);
     assert_eq!(connection.audio_buffers.lock().unwrap().len(), 1);
     let Command::Audio(packet) = receiver.try_recv().unwrap() else { panic!("expected audio") };
     assert_eq!(packet, OPUS);
@@ -40,7 +50,7 @@ fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
     connection.recycle(packet);
     let reused = connection.packet(b"new");
     assert_eq!(reused, b"new");
-    assert_eq!(reused.as_ptr(), pointer);
+    assert_eq!(reused.as_ptr(), pointer, "the buffer just recycled is the one reused");
     connection.recycle(reused);
     for _ in 0..COMMAND_CAPACITY * 2 {
         connection.recycle(Vec::with_capacity(1500));
@@ -48,6 +58,42 @@ fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
     assert_eq!(connection.audio_buffers.lock().unwrap().len(), COMMAND_CAPACITY);
     connection.close();
     assert!(matches!(connection.write(OPUS), Err(VoiceError::NotReady)));
+}
+
+#[test]
+fn speaking_and_close_always_fit_however_far_behind_the_gateway_is() {
+    let (connection, mut receiver) = connection_with_queue(COMMAND_CAPACITY);
+    // Nothing is draining the queue: the audio fills all it may.
+    for _ in 0..COMMAND_CAPACITY * 3 {
+        connection.write(OPUS).unwrap();
+    }
+    assert_eq!(
+        connection.dropped_frames.load(Ordering::Relaxed) as usize,
+        COMMAND_CAPACITY * 2 + CONTROL_RESERVE
+    );
+    // Speaking(false) used to be refused here, leaving the user shown as talking.
+    connection.speaking(false).expect("the reserve is for control commands");
+    connection.speaking(true).expect("and there is room for more than one");
+    connection.close();
+    let mut audio = 0;
+    let mut control = Vec::new();
+    while let Ok(command) = receiver.try_recv() {
+        match command {
+            Command::Audio(_) => audio += 1,
+            Command::Speaking(on) => control.push(on),
+            Command::Close => control.push(false),
+        }
+    }
+    assert_eq!(audio, COMMAND_CAPACITY - CONTROL_RESERVE);
+    assert_eq!(control, [false, true, false]);
+}
+
+#[test]
+fn a_gateway_task_that_is_gone_is_still_an_error() {
+    let (connection, receiver) = connection_with_queue(COMMAND_CAPACITY);
+    drop(receiver);
+    assert!(connection.write(OPUS).is_err(), "a closed queue is not a slow one");
+    assert!(connection.speaking(true).is_err());
 }
 
 fn state() -> VoiceState {

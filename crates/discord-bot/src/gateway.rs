@@ -138,6 +138,8 @@ pub struct Gateway {
     heartbeat_interval: Duration,
     next_heartbeat: Instant,
     heartbeat_acknowledged: bool,
+    /// The code Discord closed the connection with, once it has.
+    close_code: Option<u16>,
     sequence: Option<u64>,
 }
 
@@ -203,6 +205,7 @@ impl Gateway {
             heartbeat_interval: Duration::from_millis(interval_ms),
             next_heartbeat: Instant::now() + Duration::from_millis(interval_ms),
             heartbeat_acknowledged: true,
+            close_code: None,
             sequence: None,
         };
         gateway.identify().await?;
@@ -281,7 +284,12 @@ impl Gateway {
     pub async fn next_event(&mut self) -> Result<Option<BotEvent>, BotError> {
         loop {
             tokio::select! {
-                _ = sleep_until(self.next_heartbeat) => self.heartbeat().await?,
+                // What has already arrived is read before the heartbeat timer is
+                // looked at. A caller that was busy for a moment leaves both the
+                // acknowledgement of the last beat and the next beat's deadline
+                // ready at once, and picking the timer first would call a beat
+                // unanswered while its answer sits in the socket.
+                biased;
                 message = self.socket.next() => {
                     let Some(message) = message else { return Ok(None); };
                     match message? {
@@ -302,16 +310,29 @@ impl Gateway {
                             }
                         }
                         Message::Ping(bytes) => self.socket.send(Message::Pong(bytes)).await?,
-                        Message::Close(_) => return Ok(None),
+                        Message::Close(frame) => {
+                            self.close_code = frame.map(|frame| u16::from(frame.code));
+                            return Ok(None);
+                        }
                         Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
                     }
                 }
+                _ = sleep_until(self.next_heartbeat) => self.heartbeat().await?,
             }
         }
     }
 
     pub fn sequence(&self) -> Option<u64> {
         self.sequence
+    }
+
+    /// The code Discord closed the connection with, after `next_event` has
+    /// returned `None` for it. 4004 means the token was refused and 4010 to 4014
+    /// mean the bot's own configuration (shards, intents) is wrong: none of
+    /// them can be cured by connecting again. Other codes, and a close with no
+    /// code at all, are worth a retry.
+    pub fn close_code(&self) -> Option<u16> {
+        self.close_code
     }
 }
 
@@ -673,6 +694,87 @@ mod tests {
         let event = gateway.next_event().await.unwrap().unwrap();
         assert!(matches!(event, BotEvent::Ready(Ready { user_id, .. }) if user_id == "123"));
         assert!(gateway.next_event().await.unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    /// One connection on which the caller is slow to poll: the first heartbeat
+    /// is acknowledged, then the caller does not read until the next heartbeat
+    /// has also fallen due, so the acknowledgement and the deadline are ready
+    /// together.
+    async fn slow_caller() -> Result<Option<BotEvent>, BotError> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = json!({"op":10,"d":{"heartbeat_interval":500}});
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let _identify = socket.next().await;
+            let _first_heartbeat = socket.next().await;
+            // The acknowledgement comes after the caller has stopped reading (at
+            // 650 ms), so it can only be found sitting in the socket.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            socket.send(Message::Text(json!({"op":11,"d":null}).to_string().into())).await.unwrap();
+            // A dispatch for the caller to return on once it reads again.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let event = json!({"op":0,"t":"SOMETHING","s":2,"d":{"x":1}});
+            socket.send(Message::Text(event.to_string().into())).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let mut gateway = Gateway::connect_url(
+            format!("ws://{address}"),
+            Zeroizing::new("bot-token".to_owned()),
+            128,
+        )
+        .await
+        .unwrap();
+        // The first heartbeat goes out at 500 ms; nothing is dispatched, so this waits out.
+        assert!(tokio::time::timeout(Duration::from_millis(650), gateway.next_event())
+            .await
+            .is_err());
+        // The acknowledgement is now in the socket. Staying away lets the next beat fall due.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let event = gateway.next_event().await;
+        server.abort();
+        event
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_acknowledgement_already_received_is_never_missed_for_a_late_heartbeat() {
+        // Each connection used to fail about half the time, so sixteen at once
+        // make a return of the race all but certain to be seen.
+        let outcomes = futures_util::future::join_all((0..16).map(|_| slow_caller())).await;
+        for outcome in outcomes {
+            let event = outcome.expect("a heartbeat that was acknowledged is not unanswered");
+            assert!(matches!(event, Some(BotEvent::Other { .. })), "{event:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_close_code_is_kept_so_a_refused_token_can_be_told_from_a_dropped_link() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = json!({"op":10,"d":{"heartbeat_interval":5000}});
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let _identify = socket.next().await;
+            let frame =
+                CloseFrame { code: CloseCode::from(4004), reason: "Authentication failed".into() };
+            socket.close(Some(frame)).await.unwrap();
+        });
+        let mut gateway = Gateway::connect_url(
+            format!("ws://{address}"),
+            Zeroizing::new("bot-token".to_owned()),
+            128,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gateway.close_code(), None, "nothing has closed yet");
+        assert!(gateway.next_event().await.unwrap().is_none());
+        assert_eq!(gateway.close_code(), Some(4004));
         server.await.unwrap();
     }
 

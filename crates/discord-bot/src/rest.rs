@@ -139,32 +139,73 @@ impl DiscordRest {
             .map_err(|_| {
                 BotError::Invalid("bot token contains invalid header characters".into())
             })?;
-        let response = self
-            .client
-            .request(method, endpoint)
-            .header(AUTHORIZATION, authorization)
-            .header(CONTENT_TYPE, "application/json")
-            .header(USER_AGENT, "rustlink-discord-bot/0.1")
-            .json(body)
-            .send()
-            .await
-            .map_err(BotError::from)?;
-        let status = response.status();
-        if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES) {
-            return Err(BotError::HttpStatus {
-                status: status.as_u16(),
-                message: "Discord response exceeded the configured limit".into(),
-            });
+        let mut limited = 0;
+        loop {
+            let response = self
+                .client
+                .request(method.clone(), endpoint.clone())
+                .header(AUTHORIZATION, authorization.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .header(USER_AGENT, "rustlink-discord-bot/0.1")
+                .json(body)
+                .send()
+                .await
+                .map_err(BotError::from)?;
+            let status = response.status();
+            if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES) {
+                return Err(BotError::HttpStatus {
+                    status: status.as_u16(),
+                    message: "Discord response exceeded the configured limit".into(),
+                });
+            }
+            let retry_header = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = read_response_body(response, status).await?;
+            // Discord rate-limits per route and says how long to wait. A short
+            // wait is worth taking, because the request is otherwise lost for no
+            // fault of its own; a long one is reported, since a caller cannot
+            // sit on it (an interaction token expires within minutes).
+            if status.as_u16() == 429 && limited < MAX_RATE_LIMIT_RETRIES {
+                if let Some(wait) = retry_wait(&body, retry_header.as_deref()) {
+                    limited += 1;
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+            if !status.is_success() {
+                return Err(BotError::HttpStatus {
+                    status: status.as_u16(),
+                    message: redact(&discord_error_message(&body), self.token.as_str()),
+                });
+            }
+            return Ok(body);
         }
-        let body = read_response_body(response, status).await?;
-        if !status.is_success() {
-            return Err(BotError::HttpStatus {
-                status: status.as_u16(),
-                message: redact(&discord_error_message(&body), self.token.as_str()),
-            });
-        }
-        Ok(body)
     }
+}
+
+/// How many times a request is repeated after Discord answers 429.
+const MAX_RATE_LIMIT_RETRIES: usize = 3;
+
+/// The longest a rate limit is waited out.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a 429 asks to wait: the `retry_after` of its JSON body, which has
+/// sub-second precision, or else the `Retry-After` header. `None` when it
+/// names no usable wait or one longer than [`MAX_RATE_LIMIT_WAIT`].
+fn retry_wait(body: &[u8], header: Option<&str>) -> Option<Duration> {
+    let seconds = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("retry_after").and_then(serde_json::Value::as_f64))
+        .or_else(|| header.and_then(|text| text.trim().parse::<f64>().ok()))
+        .unwrap_or(1.0);
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let wait = Duration::from_secs_f64(seconds.min(MAX_RATE_LIMIT_WAIT.as_secs_f64() * 2.0));
+    (wait <= MAX_RATE_LIMIT_WAIT).then_some(wait.max(Duration::from_millis(50)))
 }
 
 /// Interaction tokens are spliced into URL paths, so only URL-safe characters pass.
@@ -334,6 +375,94 @@ mod tests {
         for bad in ["", "a/../b", "a?b", "a b", "a%2Fb"] {
             assert!(validate_interaction_token(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_rate_limit_wait_comes_from_the_body_then_the_header_and_is_bounded() {
+        let body = br#"{"message":"You are being rate limited.","retry_after":1.5,"global":false}"#;
+        assert_eq!(retry_wait(body, None), Some(Duration::from_millis(1500)));
+        assert_eq!(retry_wait(body, Some("9")), Some(Duration::from_millis(1500)), "the body wins");
+        assert_eq!(retry_wait(b"", Some("2")), Some(Duration::from_secs(2)));
+        assert_eq!(
+            retry_wait(b"not json", None),
+            Some(Duration::from_secs(1)),
+            "no hint: one second"
+        );
+        assert_eq!(retry_wait(br#"{"retry_after":0}"#, None), Some(Duration::from_millis(50)));
+        assert_eq!(retry_wait(br#"{"retry_after":60}"#, None), None, "too long to sit on");
+        assert_eq!(retry_wait(br#"{"retry_after":-1}"#, None), None);
+        assert_eq!(
+            retry_wait(b"", Some("nan")),
+            None,
+            "a wait that is not a number is not trusted"
+        );
+    }
+
+    /// A 429 that asks to wait `retry_after` seconds.
+    fn limited(retry_after: &str) -> String {
+        let body = format!(r#"{{"message":"limited","retry_after":{retry_after},"global":false}}"#);
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn ok() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
+    }
+
+    /// Answers each request with the next of `responses`, and reports how many
+    /// requests were made.
+    async fn scripted(responses: Vec<String>) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut served = 0;
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0u8; 4096];
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                served += 1;
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            served
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn a_short_rate_limit_is_waited_out_and_the_request_goes_through() {
+        let (base, server) = scripted(vec![limited("0.05"), limited("0.05"), ok()]).await;
+        let rest = DiscordRest::with_base("token", &base).unwrap();
+        rest.edit_interaction_response("123", "abc", "hello").await.expect("retried to success");
+        assert_eq!(server.await.unwrap(), 3, "two limited answers, then the real one");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_that_will_not_lift_is_reported_without_waiting_it_out() {
+        let (base, server) = scripted(vec![limited("600.0")]).await;
+        let rest = DiscordRest::with_base("token", &base).unwrap();
+        let started = std::time::Instant::now();
+        let error = rest.edit_interaction_response("123", "abc", "hello").await.unwrap_err();
+        assert!(matches!(error, BotError::HttpStatus { status: 429, .. }), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2), "it waited out ten minutes");
+        assert_eq!(server.await.unwrap(), 1, "and did not ask again");
+    }
+
+    #[tokio::test]
+    async fn retries_stop_after_the_limit_when_the_rate_limit_keeps_coming() {
+        // The first request and three retries.
+        let (base, server) = scripted(vec![limited("0.05"); 1 + MAX_RATE_LIMIT_RETRIES]).await;
+        let rest = DiscordRest::with_base("token", &base).unwrap();
+        let error = rest.edit_interaction_response("123", "abc", "hello").await.unwrap_err();
+        assert!(matches!(error, BotError::HttpStatus { status: 429, .. }), "{error}");
+        assert_eq!(server.await.unwrap(), 1 + MAX_RATE_LIMIT_RETRIES);
     }
 
     #[test]

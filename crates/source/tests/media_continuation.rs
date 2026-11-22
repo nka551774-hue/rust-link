@@ -137,3 +137,116 @@ fn compressed_range_response_is_rejected_before_decoding() {
     server.join().unwrap();
     assert!(opened.is_err(), "encoded byte offsets cannot resume decoded media bytes");
 }
+
+fn redirect(status: &str, location: &str) -> String {
+    format!("HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+fn whole(body: &str) -> String {
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+}
+
+fn fault(status: &str) -> String {
+    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+#[test]
+fn a_redirect_to_the_real_file_is_followed() {
+    let (url, server) = serve(vec![redirect("302 Found", "/real/file.mp3"), whole("abc")]);
+    let mut stream = service().open_seekable(&url, &Default::default()).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(bytes, b"abc");
+    assert!(requests[1].starts_with("GET /real/file.mp3 "), "{}", requests[1]);
+}
+
+#[test]
+fn every_redirect_status_is_followed_and_a_loop_is_not() {
+    for status in [
+        "301 Moved Permanently",
+        "303 See Other",
+        "307 Temporary Redirect",
+        "308 Permanent Redirect",
+    ] {
+        let (url, server) = serve(vec![redirect(status, "/next"), whole("ok")]);
+        let mut stream = service().open_seekable(&url, &Default::default()).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        server.join().unwrap();
+        assert_eq!(bytes, b"ok", "{status}");
+    }
+    // The first request plus five followed redirects, and the sixth redirect is refused.
+    let (url, server) = serve((0..6).map(|_| redirect("302 Found", "/again")).collect());
+    let opened = service().open_seekable(&url, &Default::default());
+    server.join().unwrap();
+    assert!(opened.is_err(), "a redirect loop must end");
+}
+
+#[test]
+fn a_redirect_with_nowhere_to_go_is_the_original_error() {
+    let (url, server) =
+        serve(vec!["HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()]);
+    let error = service().open_seekable(&url, &Default::default()).err().expect("no Location");
+    server.join().unwrap();
+    assert!(error.to_string().contains("302"), "{error}");
+}
+
+#[test]
+fn provider_headers_do_not_follow_a_redirect_to_another_host() {
+    let (target, target_server) = serve(vec![whole("abc")]);
+    // The same machine under another name is a different host to the redirect.
+    let elsewhere = target.replace("127.0.0.1", "localhost");
+    let (url, server) = serve(vec![redirect("302 Found", &elsewhere)]);
+    let headers = std::collections::BTreeMap::from([(
+        "Authorization".to_string(),
+        "Bearer secret".to_string(),
+    )]);
+    let mut stream = service().open_seekable(&url, &headers).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    let first = server.join().unwrap();
+    let second = target_server.join().unwrap();
+    assert_eq!(bytes, b"abc");
+    assert!(first[0].to_ascii_lowercase().contains("authorization: bearer secret"));
+    assert!(!second[0].to_ascii_lowercase().contains("authorization"), "{}", second[0]);
+}
+
+#[test]
+fn a_server_fault_on_one_continuation_does_not_end_the_track() {
+    let (url, server) = serve(vec![
+        segment("0-2/6", "", "abc"),
+        fault("503 Service Unavailable"),
+        segment("3-5/6", "", "def"),
+    ]);
+    let mut stream = service().open_seekable(&url, &Default::default()).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    server.join().unwrap();
+    assert_eq!(bytes, b"abcdef");
+}
+
+#[test]
+fn a_continuation_that_keeps_failing_ends_the_stream_after_the_retry_budget() {
+    // The first segment, then the original request and three retries.
+    let mut responses = vec![segment("0-2/6", "", "abc")];
+    responses.extend((0..4).map(|_| fault("503 Service Unavailable")));
+    let (url, server) = serve(responses);
+    let mut stream = service().open_seekable(&url, &Default::default()).unwrap();
+    let mut bytes = Vec::new();
+    let result = stream.read_to_end(&mut bytes);
+    server.join().unwrap();
+    assert!(result.is_err());
+    assert_eq!(bytes, b"abc", "what was delivered before the outage is intact");
+}
+
+#[test]
+fn a_continuation_for_an_expired_url_is_not_retried() {
+    // 404 says the URL is gone; asking again cannot help, so there is one request.
+    let (url, server) = serve(vec![segment("0-2/6", "", "abc"), fault("404 Not Found")]);
+    let mut stream = service().open_seekable(&url, &Default::default()).unwrap();
+    let mut bytes = Vec::new();
+    let result = stream.read_to_end(&mut bytes);
+    server.join().unwrap();
+    assert!(result.is_err());
+}

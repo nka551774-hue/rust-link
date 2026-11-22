@@ -10,7 +10,7 @@
 #
 #   sudo ./install.sh
 #   sudo ./install.sh --address 127.0.0.1 --port 2333
-#   sudo ./install.sh --native --password hunter2
+#   sudo RUSTLINK_PASSWORD=hunter2 ./install.sh --native
 #
 set -euo pipefail
 
@@ -21,7 +21,7 @@ DIRECTORY=/opt/rustlink
 SERVICE_USER=rustlink
 ADDRESS=0.0.0.0
 PORT=2333
-PASSWORD=
+PASSWORD=${RUSTLINK_PASSWORD:-}
 NATIVE=0
 BUILD=1
 SERVICE=1
@@ -37,7 +37,8 @@ Usage: sudo ./install.sh [options]
   --user NAME        system user it runs as (default: rustlink)
   --address ADDRESS  listen address (default: 0.0.0.0, every interface)
   --port PORT        listen port (default: 2333)
-  --password VALUE   password for clients (default: one is generated)
+  --password VALUE   password for clients (default: one is generated); it shows in
+                     the process list, so prefer RUSTLINK_PASSWORD in the environment
   --native           build with -C target-cpu=native
   --no-build         install the binary already in target/release
   --no-service       install the files without touching systemd
@@ -82,6 +83,7 @@ case $PORT in '' | *[!0-9]*) die "--port needs a number" ;; esac
 case $ADDRESS in '' | *[[:space:]]*) die "--address cannot be empty or contain spaces" ;; esac
 case $DIRECTORY in /*) ;; *) die "--dir needs an absolute path" ;; esac
 case $DIRECTORY in *[[:space:]\|]*) die "--dir cannot contain spaces or a pipe" ;; esac
+case ${DIRECTORY%/} in "" | /bin | /boot | /dev | /etc | /home | /lib | /lib64 | /opt | /proc | /root | /run | /sbin | /srv | /sys | /tmp | /usr | /usr/* | /var) die "--dir $DIRECTORY is a system directory; use a folder of its own such as /opt/rustlink" ;; esac
 case $SERVICE_USER in '' | *[!A-Za-z0-9_-]*) die "--user needs a plain name" ;; esac
 if [ -n "$PASSWORD" ]; then
     case $PASSWORD in *[\"\\]* | *[[:space:]]*) die "--password cannot contain quotes, backslashes or spaces" ;; esac
@@ -127,7 +129,7 @@ install_packages() {
         dnf | yum) "$manager" install -y "$@" ;;
         zypper) zypper --non-interactive install --no-recommends "$@" ;;
         apk) apk add --no-cache "$@" ;;
-        pacman) pacman -Sy --noconfirm --needed "$@" ;;
+        pacman) pacman -S --noconfirm --needed "$@" ;;
         *) return 1 ;;
     esac
 }
