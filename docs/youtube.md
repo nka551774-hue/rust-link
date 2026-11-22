@@ -115,7 +115,7 @@ cargo run -p rustlink-client --example bot -- "https://youtu.be/dQw4w9WgXcQ"
 
 辨認分享 URL、取得曲目中繼資料、實際取得音訊串流，是不同步驟。原生 YouTube 播放需要 InnerTube 客戶端取得直接音訊 URL；要求播放器腳本還原簽章、特殊串流協定、有效 PO token 或受到帳戶／地區／平台限制時，仍可能失敗。
 
-用戶端依序為 `ANDROID_VR 1.60.19`、`ANDROID`、`IOS`，跟 Lavalink youtube-source 的預設一樣，ANDROID_VR 排第一。2026-11-22 實測，`ANDROID_VR 1.60.19` 不用 PO token、也不用執行播放器 JS，就能以 128 KiB 分段下載完整音訊（`dQw4w9WgXcQ` 3433755/3433755 bytes）。較新的 VR 版本與 `ANDROID`、`IOS` 在同一網路下，約 900 KiB 後就被拒絕。
+用戶端依序為 `IOS_PRODUCER 0.147.945`、`ANDROID_VR 1.60.19`、`ANDROID`、`IOS`；搜尋與播放清單固定使用 `ANDROID`。2026-11-22 在一個台灣住宅網路實測：`IOS_PRODUCER` 不用 PO token、也不用執行播放器 JS，10 首熱門歌曲加上 `f2u9F-IT9wY` 都能完整下載（AAC，itag 140），包括 `ANDROID_VR` 被要求「確認不是機器人」的歌。`f2u9F-IT9wY`（4:22）在 Discord 語音頻道完整播完，結束原因為 `finished`。`ANDROID_VR 1.60.19`（Lavalink youtube-source 的首選）在 YouTube 信任的網路上也能播完整首；較新的 VR 版本與 `ANDROID`、`IOS` 約 900 KiB 後就被拒絕。
 
 YouTube 會對它不信任的網路位址回應「Sign in to confirm you're not a bot」。同一天在一個台灣住宅網路測試 10 首熱門歌曲，9 首被這樣拒絕，Cloudflare WARP 也一樣。這時請設定 `youtubeProxy`（`http://`、`socks5://` 或 `socks5h://`）：YouTube 的 API 與音訊請求都會改從代理連出，其他音源不受影響。代理設定無法使用時，YouTube 會直接載入失敗，不會改為直連。
 

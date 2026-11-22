@@ -21,6 +21,8 @@ use crate::transport::{self, Mode, Transport};
 use crate::{CloseHandler, Closed, Connection, VoiceError};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a DAVE session waits for a welcome before deciding it is alone.
+const ALONE_GRACE: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_CAPACITY: usize = 32;
 const MAX_RETAINED_PACKET: usize = 4096;
@@ -130,6 +132,8 @@ struct Gateway {
     sequence: i64,
     identify: Option<Value>,
     speaking: bool,
+    /// When to check whether the DAVE session is the call's only member.
+    alone_at: Option<Instant>,
 }
 
 pub async fn connect(
@@ -196,6 +200,7 @@ async fn connect_url(
             outstanding: None,
             sequence: -1,
             speaking: false,
+            alone_at: None,
             identify: Some(
                 json!({"op":0,"d":{"server_id":guild,"user_id":user,"session_id":state.session_id,"token":state.token,"max_dave_protocol_version":rustlink_dave::MAX_PROTOCOL_VERSION}}),
             ),
@@ -286,6 +291,12 @@ impl Gateway {
                 self.outstanding = Some((nonce,Instant::now()));
                 self.next_heartbeat = Some(heartbeat_deadline(self.interval)?);
             }
+            _ = tokio::time::sleep_until(self.alone_at.unwrap_or_else(Instant::now)), if self.alone_at.is_some() => {
+                self.alone_at = None;
+                if self.dave.start_alone().map_err(dave_error)? {
+                    log::debug!("voice DAVE: no other member joined; sending with the local group");
+                }
+            }
             message = self.stream.next() => {
                 match message.ok_or_else(|| VoiceError::Gateway("voice gateway hung up".into()))?.map_err(gateway_error)? {
                     Message::Text(text) => {
@@ -310,6 +321,9 @@ impl Gateway {
                         log::debug!("voice gateway received binary op {} ({} bytes)", bytes[2], bytes.len());
                         let outgoing = self.dave.handle_binary(bytes[2],&bytes[3..]).map_err(dave_error)?;
                         self.outbound(outgoing).await?;
+                        if bytes[2] == 25 && !self.dave.ready() {
+                            self.alone_at = Some(Instant::now() + ALONE_GRACE);
+                        }
                     }
                     Message::Ping(bytes) => self.send_message(Message::Pong(bytes)).await?,
                     Message::Close(frame) => {
@@ -418,6 +432,10 @@ impl Gateway {
                     .describe(mode, *key)?;
                 let outgoing = self.dave.negotiate(version).map_err(dave_error)?;
                 self.outbound(outgoing).await?;
+                // The external sender may already be here (op 25 before op 4).
+                if !self.dave.ready() {
+                    self.alone_at = Some(Instant::now() + ALONE_GRACE);
+                }
             }
             6 => {
                 let nonce = data.get("t").and_then(Value::as_i64);

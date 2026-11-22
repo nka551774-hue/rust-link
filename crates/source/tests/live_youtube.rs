@@ -15,7 +15,7 @@ fn a_youtube_track_is_read_past_the_first_minute() {
     let mut config = Config::default();
     apply_env(&mut config);
     let service = Service::new(config);
-    let LoadResult::Track(track) = service.load("https://youtu.be/dQw4w9WgXcQ").unwrap() else {
+    let LoadResult::Track(track) = service.load("https://youtu.be/f2u9F-IT9wY").unwrap() else {
         panic!("the video did not resolve to a track");
     };
     let mut audio = service.open(&track).unwrap();

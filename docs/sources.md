@@ -68,9 +68,10 @@ protocol are not deciphered or reconstructed. Regional, account or provider
 restrictions can also reject a request; the API returns the source error.
 Native resolution does not guarantee playback of every YouTube video.
 
-**Clients and proxy.** Clients are tried as `ANDROID_VR` 1.60.19, `ANDROID`,
-`IOS`. The VR client was measured (2026-11) to serve whole files without a
-token; the others stop after ~900 KiB on the same network. An address YouTube
+**Clients and proxy.** Playback tries `IOS_PRODUCER` 0.147.945, `ANDROID_VR`
+1.60.19, `ANDROID`, `IOS`; searches and playlists use `ANDROID`. The first two
+were measured (2026-11) to serve whole files without a token, `IOS_PRODUCER`
+even where YouTube bot-checks the others; the rest stop after ~900 KiB. An address YouTube
 distrusts is answered "Sign in to confirm you're not a bot"; `youtubeProxy`
 sends every YouTube API and audio request through an `http://`, `socks4://`,
 `socks5://` or `socks5h://` proxy instead.

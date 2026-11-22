@@ -1048,8 +1048,8 @@ mod tests {
         let cdn = format!("http://{}", listener.local_addr().unwrap());
         let media_server = std::thread::spawn(move || {
             for (path, expected_agent, response) in [
-                ("/blocked", "com.google.android.apps.youtube.vr.oculus/", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                ("/allowed", "com.google.android.youtube/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
+                ("/blocked", "com.google.ios.youtubeproducer/", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                ("/allowed", "com.google.android.apps.youtube.vr.oculus/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
             ] {
                 let until = Instant::now() + Duration::from_secs(5);
                 let (mut socket, _) = loop {
@@ -1092,7 +1092,7 @@ mod tests {
                 }});
             }
             let (client, path) =
-                if call == 2 { ("ANDROID_VR", "/blocked") } else { ("ANDROID", "/allowed") };
+                if call == 2 { ("IOS_PRODUCER", "/blocked") } else { ("ANDROID_VR", "/allowed") };
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(serde_json::Value::as_str),
                 Some(client)

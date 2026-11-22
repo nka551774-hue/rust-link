@@ -110,6 +110,30 @@ impl Session {
         self.active.is_some()
     }
 
+    /// Starts sending with the local group when no one else is in the call.
+    ///
+    /// Per "Initial Group Creation", the first member holds a group of itself
+    /// and the gateway sends nothing until someone joins, so no transition
+    /// would ever arrive. The caller waits a grace period first, because the
+    /// roster (op 11) and a welcome may still be in flight. The key is the
+    /// local group's own, so media stays encrypted; a later join moves to the
+    /// next epoch through the usual commit and transition.
+    pub fn start_alone(&mut self) -> Result<bool> {
+        let alone = self.version == Some(1)
+            && self.active.is_none()
+            && self.expected.iter().all(|&member| member == self.user)
+            && self
+                .group
+                .as_ref()
+                .is_some_and(|g| g.epoch().as_u64() == 0 && g.members().count() == 1);
+        if !alone {
+            return Ok(false);
+        }
+        let sender = self.sender()?;
+        self.prepare(0, sender)?;
+        Ok(true)
+    }
+
     pub fn active_version(&self) -> Option<u16> {
         self.active.as_ref().map(|s| match s {
             Sender::TransportOnly => 0,

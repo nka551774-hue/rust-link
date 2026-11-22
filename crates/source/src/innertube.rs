@@ -37,10 +37,23 @@ pub fn clients(config: &Config) -> Vec<Client> {
     };
     vec![
         Client {
+            name: "IOS_PRODUCER",
+            // Measured 2026-11-22 to serve whole files with no proof of origin,
+            // even to an address the other identities answer with a bot check.
+            // It offers AAC (itag 140) only.
+            version: "0.147.945".into(),
+            user_agent: Cow::Borrowed("com.google.ios.youtubeproducer/0.147.945 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"),
+            sdk: None,
+            device_make: Some("Apple"),
+            device_model: Some("iPhone16,2"),
+            os_name: Some("iPhone"),
+            os_version: Some("18.3.2.22D82"),
+        },
+        Client {
             name: "ANDROID_VR",
-            // The only identity measured (2026-11) to serve whole files with no
-            // proof of origin; newer VR versions stop after ~900 KiB like the
-            // others. It sends only these fields, as Lavalink's client does.
+            // Serves whole files with no proof of origin to an address YouTube
+            // trusts; newer VR versions stop after ~900 KiB like the others.
+            // It sends only these fields, as Lavalink's client does.
             version: "1.60.19".into(),
             user_agent: Cow::Borrowed("com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
             sdk: Some(32),
@@ -75,6 +88,14 @@ pub fn clients(config: &Config) -> Vec<Client> {
             os_version: Some("18.3.2.22D82"),
         },
     ]
+}
+
+/// The client searches and playlists are read with: Android answers them in
+/// the shape the parsers expect, whichever client plays best right now.
+fn catalogue_client(config: &Config) -> Client {
+    let mut all = clients(config);
+    let android = all.iter().position(|client| client.name == "ANDROID").unwrap_or(0);
+    all.swap_remove(android)
 }
 
 /// The client the catalogue is searched with. It needs no player script because
@@ -218,7 +239,7 @@ impl Catalog<'_> {
 
     /// Searches the catalogue for videos.
     pub fn search(&self, query: &str, want: usize) -> Result<Vec<Track>, SourceError> {
-        let client = clients(self.config).remove(0);
+        let client = catalogue_client(self.config);
         let body = json!({ "query": query, "params": SEARCH_PARAMS });
         let answer = self.web_call(&client, "search", body)?;
         let mut found = Vec::new();
@@ -243,7 +264,7 @@ impl Catalog<'_> {
     /// thousand track playlist should not hold the load open while the node
     /// reads all of it.
     pub fn playlist(&self, playlist_id: &str) -> Result<LoadResult, SourceError> {
-        let client = clients(self.config).remove(0);
+        let client = catalogue_client(self.config);
         let mut videos = Vec::new();
         let mut title = String::new();
         let mut continuation = String::new();
@@ -797,10 +818,10 @@ mod tests {
             request += 1;
             assert_eq!(body["videoId"], "1CXveaq_vFU");
             if request == 1 {
-                assert_eq!(body["context"]["client"]["clientName"], "ANDROID_VR");
+                assert_eq!(body["context"]["client"]["clientName"], "IOS_PRODUCER");
                 json!({"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"client refused"}})
             } else {
-                assert_eq!(body["context"]["client"]["clientName"], "ANDROID");
+                assert_eq!(body["context"]["client"]["clientName"], "ANDROID_VR");
                 json!({"playabilityStatus":{"status":"OK"},"videoDetails":{
                     "videoId":"1CXveaq_vFU","title":"Shared video","author":"Artist","lengthSeconds":"180"
                 }})
@@ -861,17 +882,17 @@ mod tests {
                 );
                 assert_eq!(headers["X-Media-Fixture"], "preserved");
                 if opened == 1 {
-                    assert!(url.ends_with("/ANDROID_VR"));
+                    assert!(url.ends_with("/IOS_PRODUCER"));
                     Err(SourceError::Media { status: 403 })
                 } else {
-                    assert!(url.ends_with("/ANDROID"));
-                    assert!(headers["User-Agent"].starts_with("com.google.android.youtube/"));
+                    assert!(url.ends_with("/ANDROID_VR"));
+                    assert!(headers["User-Agent"].contains("youtube.vr.oculus/"));
                     Ok(url)
                 }
             },
         );
         server.join().unwrap();
-        assert!(result.unwrap().ends_with("/ANDROID"));
+        assert!(result.unwrap().ends_with("/ANDROID_VR"));
         assert_eq!(opened, 2);
     }
 
@@ -905,7 +926,7 @@ mod tests {
     #[test]
     fn exhausted_clients_preserve_the_retryable_cdn_error() {
         let mut request = 0;
-        let (base, server) = crate::test_http::serve(3, move |_, _, _| {
+        let (base, server) = crate::test_http::serve(4, move |_, _, _| {
             request += 1;
             if request == 1 {
                 json!({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{
@@ -966,7 +987,7 @@ mod tests {
             );
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(Value::as_str),
-                Some("ANDROID_VR")
+                Some("IOS_PRODUCER")
             );
             assert_eq!(
                 body.pointer("/serviceIntegrityDimensions/poToken").and_then(Value::as_str),
@@ -1161,14 +1182,14 @@ mod tests {
     }
 
     #[test]
-    fn the_vr_client_that_serves_whole_files_is_tried_first() {
+    fn the_clients_that_serve_whole_files_are_tried_first() {
         let config = Config::default();
         let clients = clients(&config);
         let names: Vec<_> = clients.iter().map(|client| client.name).collect();
-        assert_eq!(names, ["ANDROID_VR", "ANDROID", "IOS"]);
-        assert_eq!(clients[0].version, "1.60.19");
-        assert!(clients[0].user_agent.contains("oculus/1.60.19 "));
-        assert_eq!(clients[1].version, "20.10.38");
+        assert_eq!(names, ["IOS_PRODUCER", "ANDROID_VR", "ANDROID", "IOS"]);
+        assert_eq!(clients[1].version, "1.60.19");
+        assert!(clients[1].user_agent.contains("oculus/1.60.19 "));
+        assert_eq!(catalogue_client(&config).name, "ANDROID");
     }
 
     #[test]

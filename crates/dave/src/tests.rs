@@ -357,6 +357,37 @@ fn transitions_before_session_description_cannot_enable_audio() {
 }
 
 #[test]
+fn a_lone_member_sends_with_its_local_group_until_someone_joins() {
+    let host = Host::new();
+    // Someone else in the roster: wait for their welcome instead.
+    let (mut crowded, _) = host.session(ALICE);
+    assert!(!crowded.start_alone().unwrap());
+    assert!(!crowded.ready());
+
+    let mut session = Session::new(ALICE, CHANNEL).unwrap();
+    assert!(!session.start_alone().unwrap(), "nothing negotiated yet");
+    session.negotiate(1).unwrap();
+    take_binary(session.handle_binary(25, &host.external).unwrap(), 26);
+    assert!(session.start_alone().unwrap());
+    assert!(session.ready());
+    let alone = session.encrypt_opus(OPUS).unwrap();
+    assert_ne!(alone, OPUS, "media stays encrypted while alone");
+    assert!(!session.start_alone().unwrap(), "only once");
+
+    // A member joins: the usual commit moves both to a key they share.
+    session.handle_json(11, &json!({"user_ids":[BOB.to_string()]})).unwrap();
+    let mut peer = host.peer(BOB);
+    let payload = append(&mut session, &host.add(0, &peer.create_key_package().unwrap()));
+    let (commit, welcome) = split_commit_welcome(&payload);
+    transition(&mut session, 29, 3, commit);
+    peer.process_welcome(welcome).unwrap();
+    execute(&mut session, 3);
+    let shared = session.encrypt_opus(OPUS).unwrap();
+    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &shared).unwrap(), OPUS);
+    assert!(peer.decrypt(ALICE, MediaType::AUDIO, &alone).is_err(), "the lone key is not shared");
+}
+
+#[test]
 fn the_key_package_waits_for_the_external_sender() {
     // Discord sends Session Description (op 4) before the external sender (op 25) and
     // ignores a key package that arrives ahead of it.
