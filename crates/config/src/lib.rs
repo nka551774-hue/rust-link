@@ -61,6 +61,10 @@ pub struct Config {
     pub youtube_client_version: String,
     pub youtube_po_token: String,
     pub youtube_visitor_data: String,
+    /// Sends every YouTube request through this proxy (`http://`, `socks5://`
+    /// or `socks5h://`), for a node whose own address YouTube asks to sign in.
+    /// Empty connects directly. It may carry credentials, so `Debug` hides it.
+    pub youtube_proxy: String,
 
     pub soundcloud_native: bool,
     pub soundcloud_api_endpoint: String,
@@ -146,9 +150,10 @@ impl std::fmt::Debug for Webhook {
 }
 
 /// Fields that hold credentials, by their serialized name.
-const SECRET_FIELDS: [&str; 5] = [
+const SECRET_FIELDS: [&str; 6] = [
     "password",
     "youtubePoToken",
+    "youtubeProxy",
     "soundcloudClientId",
     "spotifyClientSecret",
     "spotifyRefreshToken",
@@ -221,6 +226,7 @@ impl Default for Config {
             youtube_client_version: String::new(),
             youtube_po_token: String::new(),
             youtube_visitor_data: String::new(),
+            youtube_proxy: String::new(),
             soundcloud_native: true,
             soundcloud_api_endpoint: "https://api-v2.soundcloud.com".into(),
             soundcloud_web_endpoint: "https://soundcloud.com".into(),
@@ -415,6 +421,7 @@ mod tests {
             spotify_client_secret: "spotify-secret".into(),
             spotify_refresh_token: "refresh-secret".into(),
             youtube_po_token: "po-secret".into(),
+            youtube_proxy: "socks5://user:proxy-secret@127.0.0.1:1080".into(),
             soundcloud_client_id: "sc-secret".into(),
             ..Default::default()
         };
@@ -425,6 +432,7 @@ mod tests {
                 "spotify-secret",
                 "refresh-secret",
                 "po-secret",
+                "proxy-secret",
                 "sc-secret",
                 "hook-secret",
             ] {

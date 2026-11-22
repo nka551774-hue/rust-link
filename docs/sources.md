@@ -68,6 +68,13 @@ protocol are not deciphered or reconstructed. Regional, account or provider
 restrictions can also reject a request; the API returns the source error.
 Native resolution does not guarantee playback of every YouTube video.
 
+**Clients and proxy.** Clients are tried as `ANDROID_VR` 1.60.19, `ANDROID`,
+`IOS`. The VR client was measured (2026-11) to serve whole files without a
+token; the others stop after ~900 KiB on the same network. An address YouTube
+distrusts is answered "Sign in to confirm you're not a bot"; `youtubeProxy`
+sends every YouTube API and audio request through an `http://`, `socks4://`,
+`socks5://` or `socks5h://` proxy instead.
+
 **PO tokens.** YouTube asks for a proof-of-origin token for some clients.
 `youtubePoToken` supplies a token in the native player request and as the
 `pot` parameter of googlevideo audio URLs; `youtubeVisitorData` supplies its

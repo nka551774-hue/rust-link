@@ -219,6 +219,9 @@ impl Drop for Permit<'_> {
 pub struct Service {
     config: Config,
     agent: ureq::Agent,
+    /// What YouTube is reached with: the proxy when one is configured. A proxy
+    /// that cannot be used fails YouTube loads rather than going direct.
+    youtube_agent: Result<ureq::Agent, SourceError>,
     cache: Mutex<Cache>,
     /// One lock per identifier being resolved, so a burst of clients asking for
     /// the same playlist turns into one conversation with the source and not
@@ -233,10 +236,16 @@ pub struct Service {
 impl Service {
     pub fn new(config: Config) -> Self {
         let agent = netguard::agent(config.allow_private_networks);
+        let youtube_agent = if config.youtube_proxy.trim().is_empty() {
+            Ok(agent.clone())
+        } else {
+            netguard::proxied_agent(config.allow_private_networks, &config.youtube_proxy)
+        };
         let gate = Gate::new(config.max_concurrent_loads as usize);
         Service {
             config,
             agent,
+            youtube_agent,
             cache: Mutex::new(Cache::default()),
             inflight: Mutex::new(HashMap::new()),
             catalog_state: catalog::State::default(),
@@ -363,7 +372,8 @@ impl Service {
         if !self.config.youtube_native {
             return Err(SourceError::Disabled("YouTube is disabled (youtubeNative: false)".into()));
         }
-        let catalog = innertube::Catalog { agent: &self.agent, config: &self.config };
+        let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
+        let catalog = innertube::Catalog { agent, config: &self.config };
         if let Some(query) = identifier.strip_prefix("ytsearch:") {
             let tracks = catalog.search(query.trim(), self.config.search_results as usize)?;
             return Ok(finish_search(tracks));
@@ -582,10 +592,15 @@ impl Service {
                     if !youtube_id(&track.metadata.identifier) {
                         return Err(SourceError::Url("invalid YouTube video identifier".into()));
                     }
-                    innertube::Catalog { agent: &self.agent, config: &self.config }
-                        .with_media_url(&track.metadata.identifier, |url, headers| {
-                            self.open_seekable(&url, &headers)
-                        })
+                    let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
+                    innertube::Catalog { agent, config: &self.config }.with_media_url(
+                        &track.metadata.identifier,
+                        |url, headers| {
+                            let range = MediaRange::for_url(&url);
+                            let body = MediaBody::open(agent.clone(), &url, &headers, range)?;
+                            Ok(Box::new(body) as Box<dyn Read + Send>)
+                        },
+                    )
                 }
                 "youtube" => Err(SourceError::Disabled("youtube native source is disabled".into())),
                 _ => {
@@ -1033,8 +1048,8 @@ mod tests {
         let cdn = format!("http://{}", listener.local_addr().unwrap());
         let media_server = std::thread::spawn(move || {
             for (path, expected_agent, response) in [
-                ("/blocked", "com.google.android.youtube/", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                ("/allowed", "com.google.android.apps.youtube.vr.oculus/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
+                ("/blocked", "com.google.android.apps.youtube.vr.oculus/", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                ("/allowed", "com.google.android.youtube/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
             ] {
                 let until = Instant::now() + Duration::from_secs(5);
                 let (mut socket, _) = loop {
@@ -1077,7 +1092,7 @@ mod tests {
                 }});
             }
             let (client, path) =
-                if call == 2 { ("ANDROID", "/blocked") } else { ("ANDROID_VR", "/allowed") };
+                if call == 2 { ("ANDROID_VR", "/blocked") } else { ("ANDROID", "/allowed") };
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(serde_json::Value::as_str),
                 Some(client)

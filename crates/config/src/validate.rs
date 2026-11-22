@@ -46,6 +46,9 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if let Some(problem) = check_webhook_url(config.webhook.url.trim()) {
         return invalid(problem);
     }
+    if let Some(problem) = check_proxy_url(config.youtube_proxy.trim()) {
+        return invalid(problem);
+    }
     if config.youtube_native
         && (config.youtube_endpoint.is_empty() || config.youtube_music_endpoint.is_empty())
     {
@@ -119,6 +122,29 @@ fn check_webhook_url(url: &str) -> Option<String> {
     None
 }
 
+/// A proxy the HTTP client can use: a scheme it speaks and a host.
+fn check_proxy_url(url: &str) -> Option<String> {
+    const SCHEMES: [&str; 4] = ["http://", "socks4://", "socks5://", "socks5h://"];
+    let problem = || {
+        Some(
+            "youtubeProxy must be an http://, socks4://, socks5:// or socks5h:// URL with a host"
+                .into(),
+        )
+    };
+    if url.is_empty() {
+        return None;
+    }
+    let Some(rest) = SCHEMES.iter().find_map(|scheme| url.strip_prefix(scheme)) else {
+        return problem();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    if host.is_empty() || host.starts_with(':') {
+        return problem();
+    }
+    None
+}
+
 fn one_of(value: &str, allowed: &[&str]) -> bool {
     let value = value.trim();
     allowed.iter().any(|candidate| candidate.eq_ignore_ascii_case(value))
@@ -142,6 +168,23 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         validate(&valid()).unwrap();
+    }
+
+    #[test]
+    fn a_youtube_proxy_needs_a_supported_scheme_and_a_host() {
+        for good in [
+            "",
+            "socks5://127.0.0.1:40000",
+            "http://user:pass@proxy.example:8080",
+            "socks5h://p.example",
+        ] {
+            let config = Config { youtube_proxy: good.into(), ..valid() };
+            validate(&config).unwrap_or_else(|error| panic!("{good}: {error:?}"));
+        }
+        for bad in ["127.0.0.1:40000", "ftp://proxy.example", "socks5://", "http://user@:8080"] {
+            let config = Config { youtube_proxy: bad.into(), ..valid() };
+            assert!(validate(&config).is_err(), "{bad} was accepted");
+        }
     }
 
     #[test]

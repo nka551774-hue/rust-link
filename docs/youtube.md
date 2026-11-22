@@ -115,6 +115,10 @@ cargo run -p rustlink-client --example bot -- "https://youtu.be/dQw4w9WgXcQ"
 
 辨認分享 URL、取得曲目中繼資料、實際取得音訊串流，是不同步驟。原生 YouTube 播放需要 InnerTube 客戶端取得直接音訊 URL；要求播放器腳本還原簽章、特殊串流協定、有效 PO token 或受到帳戶／地區／平台限制時，仍可能失敗。
 
+用戶端依序為 `ANDROID_VR 1.60.19`、`ANDROID`、`IOS`，跟 Lavalink youtube-source 的預設一樣，ANDROID_VR 排第一。2026-11-22 實測，`ANDROID_VR 1.60.19` 不用 PO token、也不用執行播放器 JS，就能以 128 KiB 分段下載完整音訊（`dQw4w9WgXcQ` 3433755/3433755 bytes）。較新的 VR 版本與 `ANDROID`、`IOS` 在同一網路下，約 900 KiB 後就被拒絕。
+
+YouTube 會對它不信任的網路位址回應「Sign in to confirm you're not a bot」。同一天在一個台灣住宅網路測試 10 首熱門歌曲，9 首被這樣拒絕，Cloudflare WARP 也一樣。這時請設定 `youtubeProxy`（`http://`、`socks5://` 或 `socks5h://`）：YouTube 的 API 與音訊請求都會改從代理連出，其他音源不受影響。代理設定無法使用時，YouTube 會直接載入失敗，不會改為直連。
+
 `youtubePoToken` 會把你提供的 token 帶入 player request，並以 `pot` 參數附加到 googlevideo 音訊 URL（不會送往其他主機）。YouTube 不信任的網路在沒有 token 時，只能取得前約 768 KiB（約 1 分鐘）音訊，之後 googlevideo 回 403，播放會中途停止。Rustlink 不會自動產生或更新 token，也不保證其他串流端點接受它。`youtubeNative: false` 會停用 YouTube。來源解析失敗由 API 回覆錯誤；媒體下載或解碼的後續錯誤由 `track.failed` 事件回報。
 
 Googlevideo 音訊使用 128 KiB 分段下載，避免此次實測遇到的無結束位置或較大 Range 請求遭 403 拒絕。後續段落會檢查位移與檔案總長並連續交給解碼器；正常換段不會等待重試。選取音軌時優先非自動配音、原音及未套用動態壓縮的版本，再比較位元率。

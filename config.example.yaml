@@ -23,6 +23,7 @@ youtubeMusicEndpoint: https://music.youtube.com
 youtubeClientVersion: ""                   # empty uses the version the node ships with
 youtubePoToken: ""                         # proof-of-origin token; without it some networks stop after ~1 minute
 youtubeVisitorData: ""
+youtubeProxy: ""                           # route YouTube through http://, socks5:// or socks5h:// when your IP gets "confirm you're not a bot"
 
 # --- SoundCloud ---
 soundcloudNative: true                     # native public API client

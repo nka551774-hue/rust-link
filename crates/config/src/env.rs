@@ -22,7 +22,7 @@ pub fn apply_env(config: &mut Config) {
 /// Applies overrides read from `lookup`, which is separated from the process
 /// environment so the rules can be tested without touching global state.
 pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<String>) {
-    let strings: [(&str, StringField); 23] = [
+    let strings: [(&str, StringField); 24] = [
         ("RUSTLINK_ADDRESS", |c| &mut c.address),
         ("RUSTLINK_PASSWORD", |c| &mut c.password),
         ("RUSTLINK_FFMPEG", |c| &mut c.ffmpeg),
@@ -36,6 +36,7 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
         ("RUSTLINK_YOUTUBE_CLIENT_VERSION", |c| &mut c.youtube_client_version),
         ("RUSTLINK_YOUTUBE_PO_TOKEN", |c| &mut c.youtube_po_token),
         ("RUSTLINK_YOUTUBE_VISITOR_DATA", |c| &mut c.youtube_visitor_data),
+        ("RUSTLINK_YOUTUBE_PROXY", |c| &mut c.youtube_proxy),
         ("RUSTLINK_SOUNDCLOUD_API_ENDPOINT", |c| &mut c.soundcloud_api_endpoint),
         ("RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT", |c| &mut c.soundcloud_web_endpoint),
         ("RUSTLINK_SOUNDCLOUD_CLIENT_ID", |c| &mut c.soundcloud_client_id),

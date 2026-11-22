@@ -37,6 +37,19 @@ pub fn clients(config: &Config) -> Vec<Client> {
     };
     vec![
         Client {
+            name: "ANDROID_VR",
+            // The only identity measured (2026-11) to serve whole files with no
+            // proof of origin; newer VR versions stop after ~900 KiB like the
+            // others. It sends only these fields, as Lavalink's client does.
+            version: "1.60.19".into(),
+            user_agent: Cow::Borrowed("com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
+            sdk: Some(32),
+            device_make: None,
+            device_model: None,
+            os_name: None,
+            os_version: None,
+        },
+        Client {
             name: "ANDROID",
             // This version still returns directly usable audio for videos
             // newer Android identities expose only through SABR. Keep the
@@ -50,16 +63,6 @@ pub fn clients(config: &Config) -> Vec<Client> {
             device_model: None,
             os_name: Some("Android"),
             os_version: Some("11"),
-        },
-        Client {
-            name: "ANDROID_VR",
-            version: "1.65.10".into(),
-            user_agent: Cow::Borrowed("com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
-            sdk: Some(32),
-            device_make: Some("Oculus"),
-            device_model: Some("Quest 3"),
-            os_name: Some("Android"),
-            os_version: Some("12L"),
         },
         Client {
             name: "IOS",
@@ -794,10 +797,10 @@ mod tests {
             request += 1;
             assert_eq!(body["videoId"], "1CXveaq_vFU");
             if request == 1 {
-                assert_eq!(body["context"]["client"]["clientName"], "ANDROID");
+                assert_eq!(body["context"]["client"]["clientName"], "ANDROID_VR");
                 json!({"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"client refused"}})
             } else {
-                assert_eq!(body["context"]["client"]["clientName"], "ANDROID_VR");
+                assert_eq!(body["context"]["client"]["clientName"], "ANDROID");
                 json!({"playabilityStatus":{"status":"OK"},"videoDetails":{
                     "videoId":"1CXveaq_vFU","title":"Shared video","author":"Artist","lengthSeconds":"180"
                 }})
@@ -858,17 +861,17 @@ mod tests {
                 );
                 assert_eq!(headers["X-Media-Fixture"], "preserved");
                 if opened == 1 {
-                    assert!(url.ends_with("/ANDROID"));
+                    assert!(url.ends_with("/ANDROID_VR"));
                     Err(SourceError::Media { status: 403 })
                 } else {
-                    assert!(url.ends_with("/ANDROID_VR"));
-                    assert!(headers["User-Agent"].contains("youtube.vr"));
+                    assert!(url.ends_with("/ANDROID"));
+                    assert!(headers["User-Agent"].starts_with("com.google.android.youtube/"));
                     Ok(url)
                 }
             },
         );
         server.join().unwrap();
-        assert!(result.unwrap().ends_with("/ANDROID_VR"));
+        assert!(result.unwrap().ends_with("/ANDROID"));
         assert_eq!(opened, 2);
     }
 
@@ -963,7 +966,7 @@ mod tests {
             );
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(Value::as_str),
-                Some("ANDROID")
+                Some("ANDROID_VR")
             );
             assert_eq!(
                 body.pointer("/serviceIntegrityDimensions/poToken").and_then(Value::as_str),
@@ -1158,19 +1161,21 @@ mod tests {
     }
 
     #[test]
-    fn the_android_client_is_tried_first() {
+    fn the_vr_client_that_serves_whole_files_is_tried_first() {
         let config = Config::default();
         let clients = clients(&config);
-        assert_eq!(clients[0].name, "ANDROID");
-        assert_eq!(clients[0].version, "20.10.38");
-        assert!(clients[0].user_agent.contains("youtube/20.10.38 "));
-        assert_eq!(clients.len(), 3);
+        let names: Vec<_> = clients.iter().map(|client| client.name).collect();
+        assert_eq!(names, ["ANDROID_VR", "ANDROID", "IOS"]);
+        assert_eq!(clients[0].version, "1.60.19");
+        assert!(clients[0].user_agent.contains("oculus/1.60.19 "));
+        assert_eq!(clients[1].version, "20.10.38");
     }
 
     #[test]
-    fn a_configured_client_version_replaces_the_built_in_one() {
+    fn a_configured_client_version_replaces_the_built_in_android_one() {
         let config = Config { youtube_client_version: "99.1.2".into(), ..Config::default() };
-        assert_eq!(clients(&config)[0].version, "99.1.2");
-        assert!(clients(&config)[0].user_agent.contains("youtube/99.1.2 "));
+        let android = clients(&config).into_iter().find(|client| client.name == "ANDROID").unwrap();
+        assert_eq!(android.version, "99.1.2");
+        assert!(android.user_agent.contains("youtube/99.1.2 "));
     }
 }

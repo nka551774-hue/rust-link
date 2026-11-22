@@ -57,6 +57,7 @@ to scan without turning any record into a multiline value.
 | `youtubeClientVersion` | *(empty)* | Override the Android client version and its matching User-Agent. Empty currently uses `20.10.38`; Android VR and iOS retain their own versions. |
 | `youtubePoToken` | *(empty)* | A proof-of-origin token, sent in the player request and as `pot` on googlevideo audio URLs. Without one, networks YouTube distrusts stop after ~1 minute of audio. |
 | `youtubeVisitorData` | *(empty)* | Visitor data to send with it. |
+| `youtubeProxy` | *(empty)* | Send every YouTube request, API and audio alike, through this proxy: `http://`, `socks4://`, `socks5://` or `socks5h://`, with optional `user:password@`. Use it when YouTube answers this node's address with "Sign in to confirm you're not a bot". A proxy that cannot be used fails YouTube loads instead of connecting directly. Other sources are not proxied. |
 | `soundcloudNative` | `true` | Resolve SoundCloud with the public API. |
 | `soundcloudApiEndpoint` | `https://api-v2.soundcloud.com` | The API endpoint. |
 | `soundcloudWebEndpoint` | `https://soundcloud.com` | The site a client id is scraped from. |
@@ -147,7 +148,7 @@ The following environment overrides are supported; use these exact names:
 `RUSTLINK_YOUTUBE_NATIVE`,
 `RUSTLINK_YOUTUBE_ENDPOINT`, `RUSTLINK_YOUTUBE_MUSIC_ENDPOINT`,
 `RUSTLINK_YOUTUBE_CLIENT_VERSION`, `RUSTLINK_YOUTUBE_PO_TOKEN`,
-`RUSTLINK_YOUTUBE_VISITOR_DATA`, `RUSTLINK_SOUNDCLOUD`,
+`RUSTLINK_YOUTUBE_VISITOR_DATA`, `RUSTLINK_YOUTUBE_PROXY`, `RUSTLINK_SOUNDCLOUD`,
 `RUSTLINK_SOUNDCLOUD_API_ENDPOINT`, `RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT`,
 `RUSTLINK_SOUNDCLOUD_CLIENT_ID`, `RUSTLINK_DEEZER_API_ENDPOINT`,
 `RUSTLINK_PRIVATE_NETWORKS`, `RUSTLINK_MAX_PLAYERS`, `RUSTLINK_MAX_SESSIONS`,

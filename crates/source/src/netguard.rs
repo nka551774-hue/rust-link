@@ -114,6 +114,9 @@ fn is_public_v6(address: Ipv6Addr) -> bool {
 #[derive(Debug)]
 struct GuardedResolver {
     allow_private: bool,
+    /// The operator's own proxy, which is exempt because it usually listens
+    /// on this machine; the hosts reached through it are still checked.
+    proxy: Option<ureq::http::uri::Authority>,
 }
 
 impl Resolver for GuardedResolver {
@@ -125,7 +128,7 @@ impl Resolver for GuardedResolver {
     ) -> Result<ResolvedSocketAddrs, Error> {
         let addresses =
             DefaultResolver::default().resolve(uri, config, bounded_timeout(timeout)?)?;
-        if self.allow_private {
+        if self.allow_private || (self.proxy.is_some() && uri.authority() == self.proxy.as_ref()) {
             return Ok(addresses);
         }
         let mut allowed = Resolver::empty(&DefaultResolver::default());
@@ -200,16 +203,30 @@ fn bounded_timeout(mut timeout: NextTimeout) -> Result<NextTimeout, Error> {
 /// does not control, and it would have to be checked and re-fetched anyway, so
 /// the caller follows it deliberately instead.
 pub fn agent(allow_private: bool) -> Agent {
+    build(allow_private, None)
+}
+
+/// The same client, connecting through `proxy` (`http://`, `socks4://`,
+/// `socks5://` or `socks5h://`).
+pub fn proxied_agent(allow_private: bool, proxy: &str) -> Result<Agent, SourceError> {
+    let proxy = ureq::Proxy::new(proxy.trim())
+        .map_err(|error| SourceError::Url(format!("youtubeProxy is not usable: {error}")))?;
+    Ok(build(allow_private, Some(proxy)))
+}
+
+fn build(allow_private: bool, proxy: Option<ureq::Proxy>) -> Agent {
+    let exempt = proxy.as_ref().and_then(|proxy| proxy.uri().authority().cloned());
     let config = Agent::config_builder()
         .accept_encoding("identity")
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .max_redirects(0)
+        .proxy(proxy)
         .build();
     Agent::with_parts(
         config,
         ureq::unversioned::transport::DefaultConnector::default().chain(IdleConnector),
-        GuardedResolver { allow_private },
+        GuardedResolver { allow_private, proxy: exempt },
     )
 }
 
@@ -239,6 +256,21 @@ pub fn resolve_all_public(host: &str, port: u16, allow_private: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_proxy_is_reached_while_private_networks_stay_refused() {
+        let (proxy, server) = crate::test_http::serve(1, |_, head, _| {
+            // The tunnel is asked of the proxy, which resolves the target itself.
+            assert!(head.starts_with("CONNECT youtube.test:80 HTTP/1.1"), "{head}");
+            serde_json::json!({})
+        });
+        let proxied = proxied_agent(false, &proxy).unwrap();
+        // The fixture is no real proxy, so the tunnel itself fails afterwards.
+        let _ = proxied.get("http://youtube.test/probe").call();
+        server.join().expect("the local proxy was reached");
+        assert!(agent(false).get(&proxy).call().is_err(), "the direct client still refuses it");
+        assert!(proxied_agent(false, "not a proxy").is_err());
+    }
 
     #[test]
     fn blocking_io_has_an_idle_limit_without_a_whole_stream_lifetime_limit() {
