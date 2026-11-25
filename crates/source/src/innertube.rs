@@ -60,8 +60,8 @@ fn android_client(config: &Config) -> Client {
 }
 
 /// The clients tried in order.
-pub fn clients(config: &Config) -> Vec<Client> {
-    vec![
+pub fn clients(config: &Config) -> [Client; 4] {
+    [
         Client {
             name: "IOS_PRODUCER",
             // Measured 2026-11-22 to serve whole files with no proof of origin,
@@ -538,7 +538,7 @@ fn pick_format(answer: &Value) -> Option<Format> {
         url: &'a str,
         mime: &'a str,
         bitrate: i64,
-        rank: (bool, bool, bool, i64),
+        rank: (bool, bool, bool, bool, i64),
     }
 
     let formats = answer.pointer("/streamingData/adaptiveFormats").and_then(Value::as_array)?;
@@ -548,23 +548,38 @@ fn pick_format(answer: &Value) -> Option<Format> {
         if !mime.starts_with("audio/") || !has_audio_codec(mime) {
             continue;
         }
-        let Some(url) = entry.get("url").and_then(Value::as_str) else {
+        let Some(url) = entry.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()) else {
             // A format with no URL is one YouTube will only deliver over its own
             // streaming protocol, which the node does not speak.
             continue;
         };
-        let bitrate = entry.get("bitrate").and_then(Value::as_i64).unwrap_or(0);
+        let bitrate = entry
+            .get("bitrate")
+            .or_else(|| entry.get("averageBitrate"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         // The request locale can make an automatic dub the default track.
         // Preserve the original performance and dynamics before comparing
         // bitrate; never infer a language from YouTube's opaque track IDs.
         let dubbed =
             entry.pointer("/audioTrack/isAutoDubbed").and_then(Value::as_bool).unwrap_or(false);
-        let original = entry
+        let display = entry
             .pointer("/audioTrack/displayName")
             .and_then(Value::as_str)
-            .is_some_and(|name| name.ends_with(" original"));
+            .unwrap_or_default()
+            .trim_end_matches(')')
+            .trim_end();
+        let original = display
+            .get(display.len().saturating_sub(8)..)
+            .is_some_and(|s| s.eq_ignore_ascii_case("original"))
+            && display
+                .as_bytes()
+                .get(display.len().saturating_sub(9))
+                .is_some_and(|b| matches!(b, b' ' | b'('));
+        let default_track =
+            entry.pointer("/audioTrack/audioIsDefault").and_then(Value::as_bool).unwrap_or(true);
         let drc = entry.get("isDrc").and_then(Value::as_bool).unwrap_or(false);
-        let rank = (!dubbed, original, !drc, bitrate);
+        let rank = (!dubbed, original, default_track, !drc, bitrate);
         if best.is_some_and(|held| held.rank >= rank) {
             continue;
         }
@@ -731,12 +746,25 @@ fn video_from_renderer(value: &Value) -> Option<Media> {
         .map_or_else(String::new, Cow::into_owned);
     let length_raw = runs_cow(value.get("lengthText"));
     let seconds = length_seconds(&length_raw).unwrap_or(0.0);
+    let live = value.get("isLiveNow").and_then(Value::as_bool).unwrap_or(false)
+        || value.get("badges").and_then(Value::as_array).is_some_and(|badges| {
+            badges.iter().any(|b| {
+                b.pointer("/metadataBadgeRenderer/style").and_then(Value::as_str)
+                    == Some("BADGE_STYLE_TYPE_LIVE_NOW")
+            })
+        })
+        || value.get("thumbnailOverlays").and_then(Value::as_array).is_some_and(|overlays| {
+            overlays.iter().any(|o| {
+                o.pointer("/thumbnailOverlayTimeStatusRenderer/style").and_then(Value::as_str)
+                    == Some("LIVE")
+            })
+        });
     Some(Media {
         id: id.to_string(),
         title,
         author,
         seconds,
-        live: value.get("isLiveNow").and_then(Value::as_bool).unwrap_or(false),
+        live,
         artwork: thumbnails(value.get("thumbnail")),
     })
 }
@@ -744,23 +772,29 @@ fn video_from_renderer(value: &Value) -> Option<Media> {
 /// Reads a YouTube Music list item, whose fields are in flex columns.
 fn video_from_music_item(value: &Value) -> Option<Media> {
     let columns = value.get("flexColumns").and_then(Value::as_array)?;
-    let id = columns
-        .iter()
-        .filter_map(|column| {
-            column
-                .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")
-                .and_then(Value::as_array)
-                .and_then(|runs| {
-                    runs.iter().find_map(|run| {
+    let id = value
+        .pointer("/playlistItemData/videoId")
+        .and_then(Value::as_str)
+        .filter(|id| youtube_id(id))
+        .or_else(|| {
+            columns.iter().find_map(|column| {
+                column
+                    .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .find_map(|run| {
                         run.pointer("/navigationEndpoint/watchEndpoint/videoId")
                             .and_then(Value::as_str)
+                            .filter(|id| youtube_id(id))
                     })
-                })
+            })
         })
-        .next()?;
-    if !youtube_id(id) {
-        return None;
-    }
+        .or_else(|| {
+            value
+                .pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId")
+                .and_then(Value::as_str)
+                .filter(|id| youtube_id(id))
+        })?;
     let title = columns
         .first()
         .map(|column| runs_text(column.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
@@ -820,7 +854,23 @@ fn next_continuation(value: &Value) -> Option<&str> {
             {
                 return Some(token);
             }
-            map.values().find_map(next_continuation)
+            map.iter()
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str(),
+                        "header"
+                            | "sidebar"
+                            | "topbar"
+                            | "microformat"
+                            | "menu"
+                            | "sortFilterSubMenuRenderer"
+                            | "subMenuItems"
+                            | "chipCloudRenderer"
+                            | "adSlotRenderer"
+                            | "adPlacementRenderer"
+                    )
+                })
+                .find_map(|(_, child)| next_continuation(child))
         }
         Value::Array(items) => items.iter().find_map(next_continuation),
         _ => None,

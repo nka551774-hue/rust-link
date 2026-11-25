@@ -46,6 +46,16 @@ pub struct PureFrames {
     encoded_any: bool,
 }
 
+#[inline]
+fn skip_frames(skip: &mut u64, buf: &mut Vec<f32>, start: usize) {
+    if *skip > 0 {
+        let frames = (buf.len() - start) / 2;
+        let drop = (*skip).min(frames as u64) as usize;
+        buf.drain(start..start + drop * 2);
+        *skip -= drop as u64;
+    }
+}
+
 impl PureFrames {
     pub(crate) fn supports_timescale(set: &FilterSet) -> bool {
         set.time.is_none_or(|time| (0.05..=5.0).contains(&(time.speed / time.pitch)))
@@ -118,12 +128,7 @@ impl PureFrames {
                 self.drained = true;
                 return Ok(false);
             }
-            if self.skip > 0 {
-                let frames = (self.staging.len() - start) / 2;
-                let drop = self.skip.min(frames as u64) as usize;
-                self.staging.drain(start..start + drop * 2);
-                self.skip -= drop as u64;
-            }
+            skip_frames(&mut self.skip, &mut self.staging, start);
             if self.staging.len() > start {
                 self.dsp.process_pre(&mut self.staging[start..]);
             }
@@ -143,12 +148,7 @@ impl PureFrames {
                 // the rest of the track is still to come, so the caller has to
                 // keep pumping rather than read this as the end of the stream.
                 progressed = true;
-                if self.skip > 0 {
-                    let frames = self.scratch.len() / 2;
-                    let drop = self.skip.min(frames as u64) as usize;
-                    self.scratch.drain(..drop * 2);
-                    self.skip -= drop as u64;
-                }
+                skip_frames(&mut self.skip, &mut self.scratch, 0);
             } else {
                 self.drained = true;
             }

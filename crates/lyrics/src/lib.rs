@@ -170,8 +170,16 @@ fn weight(key: &str, lyrics: Option<&Lyrics>) -> usize {
 fn cache_key(track: &Track) -> String {
     let info = &track.metadata;
     format!(
-        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
-        info.source_name, info.identifier, info.title, info.author, info.length
+        "{}:{}{}:{}{}:{}{}:{}{}",
+        info.source_name.len(),
+        info.source_name,
+        info.identifier.len(),
+        info.identifier,
+        info.title.len(),
+        info.title,
+        info.author.len(),
+        info.author,
+        info.length,
     )
 }
 
@@ -305,27 +313,18 @@ impl Manager {
         let shared_key = if let Some((existing_key, previous)) = cache.entries.remove_entry(key) {
             cache.bytes = cache.bytes.saturating_sub(previous.weight);
             cache.order.retain(|held| held.as_ref() != key);
-            cache.order.push_back(Arc::clone(&existing_key));
             existing_key
         } else {
-            let fresh: Arc<str> = Arc::from(key);
-            cache.order.push_back(Arc::clone(&fresh));
-            fresh
+            Arc::from(key)
         };
         // Oldest first, until both the count and the bytes are within bounds.
-        while cache.order.len() > self.limit || cache.bytes + weight > CACHE_BYTES {
+        while cache.entries.len() >= self.limit || cache.bytes + weight > CACHE_BYTES {
             let Some(oldest) = cache.order.pop_front() else { break };
-            if oldest.as_ref() == key {
-                cache.order.push_back(oldest);
-                if cache.order.len() <= 1 {
-                    break;
-                }
-                continue;
-            }
             if let Some(evicted) = cache.entries.remove(&oldest) {
                 cache.bytes = cache.bytes.saturating_sub(evicted.weight);
             }
         }
+        cache.order.push_back(Arc::clone(&shared_key));
         cache.bytes += weight;
         cache.entries.insert(shared_key, Entry { lyrics, at: Instant::now(), weight });
     }

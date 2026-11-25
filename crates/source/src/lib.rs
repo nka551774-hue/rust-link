@@ -283,7 +283,7 @@ impl Service {
         identifier: &str,
         resolve: impl FnOnce() -> Result<LoadResult, SourceError>,
     ) -> Result<Arc<LoadResult>, SourceError> {
-        let deadline = Instant::now() + self.config.load_timeout();
+        let deadline = deadline::bound(Instant::now() + self.config.load_timeout());
         let identifier = identifier_text(identifier);
         if identifier.is_empty() || identifier.len() > MAX_IDENTIFIER {
             return Err(SourceError::Url("identifier must contain 1..8192 bytes".into()));
@@ -411,7 +411,7 @@ impl Service {
     fn load_http(&self, identifier: &str) -> Result<LoadResult, SourceError> {
         let (mut body, size) = self.fetch(identifier, &Default::default())?;
         let mut head = Vec::with_capacity(probe::FIRST_PROBE);
-        let mut chunk = vec![0u8; probe::FIRST_PROBE];
+        let mut chunk = [0u8; 8192];
         // Only a file with a declared length can be read on for its index: a
         // live stream has none and never ends, so the first window is all it
         // gets. A file can keep its index at the end (an M4A written without
@@ -423,6 +423,7 @@ impl Service {
         // The buffer is probed again only once it has doubled, so a long read
         // does not parse the same leading bytes thousands of times.
         let mut next_probe = probe::FIRST_PROBE;
+        let mut probed_len = 0usize;
         let mut found = probe::Probe::default();
         while head.len() < probe::MAX_PROBE {
             let cap = (probe::MAX_PROBE - head.len()).min(chunk.len());
@@ -435,7 +436,8 @@ impl Service {
                 continue;
             }
             found = probe::probe(&head, size);
-            next_probe = head.len().saturating_mul(2);
+            probed_len = head.len();
+            next_probe = head.len().saturating_mul(2).min(probe::MAX_PROBE);
             if found.audio && found.duration_ms > 0 && !found.title.is_empty() {
                 break;
             }
@@ -447,7 +449,7 @@ impl Service {
                 break;
             }
         }
-        if !found.audio && !head.is_empty() {
+        if head.len() > probed_len {
             found = probe::probe(&head, size);
         }
         if !found.audio {
@@ -485,13 +487,16 @@ fn finish_search(tracks: Vec<Track>) -> LoadResult {
 /// The last part of a URL's path, which is the closest thing a bare file has to
 /// a name.
 fn path_name(identifier: &str) -> String {
-    let path = identifier.split(['?', '#']).next().unwrap_or(identifier);
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let name = name.trim();
+    let name = http_url(identifier)
+        .and_then(|url| url.path().rsplit('/').next().map(str::trim).map(str::to_owned))
+        .unwrap_or_else(|| {
+            let path = identifier.split(['?', '#']).next().unwrap_or(identifier);
+            path.rsplit('/').next().unwrap_or(path).trim().to_owned()
+        });
     if name.is_empty() {
         "Unknown title".to_string()
     } else {
-        name.to_string()
+        name
     }
 }
 
@@ -547,7 +552,7 @@ impl Service {
         &self,
         work: impl FnOnce() -> Result<T, SourceError>,
     ) -> Result<T, SourceError> {
-        let deadline = Instant::now() + self.config.load_timeout();
+        let deadline = deadline::bound(Instant::now() + self.config.load_timeout());
         let _permit = self.gate.enter(deadline)?;
         let _scope = deadline::enter(deadline);
         work()
@@ -576,9 +581,11 @@ impl Service {
                     Ok(Box::new(body) as Box<dyn Read + Send>)
                 })
             }
-            "spotify" | "deezer" => self.with_budget(|| {
+            "spotify" | "deezer" => {
                 // A catalogue supplies metadata only; the audio is mirrored from
-                // a YouTube search for the same name.
+                // a YouTube search for the same name. Hold the deadline scope
+                // without occupying an outer Gate permit while `load_shared` and
+                // `open(best)` acquire their own single permits.
                 let name =
                     if track.metadata.source_name == "deezer" { "Deezer" } else { "Spotify" };
                 if track.metadata.title.trim().is_empty() {
@@ -586,6 +593,7 @@ impl Service {
                         "cannot match {name} track with an empty title"
                     )));
                 }
+                let _scope = deadline::enter(Instant::now() + self.config.load_timeout());
                 let query = if matching::is_unknown_artist(&track.metadata.author) {
                     format!("ytsearch:{} audio", track.metadata.title)
                 } else {
@@ -601,12 +609,12 @@ impl Service {
                     ))
                 })?;
                 self.open(best)
-            }),
+            }
             "youtube" | "soundcloud" => {
-                let declared =
-                    track.metadata.uri.as_deref().unwrap_or(track.metadata.identifier.as_str());
-                if source_kind(declared) != track.metadata.source_name {
-                    return Err(SourceError::Url("track URI does not match its source".into()));
+                if let Some(uri) = track.metadata.uri.as_deref() {
+                    if source_kind(uri) != track.metadata.source_name {
+                        return Err(SourceError::Url("track URI does not match its source".into()));
+                    }
                 }
                 self.with_budget(|| self.open_media(track))
             }

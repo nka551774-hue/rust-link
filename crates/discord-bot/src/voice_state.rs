@@ -13,7 +13,7 @@ const LATE_SERVER_WINDOW: Duration = Duration::from_secs(5);
 struct Pending {
     session_id: Option<String>,
     channel_id: Option<String>,
-    token: Option<String>,
+    token: Option<zeroize::Zeroizing<String>>,
     endpoint: Option<String>,
     emitted: bool,
     /// When a newer server arrived after a pairing was emitted. A state change
@@ -139,9 +139,13 @@ impl VoiceStatePairer {
                     // even when its replacement reuses the exact same fields.
                     pending.emitted = false;
                 }
-                pending.token = Some(update.token.clone());
+                pending.token = Some(zeroize::Zeroizing::new(update.token.clone()));
                 pending.endpoint = update.endpoint.clone();
                 self.ready(guild_id)
+            }
+            BotEvent::Ready(ready) if ready.user_id == self.bot_user_id => {
+                self.pending.clear();
+                Ok(None)
             }
             _ => Ok(None),
         }

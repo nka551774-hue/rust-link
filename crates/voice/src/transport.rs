@@ -57,19 +57,21 @@ pub fn header(sequence: u16, timestamp: u32, ssrc: u32) -> [u8; HEADER_LEN] {
     bytes
 }
 
-/// Expand the AES key at Session Description, outside the 50 Hz packet path.
+/// Pre-initialize the AEAD cipher at Session Description, outside the 50 Hz packet path.
 pub(crate) enum PacketCipher {
     Aes(Box<Aes256Gcm>),
-    // XChaCha has no reusable expanded key schedule. Keep its key zeroized
-    // and construct the small per-packet cipher where it is used.
-    XChaCha(Zeroizing<[u8; 32]>),
+    // Boxed once per session so `ZeroizeOnDrop` runs on session teardown rather
+    // than running volatile stack zeroization on every 20 ms packet.
+    XChaCha(Box<XChaCha20Poly1305>),
 }
 
 impl PacketCipher {
     pub(crate) fn new(mode: Mode, key: &[u8; 32]) -> Self {
         match mode {
             Mode::AeadAes256GcmRtpSize => Self::Aes(Box::new(Aes256Gcm::new(key.into()))),
-            Mode::AeadXChaCha20Poly1305RtpSize => Self::XChaCha(Zeroizing::new(*key)),
+            Mode::AeadXChaCha20Poly1305RtpSize => {
+                Self::XChaCha(Box::new(XChaCha20Poly1305::new(key.into())))
+            }
         }
     }
 
@@ -97,8 +99,7 @@ impl PacketCipher {
                     &mut packet[HEADER_LEN..],
                 )
             }
-            Self::XChaCha(key) => {
-                let cipher = XChaCha20Poly1305::new((&**key).into());
+            Self::XChaCha(cipher) => {
                 let mut nonce = [0u8; 24];
                 nonce[..4].copy_from_slice(&counter);
                 cipher.encrypt_in_place_detached(
@@ -124,7 +125,8 @@ pub fn ip_discovery_request(ssrc: u32) -> [u8; 74] {
 }
 
 pub fn parse_ip_discovery_response(data: &[u8], ssrc: u32) -> Option<(String, u16)> {
-    if data.len() != 74
+    if ssrc == 0
+        || data.len() != 74
         || data[..2] != 2u16.to_be_bytes()
         || data[2..4] != 70u16.to_be_bytes()
         || data[4..8] != ssrc.to_be_bytes()
@@ -135,7 +137,11 @@ pub fn parse_ip_discovery_response(data: &[u8], ssrc: u32) -> Option<(String, u1
     let end = address.iter().position(|byte| *byte == 0)?;
     let address = std::str::from_utf8(&address[..end]).ok()?.parse::<IpAddr>().ok()?;
     let port = u16::from_be_bytes([data[72], data[73]]);
-    if port == 0 || address.is_unspecified() {
+    if port == 0
+        || address.is_unspecified()
+        || address.is_multicast()
+        || matches!(address, IpAddr::V4(v4) if v4.is_broadcast())
+    {
         return None;
     }
     Some((address.to_string(), port))
@@ -194,18 +200,45 @@ impl Transport {
     pub fn write(&self, payload: &[u8]) -> Result<(), VoiceError> {
         let mut state =
             self.state.lock().map_err(|_| VoiceError::Crypto("transport lock poisoned".into()))?;
+        Self::write_locked(
+            &self.socket,
+            self.remote,
+            self.connected,
+            self.ssrc,
+            &mut state,
+            payload,
+        )
+    }
+
+    pub fn write_mut(&mut self, payload: &[u8]) -> Result<(), VoiceError> {
+        let state = self
+            .state
+            .get_mut()
+            .map_err(|_| VoiceError::Crypto("transport lock poisoned".into()))?;
+        Self::write_locked(&self.socket, self.remote, self.connected, self.ssrc, state, payload)
+    }
+
+    #[inline]
+    fn write_locked(
+        socket: &tokio::net::UdpSocket,
+        remote: SocketAddr,
+        connected: bool,
+        ssrc: u32,
+        state: &mut State,
+        payload: &[u8],
+    ) -> Result<(), VoiceError> {
         let counter = u32::try_from(state.counter)
             .map_err(|_| VoiceError::Crypto("transport nonce exhausted; reconnect voice".into()))?;
-        let rtp = header(state.sequence, state.timestamp, self.ssrc);
-        let State { cipher, packet, .. } = &mut *state;
+        let rtp = header(state.sequence, state.timestamp, ssrc);
+        let State { cipher, packet, .. } = state;
         cipher.as_ref().ok_or(VoiceError::NotReady)?.seal_into(packet, &rtp, counter, payload)?;
         state.counter += 1;
         state.sequence = state.sequence.wrapping_add(1);
         state.timestamp = state.timestamp.wrapping_add(FRAME_SAMPLES);
-        let sent = if self.connected {
-            self.socket.try_send(&state.packet)
+        let sent = if connected {
+            socket.try_send(&state.packet)
         } else {
-            self.socket.try_send_to(&state.packet, self.remote)
+            socket.try_send_to(&state.packet, remote)
         };
         match sent {
             // UDP is lossy: a full send buffer or a stale ICMP error drops one frame, not the session.

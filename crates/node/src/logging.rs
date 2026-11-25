@@ -215,7 +215,10 @@ impl Logger {
                 Format::Json => console,
                 Format::Text => text_line(label, message, at),
             };
-            files.lock().unwrap().write_line(&file_line, at.date_naive());
+            let prune_job = files.lock().unwrap().write_line(&file_line, at.date_naive());
+            if let Some((directory, retention, today)) = prune_job {
+                prune(&directory, retention, today);
+            }
         }
     }
 }
@@ -273,17 +276,19 @@ impl Files {
 
     /// Appends one record, reopening the file when the date changes so a node
     /// that stays up for weeks does not grow one file forever.
-    fn write_line(&mut self, line: &str, date: NaiveDate) {
+    fn write_line(&mut self, line: &str, date: NaiveDate) -> Option<(PathBuf, u32, NaiveDate)> {
+        let mut rotated = None;
         if date > self.date {
             // Keeping the previous file when the new day cannot be opened is
             // the lesser loss: a misnamed log beats no log.
             if let Ok(handle) = open_day(&self.directory, date) {
                 self.handle = handle;
                 self.date = date;
-                self.prune(date);
+                rotated = Some((self.directory.clone(), self.retention, date));
             }
         }
         let _ = self.handle.write_all(line.as_bytes());
+        rotated
     }
 
     /// Removes the files that have aged out of the retention window.
@@ -338,6 +343,15 @@ fn logged_day(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
 }
 
+fn is_unsafe_log_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn has_unsafe_log_char(text: &str) -> bool {
+    text.bytes().any(|b| b < b' ' || b == 0x7f || b == 0xc2 || b == 0xe2)
+        && text.chars().any(is_unsafe_log_char)
+}
+
 /// One console line: the time, the level and the message (with raw control and
 /// escape characters neutralized so remote metadata cannot inject ANSI codes).
 fn console_line(
@@ -347,16 +361,13 @@ fn console_line(
     at: DateTime<Local>,
     colored: bool,
 ) -> String {
-    let clean: std::borrow::Cow<'_, str> =
-        if message.bytes().any(|b| b < b' ' || b == 0x7f || b == 0xc2)
-            && message.chars().any(char::is_control)
-        {
-            std::borrow::Cow::Owned(
-                message.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
-            )
-        } else {
-            std::borrow::Cow::Borrowed(message)
-        };
+    let clean: std::borrow::Cow<'_, str> = if has_unsafe_log_char(message) {
+        std::borrow::Cow::Owned(
+            message.chars().map(|c| if is_unsafe_log_char(c) { ' ' } else { c }).collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
     let time = at.format(CONSOLE_TIME);
     if !colored {
         return format!("{time} {label:<5} {clean}\n");
@@ -399,8 +410,8 @@ fn quote_if_needed(value: &str) -> std::borrow::Cow<'_, str> {
     if value.is_empty() {
         return std::borrow::Cow::Borrowed("\"\"");
     }
-    if value.bytes().any(|b| b <= b' ' || b == 0x7f || b == b'"' || b == b'=')
-        || (value.bytes().any(|b| b == 0xc2) && value.chars().any(char::is_control))
+    if value.bytes().any(|b| b <= b' ' || b == 0x7f || b == b'"' || b == b'\\' || b == b'=')
+        || has_unsafe_log_char(value)
     {
         return std::borrow::Cow::Owned(format!("{value:?}"));
     }

@@ -54,13 +54,32 @@ fn validate(info: &TrackInfo) -> Result<(), CodecError> {
     Ok(())
 }
 
+struct BoundedVec<'a>(&'a mut Vec<u8>);
+
+impl std::io::Write for BoundedVec<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(buf.len()) > MAX_JSON_BYTES {
+            return Err(std::io::Error::other("track token exceeds 256 KiB"));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn encode_token(info: &TrackInfo) -> Result<String, CodecError> {
     validate(info)?;
     with_scratch(|json| {
-        serde_json::to_writer(&mut *json, info).map_err(|_| CodecError::Invalid)?;
-        if json.len() > MAX_JSON_BYTES {
-            return Err(CodecError::TextTooLong);
-        }
+        serde_json::to_writer(BoundedVec(json), info).map_err(|err| {
+            if err.is_io() {
+                CodecError::TextTooLong
+            } else {
+                CodecError::Invalid
+            }
+        })?;
         let mut token = String::with_capacity(PREFIX.len() + (json.len() * 4).div_ceil(3));
         token.push_str(PREFIX);
         URL_SAFE_NO_PAD.encode_string(json.as_slice(), &mut token);
@@ -114,7 +133,7 @@ mod tests {
         TrackInfo {
             identifier: "track-123".into(),
             source_name: "youtube".into(),
-            title: "音樂 🎶\0 UTF-8".into(),
+            title: "音樂 \u{1f3b6}\0 UTF-8".into(),
             author: "演奏者".into(),
             length: 123_456,
             position: 123,

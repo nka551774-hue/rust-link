@@ -82,6 +82,10 @@ impl Guild {
         true
     }
 
+    pub fn reset_failures(&mut self) {
+        self.failures = 0;
+    }
+
     pub fn playing(&self) -> bool {
         self.current.is_some()
     }

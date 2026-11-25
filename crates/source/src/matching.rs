@@ -79,16 +79,14 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
     let want_artist = if has_artist { tokens_from_words(&artist_name) } else { Vec::new() };
     let short_artist = has_artist && want_artist.iter().all(|word| word.chars().nth(1).is_none());
     let mut best = None;
-    let mut best_score = 0.0;
+    let mut best_score = f64::NEG_INFINITY;
     for candidate in candidates {
         if candidate.metadata.is_stream {
             continue;
         }
         let delta = candidate.metadata.length.abs_diff(want.metadata.length) as f64;
-        if want.metadata.length > 0
-            && (candidate.metadata.length <= 0
-                || delta > 15_000f64.max(want.metadata.length as f64 * 0.12))
-        {
+        let max_delta = 15_000f64.max(want.metadata.length as f64 * 0.12);
+        if want.metadata.length > 0 && (candidate.metadata.length <= 0 || delta > max_delta) {
             continue;
         }
         let title_lower = candidate.metadata.title.to_lowercase();
@@ -138,7 +136,7 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
         }
         let mut score = title + artist;
         if want.metadata.length > 0 {
-            score += 1.0 - delta / want.metadata.length as f64;
+            score += 1.0 - delta / max_delta;
         }
         if score > best_score {
             best_score = score;

@@ -60,12 +60,17 @@ TimeoutStopSec=20
 # The node needs one writable directory and nothing else.
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+SystemCallArchitectures=native
 # The sources are reached over IPv4 and IPv6, voice over UDP, and the resolver
 # reads netlink to choose a source address. Nothing else is allowed.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

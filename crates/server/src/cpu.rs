@@ -31,13 +31,16 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new() -> Self {
+        let mut system = System::new();
+        system.refresh_memory();
+        let total = system.total_memory();
         Cpu {
-            sampler: Mutex::new((System::new(), false)),
+            sampler: Mutex::new((system, false)),
             system_load: AtomicU64::new(0.0f64.to_bits()),
             process_load: AtomicU64::new(0.0f64.to_bits()),
             available: AtomicBool::new(false),
             memory_used: AtomicU64::new(0),
-            memory_total: AtomicU64::new(0),
+            memory_total: AtomicU64::new(total),
             pid: Pid::from_u32(std::process::id()),
             cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
@@ -52,7 +55,6 @@ impl Cpu {
         let mut sampler = self.sampler.lock().unwrap();
         let (system, sampled) = &mut *sampler;
         system.refresh_cpu_usage();
-        system.refresh_memory();
         let pid = self.pid;
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
@@ -64,13 +66,11 @@ impl Cpu {
         let (process_load, used) = system.process(pid).map_or((0.0, 0), |process| {
             (f64::from(process.cpu_usage()) / 100.0 / cores, process.memory())
         });
-        let total = system.total_memory();
         let was_sampled = *sampled;
         *sampled = true;
         drop(sampler);
 
         self.memory_used.store(used, Ordering::Relaxed);
-        self.memory_total.store(total, Ordering::Relaxed);
         if was_sampled {
             self.system_load.store(clamp(system_load).to_bits(), Ordering::Relaxed);
             self.process_load.store(clamp(process_load).to_bits(), Ordering::Relaxed);
@@ -108,5 +108,9 @@ impl Default for Cpu {
 }
 
 fn clamp(value: f64) -> f64 {
-    value.clamp(0.0, 1.0)
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }

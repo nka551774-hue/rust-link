@@ -79,6 +79,8 @@ struct State {
     closed: bool,
     /// Whether a thread is currently pacing frames.
     running: bool,
+    /// Whether the current playback thread is still inside `engine.start()`.
+    opening: bool,
     /// Whether the active `Frames` implementation accepts live DSP updates.
     live_filters: bool,
     /// Validated DSP configuration matching `body.filters` and `body.volume`.
@@ -151,6 +153,7 @@ impl Player {
                 started: false,
                 closed: false,
                 running: false,
+                opening: false,
                 live_filters: false,
                 filter_set: FilterSet::default(),
                 pending_filters: None,
@@ -255,6 +258,15 @@ impl Player {
         body
     }
 
+    fn take_track_locked(state: &mut State) -> Option<Track> {
+        let mut track = state.body.track.take()?;
+        track.metadata.position = state.body.state.position;
+        state.body.state.position = 0;
+        state.end_time = None;
+        state.started = false;
+        Some(track)
+    }
+
     /// Applies a player update.
     ///
     /// The update is serialized against every other update for this player, so
@@ -327,7 +339,7 @@ impl Player {
             if settings_changed {
                 if let Ok(new_set) = rustlink_audio::parse_filters(next_filters, next_volume) {
                     if state.running
-                        && state.live_filters
+                        && (state.live_filters || state.opening)
                         && state.filter_set.effective_time() == new_set.effective_time()
                     {
                         live_filter_update = Some(new_set.clone());
@@ -342,7 +354,7 @@ impl Player {
             if changes_track && !ignore {
                 need_stop = true;
                 live_filter_update = None;
-                if let Some(previous) = state.body.track.take() {
+                if let Some(previous) = Self::take_track_locked(&mut state) {
                     let reason = if track.is_some() { "replaced" } else { "stopped" };
                     events.push(("track.ended", json!({ "track": previous, "reason": reason })));
                 }
@@ -551,6 +563,7 @@ impl Player {
     fn stop(&self, state: &mut State) {
         state.generation += 1;
         state.running = false;
+        state.opening = false;
         state.live_filters = false;
         state.pending_filters = None;
         self.wake.notify_all();
@@ -579,6 +592,7 @@ impl Player {
         };
         state.generation += 1;
         state.running = true;
+        state.opening = true;
         state.live_filters = false;
         state.pending_filters = None;
         let generation = state.generation;
@@ -593,8 +607,8 @@ impl Player {
             });
         if let Err(error) = spawned {
             state.running = false;
-            if let Some(failed_track) = state.body.track.take() {
-                state.started = false;
+            state.opening = false;
+            if let Some(failed_track) = Self::take_track_locked(state) {
                 let track_json =
                     serde_json::to_value(&failed_track).unwrap_or(serde_json::Value::Null);
                 self.counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -623,27 +637,37 @@ impl Player {
         generation: u64,
         track: Track,
         position: i64,
-        volume: i64,
-        filters: Object,
+        mut volume: i64,
+        mut filters: Object,
         tempo: f64,
         connection: Arc<dyn Connection>,
     ) {
-        let mut frames = match self.deps.engine.start(&track, position, volume, &filters) {
-            Ok(frames) => frames,
-            Err(error) => {
-                self.finish(generation, Some(error));
+        let mut frames = loop {
+            let mut opened = match self.deps.engine.start(&track, position, volume, &filters) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    self.finish(generation, Some(error));
+                    return;
+                }
+            };
+            let mut state = self.state.lock().unwrap();
+            if state.generation != generation || state.closed {
                 return;
             }
-        };
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.generation == generation && !state.closed {
-                state.live_filters = frames.supports_live_filters();
-                if let Some(pending) = state.pending_filters.take() {
-                    let _ = frames.set_filters(&pending);
+            let supports_live = opened.supports_live_filters();
+            if let Some(pending) = state.pending_filters.take() {
+                if supports_live {
+                    let _ = opened.set_filters(&pending);
+                } else {
+                    volume = state.body.volume;
+                    filters = state.body.filters.clone();
+                    continue;
                 }
             }
-        }
+            state.opening = false;
+            state.live_filters = supports_live;
+            break opened;
+        };
         let mut output = VoiceOutput { connection: &connection, speaking: false };
         self.pump(generation, &mut frames, position, tempo, &mut output);
         let state = self.state.lock().unwrap();
@@ -762,6 +786,7 @@ impl Player {
                             return;
                         }
                         output.speaking = true;
+                        next = Instant::now();
                     }
                     if let Err(error) = output.connection.write(&frame) {
                         if matches!(error, rustlink_voice::VoiceError::NotReady)
@@ -828,11 +853,10 @@ impl Player {
             if state.generation != generation || state.closed || state.body.track.is_none() {
                 return;
             }
-            let track = state.body.track.take();
-            state.running = false;
-            state.live_filters = false;
-            state.pending_filters = None;
-            state.started = false;
+            let Some(track) = Self::take_track_locked(&mut state) else {
+                return;
+            };
+            self.stop(&mut state);
             if let Some(error) = error {
                 let track_json = serde_json::to_value(&track).unwrap_or(serde_json::Value::Null);
                 self.counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -876,7 +900,7 @@ impl Player {
             }
             state.closed = true;
             self.stop(&mut state);
-            if let Some(track) = state.body.track.take() {
+            if let Some(track) = Self::take_track_locked(&mut state) {
                 events.push(("track.ended", json!({ "track": track, "reason": "cleanup" })));
             }
             let connection = state.connection.take();

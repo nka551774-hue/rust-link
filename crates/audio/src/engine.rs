@@ -26,18 +26,19 @@ use crate::pure::PureFrames;
 pub struct Body {
     head: Vec<u8>,
     position: usize,
+    eof: bool,
     inner: Box<dyn Read + Send>,
 }
 
 impl Body {
     pub fn new(inner: Box<dyn Read + Send>) -> Self {
-        Body { head: Vec::new(), position: 0, inner }
+        Body { head: Vec::new(), position: 0, eof: false, inner }
     }
 
     /// Reads up to `count` unconsumed bytes ahead without consuming them.
     pub fn peek(&mut self, count: usize) -> io::Result<()> {
         let target = self.position.saturating_add(count);
-        while self.head.len() < target {
+        while !self.eof && self.head.len() < target {
             // The bytes are read straight into the buffer that keeps them, so
             // peeking does not allocate a chunk every time it needs more.
             let start = self.head.len();
@@ -45,9 +46,12 @@ impl Body {
             match self.inner.read(&mut self.head[start..]) {
                 Ok(0) => {
                     self.head.truncate(start);
-                    break;
+                    self.eof = true;
                 }
                 Ok(read) => self.head.truncate(start + read),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    self.head.truncate(start);
+                }
                 Err(error) => {
                     self.head.truncate(start);
                     return Err(error);

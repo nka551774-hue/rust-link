@@ -55,7 +55,7 @@ fn request_with_range(
     offset: Option<i64>,
     range: MediaRange,
 ) -> Result<(Box<dyn Read + Send>, i64, bool), SourceError> {
-    let response = request_media(agent, url, headers, offset, range, None)?;
+    let response = request_media(agent, url, headers, true, offset, range, None)?;
     Ok((response.body, response.size, response.partial))
 }
 
@@ -64,6 +64,9 @@ struct Response {
     size: i64,
     partial: bool,
     validator: Option<String>,
+    effective_url: String,
+    provider_headers: bool,
+    range: MediaRange,
 }
 
 /// Sends one request, without following a redirect.
@@ -150,6 +153,7 @@ fn send_once(
             ureq::Error::Io(_)
                 | ureq::Error::Timeout(_)
                 | ureq::Error::ConnectionFailed
+                | ureq::Error::ConnectProxyFailed(_)
                 | ureq::Error::Protocol(_)
         );
         if retryable {
@@ -182,12 +186,12 @@ fn request_media(
     agent: &ureq::Agent,
     url: &str,
     headers: &std::collections::BTreeMap<String, String>,
+    mut provider_headers: bool,
     offset: Option<i64>,
     mut range: MediaRange,
     validator: Option<&str>,
 ) -> Result<Response, SourceError> {
     let mut current = std::borrow::Cow::Borrowed(url);
-    let mut provider_headers = true;
     let mut hops = 0;
     // Podcasts, file hosts and short links answer with a redirect to the real
     // file. The agent does not follow them itself, because each hop is a new URL
@@ -327,7 +331,15 @@ fn request_media(
         Some(remaining) => Box::new(SliceReader { reader, remaining }),
         None => Box::new(reader),
     };
-    Ok(Response { body, size, partial, validator: next_validator })
+    Ok(Response {
+        body,
+        size,
+        partial,
+        validator: next_validator,
+        effective_url: current.into_owned(),
+        provider_headers,
+        range,
+    })
 }
 
 /// A chunked transfer has no Content-Length to enforce the declared slice.
@@ -407,8 +419,10 @@ fn parse_content_range(value: &str) -> Option<(i64, i64, Option<i64>)> {
 /// delivered, and the decoder never notices.
 pub struct MediaBody {
     agent: ureq::Agent,
+    origin_url: String,
     url: String,
     headers: std::collections::BTreeMap<String, String>,
+    provider_headers: bool,
     range: MediaRange,
     reader: Option<Box<dyn Read + Send>>,
     offset: i64,
@@ -425,13 +439,15 @@ impl MediaBody {
         headers: std::collections::BTreeMap<String, String>,
         range: MediaRange,
     ) -> Result<Self, SourceError> {
-        let url = url.into();
-        let response = request_media(&agent, &url, &headers, Some(0), range, None)?;
+        let origin_url = url.into();
+        let response = request_media(&agent, &origin_url, &headers, true, Some(0), range, None)?;
         Ok(Self {
             agent,
-            url,
+            origin_url,
+            url: response.effective_url,
             headers,
-            range,
+            provider_headers: response.provider_headers,
+            range: response.range,
             reader: Some(response.body),
             offset: 0,
             response_start: 0,
@@ -458,14 +474,30 @@ impl MediaBody {
     /// Asks for the rest of the stream, starting at the byte after the last one
     /// delivered.
     fn resume(&mut self) -> Result<(), SourceError> {
-        let response = request_media(
+        let response = match request_media(
             &self.agent,
             &self.url,
             &self.headers,
+            self.provider_headers,
             Some(self.offset),
             self.range,
             self.validator.as_deref(),
-        )?;
+        ) {
+            Ok(resp) => resp,
+            Err(SourceError::Media { status: 403 | 404 | 410 }) if self.url != self.origin_url => {
+                let origin_range = MediaRange::for_url(&self.origin_url);
+                request_media(
+                    &self.agent,
+                    &self.origin_url,
+                    &self.headers,
+                    true,
+                    Some(self.offset),
+                    origin_range,
+                    self.validator.as_deref(),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         let size = response.size;
         if self.size >= 0 && size >= 0 && self.size != size {
             return Err(SourceError::Http("media size changed while resuming the stream".into()));
@@ -476,6 +508,9 @@ impl MediaBody {
         if self.validator.is_none() {
             self.validator = response.validator;
         }
+        self.url = response.effective_url;
+        self.provider_headers = response.provider_headers;
+        self.range = response.range;
         self.reader = Some(response.body);
         self.response_start = self.offset;
         Ok(())

@@ -15,27 +15,11 @@ const MAX_TEXT_BYTES: usize = 8 << 20;
 /// Fast zero-allocation check for whether `text` contains at least one valid
 /// LRC timestamped line within resource bounds.
 pub(crate) fn has_lines(text: &str) -> bool {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut line_count = 0usize;
-    let mut text_bytes = 0usize;
-    for raw in text.split('\n') {
-        let mut rest = raw.trim_end_matches('\r').trim_start_matches([' ', '\t']);
-        let mut stamps = 0usize;
-        while let Some((taken, _)) = leading_stamp(rest) {
-            stamps += 1;
-            rest = rest[taken..].trim_start_matches([' ', '\t']);
-        }
-        if stamps == 0 {
-            continue;
-        }
-        let words_len = rest.trim().len();
-        line_count = line_count.saturating_add(stamps);
-        text_bytes = text_bytes.saturating_add(stamps.saturating_mul(words_len));
-        if line_count > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
-            return false;
-        }
-    }
-    line_count > 0
+    let mut found = false;
+    let ok = scan_lrc(text, |_, _, _| {
+        found = true;
+    });
+    ok && found
 }
 
 /// Turns the text a timed provider returns into lines.
@@ -44,33 +28,29 @@ pub(crate) fn has_lines(text: &str) -> bool {
 /// lyrics and ends the scan for that line, so a header is skipped rather than
 /// read as a line at time zero.
 pub fn parse(text: &str) -> Vec<Line> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines: Vec<Line> = Vec::new();
     let mut stamps: Vec<i64> = Vec::new();
-    let mut text_bytes = 0usize;
-    for raw in text.split('\n') {
-        let mut rest = raw.trim_end_matches('\r').trim_start_matches([' ', '\t']);
+    let ok = scan_lrc(text, |raw, words_offset, count| {
         stamps.clear();
-        while let Some((taken, at)) = leading_stamp(rest) {
-            stamps.push(at);
-            rest = rest[taken..].trim_start_matches([' ', '\t']);
+        let mut rest = raw;
+        for _ in 0..count {
+            if let Some((taken, at)) = leading_stamp(rest) {
+                stamps.push(at);
+                rest = rest[taken..].trim_start_matches([' ', '\t']);
+            }
         }
-        if stamps.is_empty() {
-            continue;
-        }
-        let words = rest.trim();
-        text_bytes = text_bytes.saturating_add(stamps.len().saturating_mul(words.len()));
-        if lines.len().saturating_add(stamps.len()) > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
-            return Vec::new();
-        }
+        let cleaned = strip_inline_stamps(raw[words_offset..].trim());
         for &at in &stamps {
             lines.push(Line {
                 timestamp: at,
                 duration: None,
-                line: words.to_owned(),
+                line: cleaned.as_ref().to_owned(),
                 plugin: Object::new(),
             });
         }
+    });
+    if !ok {
+        return Vec::new();
     }
     // Providers usually write in order, but a file with a tag out of place would
     // otherwise show a line before the one that comes first.
@@ -79,11 +59,61 @@ pub fn parse(text: &str) -> Vec<Line> {
     lines
 }
 
-/// Reads one `[mm:ss.xx]` tag from the front of `text`, reporting how many bytes
-/// it took and the time it names in milliseconds.
-///
-/// The fraction may be one, two or three digits, meaning tenths, hundredths or
-/// milliseconds.
+fn scan_lrc(text: &str, mut on_line: impl FnMut(&str, usize, usize)) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut line_count = 0usize;
+    let mut text_bytes = 0usize;
+    for raw in text.split('\n') {
+        let trimmed = raw.trim_end_matches('\r').trim_start_matches([' ', '\t']);
+        let mut rest = trimmed;
+        let mut stamps = 0usize;
+        while let Some((taken, _)) = leading_stamp(rest) {
+            stamps += 1;
+            rest = rest[taken..].trim_start_matches([' ', '\t']);
+        }
+        if stamps == 0 {
+            continue;
+        }
+        let words_offset = trimmed.len() - rest.len();
+        let words_len = rest.trim().len();
+        line_count = line_count.saturating_add(stamps);
+        text_bytes = text_bytes.saturating_add(stamps.saturating_mul(words_len));
+        if line_count > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
+            return false;
+        }
+        on_line(trimmed, words_offset, stamps);
+    }
+    true
+}
+
+fn strip_inline_stamps(words: &str) -> std::borrow::Cow<'_, str> {
+    if !words.contains('<') {
+        return std::borrow::Cow::Borrowed(words);
+    }
+    let mut out = String::with_capacity(words.len());
+    let mut rest = words;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let candidate = &rest[open..];
+        if let Some(end) = candidate.find('>') {
+            let bracketed = format!("[{}]", &candidate[1..end]);
+            if leading_stamp(&bracketed).is_some() {
+                rest = &candidate[end + 1..];
+                if out.ends_with(' ') && rest.starts_with(' ') {
+                    rest = &rest[1..];
+                }
+                continue;
+            }
+        }
+        out.push('<');
+        rest = &rest[open + 1..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out.trim().to_owned())
+}
+
+/// Reads one `[mm:ss.xx]` or `[hh:mm:ss.xx]` tag from the front of `text`,
+/// reporting how many bytes it took and the time it names in milliseconds.
 fn leading_stamp(text: &str) -> Option<(usize, i64)> {
     if !text.starts_with('[') {
         return None;
@@ -97,19 +127,14 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
         }
         digits.parse().ok()
     };
-    let minutes = decimal(body[..colon].trim())?;
-    let mut seconds = body[colon + 1..].trim();
+    let first = decimal(body[..colon].trim())?;
+    let mut rest = body[colon + 1..].trim();
     let mut fraction = 0i64;
-    if let Some((sec_part, frac_part, colon_frac)) = seconds
-        .find(['.', ','])
-        .map(|dot| (&seconds[..dot], &seconds[dot + 1..], false))
-        .or_else(|| seconds.find(':').map(|sep| (&seconds[..sep], &seconds[sep + 1..], true)))
-    {
-        seconds = sec_part;
-        if frac_part.is_empty()
-            || !frac_part.bytes().all(|byte| byte.is_ascii_digit())
-            || (colon_frac && frac_part.len() != 2)
-        {
+    let mut has_dot_frac = false;
+    if let Some(dot) = rest.find(['.', ',']) {
+        let frac_part = &rest[dot + 1..];
+        rest = &rest[..dot];
+        if frac_part.is_empty() || !frac_part.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
         let prefix = &frac_part[..frac_part.len().min(3)];
@@ -119,8 +144,37 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
             2 => value * 10,
             _ => value,
         };
+        has_dot_frac = true;
     }
-    let whole = decimal(seconds)?;
+    let (minutes, whole) = match rest.split_once(':') {
+        None => (first, decimal(rest)?),
+        Some((mid, tail)) if has_dot_frac => {
+            let mins = decimal(mid)?;
+            if mins >= 60 {
+                return None;
+            }
+            (first.checked_mul(60)?.checked_add(mins)?, decimal(tail)?)
+        }
+        Some((mid, tail)) => match tail.split_once(':') {
+            Some((sec, colon_frac)) => {
+                let mins = decimal(mid)?;
+                if mins >= 60 || !matches!(colon_frac.len(), 2 | 3) {
+                    return None;
+                }
+                let fval = decimal(colon_frac)?;
+                fraction = if colon_frac.len() == 2 { fval * 10 } else { fval };
+                (first.checked_mul(60)?.checked_add(mins)?, decimal(sec)?)
+            }
+            None => {
+                if !matches!(tail.len(), 2 | 3) {
+                    return None;
+                }
+                let fval = decimal(tail)?;
+                fraction = if tail.len() == 2 { fval * 10 } else { fval };
+                (first, decimal(mid)?)
+            }
+        },
+    };
     if whole >= 60 {
         return None;
     }

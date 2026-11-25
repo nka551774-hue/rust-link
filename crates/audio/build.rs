@@ -9,7 +9,15 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    for var in ["OPUS_LIB_DIR", "RUSTLINK_MSYS2_ROOT", "PKG_CONFIG_PATH", "PKG_CONFIG"] {
+    for var in [
+        "OPUS_LIB_DIR",
+        "RUSTLINK_MSYS2_ROOT",
+        "PKG_CONFIG",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG_ALLOW_CROSS",
+    ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
     if std::env::var_os("CARGO_FEATURE_NATIVE_OPUS").is_none() {
@@ -36,7 +44,10 @@ fn main() {
         let msys_root = std::env::var_os("RUSTLINK_MSYS2_ROOT")
             .map_or_else(|| PathBuf::from(r"C:\msys64"), PathBuf::from);
         let ucrt_lib = msys_root.join("ucrt64").join("lib");
-        if ucrt_lib.join("libopus.dll.a").is_file() || ucrt_lib.join("libopus.a").is_file() {
+        let is_gnu = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
+        if ucrt_lib.join("libopus.dll.a").is_file()
+            || (is_gnu && ucrt_lib.join("libopus.a").is_file())
+        {
             println!("cargo:rustc-link-search=native={}", ucrt_lib.display());
         }
     }
@@ -48,6 +59,14 @@ fn main() {
 /// Asks pkg-config where libopus is, which is how a Unix system normally answers
 /// and how MSYS2 answers on Windows.
 fn pkg_config() -> Option<String> {
+    let cross = std::env::var_os("HOST") != std::env::var_os("TARGET");
+    if cross
+        && std::env::var_os("PKG_CONFIG_ALLOW_CROSS").as_deref() != Some("1".as_ref())
+        && std::env::var_os("PKG_CONFIG_SYSROOT_DIR").is_none()
+        && std::env::var_os("PKG_CONFIG_LIBDIR").is_none()
+    {
+        return None;
+    }
     ["pkg-config", "pkgconf"].into_iter().find_map(|program| {
         let output = Command::new(program).args(["--libs", "opus"]).output().ok()?;
         output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())

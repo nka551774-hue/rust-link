@@ -1,5 +1,4 @@
-//! Compare per-packet key setup with a cached AES schedule. XChaCha retains
-//! per-packet construction because it has no reusable expanded key schedule.
+//! Compare legacy per-packet key setup with session-cached AES and XChaCha ciphers.
 #![allow(dead_code, unused_imports)]
 #[path = "support/legacy_transport.rs"]
 mod legacy;

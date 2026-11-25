@@ -56,21 +56,29 @@ pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
         return size <= MAX_PROBE as i64;
     }
     if head.starts_with(b"fLaC") {
+        let mut saw_streaminfo = false;
+        let mut saw_comments = false;
         let mut at = 4usize;
         while let Some(header) = head.get(at..at + 4) {
+            let kind = header[0] & 0x7f;
             let length = be_u24(&header[1..4]);
             let Some(next) = at.checked_add(4).and_then(|n| n.checked_add(length)) else {
                 return false;
             };
             if next > head.len() {
-                return true;
+                return !(saw_streaminfo && saw_comments);
             }
-            if header[0] & 0x80 != 0 {
+            if kind == 0 {
+                saw_streaminfo = true;
+            } else if kind == 4 {
+                saw_comments = true;
+            }
+            if (saw_streaminfo && saw_comments) || (header[0] & 0x80 != 0) {
                 return false;
             }
             at = next;
         }
-        return head.len() < 8;
+        return !(saw_streaminfo && saw_comments);
     }
     if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WAVE") {
         let mut saw_fmt = false;
@@ -101,11 +109,11 @@ pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
         }
         return !(saw_fmt && saw_data);
     }
-    if head.starts_with(b"ID3") && head.len() >= 10 {
+    if valid_id3_header(head) {
         let length = synchsafe(&head[6..10]);
         let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
         return head.len()
-            < 10usize.saturating_add(length).saturating_add(footer).saturating_add(64);
+            < 10usize.saturating_add(length).saturating_add(footer).saturating_add(256);
     }
     false
 }
@@ -694,12 +702,25 @@ fn probe_mp3(head: &[u8], size: i64) -> Probe {
 
 fn find_mpeg_sync(data: &[u8]) -> Option<&[u8]> {
     let limit = data.len().min(4096);
+    let mut first_single = None;
     for offset in 0..limit {
-        if parse_mpeg_frame(&data[offset..]).is_some() {
-            return Some(&data[offset..]);
+        let candidate = &data[offset..];
+        let Some(mpeg) = parse_mpeg_frame(candidate) else { continue };
+        if first_single.is_none() {
+            first_single = Some(candidate);
+        }
+        if parse_vbr_frames(candidate, &mpeg).is_some() {
+            return Some(candidate);
+        }
+        if mpeg.frame_size >= 4 {
+            if let Some(next_slice) = candidate.get(mpeg.frame_size..) {
+                if parse_mpeg_frame(next_slice).is_some_and(|next| next.rate == mpeg.rate) {
+                    return Some(candidate);
+                }
+            }
         }
     }
-    None
+    first_single
 }
 
 fn deunsync(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
@@ -869,6 +890,7 @@ struct MpegFrame {
     rate: u32,
     samples_per_frame: u32,
     side_info_len: usize,
+    frame_size: usize,
 }
 
 /// Reads the bitrate, sample rate and VBR header offset out of an MPEG frame.
@@ -881,6 +903,7 @@ fn parse_mpeg_frame(data: &[u8]) -> Option<MpegFrame> {
     let layer = (header >> 17) & 0x3;
     let bitrate_index = ((header >> 12) & 0xf) as usize;
     let rate_index = ((header >> 10) & 0x3) as usize;
+    let padding = ((header >> 9) & 0x1) as usize;
     let channel_mode = (header >> 6) & 0x3;
     if version == 0x1
         || layer == 0x0
@@ -916,13 +939,21 @@ fn parse_mpeg_frame(data: &[u8]) -> Option<MpegFrame> {
         (_, 0x2) => 1152,
         _ => 576,
     };
+    let bitrate = kbps * 1000;
+    let frame_size = if layer == 0x3 {
+        ((12 * bitrate / rate) as usize + padding) * 4
+    } else if version != 0x3 && layer == 0x1 {
+        (72 * bitrate / rate) as usize + padding
+    } else {
+        (144 * bitrate / rate) as usize + padding
+    };
     let mono = channel_mode == 0x3;
     let side_info_len = match (version == 0x3, mono) {
         (true, false) => 32,
         (true, true) | (false, false) => 17,
         (false, true) => 9,
     };
-    Some(MpegFrame { bitrate: kbps * 1000, rate, samples_per_frame, side_info_len })
+    Some(MpegFrame { bitrate, rate, samples_per_frame, side_info_len, frame_size })
 }
 
 fn parse_vbr_frames(frame: &[u8], mpeg: &MpegFrame) -> Option<u32> {

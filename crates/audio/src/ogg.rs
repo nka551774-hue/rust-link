@@ -33,7 +33,6 @@ pub struct OggOpusReader<R: Read> {
     /// Signed Q8 dB gain from OpusHead, applied by the decoder.
     output_gain: i16,
     ended: bool,
-    packet_end_granule: Option<u64>,
     packet_page_end: Option<(u64, bool)>,
 }
 
@@ -51,7 +50,6 @@ impl<R: Read> OggOpusReader<R> {
             drop_samples: 0,
             output_gain: 0,
             ended: false,
-            packet_end_granule: None,
             packet_page_end: None,
         }
     }
@@ -76,30 +74,33 @@ impl<R: Read> OggOpusReader<R> {
 
     /// Appends the next audio packet onto `packet` without clearing prior bytes,
     /// allowing a page decoder to stage a full page in one contiguous buffer.
+    #[inline]
     pub(crate) fn append_next_packet(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
+        if self.packets >= 2 {
+            return self.append_raw_packet(packet);
+        }
+        self.append_first_audio_packet(packet)
+    }
+
+    #[cold]
+    fn append_first_audio_packet(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
         let base = packet.len();
-        loop {
-            if self.packets == 1 {
-                self.skip_opus_tags()?;
-                self.packets = 2;
-                continue;
-            }
-            packet.truncate(base);
+        if self.packets == 0 {
             if !self.append_raw_packet(packet)? {
                 return Ok(false);
             }
-            self.packets += 1;
-            match self.packets {
-                1 => {
-                    let (pre_skip, output_gain) = read_head(&packet[base..])?;
-                    packet.truncate(base);
-                    self.pre_skip = pre_skip;
-                    self.drop_samples = pre_skip;
-                    self.output_gain = output_gain;
-                }
-                _ => return Ok(true),
-            }
+            let (pre_skip, output_gain) = read_head(&packet[base..])?;
+            packet.truncate(base);
+            self.pre_skip = pre_skip;
+            self.drop_samples = pre_skip;
+            self.output_gain = output_gain;
+            self.packets = 1;
         }
+        if self.packets == 1 {
+            self.skip_opus_tags()?;
+            self.packets = 2;
+        }
+        self.append_raw_packet(packet)
     }
 
     fn skip_opus_tags(&mut self) -> io::Result<()> {
@@ -143,7 +144,6 @@ impl<R: Read> OggOpusReader<R> {
     ) -> io::Result<bool> {
         let mut total = 0usize;
         let mut started = false;
-        self.packet_end_granule = None;
         self.packet_page_end = None;
         loop {
             if self.page.is_none() {
@@ -159,9 +159,17 @@ impl<R: Read> OggOpusReader<R> {
             }
             let page = self.page.as_mut().expect("a page was just read");
             let segs = &self.buffer[page.table + page.next_segment..page.table + page.count];
-            let done_at = segs.iter().position(|&s| s < 255);
-            let consumed_segs = done_at.map_or(segs.len(), |i| i + 1);
-            let chunk_len: usize = segs[..consumed_segs].iter().map(|&s| usize::from(s)).sum();
+            let mut consumed_segs = 0usize;
+            let mut chunk_len = 0usize;
+            let mut done = false;
+            for &seg in segs {
+                consumed_segs += 1;
+                chunk_len += usize::from(seg);
+                if seg < 255 {
+                    done = true;
+                    break;
+                }
+            }
             let start = page.offset;
             let end = start + chunk_len;
             if end > self.filled {
@@ -174,7 +182,7 @@ impl<R: Read> OggOpusReader<R> {
             on_span(&self.buffer[start..end]);
             page.next_segment += consumed_segs;
             page.offset = end;
-            if done_at.is_some() {
+            if done {
                 self.consumed = end;
                 // A page may finish one packet and start another. Its granule
                 // belongs to the last completed packet, even when that packet
@@ -182,7 +190,6 @@ impl<R: Read> OggOpusReader<R> {
                 if page.next_segment == page.last_complete {
                     if record_granule {
                         self.packet_page_end = Some((page.granule, page.end_of_stream));
-                        self.packet_end_granule = page.end_of_stream.then_some(page.granule);
                     }
                     if page.end_of_stream {
                         self.ended = true;
@@ -298,9 +305,16 @@ impl<R: Read> OggOpusReader<R> {
         if self.buffer.len() - self.filled < READ_CHUNK {
             self.buffer.resize(self.filled + READ_CHUNK, 0);
         }
-        let read = self.inner.read(&mut self.buffer[self.filled..self.filled + READ_CHUNK])?;
-        self.filled += read;
-        Ok(read > 0)
+        loop {
+            match self.inner.read(&mut self.buffer[self.filled..self.filled + READ_CHUNK]) {
+                Ok(read) => {
+                    self.filled += read;
+                    return Ok(read > 0);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn take_drop_samples(&mut self) -> u32 {
@@ -314,7 +328,7 @@ impl<R: Read> OggOpusReader<R> {
     /// EOS granule for the packet most recently returned. It counts decoded
     /// 48 kHz samples including pre-skip, and can trim the final packet's padding.
     pub fn packet_end_granule(&self) -> Option<u64> {
-        self.packet_end_granule
+        self.packet_page_end.and_then(|(granule, eos)| eos.then_some(granule))
     }
 
     /// Timing metadata after the last packet completed on a page. A trailing

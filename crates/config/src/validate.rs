@@ -225,9 +225,10 @@ fn valid_authority_host_port(host_port: &str) -> bool {
         };
     }
     match host_port.split_once(':') {
-        None => true,
+        None => !host_port.contains(['[', ']']),
         Some((host, port)) => {
             !host.is_empty()
+                && !host.contains(['[', ']'])
                 && !port.is_empty()
                 && !port.contains(':')
                 && port.parse::<u16>().is_ok_and(|p| p > 0)
@@ -236,7 +237,7 @@ fn valid_authority_host_port(host_port: &str) -> bool {
 }
 
 fn has_valid_url_authority(url: &str, schemes: &[&str]) -> bool {
-    if url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
+    if !url.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'\\') {
         return false;
     }
     let Some(rest) = strip_scheme_ascii_case(url, schemes) else {

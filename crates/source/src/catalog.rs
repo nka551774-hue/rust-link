@@ -206,52 +206,71 @@ impl<'a> Spotify<'a> {
     }
 }
 
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SpotifyArtist {
+    #[serde(deserialize_with = "null_default")]
     name: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SpotifyImage {
+    #[serde(deserialize_with = "null_default")]
     url: String,
+    #[serde(deserialize_with = "null_default")]
     width: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SpotifyTrack {
+    #[serde(deserialize_with = "null_default")]
     id: String,
+    #[serde(deserialize_with = "null_default")]
     name: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "null_default")]
     kind: String,
+    #[serde(deserialize_with = "null_default")]
     duration_ms: i64,
+    #[serde(deserialize_with = "null_default")]
     artists: Vec<SpotifyArtist>,
     album: Option<SpotifyAlbum>,
     external_ids: Option<SpotifyExternalIds>,
+    #[serde(deserialize_with = "null_default")]
     is_local: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SpotifyAlbum {
+    #[serde(deserialize_with = "null_default")]
     images: Vec<SpotifyImage>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct SpotifyExternalIds {
+    #[serde(deserialize_with = "null_default")]
     isrc: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct SpotifyPage<T> {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     items: Vec<T>,
     #[serde(default)]
     next: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     total: u64,
 }
 
@@ -270,6 +289,7 @@ struct SpotifySearchResponse {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SpotifyNamed {
+    #[serde(deserialize_with = "null_default")]
     name: String,
 }
 
@@ -412,10 +432,10 @@ impl Spotify<'_> {
                     ));
                 }
                 let playlist: SpotifyNamed = self.api(&format!("/playlists/{key}"))?;
-                let tracks = self
-                    .page::<SpotifyPlaylistItem>(&format!("/playlists/{key}/tracks"), |item| {
-                        item.track
-                    })?;
+                let tracks = self.page::<Option<SpotifyPlaylistItem>>(
+                    &format!("/playlists/{key}/tracks"),
+                    |item| item?.track,
+                )?;
                 if tracks.is_empty() {
                     return Ok(LoadResult::Empty);
                 }
@@ -554,9 +574,13 @@ pub struct Deezer<'a> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeezerTrack {
+    #[serde(deserialize_with = "null_default")]
     id: u64,
+    #[serde(deserialize_with = "null_default")]
     title: String,
+    #[serde(deserialize_with = "null_default")]
     duration: i64,
+    #[serde(deserialize_with = "null_default")]
     isrc: String,
     artist: Option<DeezerArtist>,
     album: Option<DeezerAlbum>,
@@ -565,19 +589,23 @@ struct DeezerTrack {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeezerArtist {
+    #[serde(deserialize_with = "null_default")]
     name: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeezerAlbum {
+    #[serde(deserialize_with = "null_default")]
     cover_xl: String,
+    #[serde(deserialize_with = "null_default")]
     cover_big: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeezerList {
+    #[serde(deserialize_with = "null_default")]
     data: Vec<DeezerTrack>,
     next: Option<String>,
 }
@@ -593,6 +621,7 @@ struct DeezerResponse<T> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeezerNamed {
+    #[serde(deserialize_with = "null_default")]
     title: String,
 }
 
@@ -673,6 +702,9 @@ impl Deezer<'_> {
             // The next link comes from the response; never follow it off the API.
             let parsed = scoped_api_url(&self.config.deezer_api_endpoint, &raw_next, "Deezer")?;
             let mut list: DeezerList = get_json(self.agent, parsed.as_str(), None)?;
+            if list.data.is_empty() {
+                break;
+            }
             next = list.next.take();
             tracks.extend(self.tracks_from_list(list));
             pages += 1;
@@ -777,24 +809,31 @@ impl<'a> SoundCloud<'a> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SoundCloudUser {
+    #[serde(deserialize_with = "null_default")]
     username: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SoundCloudTrack {
+    #[serde(deserialize_with = "null_default")]
     id: u64,
+    #[serde(deserialize_with = "null_default")]
     title: String,
+    #[serde(deserialize_with = "null_default")]
     duration: i64,
+    #[serde(deserialize_with = "null_default")]
     permalink_url: String,
     artwork_url: Option<String>,
     user: Option<SoundCloudUser>,
+    #[serde(deserialize_with = "null_default")]
     streamable: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SoundCloudList {
+    #[serde(deserialize_with = "null_default")]
     collection: Vec<SoundCloudTrack>,
 }
 
@@ -864,64 +903,72 @@ impl SoundCloud<'_> {
             return Err(SourceError::Url(format!("{id} is not a SoundCloud track or playlist")));
         }
         let answer: Value = self.api(&format!("/resolve?url={}", encode_query(&key)))?;
-        let kind = answer.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
-        if kind == "track" {
-            let entry: SoundCloudTrack = serde_json::from_value(answer)
-                .map_err(|error| SourceError::Http(error.to_string()))?;
-            let track = self.track(entry).ok_or_else(|| {
-                SourceError::Http("soundcloud described a track that cannot be played".into())
-            })?;
-            return Ok(LoadResult::Track(Box::new(track)));
-        }
-        if kind == "playlist" {
-            let name = answer.get("title").and_then(Value::as_str).unwrap_or_default().to_string();
-            let raw_entries: Vec<SoundCloudTrack> = answer
-                .get("tracks")
-                .and_then(Value::as_array)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .take(self.config.max_playlist_tracks as usize)
-                        .filter_map(|entry| SoundCloudTrack::deserialize(entry).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let stub_ids: Vec<u64> = raw_entries
-                .iter()
-                .filter(|entry| entry.id != 0 && entry.title.is_empty())
-                .map(|entry| entry.id)
-                .collect();
-            let mut hydrated = std::collections::HashMap::new();
-            for chunk in stub_ids.chunks(50) {
-                let mut ids = String::new();
-                for (idx, stub_id) in chunk.iter().enumerate() {
-                    if idx > 0 {
-                        ids.push(',');
-                    }
-                    use std::fmt::Write as _;
-                    let _ = write!(ids, "{stub_id}");
-                }
-                if let Ok(fetched) = self.api::<Vec<SoundCloudTrack>>(&format!("/tracks?ids={ids}"))
-                {
-                    for item in fetched {
-                        hydrated.insert(item.id, item);
-                    }
-                }
+        match answer.get("kind").and_then(Value::as_str).unwrap_or_default() {
+            "track" => {
+                let entry: SoundCloudTrack = serde_json::from_value(answer)
+                    .map_err(|error| SourceError::Http(error.to_string()))?;
+                let track = self.track(entry).ok_or_else(|| {
+                    SourceError::Http("soundcloud described a track that cannot be played".into())
+                })?;
+                Ok(LoadResult::Track(Box::new(track)))
             }
-            let tracks: Vec<Track> = raw_entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let full =
-                        if entry.title.is_empty() { hydrated.remove(&entry.id)? } else { entry };
-                    self.track(full)
-                })
-                .collect();
-            if tracks.is_empty() {
-                return Ok(LoadResult::Empty);
+            "playlist" => {
+                let name =
+                    answer.get("title").and_then(Value::as_str).unwrap_or_default().to_string();
+                let raw_entries: Vec<SoundCloudTrack> = answer
+                    .get("tracks")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .take(self.config.max_playlist_tracks as usize)
+                            .filter_map(|entry| SoundCloudTrack::deserialize(entry).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let stub_ids: Vec<u64> = raw_entries
+                    .iter()
+                    .filter(|entry| entry.id != 0 && entry.title.is_empty())
+                    .map(|entry| entry.id)
+                    .collect();
+                let mut hydrated = std::collections::HashMap::new();
+                for chunk in stub_ids.chunks(50) {
+                    let mut ids = String::new();
+                    for (idx, stub_id) in chunk.iter().enumerate() {
+                        if idx > 0 {
+                            ids.push(',');
+                        }
+                        use std::fmt::Write as _;
+                        let _ = write!(ids, "{stub_id}");
+                    }
+                    if let Ok(fetched) =
+                        self.api::<Vec<SoundCloudTrack>>(&format!("/tracks?ids={ids}"))
+                    {
+                        for item in fetched {
+                            hydrated.insert(item.id, item);
+                        }
+                    }
+                }
+                let tracks: Vec<Track> = raw_entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let full = if entry.title.is_empty() {
+                            hydrated.remove(&entry.id)?
+                        } else {
+                            entry
+                        };
+                        self.track(full)
+                    })
+                    .collect();
+                if tracks.is_empty() {
+                    return Ok(LoadResult::Empty);
+                }
+                Ok(LoadResult::Playlist(Box::new(Playlist::new(name, -1, tracks))))
             }
-            return Ok(LoadResult::Playlist(Box::new(Playlist::new(name, -1, tracks))));
+            kind => {
+                Err(SourceError::Url(format!("{id} resolved to a {kind}, which cannot be played")))
+            }
         }
-        Err(SourceError::Url(format!("{id} resolved to a {kind}, which cannot be played")))
     }
 
     /// Resolves a track's direct audio URL.
@@ -952,18 +999,46 @@ impl SoundCloud<'_> {
             .ok_or_else(|| SourceError::Http("soundcloud offered no stream".into()))?;
         // A progressive stream is one request; an HLS stream is a playlist of
         // them, which the node would have to assemble.
-        let chosen = transcodings
-            .iter()
-            .find(|entry| {
-                entry.pointer("/format/protocol").and_then(Value::as_str) == Some("progressive")
+        let api_origin = url::Url::parse(self.config.soundcloud_api_endpoint.trim()).ok();
+        let valid_transcoding = |raw: &str| {
+            crate::http_url(raw).is_some_and(|parsed| {
+                parsed.host_str().is_some_and(|host| {
+                    crate::host_matches(host, "soundcloud.com")
+                        || crate::host_matches(host, "sndcdn.com")
+                        || api_origin.as_ref().is_some_and(|b| {
+                            b.host_str() == Some(host)
+                                && b.port_or_known_default() == parsed.port_or_known_default()
+                        })
+                })
             })
-            .ok_or_else(|| SourceError::Http(
-                "soundcloud offered no progressive audio stream; HLS playlists are not supported".into()
-            ))?;
-        let url = chosen
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| SourceError::Http("soundcloud offered no stream url".into()))?;
+        };
+        let mut fallback_url: Option<&str> = None;
+        let mut chosen_url: Option<&str> = None;
+        for entry in transcodings {
+            if entry.pointer("/format/protocol").and_then(Value::as_str) != Some("progressive") {
+                continue;
+            }
+            let Some(candidate_url) = entry
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty() && valid_transcoding(u))
+            else {
+                continue;
+            };
+            if !entry.get("snipped").and_then(Value::as_bool).unwrap_or(false) {
+                chosen_url = Some(candidate_url);
+                break;
+            }
+            if fallback_url.is_none() {
+                fallback_url = Some(candidate_url);
+            }
+        }
+        let url = chosen_url.or(fallback_url).ok_or_else(|| {
+            SourceError::Http(
+                "soundcloud offered no progressive audio stream; HLS playlists are not supported"
+                    .into(),
+            )
+        })?;
         // The transcoding endpoint is a complete URL, not a path to append to
         // the catalogue origin. It passes the same network guard as all media.
         netguard::validate_url(url)?;
@@ -1039,6 +1114,7 @@ fn soundcloud_key(id: &str) -> String {
             if url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("m.soundcloud.com")) {
                 let _ = url.set_host(Some("soundcloud.com"));
             }
+            url.set_fragment(None);
             return url.into();
         }
         return String::new();
@@ -1061,19 +1137,27 @@ fn scrape_script_urls(page: &str, base: &str) -> Vec<String> {
     for part in page.rsplit("<script") {
         let Some(tag_end) = part.find('>') else { continue };
         let tag = &part[..tag_end];
-        let Some(src_at) = tag.find("src=\"") else { continue };
-        let rest = &tag[src_at + 5..];
-        let Some(end_quote) = rest.find('"') else { continue };
-        let candidate = &rest[..end_quote];
-        if !candidate.ends_with(".js") {
-            continue;
-        }
+        let candidate = tag
+            .find("src=\"")
+            .and_then(|at| {
+                let rest = &tag[at + 5..];
+                Some(&rest[..rest.find('"')?])
+            })
+            .or_else(|| {
+                let at = tag.find("src='")?;
+                let rest = &tag[at + 5..];
+                Some(&rest[..rest.find('\'')?])
+            });
+        let Some(candidate) = candidate else { continue };
         let resolved = if candidate.starts_with("http://") || candidate.starts_with("https://") {
             url::Url::parse(candidate).ok()
         } else {
             base_origin.as_ref().and_then(|b| b.join(candidate).ok())
         };
         let Some(parsed) = resolved else { continue };
+        if !parsed.path().ends_with(".js") {
+            continue;
+        }
         let allowed = parsed.host_str().is_some_and(|host| {
             crate::host_matches(host, "sndcdn.com")
                 || crate::host_matches(host, "soundcloud.com")
@@ -1083,7 +1167,7 @@ fn scrape_script_urls(page: &str, base: &str) -> Vec<String> {
         });
         if allowed && netguard::validate_url(parsed.as_str()).is_ok() {
             urls.push(String::from(parsed));
-            if urls.len() >= 5 {
+            if urls.len() >= 10 {
                 break;
             }
         }
@@ -1096,14 +1180,17 @@ fn scrape_script_urls(page: &str, base: &str) -> Vec<String> {
 /// The id is 32 alphanumeric characters and the page states it in more than one
 /// place, so the first value that looks like one is used.
 fn scrape_client_id(page: &str) -> Option<String> {
-    for marker in ["client_id:\"", "client_id=\"", "client_id\":\""] {
-        for rest in page.split(marker).skip(1) {
-            let bytes = rest.as_bytes();
-            if bytes.get(..32).is_some_and(|id| id.iter().all(u8::is_ascii_alphanumeric))
-                && !bytes.get(32).is_some_and(u8::is_ascii_alphanumeric)
-            {
-                return Some(rest[..32].to_owned());
-            }
+    let mut rest = page;
+    while let Some(pos) = rest.find("client_id") {
+        rest = &rest[pos + "client_id".len()..];
+        let trimmed = rest.trim_start_matches(['"', '\'', ' ', '\t']);
+        let Some(after_sep) = trimmed.strip_prefix([':', '=']) else { continue };
+        let candidate = after_sep.trim_start_matches([' ', '\t', '"', '\'']);
+        let bytes = candidate.as_bytes();
+        if bytes.get(..32).is_some_and(|id| id.iter().all(u8::is_ascii_alphanumeric))
+            && !bytes.get(32).is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            return Some(candidate[..32].to_owned());
         }
     }
     None

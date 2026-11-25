@@ -23,7 +23,7 @@
 | 節點資訊與狀態 | `/healthz`、`/version`、`/api/v1/info`、`/api/v1/stats`、`/metrics` |
 | 音源解析 | `POST /api/v1/tracks/resolve` |
 | 曲目 token | `POST /api/v1/tracks/inspect`、`inspect-batch`；`rlt1.` 是 Rustlink 自有格式 |
-| Session | `POST／GET／PATCH／DELETE /api/v1/sessions/{id}` |
+| Session | `POST /api/v1/sessions`、`GET／PATCH／DELETE /api/v1/sessions/{id}` |
 | 播放器 | `GET／PATCH／DELETE …/players/{guild}` |
 | 事件 | `GET …/events`（Rustlink 自己的 WebSocket 事件格式） |
 | 歌詞 | `POST /api/v1/lyrics`、播放器的 `…/lyrics` |

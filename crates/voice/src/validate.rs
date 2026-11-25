@@ -16,6 +16,7 @@ use crate::VoiceError;
 pub fn valid_id(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= 20
+        && !raw.starts_with('0')
         && raw.bytes().all(|byte| byte.is_ascii_digit())
         && raw.parse::<u64>().is_ok_and(|value| value != 0)
 }

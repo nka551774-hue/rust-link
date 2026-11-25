@@ -145,6 +145,14 @@ impl Connector<()> for TargetGuardConnector {
     ) -> Result<Option<Self::Out>, Error> {
         if !self.allow_private && details.config.proxy().is_some() {
             if let Some(host) = details.uri.host() {
+                let bare = host.trim_end_matches('.');
+                if bare.eq_ignore_ascii_case("localhost")
+                    || bare
+                        .get(bare.len().saturating_sub(10)..)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".localhost"))
+                {
+                    return Err(Error::HostNotFound);
+                }
                 let ip = match url::Host::parse(host) {
                     Ok(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
                     Ok(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),

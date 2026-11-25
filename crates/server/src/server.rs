@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, OriginalUri, Path, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -258,7 +258,7 @@ fn session_key(path: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(trimmed);
     }
     let bytes = raw.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len().min(192));
+    let mut decoded = Vec::with_capacity(bytes.len().min(256));
     let mut index = 0;
     while index < bytes.len() && decoded.len() < 256 {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
@@ -501,7 +501,7 @@ impl Server {
     /// Sends an event to the webhook and asks for a fresh node-wide report.
     pub fn publish(&self, event: &Value) {
         if let Some(client) = &self.deps.webhook {
-            client.send(event.clone());
+            client.send_ref(event);
         }
         self.request_report();
     }
@@ -563,14 +563,31 @@ async fn log_request(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip());
     let start = Instant::now();
-    let mut response = REMOTE.scope(remote, next.run(request)).await;
+    let server_for_scope = Arc::clone(&server);
+    let mut response = REMOTE
+        .scope(remote, async move {
+            let preflight = match request.uri().path() {
+                "/version" => server_for_scope.guard_public(PublicRoute::Version, "/version"),
+                "/healthz" => server_for_scope.guard_public(PublicRoute::Healthz, "/healthz"),
+                path => server_for_scope.verify_auth(request.headers(), path),
+            };
+            match preflight {
+                Ok(()) => next.run(request).await,
+                Err(response) => response,
+            }
+        })
+        .await;
     if (response.status().is_client_error() || response.status().is_server_error())
         && response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok())
             != Some("application/json")
     {
         let status = response.status();
+        let allow = response.headers().get(ALLOW).cloned();
         response =
             server.fail(status, status.canonical_reason().unwrap_or("request failed"), uri.path());
+        if let Some(allow) = allow {
+            response.headers_mut().insert(ALLOW, allow);
+        }
     }
     let status = response.status().as_u16();
     let millis = start.elapsed().as_millis();
@@ -602,15 +619,11 @@ impl std::fmt::Display for Remote {
 }
 
 impl Server {
-    /// The password check every protected route starts with, and then the rate
-    /// limit. The password comes first, so a request that cannot prove who it is
-    /// never spends a session's allowance: a wrong password is counted against
-    /// the sender's address instead, which is what slows guessing down.
-    // A refusal is a whole response, which the lint counts as a large error.
-    // Boxing it would only move that cost onto every route that uses `?`, and
-    // the response is the type axum handlers already return.
+    /// Checks the bearer password before Axum extracts bodies, paths or methods,
+    /// so an unauthenticated caller cannot buffer 1 MiB bodies or probe routes
+    /// via 405/400 responses without spending its failed-login budget.
     #[allow(clippy::result_large_err)]
-    fn guard(&self, route: Route, headers: &HeaderMap, path: &str) -> Result<(), Response> {
+    fn verify_auth(&self, headers: &HeaderMap, path: &str) -> Result<(), Response> {
         let given = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -618,14 +631,23 @@ impl Server {
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
             .map(|(_, token)| token)
             .unwrap_or("");
-        let limited = self.config.ratelimits.enable;
         if !same(given.as_bytes(), self.config.password.as_bytes()) {
-            if limited && !self.limits.allow_failed_login(remote_key().as_str()) {
+            if self.config.ratelimits.enable
+                && !self.limits.allow_failed_login(remote_key().as_str())
+            {
                 return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
             }
             return Err(self.fail(StatusCode::UNAUTHORIZED, "invalid authorization", path));
         }
-        if limited && !self.limits.allow_authenticated(route, &session_key(path)) {
+        Ok(())
+    }
+
+    /// Spends one token from the authenticated session's per-route bucket.
+    #[allow(clippy::result_large_err)]
+    fn rate_limit(&self, route: Route, path: &str) -> Result<(), Response> {
+        if self.config.ratelimits.enable
+            && !self.limits.allow_authenticated(route, &session_key(path))
+        {
             return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
         }
         Ok(())
@@ -695,6 +717,25 @@ impl Server {
             Some(session) if session.is_usable() => Ok(session),
             _ => Err(self.fail(StatusCode::NOT_FOUND, "session not found", path)),
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn session_and_guild(
+        &self,
+        session_id: &str,
+        guild_id: &str,
+        path: &str,
+    ) -> Result<Arc<Session>, Response> {
+        let session = self.session(session_id, path)?;
+        if !rustlink_voice::valid_id(guild_id) {
+            return Err(self.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path));
+        }
+        Ok(session)
+    }
+
+    fn active_sessions(&self) -> Vec<Arc<Session>> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        sessions.into_iter().filter(|session| session.is_usable()).collect()
     }
 
     /// Resolves an identifier into a load result, on a thread of its own so a
@@ -777,37 +818,32 @@ fn now_millis() -> i64 {
 
 type RouteResult = Result<Response, Response>;
 
-#[allow(clippy::result_large_err)]
-async fn version(State(server): State<Arc<Server>>, _headers: HeaderMap) -> RouteResult {
-    server.guard_public(PublicRoute::Version, "/version")?;
-    Ok(([(CONTENT_TYPE, "text/plain; charset=utf-8")], VERSION).into_response())
+async fn version() -> Response {
+    ([(CONTENT_TYPE, "text/plain; charset=utf-8")], VERSION).into_response()
 }
 
-#[allow(clippy::result_large_err)]
-async fn healthz(State(server): State<Arc<Server>>, _headers: HeaderMap) -> RouteResult {
+async fn healthz(State(server): State<Arc<Server>>) -> Response {
     #[derive(Serialize)]
     struct Health {
         status: &'static str,
         name: &'static str,
         version: &'static str,
     }
-    server.guard_public(PublicRoute::Healthz, "/healthz")?;
-    Ok(server.json(StatusCode::OK, Health { status: "ok", name: "Rustlink", version: VERSION }))
+    server.json(StatusCode::OK, Health { status: "ok", name: "Rustlink", version: VERSION })
 }
 
 #[allow(clippy::result_large_err)]
 async fn not_found(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
 ) -> RouteResult {
-    server.guard(Route::Root, &headers, uri.path())?;
+    server.rate_limit(Route::Root, uri.path())?;
     Ok(server.fail(StatusCode::NOT_FOUND, "route not found", uri.path()))
 }
 
 #[allow(clippy::result_large_err)]
-async fn info(State(server): State<Arc<Server>>, headers: HeaderMap) -> RouteResult {
-    server.guard(Route::Info, &headers, "/api/v1/info")?;
+async fn info(State(server): State<Arc<Server>>) -> RouteResult {
+    server.rate_limit(Route::Info, "/api/v1/info")?;
     let (_, _, cpu_available) = server.cpu.values();
     Ok(server.json(StatusCode::OK, json!({
         "name": "Rustlink", "version": VERSION, "api_version": APIVERSION,
@@ -826,18 +862,14 @@ async fn info(State(server): State<Arc<Server>>, headers: HeaderMap) -> RouteRes
 }
 
 #[allow(clippy::result_large_err)]
-async fn stats(State(server): State<Arc<Server>>, headers: HeaderMap) -> RouteResult {
-    server.guard(Route::Stats, &headers, "/api/v1/stats")?;
+async fn stats(State(server): State<Arc<Server>>) -> RouteResult {
+    server.rate_limit(Route::Stats, "/api/v1/stats")?;
     Ok(server.json(StatusCode::OK, server.stats_body()))
 }
 
 #[allow(clippy::result_large_err)]
-async fn metrics(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    OriginalUri(uri): OriginalUri,
-) -> RouteResult {
-    server.guard(Route::Metrics, &headers, uri.path())?;
+async fn metrics(State(server): State<Arc<Server>>, OriginalUri(uri): OriginalUri) -> RouteResult {
+    server.rate_limit(Route::Metrics, uri.path())?;
     Ok(([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], server.metrics_body())
         .into_response())
 }
@@ -881,13 +913,20 @@ fn read_json<T: serde::de::DeserializeOwned>(
 }
 
 #[allow(clippy::result_large_err)]
-async fn load_tracks(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> RouteResult {
+fn read_track_token(
+    server: &Server,
+    body: &[u8],
+    path: &str,
+) -> Result<rustlink_protocol::Track, Response> {
+    let request: TokenRequest = read_json(server, body, path)?;
+    decode_track_owned(request.token)
+        .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))
+}
+
+#[allow(clippy::result_large_err)]
+async fn load_tracks(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
     let path = "/api/v1/tracks/resolve";
-    server.guard(Route::ResolveTracks, &headers, path)?;
+    server.rate_limit(Route::ResolveTracks, path)?;
     let request: ResolveRequest = read_json(&server, &body, path)?;
     if request.query.trim().is_empty() || request.query.len() > 8192 {
         return Err(server.fail(StatusCode::BAD_REQUEST, "query must contain 1..8192 bytes", path));
@@ -900,28 +939,17 @@ async fn load_tracks(
 }
 
 #[allow(clippy::result_large_err)]
-async fn decode_track_route(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> RouteResult {
+async fn decode_track_route(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
     let path = "/api/v1/tracks/inspect";
-    server.guard(Route::InspectTrack, &headers, path)?;
-    let request: TokenRequest = read_json(&server, &body, path)?;
-    match decode_track_owned(request.token) {
-        Ok(track) => Ok(server.json(StatusCode::OK, track)),
-        Err(error) => Err(server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path)),
-    }
+    server.rate_limit(Route::InspectTrack, path)?;
+    let track = read_track_token(&server, &body, path)?;
+    Ok(server.json(StatusCode::OK, track))
 }
 
 #[allow(clippy::result_large_err)]
-async fn decode_tracks(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> RouteResult {
+async fn decode_tracks(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
     let path = "/api/v1/tracks/inspect-batch";
-    server.guard(Route::InspectTracks, &headers, path)?;
+    server.rate_limit(Route::InspectTracks, path)?;
     let request: TokensRequest = read_json(&server, &body, path)?;
     if request.tokens.len() > MAX_DECODE_TRACKS {
         return Err(server.fail(StatusCode::BAD_REQUEST, "at most 1000 tokens per request", path));
@@ -939,35 +967,24 @@ async fn decode_tracks(
 }
 
 #[allow(clippy::result_large_err)]
-async fn lyrics_for_track(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> RouteResult {
+async fn lyrics_for_track(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
     let path = "/api/v1/lyrics";
-    server.guard(Route::Lyrics, &headers, path)?;
-    let request: TokenRequest = read_json(&server, &body, path)?;
-    match decode_track_owned(request.token) {
-        Ok(track) => Ok(server.answer_lyrics(track, path).await),
-        Err(error) => Err(server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path)),
-    }
+    server.rate_limit(Route::Lyrics, path)?;
+    let track = read_track_token(&server, &body, path)?;
+    Ok(server.answer_lyrics(track, path).await)
 }
 
 #[allow(clippy::result_large_err)]
 async fn lyrics_for_player(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> RouteResult {
     // Keep the error path tied to this request, while excluding a query
     // string that could carry credentials or other sensitive values.
     let path = uri.path();
-    server.guard(Route::PlayerLyrics, &headers, path)?;
-    let session = server.session(&session_id, path)?;
-    if !rustlink_voice::valid_id(&guild_id) {
-        return Err(server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path));
-    }
+    server.rate_limit(Route::PlayerLyrics, path)?;
+    let session = server.session_and_guild(&session_id, &guild_id, path)?;
     let Some(player) = session.player(&guild_id) else {
         return Err(server.fail(StatusCode::NOT_FOUND, "player not found", path));
     };
@@ -980,12 +997,11 @@ async fn lyrics_for_player(
 #[allow(clippy::result_large_err)]
 async fn get_players(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path(session_id): Path<String>,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::GetPlayers, &headers, path)?;
+    server.rate_limit(Route::GetPlayers, path)?;
     let session = server.session(&session_id, path)?;
     Ok(server.json(StatusCode::OK, PlayersResponse { players: session.snapshots() }))
 }
@@ -993,16 +1009,12 @@ async fn get_players(
 #[allow(clippy::result_large_err)]
 async fn get_player(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::GetPlayer, &headers, path)?;
-    let session = server.session(&session_id, path)?;
-    if !rustlink_voice::valid_id(&guild_id) {
-        return Err(server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path));
-    }
+    server.rate_limit(Route::GetPlayer, path)?;
+    let session = server.session_and_guild(&session_id, &guild_id, path)?;
     let Some(player) = session.player(&guild_id) else {
         return Err(server.fail(StatusCode::NOT_FOUND, "player not found", path));
     };
@@ -1033,17 +1045,13 @@ impl Drop for PlayerCreation<'_> {
 #[allow(clippy::result_large_err)]
 async fn update_player(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
     body: Bytes,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::UpdatePlayer, &headers, path)?;
-    let session = server.session(&session_id, path)?;
-    if !rustlink_voice::valid_id(&guild_id) {
-        return Err(server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path));
-    }
+    server.rate_limit(Route::UpdatePlayer, path)?;
+    let session = server.session_and_guild(&session_id, &guild_id, path)?;
     let update: PlayerUpdate = read_json(&server, &body, path)?;
     let prepared = crate::player::prepare(update)
         .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))?;
@@ -1133,16 +1141,12 @@ async fn update_player(
 #[allow(clippy::result_large_err)]
 async fn delete_player(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::DeletePlayer, &headers, path)?;
-    let session = server.session(&session_id, path)?;
-    if !rustlink_voice::valid_id(&guild_id) {
-        return Err(server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path));
-    }
+    server.rate_limit(Route::DeletePlayer, path)?;
+    let session = server.session_and_guild(&session_id, &guild_id, path)?;
     let gate = session.update_gate(&guild_id);
     let _serialized = gate.lock().await;
     if let Some(player) = session.remove(&guild_id) {
@@ -1186,13 +1190,9 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
 }
 
 #[allow(clippy::result_large_err)]
-async fn create_session(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> RouteResult {
+async fn create_session(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
     let path = "/api/v1/sessions";
-    server.guard(Route::CreateSession, &headers, path)?;
+    server.rate_limit(Route::CreateSession, path)?;
     let request: CreateSession = read_json(&server, &body, path)?;
     if !rustlink_voice::valid_id(&request.bot_id)
         || request.resume_timeout_secs.is_some_and(|timeout| timeout == 0 || timeout > 86_400)
@@ -1262,12 +1262,11 @@ async fn create_session(
 #[allow(clippy::result_large_err)]
 async fn get_session(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::GetSession, &headers, path)?;
+    server.rate_limit(Route::GetSession, path)?;
     let session = server.session(&id, path)?;
     Ok(server.json(StatusCode::OK, session.snapshot()))
 }
@@ -1275,12 +1274,11 @@ async fn get_session(
 #[allow(clippy::result_large_err)]
 async fn delete_session(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::DeleteSession, &headers, path)?;
+    server.rate_limit(Route::DeleteSession, path)?;
     server.remove_session(&id);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1288,13 +1286,12 @@ async fn delete_session(
 #[allow(clippy::result_large_err)]
 async fn update_session(
     State(server): State<Arc<Server>>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
     body: Bytes,
 ) -> RouteResult {
     let path = uri.path();
-    server.guard(Route::UpdateSession, &headers, path)?;
+    server.rate_limit(Route::UpdateSession, path)?;
     let session = server.session(&id, path)?;
     let update: UpdateSession = read_json(&server, &body, path)?;
     if update.resume_timeout_secs.is_some_and(|timeout| timeout == 0 || timeout > 86_400) {
@@ -1305,7 +1302,11 @@ async fn update_session(
         ));
     }
     session.configure(update.resume, update.resume_timeout_secs);
-    Ok(server.json(StatusCode::OK, session.snapshot()))
+    let snapshot = session.snapshot();
+    if session.expired() {
+        server.remove_session(&id);
+    }
+    Ok(server.json(StatusCode::OK, snapshot))
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -1325,7 +1326,7 @@ async fn websocket(
     // Use only the path component so query parameters (which may contain
     // credentials) are never copied into an error response.
     let path = parts.uri.path().to_owned();
-    if let Err(response) = server.guard(Route::Websocket, &parts.headers, &path) {
+    if let Err(response) = server.rate_limit(Route::Websocket, &path) {
         return response;
     }
     let session = match server.session(&id, &path) {
@@ -1553,12 +1554,9 @@ impl Server {
 
     /// What `GET /api/v1/stats` reports.
     fn stats_body(&self) -> Value {
-        let (session_count, playing) = {
-            let sessions = self.sessions.lock().unwrap();
-            let playing: usize =
-                sessions.values().map(|session| session.playing_player_count()).sum();
-            (sessions.len(), playing)
-        };
+        let sessions = self.active_sessions();
+        let session_count = sessions.len();
+        let playing: usize = sessions.iter().map(|session| session.playing_player_count()).sum();
         let (system_load, process_load, _) = self.cpu.values();
         let (used, total) = self.cpu.memory();
         json!({
@@ -1578,9 +1576,9 @@ impl Server {
     /// What `GET /metrics` reports, in the text exposition format Prometheus
     /// reads.
     fn metrics_body(&self) -> String {
-        let sessions = self.sessions.lock().unwrap().len();
+        let sessions = self.active_sessions().len();
         let uptime = self.started.elapsed().as_secs_f64();
-        let mut out = String::with_capacity(768);
+        let mut out = String::with_capacity(1152);
         let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
         };
@@ -1590,7 +1588,7 @@ impl Server {
             "rustlink_http_requests_total",
             "counter",
             "HTTP requests",
-            self.requests.load(Ordering::SeqCst),
+            self.requests.load(Ordering::Relaxed),
         );
         metric(
             "rustlink_audio_frames_total",
@@ -1611,12 +1609,23 @@ impl Server {
             self.counters.errors.load(Ordering::Relaxed),
         );
         metric(
+            "rustlink_webhook_dropped_total",
+            "counter",
+            "Webhook events dropped",
+            self.deps.webhook.as_ref().map_or(0, Client::dropped),
+        );
+        metric(
             "rustlink_heap_bytes",
             "gauge",
             "Bytes this process holds; excludes media subprocesses",
             self.cpu.memory().0,
         );
-        metric("rustlink_tasks", "gauge", "Background tasks", 0);
+        metric(
+            "rustlink_tasks",
+            "gauge",
+            "Background tasks",
+            self.handle.metrics().num_alive_tasks() as u64,
+        );
         let _ = writeln!(
             out,
             "# HELP rustlink_uptime_seconds Uptime in seconds\n# TYPE rustlink_uptime_seconds gauge\nrustlink_uptime_seconds {uptime:.3}"
@@ -1734,7 +1743,7 @@ impl Server {
         }
         let report = self.player_state_report();
         if let Some(client) = &self.deps.webhook {
-            client.send(report);
+            client.send_ref(&report);
         }
     }
 
@@ -1743,7 +1752,7 @@ impl Server {
     /// and user that own a player are left out, along with the encoded track
     /// and every other field a reader has no business seeing.
     fn player_state_report(&self) -> Value {
-        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let sessions = self.active_sessions();
         let mut states = Vec::new();
         let mut playing = 0;
         for session in &sessions {
@@ -1793,13 +1802,18 @@ async fn write_loop(
     }
     loop {
         tokio::select! {
+            biased;
             _ = session.stopped() => {
+                let mut sink_ok = true;
                 while let Ok(event) = inbox.try_recv() {
                     if send_frame(&mut sink, Message::Text(event.to_string().into())).await.is_err() {
+                        sink_ok = false;
                         break;
                     }
                 }
-                let _ = send_frame(&mut sink, Message::Close(None)).await;
+                if sink_ok {
+                    let _ = send_frame(&mut sink, Message::Close(None)).await;
+                }
                 break;
             }
             command = control.recv() => match command {
@@ -1825,6 +1839,7 @@ async fn write_loop(
                     guild_id: &'a str,
                     state: rustlink_protocol::PlayerState,
                 }
+                let mut failed = false;
                 for player in session.players() {
                     let (guild_id, state) = player.state_snapshot();
                     let payload = PlayerUpdated {
@@ -1836,8 +1851,12 @@ async fn write_loop(
                     };
                     let Ok(text) = serde_json::to_string(&payload) else { continue };
                     if send_frame(&mut sink, Message::Text(text.into())).await.is_err() {
-                        return inbox;
+                        failed = true;
+                        break;
                     }
+                }
+                if failed {
+                    break;
                 }
             }
             _ = stats.tick() => {

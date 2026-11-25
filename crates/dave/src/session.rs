@@ -16,6 +16,7 @@ const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
 const MAX_PENDING_TRANSITIONS: usize = 16;
 const MAX_CANCELLED_TRANSITIONS: usize = 32;
 const MAX_EXPECTED_MEMBERS: usize = 4096;
+const MAX_PENDING_PROPOSALS: usize = MAX_EXPECTED_MEMBERS * 2;
 
 /// Messages for the authenticated Discord voice gateway, without server sequence prefixes.
 pub enum Outbound {
@@ -23,14 +24,20 @@ pub enum Outbound {
     Binary(Vec<u8>),
 }
 
-enum Sender {
+enum ActiveSender {
     TransportOnly,
     Encrypted { context: (u64, u64), media: MediaSender },
 }
 
+enum TransitionSender {
+    TransportOnly,
+    Encrypted { context: (u64, u64), media: MediaSender },
+    RetainEncrypted((u64, u64)),
+}
+
 struct Transition {
     order: u64,
-    sender: Sender,
+    sender: TransitionSender,
 }
 
 /// One voice session, driven by the gateway task that also encrypts outgoing frames.
@@ -46,7 +53,7 @@ pub struct Session {
     version: Option<u16>,
     expected: HashSet<u64>,
     own_commit: Option<Vec<u8>>,
-    active: Option<Sender>,
+    active: Option<ActiveSender>,
     /// Encrypted sender temporarily displaced by a transport-only downgrade on the same epoch.
     /// Preserves the monotonic frame nonce counter if the call upgrades back without a new commit.
     parked: Option<((u64, u64), MediaSender)>,
@@ -103,7 +110,7 @@ impl Session {
         }
         self.version = Some(version);
         if version == 0 {
-            self.active = Some(Sender::TransportOnly);
+            self.active = Some(ActiveSender::TransportOnly);
             Ok(vec![])
         } else {
             self.reset_group()?;
@@ -147,15 +154,15 @@ impl Session {
 
     pub fn active_version(&self) -> Option<u16> {
         self.active.as_ref().map(|s| match s {
-            Sender::TransportOnly => 0,
-            Sender::Encrypted { .. } => 1,
+            ActiveSender::TransportOnly => 0,
+            ActiveSender::Encrypted { .. } => 1,
         })
     }
 
     pub fn encrypt_opus(&mut self, opus: &[u8]) -> Result<Vec<u8>> {
         match self.active.as_mut() {
-            Some(Sender::TransportOnly) => Ok(opus.to_vec()),
-            Some(Sender::Encrypted { media, .. }) => media.encrypt(opus),
+            Some(ActiveSender::TransportOnly) => Ok(opus.to_vec()),
+            Some(ActiveSender::Encrypted { media, .. }) => media.encrypt(opus),
             None => Err(Error::NotReady),
         }
     }
@@ -164,8 +171,8 @@ impl Session {
     /// the 16-byte maximum DAVE footer. No mutation occurs before negotiation.
     pub fn encrypt_opus_in_place(&mut self, opus: &mut Vec<u8>) -> Result<()> {
         match self.active.as_mut() {
-            Some(Sender::TransportOnly) => Ok(()),
-            Some(Sender::Encrypted { media, .. }) => media.encrypt_in_place(opus),
+            Some(ActiveSender::TransportOnly) => Ok(()),
+            Some(ActiveSender::Encrypted { media, .. }) => media.encrypt_in_place(opus),
             None => Err(Error::NotReady),
         }
     }
@@ -204,16 +211,47 @@ impl Session {
                 validate_version(version)?;
                 let id = number(data, "transition_id")?;
                 if version == 0 {
-                    return self.prepare(id, Sender::TransportOnly, false);
+                    return self.prepare(id, TransitionSender::TransportOnly, false);
                 }
                 if self.group.is_some() {
                     self.version = Some(1);
                 }
-                if matches!(self.active, Some(Sender::TransportOnly)) {
-                    let current = self.current_context();
-                    if self.parked.as_ref().is_some_and(|(ctx, _)| Some(*ctx) == current) {
-                        let (context, media) = self.parked.take().unwrap();
-                        return self.prepare(id, Sender::Encrypted { context, media }, true);
+                if let Some(current) = self.current_context() {
+                    let already_in_flight = self.transitions.values().any(|t| {
+                        matches!(
+                            t.sender,
+                            TransitionSender::Encrypted { context, .. }
+                                | TransitionSender::RetainEncrypted(context)
+                                if context == current
+                        )
+                    });
+                    if !already_in_flight {
+                        if matches!(self.active, Some(ActiveSender::TransportOnly))
+                            && self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == current)
+                        {
+                            let (context, media) = self.parked.take().unwrap();
+                            return self.prepare(
+                                id,
+                                TransitionSender::Encrypted { context, media },
+                                true,
+                            );
+                        }
+                        let has_pending_downgrade = self
+                            .transitions
+                            .values()
+                            .any(|t| matches!(t.sender, TransitionSender::TransportOnly));
+                        if has_pending_downgrade
+                            && matches!(
+                                self.active,
+                                Some(ActiveSender::Encrypted { context, .. }) if context == current
+                            )
+                        {
+                            return self.prepare(
+                                id,
+                                TransitionSender::RetainEncrypted(current),
+                                true,
+                            );
+                        }
                     }
                 }
                 let sender = self.sender()?;
@@ -230,32 +268,7 @@ impl Session {
                 if transition.order <= self.last_executed {
                     return Err(Error::Protocol("out-of-order transition"));
                 }
-                let current = self.current_context();
-                let mut salvaged = None;
-                self.transitions.retain(|_, pending| {
-                    if pending.order < transition.order {
-                        if matches!(transition.sender, Sender::TransportOnly) && salvaged.is_none()
-                        {
-                            let dummy = Transition { order: 0, sender: Sender::TransportOnly };
-                            if let Sender::Encrypted { context, media } =
-                                std::mem::replace(pending, dummy).sender
-                            {
-                                if Some(context) == current {
-                                    salvaged = Some((context, media));
-                                }
-                            }
-                        }
-                        false
-                    } else {
-                        true
-                    }
-                });
-                self.last_executed = transition.order;
-                self.activate(transition.sender);
-                if self.parked.is_none() {
-                    self.parked = salvaged;
-                }
-                self.recovery_attempts = 0;
+                self.execute_transition(transition.order, transition.sender)?;
             }
             24 => {
                 let version = number(data, "protocol_version")?;
@@ -359,18 +372,66 @@ impl Session {
         self.group.as_ref().map(|g| (self.group_revision, g.epoch().as_u64()))
     }
 
-    fn activate(&mut self, sender: Sender) {
-        match &sender {
-            Sender::TransportOnly => {
-                if let Some(Sender::Encrypted { context, media }) = self.active.take() {
-                    self.parked = Some((context, media));
+    fn execute_transition(&mut self, order: u64, sender: TransitionSender) -> Result<()> {
+        let current = self.current_context();
+        let mut salvaged = None;
+        self.transitions.retain(|_, pending| {
+            if pending.order < order {
+                if matches!(sender, TransitionSender::TransportOnly) && salvaged.is_none() {
+                    let dummy = Transition { order: 0, sender: TransitionSender::TransportOnly };
+                    if let TransitionSender::Encrypted { context, media } =
+                        std::mem::replace(pending, dummy).sender
+                    {
+                        if Some(context) == current {
+                            salvaged = Some((context, media));
+                        }
+                    }
                 }
+                false
+            } else {
+                true
             }
-            Sender::Encrypted { .. } => {
+        });
+        self.activate(sender)?;
+        if let Some(salvaged) = salvaged {
+            self.parked = Some(salvaged);
+        }
+        self.last_executed = order;
+        self.recovery_attempts = 0;
+        Ok(())
+    }
+
+    fn activate(&mut self, sender: TransitionSender) -> Result<()> {
+        match sender {
+            TransitionSender::TransportOnly => {
+                if let Some(ActiveSender::Encrypted { context, media }) = self.active.take() {
+                    if Some(context) == self.current_context() {
+                        self.parked = Some((context, media));
+                    }
+                }
+                self.active = Some(ActiveSender::TransportOnly);
+            }
+            TransitionSender::Encrypted { context, media } => {
                 self.parked = None;
+                self.active = Some(ActiveSender::Encrypted { context, media });
+            }
+            TransitionSender::RetainEncrypted(expected) => {
+                if matches!(
+                    self.active,
+                    Some(ActiveSender::Encrypted { context, .. }) if context == expected
+                ) {
+                    self.parked = None;
+                    return Ok(());
+                }
+                if self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == expected) {
+                    let (context, media) = self.parked.take().unwrap();
+                    self.active = Some(ActiveSender::Encrypted { context, media });
+                    return Ok(());
+                }
+                return Err(Error::Protocol("retained epoch sender is unavailable"));
             }
         }
-        self.active = Some(sender);
+        Ok(())
     }
 
     fn cancel_transition(&mut self, id: u16) {
@@ -386,11 +447,19 @@ impl Session {
         }
     }
 
-    fn prepare(&mut self, id: u16, sender: Sender, resumed: bool) -> Result<Vec<Outbound>> {
-        if self.transitions.len() >= MAX_PENDING_TRANSITIONS || self.transitions.contains_key(&id) {
+    fn prepare(
+        &mut self,
+        id: u16,
+        sender: TransitionSender,
+        resumed: bool,
+    ) -> Result<Vec<Outbound>> {
+        if id != 0
+            && (self.transitions.len() >= MAX_PENDING_TRANSITIONS
+                || self.transitions.contains_key(&id))
+        {
             return Err(Error::Protocol("duplicate or excessive pending transitions"));
         }
-        if let Sender::Encrypted { context, .. } = &sender {
+        if let TransitionSender::Encrypted { context, .. } = &sender {
             if !resumed && self.last_prepared.is_some_and(|previous| previous >= *context) {
                 return Err(Error::Protocol("refusing to reuse an outgoing epoch key"));
             }
@@ -404,9 +473,7 @@ impl Session {
             .ok_or(Error::Protocol("transition counter exhausted"))?;
         self.take_cancelled(id);
         if id == 0 {
-            self.last_executed = self.transition_order;
-            self.activate(sender);
-            self.recovery_attempts = 0;
+            self.execute_transition(self.transition_order, sender)?;
             return Ok(vec![]);
         }
         self.transitions.insert(id, Transition { order: self.transition_order, sender });
@@ -490,7 +557,11 @@ impl Session {
         self.own_commit = None;
         match operation {
             0 => {
+                let mut pending_count = group.pending_proposals().count();
                 while !remaining.is_empty() {
+                    if pending_count >= MAX_PENDING_PROPOSALS {
+                        return Err(Error::Protocol("excessive pending proposals"));
+                    }
                     let (message, rest) = check(
                         MlsMessageIn::tls_deserialize_bytes(remaining),
                         "invalid proposal message",
@@ -501,7 +572,15 @@ impl Session {
                     match &protocol {
                         ProtocolMessage::PublicMessage(p)
                             if p.sender()
-                                == &SenderType::External(SenderExtensionIndex::new(0)) => {}
+                                == &SenderType::External(SenderExtensionIndex::new(0)) =>
+                        {
+                            if self.recovery_attempts > 0
+                                && group.epoch().as_u64() == 0
+                                && p.epoch().as_u64() != 0
+                            {
+                                continue;
+                            }
+                        }
                         _ => {
                             return Err(Error::Protocol(
                                 "proposal is not from the trusted external sender",
@@ -522,6 +601,7 @@ impl Session {
                         group.store_pending_proposal(self.provider.storage(), *proposal),
                         "proposal storage failed",
                     )?;
+                    pending_count += 1;
                 }
             }
             1 => {
@@ -550,6 +630,9 @@ impl Session {
                 _ => None,
             })
             .collect();
+        if removed.contains(&group.own_leaf_index()) {
+            return Ok(vec![]);
+        }
         let mut users = HashSet::new();
         for member in group.members().filter(|m| !removed.contains(&m.index)) {
             if !users.insert(identity(&member.credential)?) {
@@ -624,7 +707,12 @@ impl Session {
                     group.pending_proposals().map(|p| p.proposal_reference_ref()).collect();
                 let mut included: HashSet<&ProposalRef> = HashSet::with_capacity(known.len());
                 for proposal in staged.queued_proposals() {
-                    validate_proposal(proposal, &self.expected)?;
+                    if proposal.sender() != &SenderType::External(SenderExtensionIndex::new(0))
+                        || proposal.proposal_or_ref_type() != ProposalOrRefType::Reference
+                        || !matches!(proposal.proposal(), Proposal::Add(_) | Proposal::Remove(_))
+                    {
+                        return Err(Error::Protocol("unauthorized or inline commit proposal"));
+                    }
                     let reference = proposal.proposal_reference_ref();
                     if !known.contains(reference) || !included.insert(reference) {
                         return Err(Error::Protocol("uncached or duplicate commit proposal"));
@@ -683,7 +771,7 @@ impl Session {
         Ok(())
     }
 
-    fn sender(&self) -> Result<Sender> {
+    fn sender(&self) -> Result<TransitionSender> {
         let group = self.group.as_ref().ok_or(Error::NotReady)?;
         let secret = check(
             group.export_secret(
@@ -694,7 +782,7 @@ impl Session {
             ),
             "sender secret export failed",
         )?;
-        Ok(Sender::Encrypted {
+        Ok(TransitionSender::Encrypted {
             context: (self.group_revision, group.epoch().as_u64()),
             media: MediaSender::new(secret),
         })

@@ -74,7 +74,7 @@ FFmpeg 只在內建管線不處理的容器才需要；沒有 FFmpeg 的節點�
 | `cacheTtlSeconds` | `300` | 快取保留秒數。 |
 | `loadTimeoutSeconds` | `30` | 一次解析的時限。 |
 | `playerUpdateSeconds` | `5` | 工作階段回報播放位置的間隔。 |
-| `statsSeconds` | `60` | 取樣 `/api/v1/stats` 的間隔。 |
+| `statsSeconds` | `60` | WebSocket 推送 `node.stats` 事件的間隔。 |
 | `eventBuffer` | `256` | 等待 WebSocket 的事件數。客戶端停止讀取時，佇列滿了就會被關閉；節點不會靜默丟事件，以免客戶端顯示的狀態和實際不符。 |
 | `opusBitrate` | `192000` | Opus 目標位元率（bit/s），範圍 `16000`–`256000`。越高占用的網路頻寬越多。 |
 | `opusComplexity` | `10` | 編碼器複雜度 0–10。降低可減少每個播放器每個 frame 的 CPU 成本，適合播放器數多於核心數的節點；內建管線與 FFmpeg 後備都遵循。 |

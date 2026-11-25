@@ -261,34 +261,91 @@ impl Serialize for LoadResult {
 
 impl<'de> Deserialize<'de> for LoadResult {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = RawLoadResult::deserialize(d)?;
-        let data = raw.data.unwrap_or(Value::Null);
-        Ok(match raw.load_type.as_str() {
-            "track" => LoadResult::Track(Box::new(
-                serde_json::from_value(data).map_err(de::Error::custom)?,
-            )),
-            "playlist" => LoadResult::Playlist(Box::new(
-                serde_json::from_value(data).map_err(de::Error::custom)?,
-            )),
-            "search" => {
-                LoadResult::Search(serde_json::from_value(data).map_err(de::Error::custom)?)
-            }
-            "empty" => LoadResult::Empty,
-            "error" => LoadResult::Error(Box::new(
-                serde_json::from_value(data).map_err(de::Error::custom)?,
-            )),
-            other => return Err(de::Error::custom(format_args!("unknown load type {other}"))),
-        })
-    }
-}
+        #[derive(Deserialize)]
+        enum Field {
+            #[serde(rename = "kind")]
+            Kind,
+            #[serde(rename = "result")]
+            Result,
+        }
 
-#[derive(Deserialize)]
-struct RawLoadResult {
-    #[serde(rename = "kind")]
-    load_type: String,
-    #[serde(default)]
-    #[serde(rename = "result")]
-    data: Option<Value>,
+        struct LoadResultVisitor;
+
+        impl<'de> de::Visitor<'de> for LoadResultVisitor {
+            type Value = LoadResult;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a LoadResult object with kind and result fields")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut kind: Option<String> = None;
+                let mut parsed: Option<LoadResult> = None;
+                let mut buffered: Option<Value> = None;
+
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Kind => {
+                            if kind.is_some() {
+                                return Err(de::Error::duplicate_field("kind"));
+                            }
+                            kind = Some(map.next_value()?);
+                        }
+                        Field::Result => {
+                            if parsed.is_some() || buffered.is_some() {
+                                return Err(de::Error::duplicate_field("result"));
+                            }
+                            if let Some(k) = kind.as_deref() {
+                                parsed = Some(match k {
+                                    "track" => LoadResult::Track(Box::new(map.next_value()?)),
+                                    "playlist" => LoadResult::Playlist(Box::new(map.next_value()?)),
+                                    "search" => LoadResult::Search(map.next_value()?),
+                                    "empty" => {
+                                        let _: Option<de::IgnoredAny> = map.next_value()?;
+                                        LoadResult::Empty
+                                    }
+                                    "error" => LoadResult::Error(Box::new(map.next_value()?)),
+                                    other => {
+                                        return Err(de::Error::custom(format_args!(
+                                            "unknown load type {other}"
+                                        )));
+                                    }
+                                });
+                            } else {
+                                buffered = Some(map.next_value()?);
+                            }
+                        }
+                    }
+                }
+
+                let kind = kind.ok_or_else(|| de::Error::missing_field("kind"))?;
+                if let Some(done) = parsed {
+                    return Ok(done);
+                }
+                let data = buffered.unwrap_or(Value::Null);
+                Ok(match kind.as_str() {
+                    "track" => LoadResult::Track(Box::new(
+                        serde_json::from_value(data).map_err(de::Error::custom)?,
+                    )),
+                    "playlist" => LoadResult::Playlist(Box::new(
+                        serde_json::from_value(data).map_err(de::Error::custom)?,
+                    )),
+                    "search" => {
+                        LoadResult::Search(serde_json::from_value(data).map_err(de::Error::custom)?)
+                    }
+                    "empty" => LoadResult::Empty,
+                    "error" => LoadResult::Error(Box::new(
+                        serde_json::from_value(data).map_err(de::Error::custom)?,
+                    )),
+                    other => {
+                        return Err(de::Error::custom(format_args!("unknown load type {other}")));
+                    }
+                })
+            }
+        }
+
+        d.deserialize_struct("LoadResult", &["kind", "result"], LoadResultVisitor)
+    }
 }
 
 /// What a bot reports about its voice connection, which the node needs before it

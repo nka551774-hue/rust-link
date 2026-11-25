@@ -14,7 +14,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg libopus0 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home rustlink \
+    && useradd --system --uid 10001 --home-dir /app --no-create-home rustlink \
     && mkdir -p /app/.tools \
     && chown -R rustlink:rustlink /app
 COPY --from=build /src/target/release/rustlink /usr/local/bin/rustlink

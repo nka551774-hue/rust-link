@@ -180,22 +180,66 @@ impl SincResampler {
         if let Some(phases) = &self.phases {
             let mut centre = self.centre_frame;
             let mut phase = self.phase;
-            while produced < limit {
-                let start = centre + 1 - self.half;
-                let end = centre + self.half + 1;
-                if end > frames {
-                    break;
+            if self.half == TAPS / 2 {
+                let rows = phases.weights.as_chunks::<TAPS>().0;
+                let steps = &phases.steps[..phases.period];
+                let base_len = out.len();
+                let spare = out.spare_capacity_mut().as_chunks_mut::<CHANNELS>().0;
+                let batch = spare.len().min(limit);
+                for slot in &mut spare[..batch] {
+                    let start = centre + 1 - (TAPS / 2);
+                    let Some(window) =
+                        buf_frames.get(start..).and_then(|s| s.first_chunk::<TAPS>())
+                    else {
+                        break;
+                    };
+                    let [l, r] = convolve_taps(window, &rows[phase]);
+                    slot[0].write(l);
+                    slot[1].write(r);
+                    centre += steps[phase];
+                    phase += 1;
+                    if phase == phases.period {
+                        phase = 0;
+                    }
+                    produced += 1;
                 }
-                let base = phase * width;
-                let row = &phases.weights[base..base + width];
-                let sample = convolve(&buf_frames[start..end], row);
-                out.extend_from_slice(&sample);
-                centre += phases.steps[phase];
-                phase += 1;
-                if phase == phases.period {
-                    phase = 0;
+                // SAFETY: `0..produced` stereo pairs (`produced * CHANNELS` `f32`s) were initialized above.
+                unsafe {
+                    out.set_len(base_len + produced * CHANNELS);
                 }
-                produced += 1;
+                while produced < limit {
+                    let start = centre + 1 - (TAPS / 2);
+                    let Some(window) =
+                        buf_frames.get(start..).and_then(|s| s.first_chunk::<TAPS>())
+                    else {
+                        break;
+                    };
+                    out.extend_from_slice(&convolve_taps(window, &rows[phase]));
+                    centre += steps[phase];
+                    phase += 1;
+                    if phase == phases.period {
+                        phase = 0;
+                    }
+                    produced += 1;
+                }
+            } else {
+                while produced < limit {
+                    let start = centre + 1 - self.half;
+                    let end = centre + self.half + 1;
+                    if end > frames {
+                        break;
+                    }
+                    let base = phase * width;
+                    let row = &phases.weights[base..base + width];
+                    let sample = convolve(&buf_frames[start..end], row);
+                    out.extend_from_slice(&sample);
+                    centre += phases.steps[phase];
+                    phase += 1;
+                    if phase == phases.period {
+                        phase = 0;
+                    }
+                    produced += 1;
+                }
             }
             self.centre_frame = centre;
             self.phase = phase;
@@ -209,13 +253,13 @@ impl SincResampler {
         let mut weights = std::mem::take(&mut self.scratch);
         weights.resize(width, 0.0);
         while produced < limit {
-            let centre = self.position.floor() as usize;
+            let centre = self.position as usize;
             let start = centre + 1 - self.half;
             let end = centre + self.half + 1;
             if end > frames {
                 break;
             }
-            let fraction = self.position.fract();
+            let fraction = self.position - centre as f64;
             let mut sum = 0.0f64;
             for (tap_index, slot) in weights.iter_mut().enumerate() {
                 let w = tap(fraction, tap_offset(tap_index, self.half), cutoff);
@@ -239,7 +283,7 @@ impl SincResampler {
     /// again because the filter only looks half a window back.
     fn compact(&mut self) {
         let current_floor =
-            if self.phases.is_some() { self.centre_frame } else { self.position.floor() as usize };
+            if self.phases.is_some() { self.centre_frame } else { self.position as usize };
         // Everything before the next read position's window is never read again.
         let keep_from = current_floor.saturating_sub(self.half + 1);
         // position is relative to the current buffer. Mixing an absolute
@@ -261,23 +305,28 @@ impl SincResampler {
 /// Four-way independent accumulator FIR dot product so LLVM SLP-vectorizes and
 /// unrolls the 16-tap stereo window without needing unsafe or `-ffast-math`.
 #[inline(always)]
+fn convolve_taps(frames: &[[f32; CHANNELS]; TAPS], weights: &[f32; TAPS]) -> [f32; CHANNELS] {
+    let mut acc = [[0.0f32; CHANNELS]; 4];
+    for i in 0..TAPS / 4 {
+        for k in 0..4 {
+            let w = weights[i * 4 + k];
+            let [l, r] = frames[i * 4 + k];
+            acc[k][0] += l * w;
+            acc[k][1] += r * w;
+        }
+    }
+    [
+        (acc[0][0] + acc[1][0]) + (acc[2][0] + acc[3][0]),
+        (acc[0][1] + acc[1][1]) + (acc[2][1] + acc[3][1]),
+    ]
+}
+
+#[inline(always)]
 fn convolve(frames: &[[f32; CHANNELS]], weights: &[f32]) -> [f32; CHANNELS] {
     if let (Ok(frames), Ok(weights)) =
         (<&[[f32; CHANNELS]; TAPS]>::try_from(frames), <&[f32; TAPS]>::try_from(weights))
     {
-        let mut acc = [[0.0f32; CHANNELS]; 4];
-        for i in 0..TAPS / 4 {
-            for k in 0..4 {
-                let w = weights[i * 4 + k];
-                let [l, r] = frames[i * 4 + k];
-                acc[k][0] += l * w;
-                acc[k][1] += r * w;
-            }
-        }
-        return [
-            (acc[0][0] + acc[1][0]) + (acc[2][0] + acc[3][0]),
-            (acc[0][1] + acc[1][1]) + (acc[2][1] + acc[3][1]),
-        ];
+        return convolve_taps(frames, weights);
     }
     let mut acc = [[0.0f32; CHANNELS]; 4];
     let (frame_chunks, frame_rem) = frames.as_chunks::<4>();
@@ -319,9 +368,10 @@ impl Phases {
         let max_phases = (MAX_TABLE_BYTES / (width * 8)).clamp(1, MAX_PHASES);
         let period = (1..=max_phases).find(|period| {
             let turns = ratio * *period as f64;
-            (turns - turns.round()).abs() < 1e-9
+            let nearest = (turns + 0.5) as usize;
+            (turns - nearest as f64).abs() < 1e-9
         })?;
-        let turns = (ratio * period as f64).round() as usize;
+        let turns = (ratio * period as f64 + 0.5) as usize;
         let mut fractions = Vec::with_capacity(period);
         let mut steps = Vec::with_capacity(period);
         let mut weights = Vec::with_capacity(period * width);
@@ -416,6 +466,7 @@ pub struct TimeStretcher {
     /// The cross-fade of each frame of the overlap, worked out once.
     fades: [f32; HOP],
     primed: bool,
+    analysis_frac: f64,
     total_input_frames: u64,
     total_output_frames: u64,
 }
@@ -469,6 +520,7 @@ impl TimeStretcher {
             sums: vec![0.0; SEARCH * 2 + HOP],
             fades,
             primed: false,
+            analysis_frac: 0.0,
             total_input_frames: 0,
             total_output_frames: 0,
         }
@@ -490,7 +542,7 @@ impl TimeStretcher {
         let factor = factor.clamp(0.05, 5.0);
         // A faster factor consumes more input per output frame, which is what
         // makes the output shorter.
-        let analysis = (HOP as f64 * factor).round().max(1.0) as usize;
+        let hop_step = HOP as f64 * factor;
         let frames = self.input.len() / CHANNELS;
         let mut read = 0usize;
         // The frame is taken from the read position plus an alignment offset,
@@ -527,7 +579,10 @@ impl TimeStretcher {
                 let sum = l + r;
                 *dst = if sum.is_finite() { sum } else { 0.0 };
             }
-            read += analysis;
+            let exact = hop_step + self.analysis_frac;
+            let step = (exact as usize).max(1);
+            self.analysis_frac = (exact - step as f64).max(0.0);
+            read += step;
         }
         if read > 0 {
             self.input.drain(..read.min(frames) * CHANNELS);
@@ -564,7 +619,7 @@ impl TimeStretcher {
             return;
         }
         let factor = factor.clamp(0.05, 5.0);
-        let target_total = (self.total_input_frames as f64 / factor).round().max(1.0) as u64;
+        let target_total = ((self.total_input_frames as f64 / factor + 0.5) as u64).max(1);
         let remaining_target = target_total.saturating_sub(self.total_output_frames) as usize;
         if !self.input.is_empty() || !self.primed {
             self.skip = 0;
@@ -580,6 +635,7 @@ impl TimeStretcher {
         self.output.clear();
         self.input.clear();
         self.skip = 0;
+        self.analysis_frac = 0.0;
     }
 
     /// Finds the offset within the search window where the next frame lines up

@@ -2,7 +2,7 @@
 
 預設 origin：`http://127.0.0.1:2333`。JSON 使用 snake_case；時間與位置以毫秒表示，只有 `resume_timeout_secs` 以秒表示。Discord ID 是字串；位置、音量與期限是 JSON 整數，濾鏡參數可以是浮點數。
 
-除 `/healthz` 與 `/version` 外，所有端點（含 WebSocket 與 metrics）都要求：
+除 `/healthz` 與 `/version` 外，所有端點（含 WebSocket 與 metrics）都要求 `Authorization` 標頭，且帶 JSON body 的請求需加上 `Content-Type: application/json`：
 
 ```http
 Authorization: Bearer <設定檔 password>
@@ -45,7 +45,7 @@ password 是整個節點的存取金鑰，持有者可以管理節點上的所�
   "metadata": {
     "identifier": "source-id",
     "source": "youtube",
-    "title": "曲名 🎶",
+    "title": "曲名",
     "author": "演出者",
     "duration_ms": 180000,
     "position_ms": 0,

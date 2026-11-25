@@ -207,8 +207,8 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
     let mut out =
         fs::File::create(&file).map_err(|error| format!("{}: {error}", file.display()))?;
     let mut body = response.body_mut().as_reader();
-    let written = match copy(&mut body, &mut out, source.tool, total) {
-        Ok(written) => written,
+    let (written, got_sum) = match copy(&mut body, &mut out, source.tool, total) {
+        Ok(result) => result,
         Err(error) => {
             drop(out);
             let _ = fs::remove_file(&file);
@@ -220,13 +220,13 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
         let _ = fs::remove_file(&file);
         return Err(format!("{url} returned only {written} bytes"));
     }
-    let sums_url = match &source.sums {
-        Sums::List(list) => list.clone(),
+    let (sums_url, allow_bare) = match &source.sums {
+        Sums::List(list) => (list.clone(), false),
         Sums::Beside => {
-            format!("{}.sha256", landed.split(['?', '#']).next().unwrap_or(&landed))
+            (format!("{}.sha256", landed.split(['?', '#']).next().unwrap_or(&landed)), true)
         }
     };
-    if let Err(error) = verify(agent, &sums_url, &source.asset, &file) {
+    if let Err(error) = verify(agent, &sums_url, &source.asset, &got_sum, allow_bare) {
         let _ = fs::remove_file(&file);
         return Err(error);
     }
@@ -235,13 +235,13 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
 
 const MAX_ARCHIVE_BYTES: u64 = 512 << 20;
 
-/// Copies a download into a file, reporting where it is every so often.
+/// Copies a download into a file while hashing its bytes, reporting where it is every so often.
 fn copy(
     reader: &mut impl Read,
     out: &mut impl Write,
     tool: &str,
     total: Option<u64>,
-) -> Result<u64, String> {
+) -> Result<(u64, String), String> {
     if let Some(total) = total {
         if total > MAX_ARCHIVE_BYTES {
             return Err(format!(
@@ -251,12 +251,13 @@ fn copy(
         }
     }
     let mut buffer = vec![0u8; 64 << 10];
+    let mut hasher = Sha256::new();
     let mut written = 0u64;
     let mut next = Instant::now() + PROGRESS;
     loop {
         let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
         if read == 0 {
-            return Ok(written);
+            return Ok((written, hex_encode(&hasher.finalize())));
         }
         written += read as u64;
         if written > MAX_ARCHIVE_BYTES {
@@ -265,6 +266,7 @@ fn copy(
                 written >> 20
             ));
         }
+        hasher.update(&buffer[..read]);
         out.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
         let now = Instant::now();
         if now >= next {
@@ -358,8 +360,14 @@ fn agent() -> &'static ureq::Agent {
         )
     })
 }
-/// Checks a download against a `<sha256>  <file>` listing.
-fn verify(agent: &ureq::Agent, sums_url: &str, asset: &str, file: &Path) -> Result<(), String> {
+/// Checks a download against a `<sha256>  <file>` listing (or bare `<sha256>` sidecar).
+fn verify(
+    agent: &ureq::Agent,
+    sums_url: &str,
+    asset: &str,
+    got: &str,
+    allow_bare: bool,
+) -> Result<(), String> {
     let response = agent
         .get(sums_url)
         .header("User-Agent", "rustlink")
@@ -375,32 +383,38 @@ fn verify(agent: &ureq::Agent, sums_url: &str, asset: &str, file: &Path) -> Resu
         .limit(1 << 20)
         .read_to_string()
         .map_err(|error| format!("checksum list {sums_url}: {error}"))?;
-    let want = lookup_sum(&list, asset)
+    let want = lookup_sum(&list, asset, allow_bare)
         .ok_or_else(|| format!("checksum list {sums_url} has no entry for {asset}"))?;
-    let got = file_sum(file)?;
-    if !want.eq_ignore_ascii_case(&got) {
+    if !want.eq_ignore_ascii_case(got) {
         return Err(format!("{asset} checksum mismatch: expected {want}, downloaded {got}"));
     }
     Ok(())
 }
 
-/// Finds the hash a listing gives for one file. Accepts both `<sha256>  <file>`
-/// and GNU `sha256sum -b` `<sha256> *<file>`.
-fn lookup_sum(list: &str, asset: &str) -> Option<String> {
+/// Finds the hash a listing gives for one file. Accepts `<sha256>  <file>`,
+/// GNU `sha256sum -b` `<sha256> *<file>`, and (for a per-file `.sha256` sidecar)
+/// a single 64-digit SHA-256 hex token.
+fn lookup_sum(list: &str, asset: &str, allow_bare: bool) -> Option<String> {
     list.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
-        let (Some(hash), Some(raw_name), None) = (fields.next(), fields.next(), fields.next())
-        else {
-            return None;
-        };
-        let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
-        let name = name.strip_prefix("./").unwrap_or(name);
-        (name == asset && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| hash.to_owned())
+        let hash = fields.next()?;
+        match (fields.next(), fields.next()) {
+            (Some(raw_name), None) => {
+                let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
+                let name = name.strip_prefix("./").unwrap_or(name);
+                (name == asset && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| hash.to_owned())
+            }
+            (None, None) if allow_bare => (hash.len() == 64
+                && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_owned()),
+            _ => None,
+        }
     })
 }
 
 /// The SHA-256 of a file, as lowercase hexadecimal.
+#[cfg(test)]
 fn file_sum(file: &Path) -> Result<String, String> {
     let handle = fs::File::open(file).map_err(|error| format!("{}: {error}", file.display()))?;
     let mut reader = std::io::BufReader::with_capacity(64 << 10, handle);
@@ -438,7 +452,14 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
 /// Writes through a temporary file with executable permissions applied before
 /// atomic rename, so `target` is never half-written or non-executable.
 fn copy_into(source: &mut impl Read, target: &Path) -> Result<(), String> {
-    let temp = PathBuf::from(format!("{}.part-{}", target.display(), std::process::id()));
+    let mut nonce = [0u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let temp = PathBuf::from(format!(
+        "{}.part-{}-{}",
+        target.display(),
+        std::process::id(),
+        hex_encode(&nonce)
+    ));
     let write_result = fs::File::create(&temp)
         .map_err(|error| format!("{}: {error}", target.display()))
         .and_then(|mut out| {
@@ -713,10 +734,13 @@ mod tests {
     #[test]
     fn a_listing_yields_the_hash_of_the_named_file() {
         let list = "aaa  ffmpeg.zip\nbbb  ffmpeg.exe\nnot a listing\nccc  one two\n";
-        assert_eq!(lookup_sum(list, "ffmpeg.exe"), Some("bbb".to_string()));
-        assert_eq!(lookup_sum(list, "ffmpeg.zip"), Some("aaa".to_string()));
-        assert_eq!(lookup_sum(list, "one"), None);
-        assert_eq!(lookup_sum(list, "missing"), None);
+        assert_eq!(lookup_sum(list, "ffmpeg.exe", false), Some("bbb".to_string()));
+        assert_eq!(lookup_sum(list, "ffmpeg.zip", false), Some("aaa".to_string()));
+        assert_eq!(lookup_sum(list, "one", false), None);
+        assert_eq!(lookup_sum(list, "missing", false), None);
+        let bare = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n";
+        assert_eq!(lookup_sum(bare, "ffmpeg.zip", false), None);
+        assert_eq!(lookup_sum(bare, "ffmpeg.zip", true), Some(bare.trim().to_string()));
     }
 
     #[test]

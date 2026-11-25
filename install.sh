@@ -89,7 +89,10 @@ if [ "$SERVICE" = 1 ]; then
 fi
 case $SERVICE_USER in '' | *[!A-Za-z0-9_-]*) die "--user needs a plain name" ;; esac
 if [ -n "$PASSWORD" ]; then
-    case $PASSWORD in *[\"\\]* | *[[:space:]]*) die "--password cannot contain quotes, backslashes or spaces" ;; esac
+    [ ${#PASSWORD} -ge 8 ] || die "--password needs at least 8 characters"
+    case $(LC_ALL=C printf '%s' "$PASSWORD") in
+        *[\"\\]* | *[![:graph:]]*) die "--password must contain printable ASCII characters without quotes, backslashes or spaces" ;;
+    esac
 fi
 
 case $ADDRESS in
@@ -179,6 +182,7 @@ install_dependencies() {
 
 install_rust() {
     step "Installing the Rust toolchain"
+    export HOME=${HOME:-/root}
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
     # What the installer put on the PATH, for this shell.
     # shellcheck disable=SC1091
@@ -293,7 +297,11 @@ sed_replacement() {
 set_password() {
     local escaped_password
     escaped_password=$(sed_replacement "$PASSWORD")
-    sed -i -e "s|^password:.*|password: \"$escaped_password\"|" "$DIRECTORY/config.yaml"
+    if grep -q '^password:' "$DIRECTORY/config.yaml"; then
+        sed -i -e "s|^password:.*|password: \"$escaped_password\"|" "$DIRECTORY/config.yaml"
+    else
+        printf '\npassword: "%s"\n' "$PASSWORD" >>"$DIRECTORY/config.yaml"
+    fi
     note "the password in $DIRECTORY/config.yaml was replaced"
 }
 
@@ -360,8 +368,14 @@ summary() {
 TEXT
             ;;
         *)
+            local host_addr
+            host_addr=$(machine_address)
+            case $host_addr in
+                \<*\> | \[*\]) ;;
+                *:*) host_addr="[$host_addr]" ;;
+            esac
             printf '\n    A bot on another machine joins at:\n\n'
-            printf '        http://%s:%s/api/v1\n\n' "$(machine_address)" "$PORT"
+            printf '        http://%s:%s/api/v1\n\n' "$host_addr" "$PORT"
             printf '    with Authorization: Bearer <password>. Create a session with POST /api/v1/sessions.\n'
             printf '    The node is only as private\n'
             printf '    as the firewall around it, so let the bot through and nothing else:\n\n'

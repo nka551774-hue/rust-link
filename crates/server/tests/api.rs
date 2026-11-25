@@ -18,7 +18,7 @@ use tower::ServiceExt;
 fn track() -> Track {
     encode_track(&TrackInfo {
         identifier: "test-track".into(),
-        title: "測試 🎶".into(),
+        title: "測試 \u{1f3b6}".into(),
         source_name: "test".into(),
         is_seekable: true,
         length: 60_000,
@@ -265,9 +265,13 @@ async fn native_auth_headers_errors_and_voice_capabilities() {
         node.raw("POST", "/api/v1/sessions", "Bearer test-secret", "x".repeat((1 << 20) + 1)).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(error["error"]["code"].is_string());
-    let (status, error) = node.request("GET", "/api/v1/tracks/resolve", Value::Null).await;
+    let (status, headers, error) =
+        node.raw("GET", "/api/v1/tracks/resolve", "Bearer test-secret", String::new()).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(headers["allow"], "POST");
     assert_eq!(error["error"]["code"], "method_not_allowed");
+    let (status, _, _) = node.raw("GET", "/api/v1/tracks/resolve", "", String::new()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

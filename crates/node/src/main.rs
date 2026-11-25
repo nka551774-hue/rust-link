@@ -293,6 +293,14 @@ fn write_starter() -> Option<Starter> {
         return None;
     };
     let path = PathBuf::from(rustlink_config::STARTER_FILE);
+    let contents = rustlink_config::starter(&password);
+    let mut nonce = [0u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let temp = PathBuf::from(format!(
+        ".{}.tmp-{}",
+        rustlink_config::STARTER_FILE,
+        tools::hex_encode(&nonce)
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -300,10 +308,25 @@ fn write_starter() -> Option<Starter> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&path).and_then(|mut file| {
-        use std::io::Write;
-        file.write_all(rustlink_config::starter(&password).as_bytes())
-    });
+    let write_file = |target: &Path| {
+        options.open(target).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
+    };
+    let written = match write_file(&temp) {
+        Ok(()) => {
+            let linked = std::fs::hard_link(&temp, &path);
+            let _ = std::fs::remove_file(&temp);
+            match linked {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
+                Err(_) => write_file(&path),
+            }
+        }
+        Err(_) => write_file(&path),
+    };
     match written {
         Ok(()) => {
             // The node is normally double-clicked, so the message names the file
@@ -399,7 +422,7 @@ fn source_summary(config: &Config) -> String {
     if config.soundcloud_native {
         active.push("soundcloud(native)");
     }
-    if !config.spotify_client_id.is_empty() {
+    if config.spotify_enabled() {
         active.push("spotify");
     }
     if !config.spotify_refresh_token.is_empty() {

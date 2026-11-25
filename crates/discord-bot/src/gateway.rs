@@ -28,9 +28,10 @@ const MAX_GATEWAY_MESSAGE: usize = 16 * 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GatewayInfo {
     pub url: String,
+    #[serde(default)]
     pub shards: u32,
 }
 
@@ -140,14 +141,6 @@ impl BotEvent {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GatewayResponse {
-    url: String,
-    #[serde(default)]
-    #[serde(rename = "shards")]
-    _shards: u32,
-}
-
 /// A single Discord main-gateway connection.
 pub struct Gateway {
     socket: Socket,
@@ -160,6 +153,8 @@ pub struct Gateway {
     /// The code Discord closed the connection with, once it has.
     close_code: Option<u16>,
     sequence: Option<u64>,
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
     invalid_session_resumable: bool,
 }
 
@@ -168,7 +163,7 @@ fn apply_initial_heartbeat_jitter(gateway: &mut Gateway) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    let factor = 0.25 + (f64::from(jitter_nanos % 7_500) / 10_000.0);
+    let factor = 0.25 + (f64::from((jitter_nanos / 100) % 7_500) / 10_000.0);
     gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval.mul_f64(factor);
 }
 
@@ -210,7 +205,7 @@ impl Gateway {
                 message: format!("gateway endpoint returned {} bytes", body.len()),
             });
         }
-        let info: GatewayResponse = serde_json::from_slice(&body)?;
+        let info: GatewayInfo = serde_json::from_slice(&body)?;
         let mut gateway = Self::connect_url(info.url, token, intents).await?;
         apply_initial_heartbeat_jitter(&mut gateway);
         Ok(gateway)
@@ -230,6 +225,8 @@ impl Gateway {
         let mut gateway = Self::open_hello(resume_gateway_url.as_ref(), token, intents).await?;
         apply_initial_heartbeat_jitter(&mut gateway);
         gateway.sequence = Some(sequence);
+        gateway.session_id = Some(session_id.to_owned());
+        gateway.resume_gateway_url = Some(resume_gateway_url.as_ref().to_owned());
         gateway
             .send(json!({
                 "op": 6,
@@ -241,6 +238,42 @@ impl Gateway {
             }))
             .await?;
         Ok(gateway)
+    }
+
+    /// Whether a gateway close code indicates a permanent configuration or auth
+    /// error that reconnecting cannot cure.
+    pub fn is_fatal_close_code(code: u16) -> bool {
+        matches!(code, 4004 | 4010..=4014)
+    }
+
+    /// Reconnects after `Reconnect`, `InvalidSession`, WebSocket error, or non-fatal
+    /// close, resuming (`OP 6`) when valid and falling back to `IDENTIFY` (`OP 2`).
+    pub async fn reconnect(&mut self, cause: Option<&BotError>) -> Result<(), BotError> {
+        if let Some(code) = self.close_code.filter(|&c| Self::is_fatal_close_code(c)) {
+            return Err(BotError::Protocol(format!("fatal Discord gateway close code {code}")));
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.socket.close(None)).await;
+        let can_resume = match cause {
+            Some(BotError::InvalidSession) => self.invalid_session_resumable,
+            _ => !matches!(self.close_code, Some(4007 | 4009)),
+        };
+        if can_resume {
+            if let (Some(url), Some(session_id), Some(seq)) =
+                (self.resume_gateway_url.clone(), self.session_id.clone(), self.sequence)
+            {
+                if let Ok(resumed) =
+                    Self::resume(&url, self.token.as_str(), &session_id, seq, self.intents).await
+                {
+                    *self = resumed;
+                    return Ok(());
+                }
+            }
+        } else if matches!(cause, Some(BotError::InvalidSession)) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let fresh = Self::connect(self.token.as_str(), self.intents).await?;
+        *self = fresh;
+        Ok(())
     }
 
     async fn connect_url(
@@ -292,6 +325,8 @@ impl Gateway {
             needs_flush: false,
             close_code: None,
             sequence: None,
+            session_id: None,
+            resume_gateway_url: None,
             invalid_session_resumable: false,
         })
     }
@@ -411,7 +446,15 @@ impl Gateway {
                                 self.sequence = Some(sequence);
                             }
                             match payload.get("op").and_then(Value::as_u64) {
-                                Some(0) => return dispatch(payload),
+                                Some(0) => {
+                                    let event = dispatch(payload)?;
+                                    if let Some(BotEvent::Ready(ready)) = &event {
+                                        self.session_id = Some(ready.session_id.clone());
+                                        self.resume_gateway_url =
+                                            Some(ready.resume_gateway_url.clone());
+                                    }
+                                    return Ok(event);
+                                }
                                 Some(1) => self.send_heartbeat().await?,
                                 Some(7) => return Err(BotError::Reconnect),
                                 Some(9) => {
@@ -531,6 +574,10 @@ fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
     let event = match name.as_str() {
         "READY" => {
             let ready: RawReady = serde_json::from_value(data)?;
+            let resume_gateway_url = ready
+                .resume_gateway_url
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or_else(default_resume_url);
             Some(BotEvent::Ready(Ready {
                 user_id: ready.user.id,
                 application_id: ready
@@ -538,7 +585,7 @@ fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
                     .map(|application| application.id)
                     .unwrap_or_default(),
                 session_id: ready.session_id,
-                resume_gateway_url: ready.resume_gateway_url,
+                resume_gateway_url,
             }))
         }
         "VOICE_STATE_UPDATE" => {
@@ -607,8 +654,8 @@ struct RawReady {
     #[serde(default)]
     application: Option<RawUser>,
     session_id: String,
-    #[serde(default = "default_resume_url")]
-    resume_gateway_url: String,
+    #[serde(default)]
+    resume_gateway_url: Option<String>,
 }
 
 fn default_resume_url() -> String {

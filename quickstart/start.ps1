@@ -44,7 +44,7 @@ if ((Test-Path -LiteralPath $ConfigFile) -and (Test-Path -LiteralPath $EnvFile))
 if ($reuse) {
     $Password = Get-Saved 'RUSTLINK_PASSWORD'
     $Token = Get-Saved 'DISCORD_BOT_TOKEN'
-    $Port = (Get-Saved 'RUSTLINK_URL') -replace '^.*:(\d+)$', '$1'
+    $Port = (Get-Saved 'RUSTLINK_URL') -replace '^[a-zA-Z]+://[^/:]+:(\d+).*$', '$1'
     if (-not $Password -or -not $Token -or $Port -notmatch '^\d+$') {
         Fail "the saved settings in $Data are incomplete; delete that folder and start again"
     }
@@ -81,7 +81,7 @@ if ($reuse) {
     $Proxy = (Read-Host "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]").Trim()
     if (-not $Proxy) { $Proxy = $warp }
     if ($Proxy -match '["\\\s]') { Fail 'the proxy cannot contain quotes, backslashes or spaces' }
-    if ($Proxy -and $Proxy -notmatch '^(http|socks4|socks5h?)://') { Fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' }
+    if ($Proxy -and $Proxy -notmatch '^(https?|socks4a?|socks5h?)://') { Fail 'the proxy must start with http://, https://, socks4://, socks4a://, socks5:// or socks5h://' }
     $proxyLine = if ($Proxy) { 'youtubeProxy: "' + $Proxy + '"' } else { '' }
 
     New-Item -ItemType Directory -Force -Path $Data | Out-Null
@@ -121,23 +121,22 @@ $msysRoot = if ($env:RUSTLINK_MSYS2_ROOT) { $env:RUSTLINK_MSYS2_ROOT } else { 'C
 $msys = Join-Path $msysRoot 'ucrt64\bin'
 $msysLib = Join-Path $msysRoot 'ucrt64\lib'
 if (Test-Path -LiteralPath $msys) {
-    if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
-        $env:PATH = "$msys;$env:PATH"
-    }
+    $env:PATH = "$msys;$env:PATH"
     if (-not $env:OPUS_LIB_DIR -and (Test-Path -LiteralPath (Join-Path $msysLib 'libopus.dll.a'))) {
         $env:OPUS_LIB_DIR = $msysLib
     }
 }
 
-$Node = Join-Path $Root 'target\release\rustlink.exe'
-$Bot = Join-Path $Root 'target\release\examples\music.exe'
+$TargetDir = Join-Path $Root 'target'
+$Node = Join-Path $TargetDir 'release\rustlink.exe'
+$Bot = Join-Path $TargetDir 'release\examples\music.exe'
 if (Get-Command cargo -ErrorAction SilentlyContinue) {
     Write-Host 'Building (the first build takes a few minutes)...'
     Push-Location $Root
     try {
-        cargo build --release --locked -p rustlink --bin rustlink
+        cargo build --release --locked --target-dir $TargetDir -p rustlink --bin rustlink
         if ($LASTEXITCODE -ne 0) { Fail 'building the node failed' }
-        cargo build --release --locked -p rustlink-discord-bot --example music
+        cargo build --release --locked --target-dir $TargetDir -p rustlink-discord-bot --example music
         if ($LASTEXITCODE -ne 0) { Fail 'building the music bot failed' }
     } finally { Pop-Location }
 } elseif (-not ((Test-Path $Node) -and (Test-Path $Bot))) {
@@ -187,6 +186,6 @@ try {
 } finally {
     if ($nodeProcess -and -not $nodeProcess.HasExited) {
         Write-Host 'Stopping the node...'
-        Stop-Process -Id $nodeProcess.Id -Force
+        Stop-Process -Id $nodeProcess.Id -Force -ErrorAction SilentlyContinue
     }
 }

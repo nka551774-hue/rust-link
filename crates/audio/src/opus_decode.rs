@@ -140,12 +140,22 @@ impl Decoder {
         packet: &[u8],
         out: &mut Vec<f32>,
     ) -> Result<usize, DecodeError> {
-        let (length, expected) = packet_frame_count(packet)?;
-        let cap = expected as usize * 2;
         out.clear();
+        self.decode_float_append(packet, out)
+    }
+
+    /// Appends one decoded packet of unclipped interleaved stereo float samples onto `out`.
+    pub fn decode_float_append(
+        &mut self,
+        packet: &[u8],
+        out: &mut Vec<f32>,
+    ) -> Result<usize, DecodeError> {
+        let (length, expected) = packet_frame_count(packet)?;
+        let base = out.len();
+        let cap = expected as usize * 2;
         out.reserve(cap);
-        // SAFETY: `out.reserve(cap)` guarantees at least `expected * 2` writable `f32` slots,
-        // and `opus_decode_float` initializes `0..frames * 2` (`0 <= frames <= expected`) without reading `pcm`.
+        // SAFETY: `out.reserve(cap)` guarantees at least `expected * 2` writable `f32` slots
+        // starting at `base`, and `opus_decode_float` initializes `0..frames * 2`.
         let frames = unsafe {
             opus_decode_float(
                 self.state.as_ptr(),
@@ -160,7 +170,7 @@ impl Decoder {
             return Err(DecodeError::Decode(frames.min(-1)));
         }
         unsafe {
-            out.set_len(frames as usize * 2);
+            out.set_len(base + frames as usize * 2);
         }
         Ok(frames as usize)
     }
@@ -172,19 +182,37 @@ impl Decoder {
         frames: usize,
         out: &mut Vec<f32>,
     ) -> Result<usize, DecodeError> {
+        out.clear();
+        self.conceal_float_append(frames, out)
+    }
+
+    /// Appends concealed interleaved stereo float samples onto `out`.
+    pub fn conceal_float_append(
+        &mut self,
+        frames: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<usize, DecodeError> {
         let expected = c_int::try_from(frames)
             .ok()
             .filter(|f| (1..=MAX_PACKET_FRAMES).contains(f))
             .ok_or(DecodeError::Decode(-1))?;
-        out.resize(frames * 2, 0.0);
+        let base = out.len();
+        out.resize(base + frames * 2, 0.0);
         let produced = unsafe {
-            opus_decode_float(self.state.as_ptr(), ptr::null(), 0, out.as_mut_ptr(), expected, 0)
+            opus_decode_float(
+                self.state.as_ptr(),
+                ptr::null(),
+                0,
+                out[base..].as_mut_ptr(),
+                expected,
+                0,
+            )
         };
         if produced < 0 {
-            out.fill(0.0);
+            out[base..].fill(0.0);
             return Ok(frames);
         }
-        out.truncate(produced as usize * 2);
+        out.truncate(base + produced as usize * 2);
         Ok(produced as usize)
     }
 }
@@ -207,7 +235,23 @@ impl Decoder {
         Err(DecodeError::Decode(-7))
     }
 
+    pub fn decode_float_append(
+        &mut self,
+        _packet: &[u8],
+        _out: &mut Vec<f32>,
+    ) -> Result<usize, DecodeError> {
+        Err(DecodeError::Decode(-7))
+    }
+
     pub fn conceal_float(
+        &mut self,
+        _frames: usize,
+        _out: &mut Vec<f32>,
+    ) -> Result<usize, DecodeError> {
+        Err(DecodeError::Decode(-7))
+    }
+
+    pub fn conceal_float_append(
         &mut self,
         _frames: usize,
         _out: &mut Vec<f32>,

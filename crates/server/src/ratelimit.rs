@@ -84,7 +84,7 @@ struct Table {
     buckets: HashMap<String, Bucket>,
     /// When refilled buckets were last forgotten, so a table that stays full
     /// of busy keys is not swept on every request.
-    swept: Instant,
+    swept: Option<Instant>,
 }
 
 impl Keyed {
@@ -95,7 +95,7 @@ impl Keyed {
             rate: sanitized_rate,
             burst: sanitized_burst,
             max_keys: max_keys.max(1),
-            table: Mutex::new(Table { buckets: HashMap::new(), swept: Instant::now() }),
+            table: Mutex::new(Table { buckets: HashMap::new(), swept: None }),
             overflow: Limiter::new(sanitized_rate, burst),
         }
     }
@@ -110,10 +110,12 @@ impl Keyed {
             return bucket.allow(rate, burst, now);
         }
         if table.buckets.len() >= self.max_keys
-            && now.saturating_duration_since(table.swept) >= Duration::from_secs(1)
+            && table
+                .swept
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
         {
             table.buckets.retain(|_, bucket| !bucket.idle(rate, burst, now));
-            table.swept = now;
+            table.swept = Some(now);
         }
         if table.buckets.len() >= self.max_keys {
             drop(table);
@@ -164,8 +166,8 @@ mod tests {
     fn refilled_buckets_are_forgotten_to_make_room() {
         let keyed = Keyed::new(1000.0, 1, 2);
         assert!(keyed.allow("a") && keyed.allow("b"));
-        std::thread::sleep(Duration::from_millis(1100));
-        // Both buckets have refilled, so they are swept and "c" gets its own.
+        std::thread::sleep(Duration::from_millis(20));
+        // Both buckets have refilled, so they are swept even within the first second of uptime.
         assert!(keyed.allow("c"));
         assert_eq!(keyed.keys(), 1);
     }

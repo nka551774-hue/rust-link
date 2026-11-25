@@ -92,7 +92,7 @@ async fn run() -> Result<(), Failure> {
         guilds: HashMap::new(),
         channels: HashMap::new(),
         voiced: HashSet::new(),
-        joining: HashSet::new(),
+        joining: HashMap::new(),
         idle_since: HashMap::new(),
     };
 
@@ -105,19 +105,25 @@ async fn run() -> Result<(), Failure> {
                 Ok(()) => Step::Shutdown,
                 Err(error) => break Err(error.into()),
             },
-            event = bot.gateway.next_event() => match event {
-                Ok(event) => Step::Gateway(event),
-                Err(error) => break Err(error.into()),
-            },
+            event = bot.gateway.next_event() => Step::Gateway(event),
             event = events.recv() => Step::Rustlink(event),
             _ = tick.tick() => Step::Tick,
         };
         match step {
             Step::Shutdown => break Ok(()),
-            Step::Gateway(None) => break Err("the Discord gateway closed".into()),
-            Step::Gateway(Some(event)) => {
+            Step::Gateway(Ok(Some(event))) => {
                 if let Err(error) = bot.on_gateway(event).await {
                     break Err(error);
+                }
+            }
+            Step::Gateway(Ok(None)) => {
+                if let Err(error) = bot.gateway.reconnect(None).await {
+                    break Err(error.into());
+                }
+            }
+            Step::Gateway(Err(error)) => {
+                if let Err(fatal) = bot.gateway.reconnect(Some(&error)).await {
+                    break Err(fatal.into());
                 }
             }
             Step::Rustlink(None) => break Err("the Rustlink event stream ended".into()),
@@ -133,7 +139,7 @@ async fn run() -> Result<(), Failure> {
 
 enum Step {
     Shutdown,
-    Gateway(Option<BotEvent>),
+    Gateway(Result<Option<BotEvent>, rustlink_discord_bot::BotError>),
     Rustlink(Option<Value>),
     Tick,
 }
@@ -153,8 +159,8 @@ struct Bot {
     channels: HashMap<String, HashMap<String, String>>,
     /// Guilds whose voice state Rustlink currently holds.
     voiced: HashSet<String>,
-    /// Guilds the bot has been asked to join, and should play in once it lands.
-    joining: HashSet<String>,
+    /// Guilds the bot has been asked to join (`guild` -> target `channel`), and should play in once it lands.
+    joining: HashMap<String, String>,
     /// When each guild last ran out of music.
     idle_since: HashMap<String, Instant>,
 }
@@ -203,7 +209,7 @@ impl Bot {
                 }
             });
         }
-        let active_voice = self.voiced.contains(&guild) || self.joining.contains(&guild);
+        let active_voice = self.voiced.contains(&guild) || self.joining.contains_key(&guild);
         let guild_channels = self.channels.entry(guild.clone()).or_default();
         guild_channels.clear();
         let mut stale = false;
@@ -253,12 +259,17 @@ impl Bot {
         };
         if let Err(error) = self.session.update_player(guild, &update, false).await {
             eprintln!("Rustlink refused the voice state for guild {guild}: {error}");
-            self.joining.remove(guild);
+            let _ = self.gateway.set_voice_state(guild, None).await;
+            self.forget(guild).await;
             return;
         }
         self.voiced.insert(guild.to_string());
-        if self.joining.remove(guild) && !self.guilds.get(guild).is_some_and(Guild::playing) {
+        if self.joining.remove(guild).is_some()
+            && !self.guilds.get(guild).is_some_and(Guild::playing)
+        {
             self.start_next(guild).await;
+        } else if !self.guilds.get(guild).is_some_and(Guild::busy) {
+            self.idle_since.entry(guild.to_string()).or_insert_with(Instant::now);
         }
     }
 
@@ -289,8 +300,11 @@ impl Bot {
                 Err(error) => {
                     eprintln!("could not start {:?}: {error}", track.metadata.title);
                     state.finish();
-                    if !state.record(false) {
-                        state.clear();
+                    if state.record(false) {
+                        eprintln!(
+                            "stopped the queue in guild {guild}: {} tracks in a row could not be started",
+                            state::MAX_FAILURES_IN_A_ROW
+                        );
                         self.idle_since.insert(guild.to_string(), Instant::now());
                         return;
                     }
@@ -302,6 +316,11 @@ impl Bot {
     async fn on_rustlink(&mut self, event: Value) {
         let guild = event["guild_id"].as_str().unwrap_or_default().to_string();
         match event["type"].as_str() {
+            Some("track.started") => {
+                if let Some(state) = self.guilds.get_mut(&guild) {
+                    state.reset_failures();
+                }
+            }
             Some("track.ended") => {
                 // A track that was replaced or stopped on purpose is not the end of the queue.
                 if !matches!(event["reason"].as_str(), Some("finished" | "load_failed")) {
@@ -330,10 +349,11 @@ impl Bot {
             Some("voice.closed") => {
                 let code = event["code"].as_u64().unwrap_or(0);
                 println!("voice closed in guild {guild}: code {code}");
-                if code == 4014 {
+                if matches!(code, 4014 | 4022) {
                     self.forget(&guild).await;
                 } else {
                     self.voiced.remove(&guild);
+                    self.idle_since.entry(guild).or_insert_with(Instant::now);
                 }
             }
             _ => {}
@@ -389,14 +409,28 @@ impl Bot {
             return "請提供連結或關鍵字。".into();
         }
         let bot_channel = self.member_channel(guild, &self.user_id).map(str::to_owned);
+        let active_channel =
+            bot_channel.as_deref().or_else(|| self.joining.get(guild).map(String::as_str));
         let busy = self.guilds.get(guild).is_some_and(Guild::busy);
-        if busy && bot_channel.as_deref().is_some_and(|current| current != channel) {
+        if busy && active_channel.is_some_and(|current| current != channel) {
             return "機器人正在別的語音頻道播放。".into();
         }
         let tracks = match self.resolve(&query).await {
             Ok(tracks) => tracks,
             Err(error) => return format!("找不到可播放的內容：{error}"),
         };
+        let need_join = !(self.voiced.contains(guild) && bot_channel.as_deref() == Some(channel));
+        if need_join && self.joining.get(guild).map(String::as_str) != Some(channel) {
+            if !self.voiced.contains(guild) && bot_channel.as_deref() == Some(channel) {
+                let _ = self.pairer.clear(guild);
+                let _ = self.gateway.set_voice_state(guild, None).await;
+            }
+            self.joining.insert(guild.to_string(), channel.to_string());
+            if let Err(error) = self.gateway.set_voice_state(guild, Some(channel)).await {
+                self.joining.remove(guild);
+                return format!("無法加入語音頻道：{error}");
+            }
+        }
         let total = tracks.len();
         let first = tracks[0].metadata.title.clone();
         let state =
@@ -408,17 +442,8 @@ impl Bot {
         }
         let waiting = state.waiting();
         let message = describe_added(&first, total, added, was_playing, waiting);
-
-        if self.voiced.contains(guild) && bot_channel.as_deref() == Some(channel) {
-            if !was_playing {
-                self.start_next(guild).await;
-            }
-        } else {
-            self.joining.insert(guild.to_string());
-            if let Err(error) = self.gateway.set_voice_state(guild, Some(channel)).await {
-                self.joining.remove(guild);
-                return format!("無法加入語音頻道：{error}");
-            }
+        if !need_join && !was_playing {
+            self.start_next(guild).await;
         }
         message
     }
@@ -451,10 +476,10 @@ impl Bot {
         if state.waiting() == 0 {
             let _ = self.session.stop(guild).await;
             self.idle_since.insert(guild.to_string(), Instant::now());
-            format!("⏭️ 已跳過「{skipped}」，佇列已播完。")
+            format!("已跳過「{skipped}」，佇列已播完。")
         } else {
             self.start_next(guild).await;
-            format!("⏭️ 已跳過「{skipped}」。")
+            format!("已跳過「{skipped}」。")
         }
     }
 
@@ -463,8 +488,8 @@ impl Bot {
             return "目前沒有播放。".into();
         }
         match self.session.pause(guild, paused).await {
-            Ok(_) if paused => "⏸️ 已暫停。".into(),
-            Ok(_) => "▶️ 繼續播放。".into(),
+            Ok(_) if paused => "已暫停。".into(),
+            Ok(_) => "繼續播放。".into(),
             Err(error) => format!("操作失敗：{error}"),
         }
     }
@@ -473,7 +498,7 @@ impl Bot {
         let _ = self.session.stop(guild).await;
         let _ = self.gateway.set_voice_state(guild, None).await;
         self.forget(guild).await;
-        "⏹️ 已停止並離開語音頻道。".into()
+        "已停止並離開語音頻道。".into()
     }
 
     async fn volume(&mut self, guild: &str, level: &str) -> String {
@@ -489,7 +514,7 @@ impl Bot {
                 return format!("設定失敗：{error}");
             }
         }
-        format!("🔊 音量 {volume}%")
+        format!("音量 {volume}%")
     }
 
     fn queue_text(&self, guild: &str) -> String {
@@ -498,14 +523,14 @@ impl Bot {
         };
         let mut out = String::with_capacity(256);
         if let Some(track) = state.current() {
-            out.push_str("🎵 正在播放：");
+            out.push_str("正在播放：");
             write_describe(&mut out, track);
         }
         if state.waiting() > 0 {
             if !out.is_empty() {
                 out.push('\n');
             }
-            let _ = write!(out, "📜 接下來（共 {} 首）：", state.waiting());
+            let _ = write!(out, "接下來（共 {} 首）：", state.waiting());
             for (number, track) in state.upcoming(QUEUE_PAGE).enumerate() {
                 let _ = write!(out, "\n{}. ", number + 1);
                 write_describe(&mut out, track);
@@ -527,9 +552,8 @@ impl Bot {
         };
         let length = format_length(track.metadata.length, track.metadata.is_stream);
         let mut text = String::with_capacity(128);
-        text.push_str("🎵 ");
         write_describe(&mut text, track);
-        let _ = write!(text, "\n⏱️ {position} / {length}");
+        let _ = write!(text, "\n進度：{position} / {length}");
         if let Some(link) = &track.metadata.uri {
             text.push('\n');
             text.push_str(link);
@@ -542,6 +566,7 @@ impl Bot {
         self.voiced.remove(guild);
         self.joining.remove(guild);
         self.idle_since.remove(guild);
+        let _ = self.pairer.clear(guild);
         if let Some(state) = self.guilds.get_mut(guild) {
             state.clear();
         }
@@ -558,7 +583,9 @@ impl Bot {
             .idle_since
             .iter()
             .filter(|(guild, since)| {
-                since.elapsed() >= limit && !self.guilds.get(*guild).is_some_and(Guild::busy)
+                since.elapsed() >= limit
+                    && (!self.guilds.get(*guild).is_some_and(Guild::busy)
+                        || (!self.voiced.contains(*guild) && !self.joining.contains_key(*guild)))
             })
             .map(|(guild, _)| guild.clone())
             .collect();
@@ -588,10 +615,10 @@ fn describe_added(
     waiting: usize,
 ) -> String {
     let mut text = match (total, was_playing) {
-        (1, false) => format!("▶️ 播放：{first}"),
-        (1, true) => format!("➕ 已加入佇列 #{waiting}：{first}"),
-        (_, false) => format!("▶️ 已加入 {added} 首，從「{first}」開始播放"),
-        (_, true) => format!("➕ 已加入 {added} 首到佇列"),
+        (1, false) => format!("播放：{first}"),
+        (1, true) => format!("已加入佇列 #{waiting}：{first}"),
+        (_, false) => format!("已加入 {added} 首，從「{first}」開始播放"),
+        (_, true) => format!("已加入 {added} 首到佇列"),
     };
     if added < total {
         let _ = write!(text, "（佇列已滿，略過 {} 首）", total - added);
@@ -635,8 +662,8 @@ mod tests {
 
     #[test]
     fn the_play_reply_says_what_happened() {
-        assert_eq!(describe_added("A", 1, 1, false, 0), "▶️ 播放：A");
-        assert_eq!(describe_added("A", 1, 1, true, 3), "➕ 已加入佇列 #3：A");
+        assert_eq!(describe_added("A", 1, 1, false, 0), "播放：A");
+        assert_eq!(describe_added("A", 1, 1, true, 3), "已加入佇列 #3：A");
         assert!(describe_added("A", 5, 5, false, 4).contains("已加入 5 首，從「A」開始播放"));
         assert!(describe_added("A", 5, 3, true, 9).ends_with("（佇列已滿，略過 2 首）"));
     }

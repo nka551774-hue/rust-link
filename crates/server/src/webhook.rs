@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -52,6 +52,15 @@ pub struct Client {
     queue: SyncSender<Value>,
     /// Events given up on, whether the queue was full or the endpoint refused.
     dropped: Arc<AtomicU64>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.stop;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
 }
 
 impl Client {
@@ -80,11 +89,16 @@ impl Client {
         let worker = target.clone();
         let dropped = Arc::new(AtomicU64::new(0));
         let worker_dropped = Arc::clone(&dropped);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("webhook".into())
             .spawn(move || {
                 let mut payload = Vec::with_capacity(1024);
                 while let Ok(event) = inbox.recv() {
+                    if *worker_stop.0.lock().unwrap() {
+                        break;
+                    }
                     payload.clear();
                     let ok = if discord {
                         serde_json::to_writer(&mut payload, &discord_payload(&event)).is_ok()
@@ -94,9 +108,27 @@ impl Client {
                     if !ok {
                         continue;
                     }
-                    if let Err((attempts, error)) =
-                        deliver(|| post(&agent, &worker, &payload), thread::sleep)
-                    {
+                    let outcome = deliver(
+                        || {
+                            if *worker_stop.0.lock().unwrap() {
+                                return Err(Failure {
+                                    message: "delivery worker stopped".into(),
+                                    retryable: false,
+                                    retry_after: None,
+                                });
+                            }
+                            post(&agent, &worker, &payload)
+                        },
+                        |wait| {
+                            let (lock, cvar) = &*worker_stop;
+                            let guard = lock.lock().unwrap();
+                            let _ = cvar.wait_timeout_while(guard, wait, |stopped| !*stopped);
+                        },
+                    );
+                    if let Err((attempts, error)) = outcome {
+                        if *worker_stop.0.lock().unwrap() {
+                            break;
+                        }
                         let count = worker_dropped.fetch_add(1, Ordering::Relaxed) + 1;
                         if count == 1 || count.is_multiple_of(100) {
                             log::warn!(
@@ -107,7 +139,7 @@ impl Client {
                 }
             })
             .ok()?;
-        Some(Client { url: target, queue, dropped })
+        Some(Client { url: target, queue, dropped, stop })
     }
 
     /// The URL events are posted to.
@@ -123,12 +155,15 @@ impl Client {
     /// Queues an event for delivery. It returns immediately, so the caller is
     /// never held up by the endpoint.
     pub fn send(&self, event: Value) {
-        // Webhooks are an external sink. Keep their copy deliberately smaller
-        // than the event sent to the authenticated session: track tokens,
-        // source URLs and client metadata can contain credentials or private
-        // request data. `Server::publish` clones the event before calling us,
-        // so this cannot change the session's own event contract.
-        let event = scrub_event(event);
+        self.enqueue(scrub_event(event));
+    }
+
+    /// Queues an event by reference without cloning fields that will be scrubbed.
+    pub(crate) fn send_ref(&self, event: &Value) {
+        self.enqueue(scrub_ref(event));
+    }
+
+    fn enqueue(&self, event: Value) {
         let reason = match self.queue.try_send(event) {
             Ok(()) => return,
             // A full queue means the endpoint has not kept up with what the
@@ -187,6 +222,9 @@ fn deliver(
     Err((attempts, last))
 }
 
+const SCRUBBED_KEYS: [&str; 6] =
+    ["token", "uri", "artwork_url", "identifier", "extra", "user_data"];
+
 /// Removes fields that must not cross the webhook trust boundary.
 ///
 /// Events delivered through a session remain untouched; this function is only
@@ -198,13 +236,34 @@ fn scrub_event(mut event: Value) -> Value {
     event
 }
 
+fn scrub_ref(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut out = Map::with_capacity(object.len());
+            for (key, child) in object {
+                if !SCRUBBED_KEYS.contains(&key.as_str()) {
+                    out.insert(key.clone(), scrub_ref(child));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(scrub_ref).collect()),
+        Value::String(text) => {
+            let mut copy = text.clone();
+            redact_urls_in_place(&mut copy, false, "<redacted-url>");
+            Value::String(copy)
+        }
+        other => other.clone(),
+    }
+}
+
 fn scrub_value(value: &mut Value) {
     match value {
         Value::Object(object) => {
             // `identifier` is normally a source ID, but the native HTTP source
             // also uses the caller's URL as its identifier. Removing it avoids
             // leaking a signed query through a field that is not named `uri`.
-            for key in ["token", "uri", "artwork_url", "identifier", "extra", "user_data"] {
+            for key in SCRUBBED_KEYS {
                 object.remove(key);
             }
             for child in object.values_mut() {
@@ -219,15 +278,14 @@ fn scrub_value(value: &mut Value) {
         // Source/media/voice failures can include the URL they were trying to
         // open in diagnostic text (`message`, `cause`, `reason`, etc.). Keep
         // the diagnostic text, but replace URL tokens carrying credentials.
-        Value::String(text) => redact_urls_in_place(text),
+        Value::String(text) => redact_urls_in_place(text, false, "<redacted-url>"),
         _ => {}
     }
 }
 
-/// Redacts credential-bearing URLs embedded in diagnostic text while retaining
-/// surrounding punctuation and error text. Allocates nothing when `text` has no
-/// credentialed URL tokens.
-fn redact_urls_in_place(text: &mut String) {
+/// Redacts URLs embedded in diagnostic text while retaining surrounding
+/// punctuation and error text. Allocates nothing when no URL matches.
+fn redact_urls_in_place(text: &mut String, redact_all: bool, placeholder: &str) {
     let mut output: Option<String> = None;
     let mut cursor = 0;
     while let Some(relative) = find_http_scheme(&text[cursor..]) {
@@ -238,14 +296,14 @@ fn redact_urls_in_place(text: &mut String) {
             })
             .map_or(text.len(), |offset| start + offset);
         let candidate = &text[start..end];
-        if candidate.contains(['?', '#', '@']) {
+        if redact_all || candidate.contains(['?', '#', '@']) {
             let buf = output.get_or_insert_with(|| {
                 let mut s = String::with_capacity(text.len());
                 s.push_str(&text[..cursor]);
                 s
             });
             buf.push_str(&text[cursor..start]);
-            buf.push_str("<redacted-url>");
+            buf.push_str(placeholder);
         } else if let Some(buf) = output.as_mut() {
             buf.push_str(&text[cursor..end]);
         }
@@ -295,7 +353,8 @@ fn post(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), Failure> {
         .build()
         .send(body)
         .map_err(|error| {
-            let detail = error.to_string().replace(url, "<redacted webhook URL>");
+            let mut detail = error.to_string().replace(url, "<redacted webhook URL>");
+            redact_urls_in_place(&mut detail, true, "<redacted webhook URL>");
             Failure {
                 message: format!("webhook endpoint could not be reached: {detail}"),
                 retryable: true,
@@ -848,8 +907,9 @@ mod tests {
             url: "https://example.invalid".into(),
             queue,
             dropped: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new((Mutex::new(false), Condvar::new())),
         };
-        client.send(json!({
+        client.send_ref(&json!({
             "type": "track.started",
             "track": {
                 "token": "rlt1.secret",
@@ -870,6 +930,7 @@ mod tests {
             url: "https://example.invalid".into(),
             queue,
             dropped: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new((Mutex::new(false), Condvar::new())),
         };
         // Nothing reads the queue, as when the endpoint has stalled the worker.
         client.send(json!({ "type": "track.started" }));
@@ -1012,11 +1073,13 @@ mod tests {
 
     #[test]
     fn emoji_are_bounded_by_utf16_units_without_splitting_utf8() {
-        let emoji = "😀".repeat(300);
+        let emoji = "\u{1f600}".repeat(300);
         let cut = truncate(&emoji, 256);
         assert!(discord_len(&cut) <= 256);
         assert!(cut.ends_with('…'));
-        assert!(cut[..cut.len() - '…'.len_utf8()].chars().all(|character| character == '😀'));
+        assert!(cut[..cut.len() - '…'.len_utf8()]
+            .chars()
+            .all(|character| character == '\u{1f600}'));
     }
 
     #[test]
@@ -1095,11 +1158,11 @@ mod tests {
         let payload = discord_payload(&json!({
             "type": "track.failed", "guild_id": "1",
             "track": {"metadata": {
-                "title": "😀".repeat(3000), "author": "🎵".repeat(1500),
-                "uri": format!("https://example.com/{}", "🚀".repeat(1500)),
+                "title": "\u{1f600}".repeat(3000), "author": "\u{1f3b5}".repeat(1500),
+                "uri": format!("https://example.com/{}", "\u{1f680}".repeat(1500)),
             }},
-            "reason": "💥".repeat(1000),
-            "exception": {"message": "⚠️".repeat(1000)},
+            "reason": "\u{1f4a5}".repeat(1000),
+            "exception": {"message": "\u{26a0}\u{fe0f}".repeat(1000)},
         }));
         assert_discord_embed_limits(&payload);
     }

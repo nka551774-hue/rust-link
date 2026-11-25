@@ -104,12 +104,12 @@ impl Client {
         self.api_base.join(path).map_err(|error| Error::Invalid(error.to_string()))
     }
 
-    async fn request<T: DeserializeOwned, B: Serialize + ?Sized>(
+    async fn send<B: Serialize + ?Sized>(
         &self,
         method: Method,
         path: &str,
         body: Option<&B>,
-    ) -> Result<T, Error> {
+    ) -> Result<reqwest::Response, Error> {
         let mut request = self
             .http
             .request(method, self.endpoint(path)?)
@@ -118,16 +118,53 @@ impl Client {
             request =
                 request.header(CONTENT_TYPE, "application/json").body(serde_json::to_vec(body)?);
         }
-        let response = request.send().await?;
+        Ok(request.send().await?)
+    }
+
+    async fn request<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<T, Error> {
+        let response = self.send(method, path, body).await?;
         let status = response.status();
         if status == StatusCode::NO_CONTENT {
-            return Ok(serde_json::from_value(Value::Null)?);
+            return Err(Error::Invalid("unexpected HTTP 204 response with no body".into()));
         }
         let bytes = read_response_body(response).await?;
         if !status.is_success() {
             return Err(api_error(status, &bytes, "request failed"));
         }
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn request_optional<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<Option<T>, Error> {
+        let response = self.send(method, path, body).await?;
+        let status = response.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        let bytes = read_response_body(response).await?;
+        if !status.is_success() {
+            return Err(api_error(status, &bytes, "request failed"));
+        }
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    async fn request_empty(&self, method: Method, path: &str) -> Result<(), Error> {
+        let response = self.send::<()>(method, path, None).await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let bytes = read_response_body(response).await?;
+        Err(api_error(status, &bytes, "request failed"))
     }
 
     pub async fn info(&self) -> Result<Value, Error> {
@@ -150,12 +187,29 @@ impl Client {
         }
         self.request(Method::POST, "tracks/inspect", Some(&Body { token })).await
     }
+    pub async fn inspect_batch(&self, tokens: &[impl AsRef<str>]) -> Result<Vec<Track>, Error> {
+        if tokens.len() > 1000 {
+            return Err(Error::Invalid("at most 1000 tokens per request".into()));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            tokens: Vec<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Tracks {
+            tracks: Vec<Track>,
+        }
+        let tokens = tokens.iter().map(AsRef::as_ref).collect();
+        let body: Tracks =
+            self.request(Method::POST, "tracks/inspect-batch", Some(&Body { tokens })).await?;
+        Ok(body.tracks)
+    }
     pub async fn lyrics(&self, token: &str) -> Result<Option<Value>, Error> {
         #[derive(Serialize)]
         struct Body<'a> {
             token: &'a str,
         }
-        self.request(Method::POST, "lyrics", Some(&Body { token })).await
+        self.request_optional(Method::POST, "lyrics", Some(&Body { token })).await
     }
 
     pub async fn create_session(
@@ -169,6 +223,7 @@ impl Client {
             resume_timeout_secs: u32,
         }
         validate_snowflake(bot_id, "bot ID")?;
+        validate_resume_timeout(resume_timeout_secs)?;
         let info: SessionInfo = self
             .request(Method::POST, "sessions", Some(&Body { bot_id, resume_timeout_secs }))
             .await?;
@@ -222,6 +277,13 @@ async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, 
 fn validate_session_id(id: &str) -> Result<(), Error> {
     if id.len() != 48 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Error::Invalid("session ID must contain 48 hexadecimal characters".into()));
+    }
+    Ok(())
+}
+
+fn validate_resume_timeout(seconds: u32) -> Result<(), Error> {
+    if !(1..=86_400).contains(&seconds) {
+        return Err(Error::Invalid("resume_timeout_secs must be 1..86400".into()));
     }
     Ok(())
 }
@@ -280,12 +342,13 @@ impl Session {
             resume: bool,
             resume_timeout_secs: u32,
         }
+        validate_resume_timeout(resume_timeout_secs)?;
         self.client
             .request(Method::PATCH, &self.path(), Some(&Body { resume, resume_timeout_secs }))
             .await
     }
     pub async fn destroy(&self) -> Result<(), Error> {
-        self.client.request::<_, ()>(Method::DELETE, &self.path(), None).await
+        self.client.request_empty(Method::DELETE, &self.path()).await
     }
     pub async fn players(&self) -> Result<Vec<Player>, Error> {
         #[derive(Deserialize)]
@@ -387,8 +450,12 @@ impl Session {
         self.update_player(guild, &PlayerUpdate { voice: Some(voice), ..Default::default() }, true)
             .await
     }
+    pub async fn lyrics(&self, guild: &str) -> Result<Option<Value>, Error> {
+        let path = format!("{}/lyrics", self.player_path(guild)?);
+        self.client.request_optional::<_, ()>(Method::GET, &path, None).await
+    }
     pub async fn destroy_player(&self, guild: &str) -> Result<(), Error> {
-        self.client.request::<_, ()>(Method::DELETE, &self.player_path(guild)?, None).await
+        self.client.request_empty(Method::DELETE, &self.player_path(guild)?).await
     }
 
     /// Connect the single event subscriber. The first `next()` is
@@ -447,17 +514,26 @@ impl Events {
                 Some(Ok(Message::Ping(_))) => {
                     self.needs_flush = true;
                 }
-                Some(Ok(Message::Close(_))) | None => return Ok(None),
+                Some(Ok(Message::Close(_))) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), self.socket.flush()).await;
+                    return Ok(None);
+                }
+                None => return Ok(None),
                 Some(Err(error)) => return Err(error.into()),
                 _ => {}
             }
         }
     }
     pub async fn close(&mut self) -> Result<(), Error> {
-        tokio::time::timeout(Duration::from_secs(10), self.socket.close(None))
-            .await
-            .map_err(|_| Error::Timeout)??;
-        Ok(())
+        match tokio::time::timeout(Duration::from_secs(10), self.socket.close(None)).await {
+            Ok(Ok(()))
+            | Ok(Err(
+                tokio_tungstenite::tungstenite::Error::ConnectionClosed
+                | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
+            )) => Ok(()),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(Error::Timeout),
+        }
     }
 }
 

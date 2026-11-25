@@ -198,10 +198,9 @@ impl Session {
         self.state.lock().unwrap().players.len()
     }
 
-    /// Number of actively playing players owned by the session without allocating a `Vec`.
+    /// Number of actively playing players owned by the session without holding the session lock across player locks.
     pub fn playing_player_count(&self) -> usize {
-        let state = self.state.lock().unwrap();
-        state.players.values().filter(|player| player.playing()).count()
+        self.players().into_iter().filter(|player| player.playing()).count()
     }
 
     /// Appends sanitized webhook player reports and returns how many are actively playing.
@@ -313,13 +312,8 @@ impl Session {
 
     /// The settings a `PATCH` on the session changes, and the answer it gets.
     pub fn update(&self, resuming: Option<bool>, timeout: Option<u32>) -> Value {
-        let mut state = self.state.lock().unwrap();
-        if let Some(resuming) = resuming {
-            state.resuming = resuming;
-        }
-        if let Some(timeout) = timeout {
-            state.timeout = timeout;
-        }
+        self.configure(resuming, timeout);
+        let state = self.state.lock().unwrap();
         json!({ "resume": state.resuming, "resume_timeout_secs": state.timeout })
     }
 

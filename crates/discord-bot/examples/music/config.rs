@@ -51,24 +51,7 @@ impl Config {
     }
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let get = |name: &str| {
-            lookup(name).and_then(|mut value| {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                if trimmed.len() == value.len() {
-                    return Some(value);
-                }
-                let leading = value.len() - value.trim_start().len();
-                let len = trimmed.len();
-                if leading > 0 {
-                    value.drain(..leading);
-                }
-                value.truncate(len);
-                Some(value)
-            })
-        };
+        let get = |name: &str| lookup(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let required = |name: &str| get(name).ok_or_else(|| format!("{name} is required"));
         let number = |name: &str, default: i64, low: i64, high: i64| -> Result<i64, String> {
             match get(name) {

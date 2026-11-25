@@ -172,8 +172,11 @@ impl Drop for StartupChild {
 /// source is 30 s of output. The pure engine seeks in source time, and this
 /// keeps the two engines on the same sample.
 fn output_seek_seconds(position_ms: i64, set: &FilterSet) -> String {
+    // FFmpeg's `av_parse_time` stores `-ss` as signed 64-bit microseconds (~9.22e12 s).
+    const MAX_FFMPEG_SECONDS: f64 = 9_000_000_000_000.0;
     let factor = set.tempo_factor().max(f64::MIN_POSITIVE);
-    format!("{:.3}", position_ms as f64 / 1000.0 / factor)
+    let seconds = (position_ms.max(0) as f64 / 1000.0 / factor).min(MAX_FFMPEG_SECONDS);
+    format!("{seconds:.3}")
 }
 
 impl FfmpegFrames {
@@ -352,10 +355,10 @@ impl FfmpegFrames {
         };
         self.finished = true;
         self.stderr.finish();
+        if let Some(error) = self.take_input_error() {
+            return Err(AudioError::Io(error));
+        }
         if status.success() {
-            if let Some(error) = self.take_input_error() {
-                return Err(AudioError::Io(error));
-            }
             return Ok(());
         }
         let message = self.stderr.message();

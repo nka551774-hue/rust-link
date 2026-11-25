@@ -85,6 +85,9 @@ impl Provider for LRCLIB {
                     if let Ok(lyrics) = build(track, &entry) {
                         return Ok(lyrics);
                     }
+                    if entry.instrumental {
+                        return Err(LyricsError::NotFound);
+                    }
                 }
                 Err(LyricsError::NotFound) => {}
                 Err(error) => last = Some(error),
@@ -156,16 +159,20 @@ impl LRCLIB {
     /// answering that it has nothing, which is not a failure and is not retried.
     fn do_request(&self, url: &str, params: &[(&str, &str)]) -> Result<Vec<u8>, LyricsError> {
         match self.once(url, params) {
-            Err(LyricsError::NotFound) => Err(LyricsError::NotFound),
-            Err(error) => {
+            Ok((body, _)) => Ok(body),
+            Err((error, false)) => Err(error),
+            Err((error, true)) => {
                 std::thread::sleep(RETRY_DELAY);
-                self.once(url, params).map_err(|_| error)
+                self.once(url, params).map(|(body, _)| body).map_err(|_| error)
             }
-            Ok(body) => Ok(body),
         }
     }
 
-    fn once(&self, url: &str, params: &[(&str, &str)]) -> Result<Vec<u8>, LyricsError> {
+    fn once(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<(Vec<u8>, ()), (LyricsError, bool)> {
         let mut request = self.agent.get(url);
         for &(key, value) in params {
             request = request.query(key, value);
@@ -179,18 +186,33 @@ impl LRCLIB {
             .build()
             .call()
             .map_err(|error| {
-                LyricsError::Failed(format!("lyrics: lrclib could not be reached: {error}"))
+                (LyricsError::Failed(format!("lyrics: lrclib could not be reached: {error}")), true)
             })?;
         match response.status().as_u16() {
-            404 => return Err(LyricsError::NotFound),
+            404 => return Err((LyricsError::NotFound, false)),
             200 => {}
             status => {
-                return Err(LyricsError::Failed(format!("lyrics: lrclib answered {status}")));
+                let retryable = status == 429 || status >= 500;
+                return Err((
+                    LyricsError::Failed(format!("lyrics: lrclib answered {status}")),
+                    retryable,
+                ));
             }
         }
-        response.into_body().with_config().limit(BODY_LIMIT).read_to_vec().map_err(|error| {
-            LyricsError::Failed(format!("lyrics: lrclib sent an unreadable answer: {error}"))
-        })
+        response
+            .into_body()
+            .with_config()
+            .limit(BODY_LIMIT)
+            .read_to_vec()
+            .map(|body| (body, ()))
+            .map_err(|error| {
+                (
+                    LyricsError::Failed(format!(
+                        "lyrics: lrclib sent an unreadable answer: {error}"
+                    )),
+                    true,
+                )
+            })
     }
 }
 
@@ -371,18 +393,22 @@ fn duration_offset(duration: f64, length: i64) -> Option<i128> {
 /// The words that describe a video rather than a song, so a bracketed part of a
 /// title that contains one of them is not part of the name the database was
 /// given.
-const NOISE: [&str; 13] = [
+const NOISE: [&str; 17] = [
     "official",
     "video",
+    "videos",
     "audio",
     "lyric",
+    "lyrics",
     "mv",
     "m/v",
     "hd",
     "4k",
+    "8k",
     "visualizer",
     "visualiser",
     "remaster",
+    "remastered",
     "explicit",
     "color coded",
 ];
@@ -427,6 +453,12 @@ const TRAILER: [&str; 21] = [
 /// track are all dropped first.
 pub(crate) fn names(track: &Track) -> (String, String) {
     let raw_artist = track.metadata.author.trim();
+    let raw_artist = raw_artist
+        .get(..raw_artist.len().saturating_sub(8))
+        .filter(|prefix| {
+            !prefix.trim().is_empty() && raw_artist[prefix.len()..].eq_ignore_ascii_case(" - topic")
+        })
+        .map_or(raw_artist, str::trim);
     let mut artist = if raw_artist.eq_ignore_ascii_case("unknown artist") {
         String::new()
     } else {
@@ -567,21 +599,12 @@ fn contains_noise(text: &str) -> bool {
         return true;
     }
     for token in text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
-        for noise in NOISE {
-            if matches!(noise, "m/v" | "color coded") {
-                continue;
-            }
-            if noise.len() <= 3 {
-                if token.eq_ignore_ascii_case(noise) {
-                    return true;
-                }
-            } else if token
-                .as_bytes()
-                .get(..noise.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(noise.as_bytes()))
-            {
-                return true;
-            }
+        if NOISE
+            .iter()
+            .filter(|&&n| !matches!(n, "m/v" | "color coded"))
+            .any(|noise| token.eq_ignore_ascii_case(noise))
+        {
+            return true;
         }
     }
     false
@@ -667,7 +690,7 @@ mod tests {
 
     #[test]
     fn decoration_becomes_a_space_rather_than_nothing() {
-        let (_, title) = names(&track("A🎵Song", "Someone"));
+        let (_, title) = names(&track("A\u{1f3b5}Song", "Someone"));
         assert_eq!(title, "A Song");
     }
 

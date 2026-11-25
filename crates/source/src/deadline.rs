@@ -13,9 +13,12 @@ thread_local! {
 
 pub(super) struct Scope(Option<Instant>);
 
+pub(super) fn bound(deadline: Instant) -> Instant {
+    DEADLINE.get().map_or(deadline, |old| old.min(deadline))
+}
+
 pub(super) fn enter(deadline: Instant) -> Scope {
-    let effective = DEADLINE.get().map_or(deadline, |old| old.min(deadline));
-    Scope(DEADLINE.replace(Some(effective)))
+    Scope(DEADLINE.replace(Some(bound(deadline))))
 }
 
 impl Drop for Scope {

@@ -183,12 +183,23 @@ impl DiscordRest {
             .join(path)
             .map_err(|error| BotError::Invalid(format!("invalid Discord endpoint: {error}")))?;
         let payload = serde_json::to_vec(body)?;
+        let mut remaining_wait = max_retry_wait;
+        let deadline = tokio::time::Instant::now() + request_timeout + max_retry_wait;
         let mut limited = 0;
         loop {
+            let attempt_timeout = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(request_timeout);
+            if attempt_timeout.is_zero() {
+                return Err(BotError::HttpStatus {
+                    status: 429,
+                    message: "Discord request exceeded its retry deadline".into(),
+                });
+            }
             let mut req = self
                 .client
                 .request(method.clone(), endpoint.clone())
-                .timeout(request_timeout)
+                .timeout(attempt_timeout)
                 .header(CONTENT_TYPE, "application/json")
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .body(payload.clone());
@@ -219,11 +230,16 @@ impl DiscordRest {
             // sit on it (an interaction token expires within minutes).
             if status.as_u16() == 429 && limited < MAX_RATE_LIMIT_RETRIES {
                 if let Some(wait) = retry_wait(&response_body, retry_header.as_deref())
-                    .filter(|wait| *wait <= max_retry_wait)
+                    .filter(|wait| *wait <= remaining_wait)
                 {
-                    limited += 1;
-                    tokio::time::sleep(wait).await;
-                    continue;
+                    let post_sleep =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if wait < post_sleep {
+                        remaining_wait -= wait;
+                        limited += 1;
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                 }
             }
             if !status.is_success() {
@@ -247,11 +263,14 @@ const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(10);
 /// sub-second precision, or else the `Retry-After` header. `None` when it
 /// names no usable wait or one longer than [`MAX_RATE_LIMIT_WAIT`].
 fn retry_wait(body: &[u8], header: Option<&str>) -> Option<Duration> {
-    let seconds = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("retry_after").and_then(serde_json::Value::as_f64))
-        .or_else(|| header.and_then(|text| text.trim().parse::<f64>().ok()))
-        .unwrap_or(1.0);
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let seconds = if let Some(field) = parsed.as_ref().and_then(|v| v.get("retry_after")) {
+        field.as_f64()?
+    } else if let Some(text) = header {
+        text.trim().parse::<f64>().ok()?
+    } else {
+        1.0
+    };
     if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }

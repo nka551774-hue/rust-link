@@ -107,7 +107,7 @@ youtubeProxy: ""            # YouTube 要求登入時才填
 每次修改後執行 `rustlink --check`：它解析輔助工具並驗證設定，但不監聽。
 
 ```sh
-sudo -u rustlink /opt/rustlink/rustlink --check
+sudo -u rustlink /opt/rustlink/rustlink --config /opt/rustlink/config.yaml --check
 ```
 
 `autoDownload: false`、`.tools` 裡也沒有可用的 FFmpeg 時，節點只能播內建解碼器支援的格式。

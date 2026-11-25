@@ -47,12 +47,14 @@ impl MediaSender {
         while self.next_generation <= target_generation {
             let generation = self.next_generation as u32;
             let secret = &self.next_secret[..self.secret_len as usize];
-            let key = expand(secret, b"key", generation, 16);
-            let cipher = Aes128Gcm::new_from_slice(&key[..16])
-                .map_err(|_| Error::Protocol("invalid media key"))?;
-            match &mut self.cipher {
-                Some(slot) => **slot = cipher,
-                None => self.cipher = Some(Box::new(cipher)),
+            if self.next_generation == target_generation {
+                let key = expand(secret, b"key", generation, 16);
+                let array: &[u8; 16] = key[..16].try_into().unwrap();
+                let cipher = Aes128Gcm::new(array.into());
+                match &mut self.cipher {
+                    Some(slot) => **slot = cipher,
+                    None => self.cipher = Some(Box::new(cipher)),
+                }
             }
             self.next_secret = expand(secret, b"secret", generation, 32);
             self.secret_len = 32;

@@ -28,7 +28,8 @@ fi
 if [ "$reuse" = 1 ]; then
     PASSWORD=$(saved RUSTLINK_PASSWORD)
     TOKEN=$(saved DISCORD_BOT_TOKEN)
-    PORT=$(saved RUSTLINK_URL | sed 's/.*://')
+    PORT=$(saved RUSTLINK_URL | sed -e 's|^[a-zA-Z]*://||' -e 's|/.*||' -e 's|.*:||')
+    case $PORT in '' | *[!0-9]*) PORT= ;; esac
     [ -n "$PASSWORD" ] && [ -n "$TOKEN" ] && [ -n "$PORT" ] ||
         fail "the saved settings in $DATA are incomplete; delete that folder and start again"
 else
@@ -57,8 +58,8 @@ else
     read -r -p "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]: " PROXY
     PROXY=${PROXY:-$warp}
     case $PROXY in *[\"\\]* | *[[:space:]]*) fail 'the proxy cannot contain quotes, backslashes or spaces' ;; esac
-    case $PROXY in '' | http://* | socks4://* | socks5://* | socks5h://*) ;;
-        *) fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' ;; esac
+    case $PROXY in '' | http://* | https://* | socks4://* | socks4a://* | socks5://* | socks5h://*) ;;
+        *) fail 'the proxy must start with http://, https://, socks4://, socks4a://, socks5:// or socks5h://' ;; esac
 
     umask 077
     mkdir -p "$DATA"
@@ -91,13 +92,14 @@ export DISCORD_BOT_TOKEN=$TOKEN RUSTLINK_URL=http://127.0.0.1:$PORT
 
 # --- Build ------------------------------------------------------------------
 
-NODE=$ROOT/target/release/rustlink
-BOT=$ROOT/target/release/examples/music
+TARGET_DIR=$ROOT/target
+NODE=$TARGET_DIR/release/rustlink
+BOT=$TARGET_DIR/release/examples/music
 if command -v cargo >/dev/null 2>&1; then
     echo 'Building (the first build takes a few minutes)...'
-    (cd "$ROOT" && cargo build --release --locked -p rustlink --bin rustlink) ||
+    (cd "$ROOT" && cargo build --release --locked --target-dir "$TARGET_DIR" -p rustlink --bin rustlink) ||
         fail 'building the node failed (it needs pkg-config and libopus; see install.sh)'
-    (cd "$ROOT" && cargo build --release --locked -p rustlink-discord-bot --example music) ||
+    (cd "$ROOT" && cargo build --release --locked --target-dir "$TARGET_DIR" -p rustlink-discord-bot --example music) ||
         fail 'building the music bot failed'
 elif [ ! -x "$NODE" ] || [ ! -x "$BOT" ]; then
     fail 'Rust is not installed; get it from https://rustup.rs and run this again'

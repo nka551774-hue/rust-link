@@ -47,7 +47,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             event = gateway.next_event() => {
-                let Some(event) = event? else { break; };
+                let event = match event {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        gateway.reconnect(None).await?;
+                        continue;
+                    }
+                    Err(error) => {
+                        gateway.reconnect(Some(&error)).await?;
+                        continue;
+                    }
+                };
                 if let Some(voice) = pairer.observe(&event)? {
                     session.set_voice(&guild, voice).await?;
                     if !started {

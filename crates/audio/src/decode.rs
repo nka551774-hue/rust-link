@@ -11,7 +11,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
 use symphonia::core::audio::{Channels, SampleBuffer, SignalSpec};
-use symphonia::core::codecs::{Decoder as SymphoniaDecoder, DecoderOptions, CODEC_TYPE_OPUS};
+use symphonia::core::codecs::{
+    Decoder as SymphoniaDecoder, DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_NULL, CODEC_TYPE_OPUS,
+};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
@@ -95,22 +97,72 @@ fn finite_or_zero(s: f32) -> f32 {
     }
 }
 
-#[inline]
-fn extend_scaled_finite(samples: &[f32], gain: f32, out: &mut Vec<f32>) {
-    if gain == 1.0 {
-        out.extend(samples.iter().copied().map(finite_or_zero));
-    } else {
-        out.extend(samples.iter().map(|&s| finite_or_zero(s * gain)));
+struct OpusStream {
+    decoder: opus_decode::Decoder,
+    skip: u32,
+    gain: f32,
+}
+
+impl OpusStream {
+    fn new(skip: u32, gain: f32) -> Result<Self, AudioError> {
+        Ok(Self {
+            decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
+            skip,
+            gain,
+        })
+    }
+
+    #[inline]
+    fn decode_packet(
+        &mut self,
+        packet: &[u8],
+        expected: usize,
+        pkt_trim_start: usize,
+        max_end: Option<usize>,
+        pkt_trim_end: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<bool, AudioError> {
+        let base = out.len();
+        let frames = match self.decoder.decode_float_append(packet, out) {
+            Ok(frames) => frames,
+            Err(_) => {
+                out.truncate(base);
+                self.decoder
+                    .conceal_float_append(expected, out)
+                    .map_err(|e| AudioError::Decode(e.to_string()))?
+            }
+        };
+        let drop_pre = (self.skip as usize).min(frames);
+        self.skip -= drop_pre as u32;
+        let limit = max_end.map_or(frames, |keep| keep.min(frames));
+        let end = limit.saturating_sub(pkt_trim_end);
+        let start = drop_pre.max(pkt_trim_start).min(end);
+        if start == end {
+            out.truncate(base);
+            return Ok(false);
+        }
+        out.truncate(base + end * 2);
+        if start > 0 {
+            out.drain(base..base + start * 2);
+        }
+        if self.gain == 1.0 {
+            for s in &mut out[base..] {
+                *s = finite_or_zero(*s);
+            }
+        } else {
+            let gain = self.gain;
+            for s in &mut out[base..] {
+                *s = finite_or_zero(*s * gain);
+            }
+        }
+        Ok(true)
     }
 }
 
 struct ContainerOpusDecoder {
     format: Box<dyn FormatReader>,
-    decoder: opus_decode::Decoder,
+    opus: OpusStream,
     track_id: u32,
-    skip: u32,
-    gain: f32,
-    scratch: Vec<f32>,
 }
 
 fn parse_container_opus_params(
@@ -160,6 +212,8 @@ fn parse_container_opus_params(
                 skip = u32::from(u16::from_be_bytes([s0, s1]));
             }
             output_gain = i16::from_be_bytes([g0, g1]);
+        } else {
+            return Err(AudioError::Decode("unsupported Opus header in container".into()));
         }
     }
     let gain = 10.0f32.powf(output_gain as f32 / (20.0 * 256.0));
@@ -173,14 +227,7 @@ impl ContainerOpusDecoder {
         params: &symphonia::core::codecs::CodecParameters,
     ) -> Result<Self, AudioError> {
         let (skip, gain) = parse_container_opus_params(params)?;
-        Ok(Self {
-            format,
-            decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
-            track_id,
-            skip,
-            gain,
-            scratch: Vec::new(),
-        })
+        Ok(Self { format, opus: OpusStream::new(skip, gain)?, track_id })
     }
 
     fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
@@ -190,7 +237,17 @@ impl ContainerOpusDecoder {
                 Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     return Ok(false);
                 }
-                Err(SymphoniaError::ResetRequired) => continue,
+                Err(SymphoniaError::ResetRequired) => {
+                    let track = select_audio_track(self.format.as_ref())?;
+                    if track.codec_params.codec != CODEC_TYPE_OPUS {
+                        return Err(AudioError::Decode("chained container codec changed".into()));
+                    }
+                    let (skip, gain) = parse_container_opus_params(&track.codec_params)?;
+                    let new_id = track.id;
+                    self.opus = OpusStream::new(skip, gain)?;
+                    self.track_id = new_id;
+                    continue;
+                }
                 Err(e) => return Err(AudioError::Decode(e.to_string())),
             };
             if packet.track_id() != self.track_id {
@@ -200,23 +257,16 @@ impl ContainerOpusDecoder {
             let Some(expected) = opus_decode::packet_samples(buf) else {
                 continue;
             };
-            let frames = match self.decoder.decode_float(buf, &mut self.scratch) {
-                Ok(frames) => frames,
-                Err(_) => self
-                    .decoder
-                    .conceal_float(expected, &mut self.scratch)
-                    .map_err(|e| AudioError::Decode(e.to_string()))?,
-            };
-            let pkt_trim_start = packet.trim_start() as usize;
-            let drop_pre = (self.skip as usize).min(frames);
-            self.skip -= drop_pre as u32;
-            let start = drop_pre.max(pkt_trim_start).min(frames);
-            let end = frames.saturating_sub(packet.trim_end() as usize).max(start);
-            if end == start {
-                continue;
+            if self.opus.decode_packet(
+                buf,
+                expected,
+                packet.trim_start() as usize,
+                None,
+                packet.trim_end() as usize,
+                out,
+            )? {
+                return Ok(true);
             }
-            extend_scaled_finite(&self.scratch[start * 2..end * 2], self.gain, out);
-            return Ok(true);
         }
     }
 }
@@ -234,28 +284,22 @@ struct OggPacket {
 /// PCM storage remains one packet (at most 120 ms), not an entire decoded page.
 struct OggDecoder {
     reader: OggOpusReader<Body>,
-    decoder: opus_decode::Decoder,
-    skip: u32,
-    gain: f32,
+    opus: OpusStream,
     page: Vec<u8>,
     packets: VecDeque<OggPacket>,
     previous_granule: Option<u64>,
     ended: bool,
-    scratch: Vec<f32>,
 }
 
 impl OggDecoder {
     fn new(body: Body) -> Result<Self, AudioError> {
         let mut decoder = Self {
             reader: OggOpusReader::new(body),
-            decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
-            skip: 0,
-            gain: 1.0,
+            opus: OpusStream::new(0, 1.0)?,
             page: Vec::new(),
             packets: VecDeque::new(),
             previous_granule: None,
             ended: false,
-            scratch: Vec::new(),
         };
         // Validate the initial granule and establish cropping before playback
         // starts, while the caller can still select its FFmpeg fallback.
@@ -304,12 +348,10 @@ impl OggDecoder {
             }
             let keep = match self.previous_granule {
                 None => {
-                    self.skip = self.reader.pre_skip();
-                    self.gain = 10.0f32.powf(self.reader.output_gain() as f32 / (20.0 * 256.0));
+                    self.opus.skip = self.reader.pre_skip();
+                    self.opus.gain =
+                        10.0f32.powf(self.reader.output_gain() as f32 / (20.0 * 256.0));
                     if end_of_stream {
-                        if granule < u64::from(self.skip) {
-                            return Err(AudioError::Decode("ogg end precedes pre-skip".into()));
-                        }
                         // A single EOS page can trim from a zero origin, or
                         // have a nonzero origin when its granule exceeds its
                         // complete decoded duration (RFC 7845 section 4.5).
@@ -333,6 +375,9 @@ impl OggDecoder {
                     delta
                 }
             };
+            if end_of_stream && keep < u64::from(self.opus.skip) {
+                return Err(AudioError::Decode("ogg end precedes pre-skip".into()));
+            }
             let mut remaining = keep as usize;
             for packet in &mut self.packets {
                 let keep_frames = remaining.min(usize::from(packet.frames));
@@ -354,32 +399,100 @@ impl OggDecoder {
             if self.ended && packet.keep == 0 {
                 continue;
             }
-            let pkt_frames = usize::from(packet.frames);
-            let drop = (self.skip as usize).min(pkt_frames);
-            self.skip -= drop as u32;
             let start_byte = packet.offset as usize;
             let end_byte = start_byte + packet.length as usize;
-            let frames = match self
-                .decoder
-                .decode_float(&self.page[start_byte..end_byte], &mut self.scratch)
-            {
-                Ok(frames) => frames,
-                // The TOC gave a valid duration: conceal the damaged packet so it
-                // still occupies its exact duration on the page's clock.
-                Err(_) => self
-                    .decoder
-                    .conceal_float(pkt_frames, &mut self.scratch)
-                    .map_err(|e| AudioError::Decode(e.to_string()))?,
-            };
-            let end = usize::from(packet.keep).min(frames);
-            let start = drop.min(end);
-            if start == end {
-                continue;
+            if self.opus.decode_packet(
+                &self.page[start_byte..end_byte],
+                usize::from(packet.frames),
+                0,
+                Some(usize::from(packet.keep)),
+                0,
+                out,
+            )? {
+                return Ok(true);
             }
-            extend_scaled_finite(&self.scratch[start * 2..end * 2], self.gain, out);
-            return Ok(true);
         }
     }
+}
+
+fn select_audio_track(
+    format: &dyn FormatReader,
+) -> Result<&symphonia::core::formats::Track, AudioError> {
+    format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .or_else(|| format.default_track())
+        .ok_or_else(|| AudioError::Decode("the stream holds no playable track".into()))
+}
+
+/// Validates ISO/IEC 14496-3 AudioSpecificConfig for Symphonia's AAC-LC-only
+/// decoder, declining SBR/PS so `PureFrames::start` falls back to FFmpeg before
+/// playback begins and recovering the true sample rate on 88.2/96 kHz M4As.
+fn parse_aac_lc_rate(
+    extra: Option<&[u8]>,
+    container_rate: Option<u32>,
+) -> Result<Option<u32>, AudioError> {
+    const AAC_RATES: [u32; 13] = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+        8_000, 7_350,
+    ];
+    let Some(extra) = extra else { return Ok(None) };
+    if extra.len() < 2 {
+        return Err(AudioError::Decode("truncated AAC AudioSpecificConfig".into()));
+    }
+    let mut pos = 0usize;
+    fn read_bits(extra: &[u8], pos: &mut usize, count: usize) -> Option<u32> {
+        if *pos + count > extra.len() * 8 {
+            return None;
+        }
+        let mut val = 0u32;
+        for _ in 0..count {
+            let bit = (extra[*pos >> 3] >> (7 - (*pos & 7))) & 1;
+            val = (val << 1) | u32::from(bit);
+            *pos += 1;
+        }
+        Some(val)
+    }
+    let mut aot = read_bits(extra, &mut pos, 5)
+        .ok_or_else(|| AudioError::Decode("truncated AAC config".into()))?;
+    if aot == 31 {
+        aot = 32
+            + read_bits(extra, &mut pos, 6)
+                .ok_or_else(|| AudioError::Decode("truncated AAC config".into()))?;
+    }
+    if aot == 5 || aot == 29 {
+        return Err(AudioError::Decode("HE-AAC (SBR/PS) requires ffmpeg".into()));
+    }
+    let freq_idx = read_bits(extra, &mut pos, 4)
+        .ok_or_else(|| AudioError::Decode("truncated AAC config".into()))?;
+    let asc_rate = *AAC_RATES
+        .get(freq_idx as usize)
+        .ok_or_else(|| AudioError::Decode("unsupported AAC sample rate".into()))?;
+    let chan_cfg = read_bits(extra, &mut pos, 4)
+        .ok_or_else(|| AudioError::Decode("truncated AAC config".into()))?;
+    if aot == 2 && chan_cfg != 0 {
+        let _short = read_bits(extra, &mut pos, 1);
+        if read_bits(extra, &mut pos, 1) == Some(1) {
+            let _ = read_bits(extra, &mut pos, 14);
+        }
+        if read_bits(extra, &mut pos, 1) == Some(0)
+            && extra.len() * 8 - pos >= 16
+            && read_bits(extra, &mut pos, 11) == Some(0x2b7)
+        {
+            let mut ext_aot = read_bits(extra, &mut pos, 5).unwrap_or(0);
+            if ext_aot == 31 {
+                ext_aot = 32 + read_bits(extra, &mut pos, 6).unwrap_or(0);
+            }
+            if (ext_aot == 5 || ext_aot == 29) && read_bits(extra, &mut pos, 1) == Some(1) {
+                return Err(AudioError::Decode("HE-AAC (SBR/PS) requires ffmpeg".into()));
+            }
+        }
+    }
+    if container_rate == Some(asc_rate.saturating_mul(2)) {
+        return Err(AudioError::Decode("implicit HE-AAC (SBR) requires ffmpeg".into()));
+    }
+    Ok(Some(asc_rate))
 }
 
 impl Decoder {
@@ -412,16 +525,22 @@ impl Decoder {
         .map_err(|_| AudioError::Decode("the stream header is malformed".into()))?
         .map_err(|e| AudioError::Decode(e.to_string()))?;
         let format = probed.format;
-        let track = format
-            .default_track()
-            .ok_or_else(|| AudioError::Decode("the stream holds no playable track".into()))?;
+        let track = select_audio_track(format.as_ref())?;
         let track_id = track.id;
         if track.codec_params.codec == CODEC_TYPE_OPUS {
             let params = track.codec_params.clone();
             let opus = ContainerOpusDecoder::from_track(format, track_id, &params)?;
             return Ok(Decoder { inner: Inner::ContainerOpus(Box::new(opus)), rate: 48_000 });
         }
-        let rate = track.codec_params.sample_rate.unwrap_or(48_000);
+        let asc_rate = if track.codec_params.codec == CODEC_TYPE_AAC {
+            parse_aac_lc_rate(
+                track.codec_params.extra_data.as_deref(),
+                track.codec_params.sample_rate,
+            )?
+        } else {
+            None
+        };
+        let rate = asc_rate.or(track.codec_params.sample_rate).unwrap_or(48_000);
         if rate == 0 {
             // A zero rate would make the resampler expand every frame ~10^6 times.
             return Err(AudioError::Decode("the stream has a zero sample rate".into()));
@@ -479,7 +598,38 @@ impl Decoder {
                         return Ok(false)
                     }
                     Err(SymphoniaError::ResetRequired) => {
-                        decoder.reset();
+                        let track = select_audio_track(format.as_ref())?;
+                        let asc_rate = if track.codec_params.codec == CODEC_TYPE_AAC {
+                            parse_aac_lc_rate(
+                                track.codec_params.extra_data.as_deref(),
+                                track.codec_params.sample_rate,
+                            )?
+                        } else {
+                            None
+                        };
+                        let new_rate =
+                            asc_rate.or(track.codec_params.sample_rate).unwrap_or(self.rate);
+                        if new_rate != self.rate {
+                            return Err(AudioError::Decode(
+                                "source sample rate changed during playback".into(),
+                            ));
+                        }
+                        let new_id = track.id;
+                        let new_channels = track.codec_params.channels.unwrap_or(spec.channels);
+                        if new_channels.count() == 0 {
+                            return Err(AudioError::Decode(
+                                "the stream has zero audio channels".into(),
+                            ));
+                        }
+                        *decoder = symphonia::default::get_codecs()
+                            .make(&track.codec_params, &DecoderOptions::default())
+                            .map_err(|e| AudioError::Decode(e.to_string()))?;
+                        *track_id = new_id;
+                        if new_channels != spec.channels {
+                            *spec = SignalSpec::new(self.rate, new_channels);
+                            *mixer = Downmix::new(new_channels);
+                            *samples = SampleBuffer::new(0, *spec);
+                        }
                         continue;
                     }
                     Err(e) => return Err(AudioError::Decode(e.to_string())),

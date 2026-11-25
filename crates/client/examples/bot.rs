@@ -1,4 +1,5 @@
-//! Run with RUSTLINK_URL, RUSTLINK_PASSWORD, DISCORD_BOT_ID, DISCORD_GUILD_ID.
+//! Run with RUSTLINK_URL, RUSTLINK_PASSWORD, DISCORD_BOT_ID, DISCORD_GUILD_ID,
+//! and DISCORD_CHANNEL_ID.
 //! The three DISCORD_VOICE_* values come from your bot's Discord gateway events,
 //! not from its bot token. This example does not log in to Discord itself.
 use rustlink_client::{Client, LoadResult, VoiceState};

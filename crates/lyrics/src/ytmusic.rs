@@ -166,7 +166,8 @@ impl YTMusic {
         } else {
             client.version
         };
-        body["context"] = json!({ "client": client_context(client, version) });
+        body["context"] =
+            json!({ "client": client_context(client, version, self.visitor_data.trim()) });
         let base =
             if self.endpoint.trim().is_empty() { YTMUSIC_ENDPOINT } else { self.endpoint.trim() };
         let url =
@@ -215,13 +216,16 @@ impl YTMusic {
 
 /// Builds the client identity. Only the body carries it, the same as the source
 /// package: the endpoint needs no API key.
-fn client_context(client: &Client, version: &str) -> Value {
+fn client_context(client: &Client, version: &str, visitor_data: &str) -> Value {
     let mut context =
         json!({ "clientName": client.name, "clientVersion": version, "hl": "en", "gl": "US" });
     if client.mobile {
         context["androidSdkVersion"] = json!(30);
         context["osName"] = json!("Android");
         context["osVersion"] = json!("11");
+    }
+    if !visitor_data.is_empty() {
+        context["visitorData"] = json!(visitor_data);
     }
     context
 }
@@ -252,15 +256,38 @@ fn trim_owned(mut text: String) -> String {
     text
 }
 
+fn find_key<'a>(value: &'a Value, target: &str, depth: usize) -> Option<&'a Value> {
+    if depth == 0 {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(target) {
+                return Some(found);
+            }
+            map.values().find_map(|child| find_key(child, target, depth - 1))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_key(child, target, depth - 1)),
+        _ => None,
+    }
+}
+
 /// Builds the payload from the mobile answer.
 ///
 /// Timed lines are returned when every line carries a cue; an answer that has
 /// the words without the timings is still worth returning as text, because a
 /// wall of text beats nothing.
 fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
-    let data = answer.pointer(
-        "/contents/elementRenderer/newElement/type/componentType/model/timedLyricsModel/lyricsData",
-    )?;
+    let data = answer
+        .pointer(
+            "/contents/elementRenderer/newElement/type/componentType/model/timedLyricsModel/lyricsData",
+        )
+        .or_else(|| {
+            answer
+                .get("contents")
+                .and_then(|c| find_key(c, "timedLyricsModel", 12))
+                .and_then(|m| m.get("lyricsData"))
+        })?;
     let lines = data.get("timedLyricsData").and_then(Value::as_array)?;
     if lines.is_empty() {
         return None;
@@ -312,8 +339,15 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
 /// An answer with no run is the catalogue saying it has nothing, such as the
 /// message it sends for a track whose lyrics are not licensed.
 fn from_web(track: &Track, answer: &Value) -> Option<Lyrics> {
-    let contents = answer.pointer("/contents/sectionListRenderer/contents")?.as_array()?;
-    let shelf = contents.iter().find_map(|item| item.get("musicDescriptionShelfRenderer"))?;
+    let shelf = answer
+        .pointer("/contents/sectionListRenderer/contents")
+        .and_then(Value::as_array)
+        .and_then(|contents| {
+            contents.iter().find_map(|item| item.get("musicDescriptionShelfRenderer"))
+        })
+        .or_else(|| {
+            answer.get("contents").and_then(|c| find_key(c, "musicDescriptionShelfRenderer", 10))
+        })?;
     let runs = shelf.pointer("/description/runs").and_then(Value::as_array)?;
     let text = trim_owned(
         runs.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect::<String>(),
@@ -492,9 +526,12 @@ mod tests {
 
     #[test]
     fn the_mobile_client_names_itself_as_the_android_app() {
-        let context = client_context(&MOBILE, MOBILE_VERSION);
+        let context = client_context(&MOBILE, MOBILE_VERSION, "visitor-token");
         assert_eq!(context["clientName"], "ANDROID_MUSIC");
         assert_eq!(context["osName"], "Android");
-        assert!(client_context(&WEB, WEB_VERSION).get("osName").is_none());
+        assert_eq!(context["visitorData"], "visitor-token");
+        let web = client_context(&WEB, WEB_VERSION, "");
+        assert!(web.get("osName").is_none());
+        assert!(web.get("visitorData").is_none());
     }
 }

@@ -64,7 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let event = tokio::select! {
             result = &mut shutdown => { result?; break; }
             ended = &mut event_task => { ended??; break; }
-            event = gateway.next_event() => match event? { Some(event) => event, None => break },
+            event = gateway.next_event() => match event {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    gateway.reconnect(None).await?;
+                    continue;
+                }
+                Err(error) => {
+                    gateway.reconnect(Some(&error)).await?;
+                    continue;
+                }
+            },
         };
         if let Some(voice) = pairer.observe(&event)? {
             let guild = event.guild_id().unwrap_or_default().to_owned();
@@ -186,7 +196,7 @@ async fn play(
     let query = request.option("url").unwrap_or_default();
     let message = match resolve(rustlink, query).await {
         Ok(track) => match session.play(guild, &track.token).await {
-            Ok(_) => format!("▶️ 正在播放：{}（{}）", track.metadata.title, track.metadata.author),
+            Ok(_) => format!("正在播放：{}（{}）", track.metadata.title, track.metadata.author),
             Err(error) => format!("播放失敗：{error}"),
         },
         Err(error) => format!("找不到可播放的內容：{error}"),
