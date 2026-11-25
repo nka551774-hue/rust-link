@@ -14,7 +14,7 @@
 [![Zero GC](https://img.shields.io/badge/20ms%20Hot%20Path-0%20GC%20%C2%B7%200%20Heap%20Allocs-2ea043)](#benchmarks)
 [![License](https://img.shields.io/badge/License-GPL--3.0--or--later-blue)](LICENSE)
 
-[快速開始](#quickstart) · [為何選擇純 Rust](#why-rust) · [橫向效能對比](#comparison) · [系統架構](#architecture) · [實測效能](#benchmarks) · [機器人範例](#examples) · [完整文件](#docs)
+[快速開始](#quickstart) · [為何選擇純 Rust](#why-rust) · [系統架構](#architecture) · [實測效能](#benchmarks) · [機器人範例](#examples) · [完整文件](#docs)
 
 </div>
 
@@ -77,31 +77,6 @@
 | **視窗化 Sinc 重取樣**（44.1 kHz → 48 kHz 雙聲道） | **4.54 µs / 20ms 音框** | **0 allocs（5,000 音框）** | 即時速度的 **4,408×**（僅佔音框預算 **0.023%**） |
 | **全開 8 階 SIMD/相量 DSP 濾鏡鏈**（含非線性失真） | **38.78 µs / 20ms 音框** | **0 allocs（5,000 音框）** | 即時速度的 **516×**（僅佔音框預算 **0.19%**） |
 | **48 kHz WAV 解碼 + `libopus` 最高複雜度 10 編碼** | **171.02 µs / 20ms 音框** | 預配置重用緩衝 | 即時速度的 **117.0×**（僅佔音框預算 **0.86%**） |
-
----
-
-<a id="comparison"></a>
-## Rustlink 與其他音訊節點方案深度對比
-
-在 Discord 音訊生態系中，常見方案包含基於 JVM 的 **Lavalink**、基於 Node.js V8 的 **NodeLink**、基於 Go 執行環境的音訊節點／客戶端生態（如 **GoLink** 搭配 Go 語音服務），以及傳統機器人直接呼叫 **`yt-dlp` + `FFmpeg` 子程序**。下表從執行環境本質、記憶體模型、20 ms 音框抖動來源與加密邊界進行客觀對比：
-
-<p align="center">
-  <img src="docs/assets/comparison.svg" alt="Rustlink vs Lavalink vs NodeLink vs Go Audio Nodes vs yt-dlp Comparison" width="100%" />
-</p>
-
-| 對比維度 | **Rustlink（純 Rust）** | **Lavalink（Java / JVM）** | **NodeLink（Node.js / V8）** | **Go 音訊節點 / GoLink 生態** | **傳統 `yt-dlp` + `FFmpeg` 機器人** |
-| --- | --- | --- | --- | --- | --- |
-| **執行環境與部署產物** | **單一 ~9.7 MiB 原生執行檔** + `libopus`（零 VM、零直譯器） | JRE 17/21 + Spring Boot FAT JAR + 外掛 JAR | Node.js V8 執行環境 + `node_modules` + 原生擴充 | Go 靜態／半靜態執行檔 + `cgo` C 函式庫橋接 | 機器人主程序 + Python 直譯器 + `yt-dlp` + `FFmpeg` |
-| **典型閒置記憶體（Idle RSS）** | **~12–18 MiB** | ~220–450+ MiB（JVM 預留 Heap、Metaspace 與 JIT 快取） | ~75–130 MiB（V8 Isolate 與基礎堆積） | ~25–45 MiB（Go Runtime 與初期 Heap） | 基礎程序外，每首解析額外暴增 **+60–120 MiB** 子程序記憶體 |
-| **冷啟動就緒時間** | **< 15 ms**（直接進入系統呼叫監聽） | ~2,000–6,000 ms（類別載入、DI 容器與 JIT 暖機） | ~300–900 ms（模組解析與 V8 初始化） | ~30–80 ms | 每次切歌啟動 Python 子程序需 **~800–2,500 ms** |
-| **20 ms 音框排程與 GC 抖動** | **0 GC（編譯期 RAII）** + 世代安全獨立排程執行緒 + 熱路徑 `0` 堆積配置 | 依賴 G1GC / ZGC；大型 JSON 歌單配置風暴可能觸發 Safepoint 停頓 | 單執行緒事件迴圈易受大型 JSON 解析阻塞；Worker 間需傳遞緩衝 | 並行標記清除 GC + 每 20 ms 呼叫 `cgo`（Opus/加密）有執行緒棧切換成本 | 作業系統管線（Pipe）緩衝不可控，即時調整濾鏡往往需重啟 `FFmpeg` 造成斷音 |
-| **DAVE v1（MLS E2EE）與 RTP 加密** | **程序內純 Rust OpenMLS** + 原地加密（合計 **489.5 ns / 音框**，`0` 配置、零 FFI 跨界拷貝） | 透過 JNI / JNA 呼叫原生 `libdave` C++ 函式庫，伴隨受管／原生陣列邊界轉換 | 透過 N-API 原生擴充跨界呼叫，需維護 V8 `Buffer` 外部分配生命週期 | 多透過 `cgo` 綁定外部 C/C++ 實作，每音框跨越 Go/C 邊界 | 依賴各語言機器人框架各自的語音與 FFI 綁定，品質不一 |
-| **音源解析與快取共享** | **程序內原生解析 + `Singleflight` + `Arc<LoadResult>`**（百首歌單命中 **43.3 ns**） | 成熟外掛體系（Lavaplayer / youtube-source），物件圖駐留於 JVM Heap | JS 非同步串流解析，快取序列化／複製受 V8 物件模型限制 | 原生 `goroutine` 併發高，但結構體深拷貝或 JSON 快取仍產生 GC 壓力 | 每次查詢呼叫外部 CLI 輸出大型 JSON，CPU 與 I/O 開銷最高 |
-| **即時濾鏡平滑切換** | **原生 10 種濾鏡原位更新係數**（保留 LFO 相位與雙二階狀態，**零爆音、零重啟**） | 支援原生濾鏡鏈，部分自訂濾鏡外掛增加 GC 短命陣列配置 | 支援 JS / Native 濾鏡，高負載下受制於執行緒池排程 | 視實作而定，常需仰賴外部 `FFmpeg` 濾鏡圖 | 修改濾鏡參數通常需重建 `FFmpeg` 子程序並重新 Seek |
-| **生態系定位與取捨** | **極致輕量、最低延遲、可審計單一純淨協定（API v1）**；不背負舊協定相容包袱 | **生態最成熟**，擁有最多現成多語言客戶端與第三方音源外掛 | 適合全棧 JavaScript 團隊快速客製化與修改腳本 | 適合純 Go 技術棧（註：`GoLink` 本身為客戶端庫而非獨立節點協定） | 僅適合超小型單機測試機器人，不適合多伺服器長期營運 |
-
-> [!NOTE]
-> **誠實工程邊界說明**：上表中 Lavalink、NodeLink 與 Go 節點之數值反映各受管執行環境（JVM / V8 / Go Runtime）的典型架構基準，實際表現會隨硬體、GC 參數調校與外掛組合而異；Rustlink 的微秒／奈秒級數據則全數來自本倉庫內建之可重現 `--release` 基準測試（見下方驗證指令）。若您的首要需求是直接沿用既有 Lavalink v4 外掛生態，Lavalink 仍是成熟選擇；若您追求**最低 VPS 記憶體成本、零 GC 音訊穩定度、原生 DAVE v1 安全性與純 Rust 技術棧**，Rustlink 能以不到十分之一的閒置資源提供極致表現。
 
 ---
 
