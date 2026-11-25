@@ -76,36 +76,89 @@ pub fn visionos_client() -> Client {
     }
 }
 
-/// Client identities tried in priority order (`VISIONOS` first, `IOS_PRODUCER` second).
+fn ios_producer_client() -> Client {
+    Client {
+        name: "IOS_PRODUCER",
+        version: Cow::Borrowed("0.147.945"),
+        user_agent: Cow::Borrowed(
+            "com.google.ios.youtubeproducer/0.147.945 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        ),
+        sdk: None,
+        device_make: Some("Apple"),
+        device_model: Some("iPhone16,2"),
+        os_name: Some("iPhone"),
+        os_version: Some("18.3.2.22D82"),
+        needs_visitor_data: false,
+        throttled_without_pot: false,
+    }
+}
+
+fn android_vr_client() -> Client {
+    Client {
+        name: "ANDROID_VR",
+        version: Cow::Borrowed("1.60.19"),
+        user_agent: Cow::Borrowed(
+            "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+        ),
+        sdk: Some(32),
+        device_make: None,
+        device_model: None,
+        os_name: None,
+        os_version: None,
+        needs_visitor_data: false,
+        throttled_without_pot: false,
+    }
+}
+
+fn clients_with_pot(config: &Config, has_pot: bool) -> [Client; 4] {
+    if has_pot {
+        // With an operator-supplied poToken, VISIONOS and ANDROID both accept
+        // `serviceIntegrityDimensions.poToken` + `&pot=` and serve 48 kHz Opus (`itag 251`).
+        [visionos_client(), android_client(config), ios_producer_client(), android_vr_client()]
+    } else {
+        [visionos_client(), ios_producer_client(), android_vr_client(), android_client(config)]
+    }
+}
+
+/// Client identities tried in priority order.
 pub fn clients(config: &Config) -> [Client; 4] {
-    [
-        visionos_client(),
-        Client {
-            name: "IOS_PRODUCER",
-            version: Cow::Borrowed("0.147.945"),
-            user_agent: Cow::Borrowed("com.google.ios.youtubeproducer/0.147.945 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"),
-            sdk: None,
-            device_make: Some("Apple"),
-            device_model: Some("iPhone16,2"),
-            os_name: Some("iPhone"),
-            os_version: Some("18.3.2.22D82"),
-            needs_visitor_data: false,
-            throttled_without_pot: false,
-        },
-        Client {
-            name: "ANDROID_VR",
-            version: Cow::Borrowed("1.60.19"),
-            user_agent: Cow::Borrowed("com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
-            sdk: Some(32),
-            device_make: None,
-            device_model: None,
-            os_name: None,
-            os_version: None,
-            needs_visitor_data: false,
-            throttled_without_pot: false,
-        },
-        android_client(config),
-    ]
+    let (pot, _) = parse_pot_pair(&config.youtube_po_token, &config.youtube_visitor_data);
+    clients_with_pot(config, !pot.is_empty())
+}
+
+/// Parses operator-supplied `poToken` and `visitorData`, supporting separate strings,
+/// JSON `{"poToken":"...","visitorData":"..."}`, or combined `<visitorData>:<poToken>`.
+pub(crate) fn parse_pot_pair(raw_pot: &str, raw_vd: &str) -> (String, String) {
+    let (pot, vd) = (raw_pot.trim(), raw_vd.trim());
+    if pot.starts_with('{') {
+        if let Ok(obj) = serde_json::from_str::<Value>(pot) {
+            let parsed_pot = obj
+                .get("poToken")
+                .or_else(|| obj.get("po_token"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            let parsed_vd = if !vd.is_empty() {
+                vd
+            } else {
+                obj.get("visitorData")
+                    .or_else(|| obj.get("visitor_data"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+            };
+            return (parsed_pot.to_owned(), parsed_vd.to_owned());
+        }
+    }
+    if vd.is_empty() && !pot.contains("://") {
+        if let Some((left, right)) = pot.split_once(':') {
+            let (left, right) = (left.trim(), right.trim());
+            if !left.is_empty() && !right.is_empty() {
+                return (right.to_owned(), left.to_owned());
+            }
+        }
+    }
+    (pot.to_owned(), vd.to_owned())
 }
 
 fn catalogue_client(config: &Config) -> Client {
@@ -168,8 +221,11 @@ struct RequestContext<'a> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RequestEnvelope<'a, B: Serialize + ?Sized> {
     context: RequestContext<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_integrity_dimensions: Option<IntegrityDimensions<'a>>,
     #[serde(flatten)]
     body: &'a B,
 }
@@ -186,8 +242,6 @@ struct PlayerRequest<'a> {
     video_id: &'a str,
     content_check_ok: bool,
     racy_check_ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_integrity_dimensions: Option<IntegrityDimensions<'a>>,
 }
 
 #[derive(Serialize)]
@@ -218,10 +272,11 @@ fn call<B: Serialize + ?Sized>(
     base: &str,
     client: &Client,
     visitor_data: &str,
+    po_token: &str,
     endpoint: &str,
     body: &B,
 ) -> Result<Value, SourceError> {
-    let visitor = visitor_data.trim();
+    let (visitor, pot) = (visitor_data.trim(), po_token.trim());
     let payload = RequestEnvelope {
         context: RequestContext {
             client: ClientIdentity {
@@ -237,6 +292,8 @@ fn call<B: Serialize + ?Sized>(
                 os_version: client.os_version,
             },
         },
+        service_integrity_dimensions: (!pot.is_empty())
+            .then_some(IntegrityDimensions { po_token: pot }),
         body,
     };
     let url = format!("{}/youtubei/v1/{endpoint}?prettyPrint=false", base.trim_end_matches('/'));
@@ -394,8 +451,18 @@ impl<'a> Catalog<'a> {
         self.state.filter(|_| is_https(&self.config.youtube_endpoint))
     }
 
+    fn configured_auth(&self) -> (String, String) {
+        if let Some(state) = self.state {
+            if let Some(auth) = crate::lock(&state.youtube_auth).as_ref() {
+                return (auth.po_token.clone(), auth.visitor_data.clone());
+            }
+        }
+        parse_pot_pair(&self.config.youtube_po_token, &self.config.youtube_visitor_data)
+    }
+
     fn ordered_clients(&self) -> [Client; 4] {
-        let base = clients(self.config);
+        let (pot, _) = self.configured_auth();
+        let base = clients_with_pot(self.config, !pot.is_empty());
         match self.https_state() {
             Some(s) => s.youtube_health.partition_clients(base, |c| c.name),
             None => base,
@@ -424,11 +491,12 @@ impl<'a> Catalog<'a> {
     }
 
     fn stream_key(&self, video_id: &str) -> YoutubeStreamKey {
+        let (pot, _) = self.configured_auth();
         YoutubeStreamKey {
             video_id: video_id.to_owned(),
             endpoint: self.config.youtube_endpoint.trim().to_owned(),
             client_version: self.config.youtube_client_version.trim().to_owned(),
-            has_po_token: !self.config.youtube_po_token.trim().is_empty(),
+            has_po_token: !pot.is_empty(),
         }
     }
 
@@ -457,16 +525,17 @@ impl<'a> Catalog<'a> {
         );
     }
 
-    fn effective_visitor_data(&self, bootstrap: bool) -> String {
-        let configured = self.config.youtube_visitor_data.trim();
-        if !configured.is_empty() {
-            return configured.to_owned();
+    fn effective_credentials(&self, bootstrap: bool) -> (String, String) {
+        let (pot, explicit_vd) = self.configured_auth();
+        if !explicit_vd.is_empty() {
+            return (pot, explicit_vd);
         }
         if let Some(cached) = self.visitor_cache().and_then(CredentialCache::peek) {
-            return cached;
+            return (pot, cached);
         }
-        if !bootstrap || !is_https(&self.config.youtube_endpoint) {
-            return String::new();
+        // Always ensure visitorData is present when a poToken is configured on HTTPS.
+        if (!bootstrap && pot.is_empty()) || !is_https(&self.config.youtube_endpoint) {
+            return (pot, String::new());
         }
         let fetch = || {
             fetch_visitor_data(
@@ -475,14 +544,19 @@ impl<'a> Catalog<'a> {
                 &self.config.youtube_music_endpoint,
             )
         };
-        match self.visitor_cache() {
+        let vd = match self.visitor_cache() {
             Some(cache) => cache.get_or_refresh(fetch).unwrap_or_default(),
             None => fetch().map(|(vd, _)| vd).unwrap_or_default(),
-        }
+        };
+        (pot, vd)
+    }
+
+    fn has_explicit_visitor_data(&self) -> bool {
+        !self.configured_auth().1.is_empty()
     }
 
     fn harvest_visitor_data(&self, answer: &Value) {
-        if !self.config.youtube_visitor_data.trim().is_empty() {
+        if self.has_explicit_visitor_data() {
             return;
         }
         if let (Some(cache), Some(vd)) =
@@ -493,7 +567,7 @@ impl<'a> Catalog<'a> {
     }
 
     fn invalidate_visitor_if_stale(&self, used_vd: &str, answer: &Value) {
-        if used_vd.is_empty() || !self.config.youtube_visitor_data.trim().is_empty() {
+        if used_vd.is_empty() || self.has_explicit_visitor_data() {
             return;
         }
         if let Some(cache) = self.visitor_cache() {
@@ -517,41 +591,37 @@ impl<'a> Catalog<'a> {
         endpoint: &str,
         body: &B,
     ) -> Result<Value, SourceError> {
-        let vd = self.effective_visitor_data(client.needs_visitor_data);
-        let answer = call(self.agent, &self.config.youtube_endpoint, client, &vd, endpoint, body)?;
+        let (pot, vd) = self.effective_credentials(client.needs_visitor_data);
+        let answer =
+            call(self.agent, &self.config.youtube_endpoint, client, &vd, &pot, endpoint, body)?;
         self.harvest_visitor_data(&answer);
         Ok(answer)
     }
 
     fn player_request<'b>(&'b self, video_id: &'b str) -> PlayerRequest<'b> {
-        let token = self.config.youtube_po_token.trim();
-        PlayerRequest {
-            video_id,
-            content_check_ok: true,
-            racy_check_ok: true,
-            service_integrity_dimensions: (!token.is_empty())
-                .then_some(IntegrityDimensions { po_token: token }),
-        }
+        PlayerRequest { video_id, content_check_ok: true, racy_check_ok: true }
     }
 
     fn player_call(&self, client: &Client, video_id: &str) -> Result<Value, SourceError> {
         let req = self.player_request(video_id);
-        let vd = self.effective_visitor_data(client.needs_visitor_data);
-        let answer = call(self.agent, &self.config.youtube_endpoint, client, &vd, "player", &req)?;
+        let (pot, vd) = self.effective_credentials(client.needs_visitor_data);
+        let answer =
+            call(self.agent, &self.config.youtube_endpoint, client, &vd, &pot, "player", &req)?;
         if let Err(err) = check_playability(&answer) {
             self.invalidate_visitor_if_stale(&vd, &answer);
-            if client.needs_visitor_data
+            if (client.needs_visitor_data || !pot.is_empty())
                 && !vd.is_empty()
-                && self.config.youtube_visitor_data.trim().is_empty()
+                && !self.has_explicit_visitor_data()
                 && self.https_state().is_some()
             {
-                let fresh = self.effective_visitor_data(true);
+                let (_, fresh) = self.effective_credentials(true);
                 if !fresh.is_empty() && fresh != vd {
                     let retried = call(
                         self.agent,
                         &self.config.youtube_endpoint,
                         client,
                         &fresh,
+                        &pot,
                         "player",
                         &req,
                     )?;
@@ -574,12 +644,13 @@ impl<'a> Catalog<'a> {
         endpoint: &str,
         body: &B,
     ) -> Result<Value, SourceError> {
-        let vd = self.effective_visitor_data(false);
+        let (pot, vd) = self.effective_credentials(false);
         let answer = call(
             self.agent,
             &self.config.youtube_music_endpoint,
             &MUSIC_CLIENT,
             &vd,
+            &pot,
             endpoint,
             body,
         )?;
@@ -744,12 +815,13 @@ impl<'a> Catalog<'a> {
         raw_url: String,
         mut headers: BTreeMap<String, String>,
         user_agent: &str,
+        pot: &str,
         probe_len: Option<i64>,
     ) -> Result<(String, BTreeMap<String, String>), SourceError> {
         netguard::validate_url(&raw_url)?;
         headers.retain(|k, _| !k.eq_ignore_ascii_case("user-agent"));
         headers.insert("User-Agent".into(), user_agent.to_owned());
-        let url = with_po_token(raw_url, &self.config.youtube_po_token);
+        let url = with_po_token(raw_url, pot);
         if let Some(len) = probe_len {
             probe_tail_byte(self.agent, &url, &headers, len)?;
         }
@@ -762,7 +834,8 @@ impl<'a> Catalog<'a> {
         mut open: impl FnMut(String, BTreeMap<String, String>) -> Result<T, SourceError>,
     ) -> Result<T, SourceError> {
         let (mut first, mut stream_error, mut skip_recent) = (None, None, None);
-        let no_pot = self.config.youtube_po_token.trim().is_empty();
+        let (pot, _) = self.configured_auth();
+        let no_pot = pot.is_empty();
 
         if let Some(state) = self.state {
             let key = self.stream_key(video_id);
@@ -776,6 +849,7 @@ impl<'a> Catalog<'a> {
                         cached.url.clone(),
                         cached.headers.clone(),
                         &cached.user_agent,
+                        &pot,
                         need_probe.then_some(cached.content_length),
                     )
                     .and_then(|(url, headers)| {
@@ -822,6 +896,7 @@ impl<'a> Catalog<'a> {
                             format.url,
                             format.headers,
                             &client.user_agent,
+                            &pot,
                             need_probe.then_some(format.content_length),
                         )
                         .and_then(|(url, headers)| open(url, headers));
@@ -852,7 +927,29 @@ impl<'a> Catalog<'a> {
 
     #[cfg(test)]
     fn player_body(&self, video_id: &str) -> Value {
-        serde_json::to_value(self.player_request(video_id)).expect("valid player request")
+        let (pot, vd) = self.effective_credentials(false);
+        let req = self.player_request(video_id);
+        let client = visionos_client();
+        serde_json::to_value(RequestEnvelope {
+            context: RequestContext {
+                client: ClientIdentity {
+                    client_name: client.name,
+                    client_version: client.version.as_ref(),
+                    hl: "en",
+                    gl: "US",
+                    visitor_data: vd.trim(),
+                    android_sdk_version: client.sdk,
+                    device_make: client.device_make,
+                    device_model: client.device_model,
+                    os_name: client.os_name,
+                    os_version: client.os_version,
+                },
+            },
+            service_integrity_dimensions: (!pot.is_empty())
+                .then_some(IntegrityDimensions { po_token: pot.trim() }),
+            body: &req,
+        })
+        .expect("valid player request")
     }
 
     pub fn player(&self, client: &Client, video_id: &str) -> Result<Option<Format>, SourceError> {
@@ -1557,6 +1654,33 @@ mod tests {
             .player_body("dQw4w9WgXcQ")
             .get("serviceIntegrityDimensions")
             .is_none());
+
+        // Combined `<visitorData>:<poToken>` and JSON `{"poToken":...,"visitorData":...}`
+        // are parsed cleanly and promote ANDROID right behind VISIONOS.
+        assert_eq!(
+            parse_pot_pair("CgtVisitor==:MnSPoToken==", ""),
+            ("MnSPoToken==".to_owned(), "CgtVisitor==".to_owned())
+        );
+        assert_eq!(
+            parse_pot_pair(r#"{"poToken":"MnSJson","visitorData":"CgtJson"}"#, ""),
+            ("MnSJson".to_owned(), "CgtJson".to_owned())
+        );
+        let pot_names: Vec<_> = clients(&config).into_iter().map(|c| c.name).collect();
+        assert_eq!(pot_names, ["VISIONOS", "ANDROID", "IOS_PRODUCER", "ANDROID_VR"]);
+
+        // Search calls also forward `serviceIntegrityDimensions.poToken` when configured.
+        let (s_base, s_srv) = test_http::serve(1, |_, headers, body| {
+            assert!(headers.starts_with("POST /youtubei/v1/search?prettyPrint=false "));
+            assert!(headers.to_ascii_lowercase().contains("x-goog-visitor-id: visitor-fixture"));
+            assert_eq!(
+                body.pointer("/serviceIntegrityDimensions/poToken").and_then(Value::as_str),
+                Some("player-token-fixture")
+            );
+            json!({"contents": []})
+        });
+        config.youtube_endpoint = s_base;
+        assert!(Catalog::new(&agent, &config).search("song", 1).unwrap().is_empty());
+        s_srv.join().unwrap();
     }
 
     #[test]

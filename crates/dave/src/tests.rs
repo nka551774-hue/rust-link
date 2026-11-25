@@ -165,7 +165,8 @@ fn own_initial_commit_is_interoperable_and_waits_for_execute() {
     let host = Host::new();
     let (mut session, key_package) = host.session(ALICE);
     assert!(KeyPackageIn::tls_deserialize_exact_bytes(&key_package).is_ok());
-    assert!(MlsMessageIn::tls_deserialize_exact_bytes(&key_package).is_err());
+    // Bare KeyPackage carries cipher_suite=0x0002 at bytes 2..4, never MlsMessage wire_format=0x0005.
+    assert_eq!(&key_package[..4], &[0x00, 0x01, 0x00, 0x02]);
     let mut peer = host.peer(BOB);
     let proposal = host.add_peer(0, &mut peer);
     let ready = welcome_peer(&mut session, &proposal, 7, &mut peer);

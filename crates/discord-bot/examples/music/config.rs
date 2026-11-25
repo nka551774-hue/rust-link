@@ -10,6 +10,8 @@ pub struct Config {
     pub token: String,
     pub password: String,
     pub rustlink_url: String,
+    pub youtube_po_token: String,
+    pub youtube_visitor_data: String,
     pub guilds: Option<HashSet<String>>,
     pub volume: i64,
     pub max_queue: usize,
@@ -22,6 +24,14 @@ impl std::fmt::Debug for Config {
             .field("token", &"<redacted>")
             .field("password", &"<redacted>")
             .field("rustlink_url", &self.rustlink_url)
+            .field(
+                "youtube_po_token",
+                &if self.youtube_po_token.is_empty() { "" } else { "<redacted>" },
+            )
+            .field(
+                "youtube_visitor_data",
+                &if self.youtube_visitor_data.is_empty() { "" } else { "<redacted>" },
+            )
             .field("guilds", &self.guilds)
             .field("volume", &self.volume)
             .field("max_queue", &self.max_queue)
@@ -76,6 +86,12 @@ impl Config {
             token: required("DISCORD_BOT_TOKEN")?,
             password: required("RUSTLINK_PASSWORD")?,
             rustlink_url: get("RUSTLINK_URL").unwrap_or_else(|| "http://127.0.0.1:2333".into()),
+            youtube_po_token: get("RUSTLINK_YOUTUBE_PO_TOKEN")
+                .or_else(|| get("YOUTUBE_PO_TOKEN"))
+                .unwrap_or_default(),
+            youtube_visitor_data: get("RUSTLINK_YOUTUBE_VISITOR_DATA")
+                .or_else(|| get("YOUTUBE_VISITOR_DATA"))
+                .unwrap_or_default(),
             guilds,
             volume: number("BOT_DEFAULT_VOLUME", 100, 0, 200)?,
             max_queue: number("BOT_MAX_QUEUE", 100, 1, 1000)? as usize,

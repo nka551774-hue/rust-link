@@ -252,6 +252,36 @@ impl Service {
         )
     }
 
+    /// Hot-reloads YouTube `poToken` and `visitorData` in memory without restarting
+    /// the node or dropping active voice players, flushing cached YouTube state.
+    pub fn set_youtube_tokens(
+        &self,
+        po_token: impl Into<String>,
+        visitor_data: impl Into<String>,
+    ) -> Result<(bool, bool), SourceError> {
+        let raw_pot = po_token.into();
+        let raw_vd = visitor_data.into();
+        let (pot, vd) = innertube::parse_pot_pair(&raw_pot, &raw_vd);
+        if pot.bytes().any(|b| b <= 0x1f || b == 0x7f) || pot.chars().any(char::is_control) {
+            return Err(SourceError::Url(
+                "youtubePoToken must not contain control characters".into(),
+            ));
+        }
+        if !vd.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+            return Err(SourceError::Url(
+                "youtubeVisitorData must contain only printable ASCII characters".into(),
+            ));
+        }
+        let has_pot = !pot.is_empty();
+        let has_vd = !vd.is_empty();
+        *lock(&self.catalog_state.youtube_auth) =
+            Some(catalog::YoutubeAuth { po_token: pot, visitor_data: vd });
+        self.catalog_state.youtube_streams.clear();
+        self.catalog_state.youtube_health.clear();
+        lock(&self.cache).clear();
+        Ok((has_pot, has_vd))
+    }
+
     pub fn cache_hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
@@ -1119,5 +1149,33 @@ mod tests {
         assert!(gate.enter(Instant::now()).is_err());
         drop(first);
         assert!(gate.enter(deadline).is_ok());
+    }
+
+    #[test]
+    fn set_youtube_tokens_hot_reloads_auth_and_flushes_cached_entries() {
+        let (base, server) = test_http::serve(1, |_, headers, body| {
+            assert!(headers.to_ascii_lowercase().contains("x-goog-visitor-id: cgthot=="));
+            assert_eq!(
+                body.pointer("/serviceIntegrityDimensions/poToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("MnSHot==")
+            );
+            serde_json::json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {"videoId": "dQw4w9WgXcQ", "title": "Hot Reloaded", "lengthSeconds": "213"}
+            })
+        });
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        let service = Service::new(cfg);
+        assert!(matches!(service.load("just some words").unwrap(), LoadResult::Empty));
+        assert_eq!(service.set_youtube_tokens("CgtHot==:MnSHot==", "").unwrap(), (true, true));
+        assert!(service.set_youtube_tokens("bad\ncontrol", "").is_err());
+        let LoadResult::Track(track) = service.load("dQw4w9WgXcQ").unwrap() else {
+            panic!("expected track");
+        };
+        server.join().unwrap();
+        assert_eq!(track.metadata.title, "Hot Reloaded");
     }
 }

@@ -108,6 +108,15 @@ impl Cache {
         let entry = self.take_slot(index);
         self.entries.remove(&entry.key);
     }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.slots.clear();
+        self.vacant.clear();
+        self.first = None;
+        self.last = None;
+        self.bytes = 0;
+    }
 }
 
 pub(super) fn result_size(result: &LoadResult) -> Option<usize> {

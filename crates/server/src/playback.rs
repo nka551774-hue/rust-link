@@ -15,6 +15,15 @@ pub trait Loader: Send + Sync {
     }
 
     fn open(&self, track: &Track) -> Result<Box<dyn std::io::Read + Send>, SourceError>;
+
+    fn set_youtube_tokens(
+        &self,
+        po_token: String,
+        visitor_data: String,
+    ) -> Result<(bool, bool), SourceError> {
+        let (pot, vd) = (po_token.trim(), visitor_data.trim());
+        Ok((!pot.is_empty(), !vd.is_empty() || (!pot.contains("://") && pot.contains(':'))))
+    }
 }
 
 impl Loader for rustlink_source::Service {
@@ -28,6 +37,14 @@ impl Loader for rustlink_source::Service {
 
     fn open(&self, track: &Track) -> Result<Box<dyn std::io::Read + Send>, SourceError> {
         rustlink_source::Service::open(self, track)
+    }
+
+    fn set_youtube_tokens(
+        &self,
+        po_token: String,
+        visitor_data: String,
+    ) -> Result<(bool, bool), SourceError> {
+        rustlink_source::Service::set_youtube_tokens(self, po_token, visitor_data)
     }
 }
 

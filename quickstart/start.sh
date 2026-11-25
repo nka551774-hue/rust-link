@@ -37,6 +37,10 @@ ENV_TOKEN=${DISCORD_BOT_TOKEN:-}
 ENV_PASSWORD=${RUSTLINK_PASSWORD:-}
 ENV_PORT=${RUSTLINK_PORT:-}
 ENV_PROXY=${RUSTLINK_YOUTUBE_PROXY-__unset__}
+ENV_POT=${RUSTLINK_YOUTUBE_PO_TOKEN-__unset__}
+ENV_VD=${RUSTLINK_YOUTUBE_VISITOR_DATA-__unset__}
+
+yaml_single() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
 
 reuse=0
 if [ -z "$ENV_TOKEN" ] && [ -f "$CONFIG" ] && [ -f "$ENV_FILE" ]; then
@@ -57,8 +61,9 @@ else
         PASSWORD=${ENV_PASSWORD:-$(saved RUSTLINK_PASSWORD)}
         [ -n "$PASSWORD" ] || PASSWORD=$(gen_password)
         PORT=${ENV_PORT:-2333}
-        PROXY=
-        [ "$ENV_PROXY" = "__unset__" ] || PROXY=$ENV_PROXY
+        PROXY=; [ "$ENV_PROXY" = "__unset__" ] || PROXY=$ENV_PROXY
+        PO_TOKEN=; [ "$ENV_POT" = "__unset__" ] || PO_TOKEN=$ENV_POT
+        VISITOR_DATA=; [ "$ENV_VD" = "__unset__" ] || VISITOR_DATA=$ENV_VD
     else
         if [ -n "$ENV_PASSWORD" ]; then
             PASSWORD=$ENV_PASSWORD
@@ -81,6 +86,18 @@ else
             read -r -p "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]: " PROXY
             PROXY=${PROXY:-$warp}
         fi
+        if [ "$ENV_POT" != "__unset__" ]; then
+            PO_TOKEN=$ENV_POT
+        else
+            read -r -p 'YouTube PO token (empty = none): ' PO_TOKEN
+        fi
+        if [ "$ENV_VD" != "__unset__" ]; then
+            VISITOR_DATA=$ENV_VD
+        elif [ -n "$PO_TOKEN" ]; then
+            case $PO_TOKEN in \{* | *:*) VISITOR_DATA= ;; *) read -r -p 'YouTube visitorData (empty = auto): ' VISITOR_DATA ;; esac
+        else
+            VISITOR_DATA=
+        fi
     fi
 
     case $PASSWORD in *[\"\\]* | *[[:space:]]*) fail 'password cannot contain quotes, backslashes or spaces' ;; esac
@@ -99,6 +116,8 @@ else
     {
         printf 'address: 127.0.0.1:%s\npassword: "%s"\nlogLevel: info\nlogDirectory: logs\ntoolsDirectory: .tools\nautoDownload: true\n' "$PORT" "$PASSWORD"
         [ -z "$PROXY" ] || printf 'youtubeProxy: "%s"\n' "$PROXY"
+        [ -z "$PO_TOKEN" ] || printf 'youtubePoToken: %s\n' "$(yaml_single "$PO_TOKEN")"
+        [ -z "$VISITOR_DATA" ] || printf 'youtubeVisitorData: %s\n' "$(yaml_single "$VISITOR_DATA")"
     } > "$CONFIG"
     printf 'DISCORD_BOT_TOKEN=%s\nRUSTLINK_PASSWORD=%s\nRUSTLINK_URL=http://127.0.0.1:%s\n' "$TOKEN" "$PASSWORD" "$PORT" > "$ENV_FILE"
     echo "Settings saved to $DATA"
@@ -106,6 +125,7 @@ fi
 
 export RUSTLINK_PASSWORD="$PASSWORD" RUSTLINK_ADDRESS="127.0.0.1:$PORT"
 export DISCORD_BOT_TOKEN="$TOKEN" RUSTLINK_URL="http://127.0.0.1:$PORT"
+unset RUSTLINK_YOUTUBE_PO_TOKEN RUSTLINK_YOUTUBE_VISITOR_DATA RUSTLINK_YOUTUBE_PROXY
 
 for p in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do
     [ -d "$p" ] && case :$PATH: in *:"$p":*) ;; *) PATH="$PATH:$p" ;; esac

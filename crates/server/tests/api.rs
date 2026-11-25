@@ -716,6 +716,12 @@ async fn rust_client_drives_the_real_http_and_event_contract() {
     let session = client.create_session("123", 60).await.unwrap();
     let mut events = session.events().await.unwrap();
     assert_eq!(events.next().await.unwrap().unwrap()["type"], "session.ready");
+    let yt = client.set_youtube_tokens("CgtVisitor==:MnSPoToken==", "").await.unwrap();
+    assert_eq!(
+        (yt["po_token_configured"].as_bool(), yt["visitor_data_configured"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert!(!yt.to_string().contains("MnSPoToken"));
     let track = client.resolve("song").await.unwrap().track().unwrap();
     assert_eq!(client.inspect(&track.token).await.unwrap(), track);
     assert!(client.lyrics(&track.token).await.unwrap().is_none());

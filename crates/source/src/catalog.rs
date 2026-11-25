@@ -25,6 +25,19 @@ const YOUTUBE_STREAM_EXPIRY_MARGIN_SECS: u64 = 120;
 const CLIENT_COOLDOWN_BASE: Duration = Duration::from_secs(30);
 const CLIENT_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 
+/// Runtime override for YouTube `poToken` and `visitorData`, wiped on drop.
+pub(crate) struct YoutubeAuth {
+    pub po_token: String,
+    pub visitor_data: String,
+}
+
+impl Drop for YoutubeAuth {
+    fn drop(&mut self) {
+        wipe_string(&mut self.po_token);
+        wipe_string(&mut self.visitor_data);
+    }
+}
+
 /// Long-lived provider credentials, YouTube stream cache, and client health state.
 #[derive(Default)]
 pub struct State {
@@ -33,6 +46,7 @@ pub struct State {
     pub(crate) youtube_visitor: Arc<CredentialCache>,
     pub(crate) youtube_streams: Arc<YoutubeStreamCache>,
     pub(crate) youtube_health: Arc<YoutubeClientHealth>,
+    pub(crate) youtube_auth: Mutex<Option<YoutubeAuth>>,
 }
 
 fn wipe_string(secret: &mut String) {
@@ -137,6 +151,10 @@ impl YoutubeStreamCache {
     pub(crate) fn invalidate(&self, key: &YoutubeStreamKey) {
         lock(&self.entries).remove(key);
     }
+
+    pub(crate) fn clear(&self) {
+        lock(&self.entries).clear();
+    }
 }
 
 struct ClientHealthSlot {
@@ -209,6 +227,10 @@ impl YoutubeClientHealth {
             }
         }
         ordered.try_into().unwrap_or_else(|_| unreachable!())
+    }
+
+    pub(crate) fn clear(&self) {
+        lock(&self.slots).clear();
     }
 }
 

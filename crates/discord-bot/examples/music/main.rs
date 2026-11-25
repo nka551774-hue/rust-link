@@ -69,6 +69,12 @@ async fn run() -> Result<(), Failure> {
             }
         }
     }
+    if !config.youtube_po_token.is_empty() || !config.youtube_visitor_data.is_empty() {
+        rustlink
+            .set_youtube_tokens(&config.youtube_po_token, &config.youtube_visitor_data)
+            .await
+            .map_err(|e| format!("failed to push YouTube PO token to Rustlink: {e}"))?;
+    }
 
     let rest = Arc::new(DiscordRest::new(config.token.clone())?);
     let (gateway, ready, message_content) =

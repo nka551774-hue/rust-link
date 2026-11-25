@@ -76,11 +76,12 @@ enum Route {
     CreateSession,
     GetSession,
     DeleteSession,
+    UpdateYoutube,
     Root,
 }
 
 impl Route {
-    const COUNT: usize = 18;
+    const COUNT: usize = 19;
     const BUDGETS: [(f64, usize); Self::COUNT] = [
         (5.0, 10),   // Info
         (2.0, 5),    // Stats
@@ -99,6 +100,7 @@ impl Route {
         (5.0, 10),   // CreateSession
         (20.0, 40),  // GetSession
         (10.0, 20),  // DeleteSession
+        (2.0, 5),    // UpdateYoutube
         (2.0, 5),    // Root
     ];
 }
@@ -325,6 +327,7 @@ impl Server {
             .route("/api/v1/tracks/resolve", post(load_tracks))
             .route("/api/v1/tracks/inspect", post(decode_track_route))
             .route("/api/v1/tracks/inspect-batch", post(decode_tracks))
+            .route("/api/v1/youtube", axum::routing::patch(update_youtube))
             .route("/api/v1/lyrics", post(lyrics_for_track))
             .route(
                 "/api/v1/sessions/{session_id}/players/{guild_id}/lyrics",
@@ -945,6 +948,39 @@ async fn read_track_body(server: &Server, body: Body, path: &str) -> Result<Trac
     let request: TokenRequest = read_body_json(server, body, SINGLE_TOKEN_BODY_LIMIT, path).await?;
     decode_track_owned(request.token)
         .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YoutubeTokensRequest {
+    #[serde(default, alias = "poToken")]
+    po_token: String,
+    #[serde(default, alias = "visitorData")]
+    visitor_data: String,
+}
+
+#[allow(clippy::result_large_err)]
+async fn update_youtube(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
+    let path = "/api/v1/youtube";
+    server.rate_limit(Route::UpdateYoutube, path)?;
+    let req: YoutubeTokensRequest = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
+    let (po_token_configured, visitor_data_configured) = server
+        .deps
+        .loader
+        .set_youtube_tokens(req.po_token, req.visitor_data)
+        .map_err(|e| server.fail(StatusCode::BAD_REQUEST, &e.to_string(), path))?;
+    log::info!(
+        "youtube runtime credentials updated poToken={} visitorData={}",
+        po_token_configured,
+        visitor_data_configured
+    );
+    Ok(server.json(
+        StatusCode::OK,
+        json!({
+            "po_token_configured": po_token_configured,
+            "visitor_data_configured": visitor_data_configured,
+        }),
+    ))
 }
 
 #[allow(clippy::result_large_err)]

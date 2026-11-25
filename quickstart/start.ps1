@@ -72,6 +72,8 @@ if ($reuse) {
         if (-not $Password) { $Password = New-RandomPassword }
         $Port = if ($env:RUSTLINK_PORT) { $env:RUSTLINK_PORT.Trim() } else { '2333' }
         $Proxy = if ($null -ne $env:RUSTLINK_YOUTUBE_PROXY) { $env:RUSTLINK_YOUTUBE_PROXY.Trim() } else { '' }
+        $PoToken = if ($null -ne $env:RUSTLINK_YOUTUBE_PO_TOKEN) { $env:RUSTLINK_YOUTUBE_PO_TOKEN.Trim() } else { '' }
+        $VisitorData = if ($null -ne $env:RUSTLINK_YOUTUBE_VISITOR_DATA) { $env:RUSTLINK_YOUTUBE_VISITOR_DATA.Trim() } else { '' }
     } else {
         $Password = if ($env:RUSTLINK_PASSWORD) { $env:RUSTLINK_PASSWORD } else { Read-Secret 'Node password (empty = generate one)' }
         if (-not $Password) { $Password = New-RandomPassword }
@@ -87,6 +89,12 @@ if ($reuse) {
             $Proxy = (Read-Host "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]").Trim()
             if (-not $Proxy) { $Proxy = $warp }
         }
+        $PoToken = if ($null -ne $env:RUSTLINK_YOUTUBE_PO_TOKEN) { $env:RUSTLINK_YOUTUBE_PO_TOKEN.Trim() } else { (Read-Host 'YouTube PO token (empty = none)').Trim() }
+        $VisitorData = if ($null -ne $env:RUSTLINK_YOUTUBE_VISITOR_DATA) {
+            $env:RUSTLINK_YOUTUBE_VISITOR_DATA.Trim()
+        } elseif ($PoToken -and $PoToken -notmatch ':' -and -not $PoToken.StartsWith('{')) {
+            (Read-Host 'YouTube visitorData (empty = auto)').Trim()
+        } else { '' }
     }
 
     if ($Password -match '["\\\s]' -or $Password.Length -lt 8) { Fail 'password must be >= 8 characters without quotes, backslashes or spaces' }
@@ -95,10 +103,14 @@ if ($reuse) {
     if ($Proxy -match '["\\\s]') { Fail 'proxy cannot contain quotes, backslashes or spaces' }
     if ($Proxy -and $Proxy -notmatch '^(https?|socks4a?|socks5h?)://') { Fail 'proxy must start with http://, https://, socks4://, socks4a://, socks5:// or socks5h://' }
 
-    $proxyLine = if ($Proxy) { "youtubeProxy: `"$Proxy`"" } else { '' }
+    $extraYaml = @()
+    if ($Proxy) { $extraYaml += "youtubeProxy: `"$Proxy`"" }
+    if ($PoToken) { $extraYaml += "youtubePoToken: '$($PoToken.Replace(`"'`", `"''`"))'" }
+    if ($VisitorData) { $extraYaml += "youtubeVisitorData: '$($VisitorData.Replace(`"'`", `"''`"))'" }
+    $extraBlock = if ($extraYaml.Count -gt 0) { ($extraYaml -join "`n") + "`n" } else { '' }
     [IO.Directory]::CreateDirectory($Data) | Out-Null
     $utf8 = New-Object Text.UTF8Encoding $false
-    [IO.File]::WriteAllText($ConfigFile, "address: 127.0.0.1:$Port`npassword: `"$Password`"`nlogLevel: info`nlogDirectory: logs`ntoolsDirectory: .tools`nautoDownload: true`n$proxyLine`n", $utf8)
+    [IO.File]::WriteAllText($ConfigFile, "address: 127.0.0.1:$Port`npassword: `"$Password`"`nlogLevel: info`nlogDirectory: logs`ntoolsDirectory: .tools`nautoDownload: true`n$extraBlock", $utf8)
     [IO.File]::WriteAllText($EnvFile, "DISCORD_BOT_TOKEN=$Token`nRUSTLINK_PASSWORD=$Password`nRUSTLINK_URL=http://127.0.0.1:$Port`n", $utf8)
     Write-Host "Settings saved to $Data"
 }
@@ -108,6 +120,7 @@ $env:RUSTLINK_ADDRESS = "127.0.0.1:$Port"
 $env:DISCORD_BOT_TOKEN = $Token
 $env:RUSTLINK_URL = "http://127.0.0.1:$Port"
 $env:RUSTLINK_NO_PAUSE = '1'
+Remove-Item Env:RUSTLINK_YOUTUBE_PO_TOKEN, Env:RUSTLINK_YOUTUBE_VISITOR_DATA, Env:RUSTLINK_YOUTUBE_PROXY -ErrorAction SilentlyContinue
 
 $msysRoot = if ($env:RUSTLINK_MSYS2_ROOT) { $env:RUSTLINK_MSYS2_ROOT } else { 'C:\msys64' }
 $bash = Join-Path $msysRoot 'usr\bin\bash.exe'

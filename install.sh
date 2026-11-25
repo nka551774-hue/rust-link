@@ -18,6 +18,9 @@ ADDRESS_SET=0
 PORT_SET=0
 PASSWORD=${RUSTLINK_PASSWORD:-}
 BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+PO_TOKEN=${RUSTLINK_YOUTUBE_PO_TOKEN:-}
+VISITOR_DATA=${RUSTLINK_YOUTUBE_VISITOR_DATA:-}
+YOUTUBE_PROXY=${RUSTLINK_YOUTUBE_PROXY:-}
 WITH_BOT=0
 NATIVE=0
 BUILD=1
@@ -37,6 +40,9 @@ usage() {
         "  --password VALUE   node password (prefer RUSTLINK_PASSWORD env var)" \
         "  --bot-token VALUE  Discord bot token; implies --with-bot (prefer DISCORD_BOT_TOKEN)" \
         "  --with-bot         build and deploy rustlink-bot.service alongside rustlink.service" \
+        "  --po-token VALUE   YouTube PO token (or RUSTLINK_YOUTUBE_PO_TOKEN)" \
+        "  --visitor-data VAL YouTube visitorData (or RUSTLINK_YOUTUBE_VISITOR_DATA)" \
+        "  --youtube-proxy U  YouTube proxy URL (or RUSTLINK_YOUTUBE_PROXY)" \
         "  --native           build with -C target-cpu=native" \
         "  --no-build         install existing binaries from target/release" \
         "  --no-service       install files without touching systemd" \
@@ -59,6 +65,9 @@ while [ $# -gt 0 ]; do
         --password) [ $# -ge 2 ] || die "--password needs a value"; PASSWORD=$2; shift 2 ;;
         --bot-token) [ $# -ge 2 ] || die "--bot-token needs a value"; BOT_TOKEN=$2; WITH_BOT=1; shift 2 ;;
         --with-bot) WITH_BOT=1; shift ;;
+        --po-token) [ $# -ge 2 ] || die "--po-token needs a value"; PO_TOKEN=$2; shift 2 ;;
+        --visitor-data) [ $# -ge 2 ] || die "--visitor-data needs a value"; VISITOR_DATA=$2; shift 2 ;;
+        --youtube-proxy) [ $# -ge 2 ] || die "--youtube-proxy needs a value"; YOUTUBE_PROXY=$2; shift 2 ;;
         --native) NATIVE=1; shift ;;
         --no-build) BUILD=0; shift ;;
         --no-service) SERVICE=0; shift ;;
@@ -237,6 +246,23 @@ write_config() {
     chmod 0640 "$DIRECTORY/config.yaml"
 }
 
+set_yaml_single() {
+    local file=$1 key=$2 val=$3 sq esc
+    sq="'$(printf '%s' "$val" | sed "s/'/''/g")'"
+    esc=$(sed_replacement "$sq")
+    if grep -q "^${key}:" "$file"; then
+        sed -i -e "s|^${key}:.*|${key}: ${esc}|" "$file"
+    else
+        printf '\n%s: %s\n' "$key" "$sq" >>"$file"
+    fi
+}
+
+apply_youtube_settings() {
+    [ -z "$PO_TOKEN" ] || set_yaml_single "$DIRECTORY/config.yaml" youtubePoToken "$PO_TOKEN"
+    [ -z "$VISITOR_DATA" ] || set_yaml_single "$DIRECTORY/config.yaml" youtubeVisitorData "$VISITOR_DATA"
+    [ -z "$YOUTUBE_PROXY" ] || set_yaml_single "$DIRECTORY/config.yaml" youtubeProxy "$YOUTUBE_PROXY"
+}
+
 set_password() {
     local esc_pw
     esc_pw=$(sed_replacement "$PASSWORD")
@@ -403,12 +429,14 @@ main() {
     if [ -f "$DIRECTORY/config.yaml" ]; then
         note "preserving existing $DIRECTORY/config.yaml"
         [ -z "$PASSWORD" ] || set_password
+        apply_youtube_settings
     else
         if [ -z "$PASSWORD" ]; then
             PASSWORD=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
             GENERATED_PASSWORD=$PASSWORD
         fi
         write_config
+        apply_youtube_settings
     fi
     [ "$INSTALL_BOT" = 1 ] && write_bot_env
 

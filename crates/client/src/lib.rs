@@ -254,6 +254,20 @@ impl Client {
         self.request_optional(Method::POST, "lyrics", Some(&TokenBody { token })).await
     }
 
+    /// Hot-reloads YouTube `poToken` and `visitorData` on the node without restarting it.
+    pub async fn set_youtube_tokens(
+        &self,
+        po_token: &str,
+        visitor_data: &str,
+    ) -> Result<Value, Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            po_token: &'a str,
+            visitor_data: &'a str,
+        }
+        self.patch_json("youtube", &Body { po_token, visitor_data }).await
+    }
+
     pub async fn create_session(
         &self,
         bot_id: &str,
