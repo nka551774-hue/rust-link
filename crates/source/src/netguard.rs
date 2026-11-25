@@ -19,14 +19,17 @@ use crate::{deadline, SourceError};
 /// Credentials are refused because they are a way to hide the real destination
 /// from a log, and because nothing the node streams needs them.
 pub fn validate_url(raw: &str) -> Result<(), SourceError> {
-    let Some((scheme, rest)) = raw.split_once("://") else {
-        return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
-    };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    if raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\') {
         return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') {
+    let Ok(url) = url::Url::parse(raw) else {
+        return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
     }
     Ok(())
@@ -114,11 +117,10 @@ fn is_public_v6(address: Ipv6Addr) -> bool {
 #[derive(Debug)]
 struct GuardedResolver {
     allow_private: bool,
-    /// The operator's own proxy, which is exempt because it usually listens
-    /// on this machine. A proxy that resolves names itself (http, socks5h)
-    /// also resolves the targets, which this guard cannot see; socks5 leaves
-    /// that resolution here, so targets are still checked.
-    proxy: Option<ureq::http::uri::Authority>,
+    /// The operator's own proxy `(host, port)`, which is exempt because it
+    /// usually listens on this machine. Stored without userinfo so authenticated
+    /// local proxies match the host URI ureq resolves.
+    proxy: Option<(String, Option<u16>)>,
 }
 
 impl Resolver for GuardedResolver {
@@ -130,7 +132,11 @@ impl Resolver for GuardedResolver {
     ) -> Result<ResolvedSocketAddrs, Error> {
         let addresses =
             DefaultResolver::default().resolve(uri, config, bounded_timeout(timeout)?)?;
-        if self.allow_private || (self.proxy.is_some() && uri.authority() == self.proxy.as_ref()) {
+        let is_proxy = self.proxy.as_ref().is_some_and(|(proxy_host, proxy_port)| {
+            uri.host().is_some_and(|host| host.eq_ignore_ascii_case(proxy_host))
+                && (*proxy_port == uri.port_u16() || proxy_port.is_none())
+        });
+        if self.allow_private || is_proxy {
             return Ok(addresses);
         }
         let mut allowed = Resolver::empty(&DefaultResolver::default());
@@ -217,7 +223,10 @@ pub fn proxied_agent(allow_private: bool, proxy: &str) -> Result<Agent, SourceEr
 }
 
 fn build(allow_private: bool, proxy: Option<ureq::Proxy>) -> Agent {
-    let exempt = proxy.as_ref().and_then(|proxy| proxy.uri().authority().cloned());
+    let exempt = proxy.as_ref().and_then(|proxy| {
+        let uri = proxy.uri();
+        Some((uri.host()?.to_ascii_lowercase(), uri.port_u16()))
+    });
     let config = Agent::config_builder()
         .accept_encoding("identity")
         .timeout_connect(Some(std::time::Duration::from_secs(10)))

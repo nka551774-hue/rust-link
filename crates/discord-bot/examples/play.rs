@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let session = rustlink.create_session(&ready.user_id, 60).await?;
     let mut rustlink_events = session.events().await?;
-    let event_task = tokio::spawn(async move {
+    let mut event_task = tokio::spawn(async move {
         while let Some(event) = rustlink_events.next().await? {
             println!("rustlink event: {event}");
         }
@@ -48,6 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
+                break;
+            }
+            ended = &mut event_task => {
+                ended??;
                 break;
             }
             event = gateway.next_event() => {

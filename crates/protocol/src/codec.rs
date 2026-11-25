@@ -31,18 +31,34 @@ fn validate(info: &TrackInfo) -> Result<(), CodecError> {
     Ok(())
 }
 
-pub fn encode_track(info: &TrackInfo) -> Result<Track, CodecError> {
+fn encode_token(info: &TrackInfo) -> Result<String, CodecError> {
     validate(info)?;
     let json = serde_json::to_vec(info).map_err(|_| CodecError::Invalid)?;
     if json.len() > (MAX_ENCODED_TRACK - PREFIX.len()) / 4 * 3 {
         return Err(CodecError::TextTooLong);
     }
-    Ok(Track::new(format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(json)), info.clone()))
+    let mut token = String::with_capacity(PREFIX.len() + json.len().div_ceil(3) * 4);
+    token.push_str(PREFIX);
+    URL_SAFE_NO_PAD.encode_string(&json, &mut token);
+    Ok(token)
+}
+
+pub fn encode_track(info: &TrackInfo) -> Result<Track, CodecError> {
+    let token = encode_token(info)?;
+    Ok(Track::new(token, info.clone()))
+}
+
+pub fn encode_track_owned(info: TrackInfo) -> Result<Track, CodecError> {
+    let token = encode_token(&info)?;
+    Ok(Track::new(token, info))
 }
 
 pub fn decode_track(token: &str) -> Result<Track, CodecError> {
     if token.len() > MAX_ENCODED_TRACK {
         return Err(CodecError::TextTooLong);
+    }
+    if token.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(CodecError::Invalid);
     }
     let payload = token.strip_prefix(PREFIX).ok_or(CodecError::UnsupportedVersion)?;
     let json = URL_SAFE_NO_PAD.decode(payload).map_err(|_| CodecError::Invalid)?;
@@ -71,9 +87,13 @@ mod tests {
     fn unicode_metadata_roundtrips() {
         let info = sample();
         let track = encode_track(&info).unwrap();
+        let owned = encode_track_owned(info.clone()).unwrap();
+        assert_eq!(track, owned);
         assert!(track.token.starts_with(PREFIX));
         assert_eq!(decode_track(&track.token).unwrap(), track);
         assert_eq!(track.metadata, info);
+        assert_eq!(decode_track(&format!(" {}", track.token)), Err(CodecError::Invalid));
+        assert_eq!(decode_track(&format!("{}\n", track.token)), Err(CodecError::Invalid));
     }
     #[test]
     fn rejects_legacy_unknown_malformed_and_oversized_tokens() {

@@ -10,7 +10,8 @@ use zeroize::Zeroizing;
 use crate::{Error, Result};
 
 pub(crate) struct MediaSender {
-    next_secret: Zeroizing<Vec<u8>>,
+    next_secret: Zeroizing<[u8; 32]>,
+    secret_len: u8,
     cipher: Option<Box<Aes128Gcm>>,
     next_generation: u64,
     frame: u64,
@@ -18,7 +19,17 @@ pub(crate) struct MediaSender {
 
 impl MediaSender {
     pub(crate) fn new(secret: Vec<u8>) -> Self {
-        Self { next_secret: Zeroizing::new(secret), cipher: None, next_generation: 0, frame: 0 }
+        let secret = Zeroizing::new(secret);
+        assert!(secret.len() <= 32, "MLS exporter secret exceeds 32 bytes");
+        let mut next_secret = Zeroizing::new([0u8; 32]);
+        next_secret[..secret.len()].copy_from_slice(&secret);
+        Self {
+            next_secret,
+            secret_len: secret.len() as u8,
+            cipher: None,
+            next_generation: 0,
+            frame: 0,
+        }
     }
 
     pub(crate) fn encrypt(&mut self, opus: &[u8]) -> Result<Vec<u8>> {
@@ -38,12 +49,16 @@ impl MediaSender {
         }
         while self.next_generation <= generation {
             let generation = self.next_generation as u32;
-            let key = expand(&self.next_secret, b"key", generation, 16);
-            self.cipher = Some(Box::new(
-                Aes128Gcm::new_from_slice(&key)
-                    .map_err(|_| Error::Protocol("invalid media key"))?,
-            ));
-            self.next_secret = expand(&self.next_secret, b"secret", generation, 32);
+            let secret = &self.next_secret[..self.secret_len as usize];
+            let key = expand(secret, b"key", generation, 16);
+            let cipher = Aes128Gcm::new_from_slice(&key[..16])
+                .map_err(|_| Error::Protocol("invalid media key"))?;
+            match &mut self.cipher {
+                Some(slot) => **slot = cipher,
+                None => self.cipher = Some(Box::new(cipher)),
+            }
+            self.next_secret = expand(secret, b"secret", generation, 32);
+            self.secret_len = 32;
             self.next_generation += 1;
         }
         let truncated = self.frame as u32;
@@ -78,20 +93,23 @@ impl MediaSender {
 
 // RFC 9420 ExpandWithLabel, using one HKDF-Expand block (all outputs <= 32).
 // MLS variable-length vectors shorter than 64 bytes use a single length byte.
-fn expand(secret: &[u8], label: &[u8], generation: u32, length: u16) -> Zeroizing<Vec<u8>> {
-    let mut info = Vec::with_capacity(32);
-    info.extend_from_slice(&length.to_be_bytes());
-    info.push((8 + label.len()) as u8);
-    info.extend_from_slice(b"MLS 1.0 ");
-    info.extend_from_slice(label);
-    info.push(4);
-    info.extend_from_slice(&generation.to_be_bytes());
-    info.push(1); // first HKDF block
+fn expand(secret: &[u8], label: &[u8], generation: u32, length: u16) -> Zeroizing<[u8; 32]> {
+    debug_assert!(label.len() <= 15 && length <= 32);
+    let mut info = [0u8; 32];
+    info[..2].copy_from_slice(&length.to_be_bytes());
+    info[2] = (8 + label.len()) as u8;
+    info[3..11].copy_from_slice(b"MLS 1.0 ");
+    let label_end = 11 + label.len();
+    info[11..label_end].copy_from_slice(label);
+    info[label_end] = 4;
+    info[label_end + 1..label_end + 5].copy_from_slice(&generation.to_be_bytes());
+    info[label_end + 5] = 1; // first HKDF block
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(&info);
-    let block = Zeroizing::new(mac.finalize().into_bytes().to_vec());
-    Zeroizing::new(block[..length as usize].to_vec())
+    mac.update(&info[..label_end + 6]);
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -102,7 +120,7 @@ mod tests {
     fn ratchet_matches_the_independent_dave_reference_vector() {
         let secret = [206, 221, 97, 177, 184, 161, 202, 105, 4, 101, 84, 40, 44, 247, 11, 123];
         assert_eq!(
-            &*expand(&secret, b"key", 0, 16),
+            &expand(&secret, b"key", 0, 16)[..16],
             &[117, 48, 249, 169, 148, 94, 45, 46, 6, 208, 101, 31, 123, 42, 134, 75]
         );
     }

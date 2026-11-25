@@ -145,10 +145,10 @@ tokio::task_local! {
     static REMOTE: Option<std::net::IpAddr>;
 }
 
-/// The limit key for the caller: its address, with an IPv6 address reduced to
-/// its /64, because one host usually controls the whole prefix.
+/// The limit key for the caller: its address, with IPv4-mapped IPv6 addresses
+/// canonicalized to IPv4 and native IPv6 addresses reduced to their /64.
 fn remote_key() -> String {
-    match REMOTE.try_with(|remote| *remote).ok().flatten() {
+    match REMOTE.try_with(|remote| remote.map(|ip| ip.to_canonical())).ok().flatten() {
         Some(std::net::IpAddr::V4(address)) => address.to_string(),
         Some(std::net::IpAddr::V6(address)) => {
             let segments = address.segments();
@@ -158,16 +158,43 @@ fn remote_key() -> String {
     }
 }
 
-/// The key a session's budget is kept under: the session ID in the path, or
-/// `node` for a route that is not about one session. Only a caller that has
-/// already authenticated can choose it, and the table is bounded either way.
-fn session_key(path: &str) -> &str {
-    path.split_once("/sessions/")
+/// The key a session's budget is kept under: the session ID in the path (with
+/// ASCII percent-encoding normalized so `%61` and `a` share one bucket), or
+/// `node` for a route that is not about one session.
+fn session_key(path: &str) -> std::borrow::Cow<'_, str> {
+    let Some(raw) = path
+        .split_once("/sessions/")
         .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
         .filter(|id| !id.is_empty())
-        // Cut on a character boundary: a raw multi-byte character in the path
-        // would make a byte cut panic.
-        .map_or("node", |id| id.char_indices().nth(64).map_or(id, |(end, _)| &id[..end]))
+    else {
+        return std::borrow::Cow::Borrowed("node");
+    };
+    if !raw.contains('%') {
+        let trimmed = raw.char_indices().nth(64).map_or(raw, |(end, _)| &raw[..end]);
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len().min(192));
+    let mut index = 0;
+    while index < bytes.len() && decoded.len() < 256 {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) =
+                ((bytes[index + 1] as char).to_digit(16), (bytes[index + 2] as char).to_digit(16))
+            {
+                decoded.push(((hi << 4) | lo) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    let text = String::from_utf8_lossy(&decoded);
+    if text.is_empty() {
+        return std::borrow::Cow::Borrowed("node");
+    }
+    let owned: String = text.chars().take(64).collect();
+    std::borrow::Cow::Owned(owned)
 }
 
 pub struct Server {
@@ -294,8 +321,11 @@ impl Server {
         log::info!("Rustlink listening address={address} version={VERSION}");
         // The request log names the client, so the peer address has to travel
         // with the request.
+        let closer = Arc::clone(&self);
         let routes = self.router().into_make_service_with_connect_info::<std::net::SocketAddr>();
-        axum::serve(listener, routes).with_graceful_shutdown(shutdown).await
+        let result = axum::serve(listener, routes).with_graceful_shutdown(shutdown).await;
+        closer.close();
+        result
     }
 
     /// Stops every session and ends every track. The node does not come back
@@ -476,7 +506,7 @@ impl Server {
             }
             return Err(self.fail(StatusCode::UNAUTHORIZED, "invalid authorization", path));
         }
-        if limited && !self.limits.allow_authenticated(route, session_key(path)) {
+        if limited && !self.limits.allow_authenticated(route, &session_key(path)) {
             return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
         }
         Ok(())
@@ -579,9 +609,15 @@ impl Server {
 }
 
 /// Compares two secrets without letting the time taken say how much of one
-/// matched.
+/// matched or whether the candidate length matched `expected`.
 fn same(given: &[u8], expected: &[u8]) -> bool {
-    given.len() == expected.len() && bool::from(given.ct_eq(expected))
+    let len_eq = (given.len() as u64).ct_eq(&(expected.len() as u64));
+    let mut diff = 0u8;
+    for (index, &exp) in expected.iter().enumerate() {
+        let got = given.get(index).copied().unwrap_or(0);
+        diff |= got ^ exp;
+    }
+    bool::from(len_eq & diff.ct_eq(&0))
 }
 
 fn now_millis() -> i64 {
@@ -798,6 +834,9 @@ async fn lyrics_for_player(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if !rustlink_voice::valid_id(&guild_id) {
+        return server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path);
+    }
     let Some(player) = session.player(&guild_id) else {
         return server.fail(StatusCode::NOT_FOUND, "player not found", path);
     };
@@ -838,6 +877,9 @@ async fn get_player(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if !rustlink_voice::valid_id(&guild_id) {
+        return server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path);
+    }
     let Some(player) = session.player(&guild_id) else {
         return server.fail(StatusCode::NOT_FOUND, "player not found", path);
     };
@@ -977,6 +1019,9 @@ async fn delete_player(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if !rustlink_voice::valid_id(&guild_id) {
+        return server.fail(StatusCode::BAD_REQUEST, "invalid guild ID", path);
+    }
     let gate = session.update_gate(&guild_id);
     let _serialized = gate.lock().await;
     if let Some(player) = session.remove(&guild_id) {
@@ -1040,24 +1085,48 @@ async fn create_session(
         );
     }
     let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    let mut sessions = server.sessions.lock().unwrap();
-    if server.closed.load(Ordering::SeqCst) || sessions.len() >= server.config.max_sessions as usize
-    {
+    let mut expired_sessions = Vec::new();
+    let response_body = {
+        let mut sessions = server.sessions.lock().unwrap();
+        if sessions.len() >= server.config.max_sessions as usize {
+            let expired_ids: Vec<String> = sessions
+                .values()
+                .filter(|session| session.expired())
+                .map(|session| session.id.clone())
+                .collect();
+            for expired_id in expired_ids {
+                if let Some(session) = sessions.remove(&expired_id) {
+                    expired_sessions.push(session);
+                }
+            }
+        }
+        if server.closed.load(Ordering::SeqCst)
+            || sessions.len() >= server.config.max_sessions as usize
+        {
+            None
+        } else {
+            let session = Session::new(
+                id.clone(),
+                request.bot_id,
+                Arc::downgrade(&server),
+                server.config.event_buffer as usize,
+            );
+            session.update(Some(true), request.resume_timeout_secs);
+            let body = session.snapshot();
+            sessions.insert(id.clone(), session);
+            Some(body)
+        }
+    };
+    for session in expired_sessions {
+        session.destroy();
+    }
+    let Some(body) = response_body else {
         return server.fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "session capacity reached or server shutting down",
             path,
         );
-    }
-    let session = Session::new(
-        id.clone(),
-        request.bot_id,
-        Arc::downgrade(&server),
-        server.config.event_buffer as usize,
-    );
-    session.update(Some(true), request.resume_timeout_secs);
-    let body = session.snapshot();
-    sessions.insert(id.clone(), session);
+    };
     let mut response = server.json(StatusCode::CREATED, body);
     response
         .headers_mut()
@@ -1248,8 +1317,8 @@ impl Server {
             .await,
             Ok(Ok(()))
         ) {
-            self.detach(&session);
             session.restore_inbox(inbox);
+            self.detach(&session);
             return;
         }
         let (sink, mut stream) = socket.split();
@@ -1286,10 +1355,10 @@ impl Server {
             Some(result) => result,
             None => writer.await,
         };
-        self.detach(&session);
         if let Ok(inbox) = result {
             session.restore_inbox(inbox);
         }
+        self.detach(&session);
     }
 
     /// Detaches a socket from its session. A session that asked to be resumed
@@ -1439,7 +1508,11 @@ impl Server {
         if !self.sample_cpu().await {
             return;
         }
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = self.shutdown_requested() => return,
@@ -1491,17 +1564,33 @@ impl Server {
                     if request.is_none() {
                         return;
                     }
+                    if let Some(wait) = self.report_cooldown_remaining() {
+                        tokio::select! {
+                            _ = self.shutdown_requested() => return,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                        // Drain any coalesced signal arrived during the wait.
+                        let _ = reports.try_recv();
+                    }
                     self.report_player_state();
                 }
             }
         }
     }
 
+    fn report_cooldown_remaining(&self) -> Option<Duration> {
+        let latency = self.config.webhook.state_latency_seconds;
+        if self.deps.webhook.is_none() || latency < 1 {
+            return None;
+        }
+        let window = Duration::from_secs(latency as u64);
+        let last = *self.last_report.lock().unwrap();
+        last.and_then(|at| window.checked_sub(at.elapsed())).filter(|wait| !wait.is_zero())
+    }
+
     /// Posts the state of every player on the node. Clients keep receiving
     /// their own `player.updated` per session; this is the node-wide summary an
-    /// operator watches. Reports are spaced by the configured latency, and a
-    /// request that arrives sooner than that is dropped rather than queued, so
-    /// a busy node posts one on that interval and an idle one goes quiet.
+    /// operator watches. Reports are spaced by the configured latency.
     fn report_player_state(&self) {
         let latency = self.config.webhook.state_latency_seconds;
         if self.deps.webhook.is_none() || latency < 1 {
@@ -1589,9 +1678,23 @@ async fn write_loop(
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut previous_sent = server.counters.sent.load(Ordering::Relaxed);
     let mut previous_deficit = server.counters.deficit.load(Ordering::Relaxed);
+    if let Some(unsent) = session.take_unsent() {
+        if send_frame(&mut sink, Message::Text(unsent.to_string().into())).await.is_err() {
+            session.restore_unsent(unsent);
+            return inbox;
+        }
+    }
     loop {
         tokio::select! {
-            _ = session.stopped() => break,
+            _ = session.stopped() => {
+                while let Ok(event) = inbox.try_recv() {
+                    if send_frame(&mut sink, Message::Text(event.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = send_frame(&mut sink, Message::Close(None)).await;
+                break;
+            }
             command = control.recv() => match command {
                 Some(command) => if send_frame(&mut sink, command).await.is_err() { break },
                 None => break,
@@ -1599,6 +1702,7 @@ async fn write_loop(
             event = inbox.recv() => match event {
                 Some(event) => {
                     if send_frame(&mut sink, Message::Text(event.to_string().into())).await.is_err() {
+                        session.restore_unsent(event);
                         break;
                     }
                 }
@@ -1620,8 +1724,8 @@ async fn write_loop(
                 let sent = server.counters.sent.load(Ordering::Relaxed);
                 let deficit = server.counters.deficit.load(Ordering::Relaxed);
                 body["frames"] = json!({
-                    "sent": sent - previous_sent,
-                    "deficit": deficit - previous_deficit,
+                    "sent": sent.saturating_sub(previous_sent),
+                    "deficit": deficit.saturating_sub(previous_deficit),
                 });
                 previous_sent = sent;
                 previous_deficit = deficit;
@@ -1654,6 +1758,7 @@ mod tests {
     #[test]
     fn a_session_budget_is_keyed_by_the_session_in_the_path() {
         assert_eq!(session_key("/api/v1/sessions/abc123/players/42"), "abc123");
+        assert_eq!(session_key("/api/v1/sessions/%61bc123/players/42"), "abc123");
         assert_eq!(session_key("/api/v1/sessions/abc123"), "abc123");
         assert_eq!(session_key("/api/v1/sessions"), "node", "creating a session has none yet");
         assert_eq!(session_key("/api/v1/stats"), "node");
@@ -1674,6 +1779,7 @@ mod tests {
                 .block_on(REMOTE.scope(Some(address), async { remote_key() }))
         };
         assert_eq!(key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
         assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), key("2001:db8:1:2::1"));
         assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
         // Outside a request there is no address to key on.

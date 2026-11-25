@@ -4,7 +4,7 @@
 #
 #   install -d -o rustlink -g rustlink /opt/rustlink
 #   install -m 0755 rustlink /opt/rustlink/
-#   install -m 0644 config.yaml /opt/rustlink/
+#   install -m 0640 -o root -g rustlink config.yaml /opt/rustlink/
 #   install -m 0644 deploy/rustlink.service /etc/systemd/system/
 #   systemctl daemon-reload
 #   systemctl enable --now rustlink
@@ -19,7 +19,7 @@ Type=simple
 User=rustlink
 Group=rustlink
 WorkingDirectory=/opt/rustlink
-ExecStart=/opt/rustlink/rustlink
+ExecStart=/opt/rustlink/rustlink --config /opt/rustlink/config.yaml
 
 # A node that stops because of a bug comes back; one that was asked to stop
 # stays stopped, because a clean shutdown exits zero.

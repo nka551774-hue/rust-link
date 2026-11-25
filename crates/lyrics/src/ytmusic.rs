@@ -255,7 +255,12 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
     // Every line has to carry a cue for the answer to be the timed one. One line
     // without a cue means the catalogue has the words but not when they are
     // sung, which is still worth returning, as text.
-    let timed = lines.iter().all(|line| line.get("cueRange").is_some_and(|cue| !cue.is_null()));
+    let timed = lines.iter().all(|line| line.get("cueRange").is_some_and(|cue| !cue.is_null()))
+        && (lines.len() <= 1
+            || lines.iter().any(|line| {
+                millis(line.pointer("/cueRange/startTimeMilliseconds")) > 0
+                    || millis(line.pointer("/cueRange/endTimeMilliseconds")) > 0
+            }));
     if !timed {
         let words: Vec<&str> = lines
             .iter()
@@ -290,8 +295,8 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
 /// An answer with no run is the catalogue saying it has nothing, such as the
 /// message it sends for a track whose lyrics are not licensed.
 fn from_web(track: &Track, answer: &Value) -> Option<Lyrics> {
-    let shelf =
-        answer.pointer("/contents/sectionListRenderer/contents/0/musicDescriptionShelfRenderer")?;
+    let contents = answer.pointer("/contents/sectionListRenderer/contents")?.as_array()?;
+    let shelf = contents.iter().find_map(|item| item.get("musicDescriptionShelfRenderer"))?;
     let runs = shelf.pointer("/description/runs").and_then(Value::as_array)?;
     let text: String =
         runs.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect();

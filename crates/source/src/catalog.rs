@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
-use rustlink_protocol::{encode_track, LoadResult, Playlist, Track, TrackInfo};
+use rustlink_protocol::{encode_track_owned, LoadResult, Playlist, Track, TrackInfo};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -84,6 +84,13 @@ impl CredentialCache {
         self.held.lock().unwrap_or_else(|error| error.into_inner()).value =
             Some((value.clone(), Instant::now() + ttl));
         Ok(value)
+    }
+
+    fn invalidate_if(&self, stale: &str) {
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        if held.value.as_ref().is_some_and(|(current, _)| current == stale) {
+            held.value = None;
+        }
     }
 }
 
@@ -312,17 +319,28 @@ impl Spotify<'_> {
             return Err(SourceError::Url("Spotify pagination left the catalogue API".into()));
         }
         let token = self.token()?;
-        get_json(self.agent, &url, Some(&token))
+        match get_json(self.agent, &url, Some(&token)) {
+            Err(SourceError::Media { status: 401 }) => {
+                self.token.invalidate_if(&token);
+                let fresh = self.token()?;
+                get_json(self.agent, &url, Some(&fresh))
+            }
+            other => other,
+        }
     }
 
     /// Loads whatever a Spotify identifier names.
     pub fn load(&self, id: &str) -> Result<LoadResult, SourceError> {
         if let Some(query) = id.strip_prefix("spsearch:") {
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(LoadResult::Empty);
+            }
             let limit = self.config.search_results.min(10);
             let path = format!(
                 "/search?type=track&limit={limit}&market={}&q={}",
-                self.config.spotify_market,
-                encode_query(query.trim())
+                encode_query(self.config.spotify_market.trim()),
+                encode_query(query)
             );
             let answer = self.api(&path)?;
             let tracks: Vec<Track> = answer
@@ -484,7 +502,7 @@ impl Spotify<'_> {
             source_name: "spotify".into(),
             ..Default::default()
         };
-        Some(encode_track(&info).unwrap_or_else(|_| Track::new(String::new(), info)))
+        encode_track_owned(info).ok()
     }
 }
 // ---------------------------------------------------------------------------
@@ -536,9 +554,13 @@ impl Deezer<'_> {
     /// Loads whatever a Deezer identifier names.
     pub fn load(&self, id: &str) -> Result<LoadResult, SourceError> {
         if let Some(query) = id.strip_prefix("dzsearch:") {
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(LoadResult::Empty);
+            }
             let limit = self.config.search_results.min(25);
             let answer =
-                self.api(&format!("/search/track?limit={limit}&q={}", encode_query(query.trim())))?;
+                self.api(&format!("/search/track?limit={limit}&q={}", encode_query(query)))?;
             let tracks = self.list_tracks(answer)?;
             if tracks.is_empty() {
                 return Ok(LoadResult::Empty);
@@ -546,7 +568,11 @@ impl Deezer<'_> {
             return Ok(LoadResult::Search(tracks));
         }
         if let Some(isrc) = id.strip_prefix("dzisrc:") {
-            let answer = self.api(&format!("/track/isrc:{}", encode_query(isrc.trim())))?;
+            let isrc = isrc.trim();
+            if isrc.is_empty() {
+                return Ok(LoadResult::Empty);
+            }
+            let answer = self.api(&format!("/track/isrc:{}", encode_query(isrc)))?;
             if answer.get("error").is_some() {
                 return Ok(LoadResult::Empty);
             }
@@ -604,17 +630,28 @@ impl Deezer<'_> {
         let mut tracks = Vec::new();
         let mut next = Some(path.to_string());
         let mut pages = 0;
-        while let Some(path) = next.take() {
+        let base_str = self.config.deezer_api_endpoint.trim_end_matches('/');
+        let base =
+            url::Url::parse(base_str).map_err(|error| SourceError::Url(error.to_string()))?;
+        let base_prefix = base.path().trim_end_matches('/');
+        while let Some(raw_next) = next.take() {
             // The next link comes from the response; never follow it off the API.
-            let base = self.config.deezer_api_endpoint.trim_end_matches('/');
-            let path = match path.strip_prefix(base) {
-                Some(rest) if rest.starts_with('/') => rest.to_string(),
-                _ if path.starts_with('/') => path,
-                _ => {
-                    return Err(SourceError::Url("Deezer pagination left the catalogue API".into()))
-                }
-            };
-            let answer = self.api(&path)?;
+            if raw_next.starts_with("//") {
+                return Err(SourceError::Url("Deezer pagination left the catalogue API".into()));
+            }
+            let full =
+                if raw_next.starts_with('/') { format!("{base_str}{raw_next}") } else { raw_next };
+            let parsed = crate::http_url(&full).ok_or_else(|| {
+                SourceError::Url("Deezer pagination left the catalogue API".into())
+            })?;
+            if parsed.origin() != base.origin()
+                || (!base_prefix.is_empty()
+                    && !parsed.path().starts_with(&format!("{base_prefix}/")))
+                || parsed.fragment().is_some()
+            {
+                return Err(SourceError::Url("Deezer pagination left the catalogue API".into()));
+            }
+            let answer = get_json(self.agent, parsed.as_str(), None)?;
             next = answer.get("next").and_then(Value::as_str).map(str::to_string);
             tracks.extend(self.list_tracks(answer)?);
             pages += 1;
@@ -627,6 +664,7 @@ impl Deezer<'_> {
     }
 
     fn parse(&self, id: &str) -> Result<(String, String), SourceError> {
+        let id = crate::identifier_text(id);
         // The key is spliced into an API path, so only Deezer's numeric ids pass.
         let valid = |kind: &str, key: &str| {
             matches!(kind, "track" | "album" | "playlist")
@@ -689,7 +727,7 @@ impl Deezer<'_> {
             source_name: "deezer".into(),
             ..Default::default()
         };
-        Some(encode_track(&info).unwrap_or_else(|_| Track::new(String::new(), info)))
+        encode_track_owned(info).ok()
     }
 }
 // ---------------------------------------------------------------------------
@@ -761,15 +799,29 @@ impl SoundCloud<'_> {
         let base = self.config.soundcloud_api_endpoint.trim_end_matches('/');
         let separator = if path.contains('?') { '&' } else { '?' };
         let url = format!("{base}{path}{separator}client_id={}", encode_query(&client));
-        get_json(self.agent, &url, None)
+        match get_json(self.agent, &url, None) {
+            Err(SourceError::Media { status: 401 | 403 })
+                if self.config.soundcloud_client_id.trim().is_empty() =>
+            {
+                self.client_id.invalidate_if(&client);
+                let fresh = self.client_id()?;
+                let url = format!("{base}{path}{separator}client_id={}", encode_query(&fresh));
+                get_json(self.agent, &url, None)
+            }
+            other => other,
+        }
     }
 
     /// Loads a SoundCloud search, track or playlist.
     pub fn load(&self, id: &str) -> Result<LoadResult, SourceError> {
         if let Some(query) = id.strip_prefix("scsearch:") {
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(LoadResult::Empty);
+            }
             let limit = self.config.search_results.min(20);
-            let answer = self
-                .api(&format!("/search/tracks?q={}&limit={limit}", encode_query(query.trim())))?;
+            let answer =
+                self.api(&format!("/search/tracks?q={}&limit={limit}", encode_query(query)))?;
             let list: SoundCloudList = serde_json::from_value(answer)
                 .map_err(|error| SourceError::Http(error.to_string()))?;
             let tracks: Vec<Track> =
@@ -897,18 +949,27 @@ impl SoundCloud<'_> {
             source_name: "soundcloud".into(),
             ..Default::default()
         };
-        Some(encode_track(&info).unwrap_or_else(|_| Track::new(String::new(), info)))
+        encode_track_owned(info).ok()
     }
 }
 
 /// Turns a SoundCloud identifier or URL into the page URL the API resolves.
 fn soundcloud_key(id: &str) -> String {
-    let trimmed = id.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return trimmed.to_string();
+    let trimmed = crate::identifier_text(id);
+    if let Some(url) = crate::http_url(trimmed) {
+        if url.host_str().is_some_and(|host| crate::host_matches(host, "soundcloud.com")) {
+            return url.into();
+        }
+        return String::new();
     }
     if let Some(rest) = trimmed.strip_prefix("soundcloud:") {
-        return format!("https://soundcloud.com/{rest}");
+        let rest = rest.trim().trim_start_matches('/');
+        if !rest.is_empty()
+            && !rest.bytes().any(|b| b <= b' ' || b == 0x7f || b == b'\\' || b == b'@')
+            && !rest.split('/').any(|seg| seg == "..")
+        {
+            return format!("https://soundcloud.com/{rest}");
+        }
     }
     String::new()
 }

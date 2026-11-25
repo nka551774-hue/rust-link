@@ -147,18 +147,38 @@ pub fn fatal(message: &str, error: &str) -> ! {
 }
 
 /// Keeps the last line readable when it was written into a window that closes
-/// with the process, which is the window a double-clicked binary gets.
+/// with the process, which is the window a double-clicked Windows binary gets.
 ///
-/// A node that was given a flag was typed at a prompt, and one without a
-/// terminal is a service or a container: neither has a window to hold open.
+/// A node given CLI flags, `RUSTLINK_NO_PAUSE`, a non-terminal stdin, a Unix
+/// shell, or an existing parent console session exits immediately without blocking.
 fn hold_console() {
-    if std::env::args().len() > 1 || !std::io::stdin().is_terminal() {
+    if std::env::args().len() > 1
+        || std::env::var_os("RUSTLINK_NO_PAUSE").is_some()
+        || !std::io::stdin().is_terminal()
+        || !owns_ephemeral_console()
+    {
         return;
     }
     println!();
     println!("press Enter to close");
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
+}
+
+#[cfg(windows)]
+fn owns_ephemeral_console() -> bool {
+    extern "system" {
+        fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
+    }
+    let mut pids = [0u32; 2];
+    // SAFETY: `pids` points to two writable `u32` slots matching `dwProcessCount = 2`.
+    let attached = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) };
+    attached == 1
+}
+
+#[cfg(not(windows))]
+fn owns_ephemeral_console() -> bool {
+    false
 }
 
 /// The logger the crates write to.
@@ -238,7 +258,7 @@ impl Files {
     /// that stays up for weeks does not grow one file forever.
     fn write(&mut self, format: Format, label: &str, message: &str, at: DateTime<Local>) {
         let day = at.format("%Y-%m-%d").to_string();
-        if day != self.day {
+        if day > self.day {
             // Keeping the previous file when the new day cannot be opened is
             // the lesser loss: a misnamed log beats no log.
             if let Ok(handle) = open_day(&self.directory, &day) {
@@ -262,11 +282,14 @@ impl Files {
 
 fn open_day(directory: &Path, day: &str) -> Result<File, String> {
     let path = directory.join(format!("{FILE_PREFIX}{day}.log"));
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("log file {}: {error}", path.display()))
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o640);
+    }
+    options.open(&path).map_err(|error| format!("log file {}: {error}", path.display()))
 }
 
 /// Deletes the daily files older than the retention window.
@@ -279,7 +302,8 @@ fn prune(directory: &Path, retention: u32) {
     if retention == 0 {
         return;
     }
-    let Some(cutoff) = Local::now().date_naive().checked_sub_days(Days::new(u64::from(retention)))
+    let Some(cutoff) =
+        Local::now().date_naive().checked_sub_days(Days::new(u64::from(retention - 1)))
     else {
         return;
     };
@@ -304,7 +328,8 @@ fn logged_day(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
 }
 
-/// One console line: the time, the level and the message.
+/// One console line: the time, the level and the message (with raw control and
+/// escape characters neutralized so remote metadata cannot inject ANSI codes).
 fn console_line(
     label: &str,
     color: &str,
@@ -312,13 +337,20 @@ fn console_line(
     at: DateTime<Local>,
     colored: bool,
 ) -> String {
+    let clean: std::borrow::Cow<'_, str> = if message.chars().any(|c| c < ' ' || c == '\x7f') {
+        std::borrow::Cow::Owned(
+            message.chars().map(|c| if c < ' ' || c == '\x7f' { ' ' } else { c }).collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
     let time = at.format(CONSOLE_TIME).to_string();
     if !colored {
-        return format!("{time} {label:<5} {message}\n");
+        return format!("{time} {label:<5} {clean}\n");
     }
     let padded = format!("{label:<5}");
     format!(
-        "{dim}{time}{reset} {color}{padded}{reset} {bold}{message}{reset}\n",
+        "{dim}{time}{reset} {color}{padded}{reset} {bold}{clean}{reset}\n",
         dim = paint::DIM,
         reset = paint::RESET,
         color = color,

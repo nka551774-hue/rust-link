@@ -66,11 +66,9 @@ impl<T> Patch<T> {
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let v = Option::<Value>::deserialize(d)?;
-        match v {
+        match Option::<T>::deserialize(d)? {
             None => Ok(Patch::Null),
-            Some(Value::Null) => Ok(Patch::Null),
-            Some(other) => T::deserialize(other).map(Patch::Value).map_err(de::Error::custom),
+            Some(v) => Ok(Patch::Value(v)),
         }
     }
 }

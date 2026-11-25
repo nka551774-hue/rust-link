@@ -19,6 +19,10 @@ unsafe impl GlobalAlloc for CountAlloc {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc_zeroed(layout) }
+    }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }

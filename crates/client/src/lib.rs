@@ -12,7 +12,9 @@ use reqwest::{Method, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest, protocol::WebSocketConfig, Message,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -141,6 +143,7 @@ impl Client {
         bot_id: &str,
         resume_timeout_secs: u32,
     ) -> Result<Session, Error> {
+        validate_snowflake(bot_id, "bot ID")?;
         let info: SessionInfo = self
             .request(
                 Method::POST,
@@ -190,6 +193,17 @@ fn validate_session_id(id: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_snowflake(id: &str, label: &str) -> Result<(), Error> {
+    if id.is_empty()
+        || id.len() > 20
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+        || id.parse::<u64>().map_or(true, |value| value == 0)
+    {
+        return Err(Error::Invalid(format!("{label} must be a nonzero Discord snowflake")));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
@@ -215,12 +229,7 @@ impl Session {
         format!("sessions/{}", self.id)
     }
     fn player_path(&self, guild: &str) -> Result<String, Error> {
-        if guild.is_empty()
-            || !guild.bytes().all(|byte| byte.is_ascii_digit())
-            || guild.parse::<u64>().map_or(true, |id| id == 0)
-        {
-            return Err(Error::Invalid("guild ID must be a nonzero Discord snowflake".into()));
-        }
+        validate_snowflake(guild, "guild ID")?;
         Ok(format!("{}/players/{guild}", self.path()))
     }
     pub async fn info(&self) -> Result<SessionInfo, Error> {
@@ -350,12 +359,35 @@ impl Session {
             .map_err(|error| Error::Invalid(error.to_string()))?;
         auth.set_sensitive(true);
         request.headers_mut().insert("authorization", auth);
-        let (socket, _) = tokio::time::timeout(
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_RESPONSE_BYTES))
+            .max_frame_size(Some(MAX_RESPONSE_BYTES));
+        let connected = tokio::time::timeout(
             Duration::from_secs(15),
-            tokio_tungstenite::connect_async(request),
+            tokio_tungstenite::connect_async_with_config(request, Some(config), true),
         )
         .await
-        .map_err(|_| Error::Timeout)??;
+        .map_err(|_| Error::Timeout)?;
+        let (socket, _) = match connected {
+            Ok(pair) => pair,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                let status = response.status();
+                let body: Value = response
+                    .body()
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                    .unwrap_or(Value::Null);
+                return Err(Error::Api {
+                    status: status.as_u16(),
+                    code: body["error"]["code"].as_str().unwrap_or("http_error").into(),
+                    message: body["error"]["message"]
+                        .as_str()
+                        .unwrap_or(status.canonical_reason().unwrap_or("websocket upgrade failed"))
+                        .into(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(Events { socket })
     }
 }
@@ -372,7 +404,11 @@ impl Events {
             match message {
                 Some(Ok(Message::Text(text))) => return Ok(Some(serde_json::from_str(&text)?)),
                 // tungstenite queues the Pong automatically; flush it now.
-                Some(Ok(Message::Ping(_))) => self.socket.flush().await?,
+                Some(Ok(Message::Ping(_))) => {
+                    tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
+                        .await
+                        .map_err(|_| Error::Timeout)??;
+                }
                 Some(Ok(Message::Close(_))) | None => return Ok(None),
                 Some(Err(error)) => return Err(error.into()),
                 _ => {}
@@ -380,7 +416,9 @@ impl Events {
         }
     }
     pub async fn close(&mut self) -> Result<(), Error> {
-        self.socket.close(None).await?;
+        tokio::time::timeout(Duration::from_secs(10), self.socket.close(None))
+            .await
+            .map_err(|_| Error::Timeout)??;
         Ok(())
     }
 }

@@ -89,8 +89,10 @@ impl Provider for LRCLIB {
                     continue;
                 }
             };
-            if let Some(best) = best(&found, track.metadata.length) {
-                return build(track, best);
+            if let Some(picked) = best_for(&found, &title, &artist, track.metadata.length) {
+                if let Ok(lyrics) = build(track, picked) {
+                    return Ok(lyrics);
+                }
             }
         }
         match last {
@@ -243,22 +245,57 @@ fn bracketed(title: &str) -> String {
     parts.join(" ")
 }
 
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Picks the entry that is most likely to be the same recording.
 ///
 /// A search for a song returns covers and live takes as well, and the length is
 /// what tells them apart when the names are the same.
+#[cfg(test)]
 fn best(found: &[Entry], length: i64) -> Option<&Entry> {
+    best_for(found, "", "", length)
+}
+
+fn best_for<'a>(
+    found: &'a [Entry],
+    want_title: &str,
+    want_artist: &str,
+    length: i64,
+) -> Option<&'a Entry> {
+    let title_words = words(want_title);
+    let artist_words = words(want_artist);
     let mut best: Option<&Entry> = None;
     let mut best_score = -1;
     for entry in found {
-        if entry.synced_lyrics.trim().is_empty() && entry.plain_lyrics.trim().is_empty() {
+        let has_synced = !entry.synced_lyrics.trim().is_empty()
+            && !lrc::parse(entry.synced_lyrics.trim()).is_empty();
+        let has_plain = !entry.plain_lyrics.trim().is_empty();
+        if !has_synced && !has_plain {
             continue;
         }
+        if !title_words.is_empty() && !entry.track_name.trim().is_empty() {
+            let entry_title = words(&entry.track_name);
+            if !title_words.iter().any(|w| entry_title.contains(w)) {
+                continue;
+            }
+        }
         let mut score = 0;
+        if !artist_words.is_empty() && !entry.artist_name.trim().is_empty() {
+            let entry_artist = words(&entry.artist_name);
+            if artist_words.iter().any(|w| entry_artist.contains(w)) {
+                score += 2;
+            }
+        }
         if entry.instrumental {
             score -= 1;
         }
-        if !entry.synced_lyrics.trim().is_empty() {
+        if has_synced {
             score += 2;
         }
         if length > 0 && entry.duration != 0.0 {
@@ -354,7 +391,12 @@ const TRAILER: [&str; 21] = [
 /// only describe the video, the decoration and the list of who else is on the
 /// track are all dropped first.
 pub(crate) fn names(track: &Track) -> (String, String) {
-    let mut artist = track.metadata.author.trim().to_string();
+    let raw_artist = track.metadata.author.trim();
+    let mut artist = if raw_artist.eq_ignore_ascii_case("unknown artist") {
+        String::new()
+    } else {
+        raw_artist.to_string()
+    };
     let mut title = strip_symbols(&strip_title_noise(track.metadata.title.trim()));
     title = strip_featured(&title);
     title = strip_trailer(&title);
@@ -426,35 +468,54 @@ fn strip_symbols(text: &str) -> String {
 /// A bracket that is part of the song, such as a remix or a reprise, is left
 /// alone, because those words change what the lyrics are.
 fn strip_title_noise(title: &str) -> String {
-    let bytes = title.as_bytes();
+    const PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('【', '】'), ('（', '）')];
     let mut out = String::with_capacity(title.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let open = bytes[index];
-        if open != b'(' && open != b'[' {
-            // A multi-byte character is copied whole rather than byte by byte.
-            let rest = &title[index..];
-            let character = rest.chars().next().unwrap_or_default();
-            out.push(character);
-            index += character.len_utf8();
+    let mut rest = title;
+    while !rest.is_empty() {
+        let mut chars = rest.chars();
+        let ch = chars.next().unwrap();
+        let Some((_, close)) = PAIRS.iter().copied().find(|(open, _)| *open == ch) else {
+            out.push(ch);
+            rest = chars.as_str();
             continue;
-        }
-        let close = if open == b'(' { b')' } else { b']' };
-        let Some(end) = bytes[index..].iter().position(|byte| *byte == close) else {
-            out.push_str(&title[index..]);
+        };
+        let after_open = chars.as_str();
+        let Some(end) = after_open.find(close) else {
+            out.push_str(rest);
             break;
         };
-        if !contains_noise(&title[index + 1..index + end]) {
-            out.push_str(&title[index..index + end + 1]);
+        let inner = &after_open[..end];
+        let total = ch.len_utf8() + end + close.len_utf8();
+        if !contains_noise(inner) {
+            out.push_str(&rest[..total]);
+        } else {
+            out.push(' ');
         }
-        index += end + 1;
+        rest = &rest[total..];
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn contains_noise(text: &str) -> bool {
     let lower = text.to_lowercase();
-    NOISE.iter().any(|word| lower.contains(word))
+    if lower.contains("m/v") || lower.contains("color coded") {
+        return true;
+    }
+    for token in lower.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        for noise in NOISE {
+            if matches!(noise, "m/v" | "color coded") {
+                continue;
+            }
+            if noise.len() <= 3 {
+                if token == noise {
+                    return true;
+                }
+            } else if token.starts_with(noise) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -496,6 +557,10 @@ mod tests {
     fn a_bracket_that_is_part_of_the_song_is_kept() {
         let (_, title) = names(&track("A Song (Remix)", "Someone"));
         assert_eq!(title, "A Song (Remix)");
+        let (_, birthday) = names(&track("Song (Birthday Version)", "Someone"));
+        assert_eq!(birthday, "Song (Birthday Version)");
+        let (_, fullwidth) = names(&track("夜に駆ける【Official MV】", "YOASOBI"));
+        assert_eq!(fullwidth, "夜に駆ける");
     }
 
     #[test]
@@ -557,9 +622,17 @@ mod tests {
         let base = format!("http://{}/api", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut buffer = [0; 4096];
-            let read = socket.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
                 .unwrap();
@@ -581,8 +654,8 @@ mod tests {
     #[test]
     fn the_length_decides_between_recordings_of_the_same_name() {
         let found = vec![
-            Entry { duration: 60.0, synced_lyrics: "x".into(), ..Default::default() },
-            Entry { duration: 200.0, synced_lyrics: "x".into(), ..Default::default() },
+            Entry { duration: 60.0, synced_lyrics: "[00:01.00]x".into(), ..Default::default() },
+            Entry { duration: 200.0, synced_lyrics: "[00:01.00]x".into(), ..Default::default() },
         ];
         let picked = best(&found, 200_000).unwrap();
         assert_eq!(picked.duration, 200.0);
@@ -591,17 +664,21 @@ mod tests {
     #[test]
     fn an_unrepresentable_duration_cannot_be_scored_as_an_exact_match() {
         let found = vec![
-            Entry { synced_lyrics: "timed".into(), ..Default::default() },
+            Entry { synced_lyrics: "[00:01.00]timed".into(), ..Default::default() },
             Entry { duration: f64::MAX, plain_lyrics: "plain".into(), ..Default::default() },
         ];
         let picked = best(&found, i64::MAX).unwrap();
-        assert_eq!(picked.synced_lyrics, "timed");
+        assert_eq!(picked.synced_lyrics, "[00:01.00]timed");
     }
 
     #[test]
     fn an_invalid_duration_is_worse_than_a_nearby_valid_duration() {
         let found = vec![
-            Entry { duration: f64::NAN, synced_lyrics: "invalid".into(), ..Default::default() },
+            Entry {
+                duration: f64::NAN,
+                synced_lyrics: "[00:01.00]invalid".into(),
+                ..Default::default()
+            },
             Entry { duration: 202.5, plain_lyrics: "nearby".into(), ..Default::default() },
         ];
         let picked = best(&found, 200_000).unwrap();
@@ -613,13 +690,13 @@ mod tests {
         let found = vec![
             Entry {
                 instrumental: true,
-                synced_lyrics: "x".into(),
+                synced_lyrics: "[00:01.00]x".into(),
                 duration: 200.0,
                 ..Default::default()
             },
             Entry {
                 instrumental: false,
-                synced_lyrics: "x".into(),
+                synced_lyrics: "[00:01.00]x".into(),
                 duration: 200.0,
                 ..Default::default()
             },

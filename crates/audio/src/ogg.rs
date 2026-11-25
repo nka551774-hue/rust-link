@@ -6,6 +6,8 @@ use std::io::{self, Read};
 const PAGE_HEADER: usize = 27;
 /// Reject damaged packets before their storage can grow without bound.
 const MAX_PACKET: usize = 1 << 20;
+/// `OpusTags` may carry embedded cover art larger than an audio packet.
+const MAX_TAGS_PACKET: usize = 64 << 20;
 const READ_CHUNK: usize = 16 * 1024;
 
 struct PageState {
@@ -65,6 +67,11 @@ impl<R: Read> OggOpusReader<R> {
     /// The buffer is cleared before every packet and at EOF.
     pub fn next_packet_into(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
         loop {
+            if self.packets == 1 {
+                self.skip_opus_tags()?;
+                self.packets = 2;
+                continue;
+            }
             if !self.next_raw_packet_into(packet)? {
                 return Ok(false);
             }
@@ -76,10 +83,65 @@ impl<R: Read> OggOpusReader<R> {
                     self.drop_samples = pre_skip;
                     self.output_gain = output_gain;
                 }
-                2 if packet.starts_with(b"OpusTags") => {}
-                2 => return Err(io::Error::new(io::ErrorKind::InvalidData, "missing OpusTags")),
                 _ => return Ok(true),
             }
+        }
+    }
+
+    fn skip_opus_tags(&mut self) -> io::Result<()> {
+        let mut magic = [0u8; 8];
+        let mut magic_len = 0usize;
+        let mut total = 0usize;
+        self.packet_end_granule = None;
+        self.packet_page_end = None;
+        loop {
+            if self.page.is_none() {
+                if !self.have_page()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "missing OpusTags".chars().as_str(),
+                    ));
+                }
+                self.page = Some(self.read_page_header()?);
+            }
+            let page = self.page.as_mut().expect("a page was just read");
+            while page.next_segment < page.count {
+                let size = self.buffer[page.table + page.next_segment] as usize;
+                page.next_segment += 1;
+                let end = page.offset + size;
+                if end > self.buffer.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
+                }
+                total = total.saturating_add(size);
+                if total > MAX_TAGS_PACKET {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "OpusTags packet too large",
+                    ));
+                }
+                if magic_len < 8 {
+                    let take = (8 - magic_len).min(size);
+                    magic[magic_len..magic_len + take]
+                        .copy_from_slice(&self.buffer[page.offset..page.offset + take]);
+                    magic_len += take;
+                }
+                page.offset = end;
+                if size < 255 {
+                    self.consumed = page.offset;
+                    if page.end_of_stream && page.next_segment == page.last_complete {
+                        self.ended = true;
+                    }
+                    if page.next_segment >= page.count {
+                        self.page = None;
+                    }
+                    if magic_len < 8 || &magic != b"OpusTags" {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing OpusTags"));
+                    }
+                    return Ok(());
+                }
+            }
+            self.consumed = page.offset;
+            self.page = None;
         }
     }
 
@@ -146,6 +208,12 @@ impl<R: Read> OggOpusReader<R> {
             let available = self.buffer.len() - self.consumed;
             if available >= 4 && &self.buffer[self.consumed..self.consumed + 4] != b"OggS" {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ogg page"));
+            }
+            if available >= 5 && self.buffer[self.consumed + 4] != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported ogg page version",
+                ));
             }
             if available >= PAGE_HEADER {
                 let segments = self.buffer[self.consumed + 26] as usize;
@@ -407,5 +475,38 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2000);
+    }
+
+    #[test]
+    fn large_opus_tags_cover_art_over_one_mib_is_stream_skipped() {
+        let head = opus_head(312);
+        let mut stream = page(2, 0, &[head.len() as u8], &head);
+        // Build a 1.5 MiB OpusTags packet spanning ~25 full Ogg pages.
+        let mut tags = b"OpusTags".to_vec();
+        tags.resize((3 << 19) + 17, b'A');
+        let mut rest = tags.as_slice();
+        let mut seq = 1u32;
+        while !rest.is_empty() {
+            let max_page = 255 * 255;
+            if rest.len() > max_page {
+                stream.extend_from_slice(&page(
+                    if seq == 1 { 0 } else { 1 },
+                    seq,
+                    &[255; 255],
+                    &rest[..max_page],
+                ));
+                rest = &rest[max_page..];
+            } else {
+                let mut segs = vec![255u8; rest.len() / 255];
+                segs.push((rest.len() % 255) as u8);
+                stream.extend_from_slice(&page(if seq == 1 { 0 } else { 1 }, seq, &segs, rest));
+                rest = &[];
+            }
+            seq += 1;
+        }
+        stream.extend_from_slice(&page(4, seq, &[3], &[9, 8, 7]));
+        let mut reader = OggOpusReader::new(stream.as_slice());
+        assert_eq!(reader.next_packet().unwrap().unwrap(), vec![9, 8, 7]);
+        assert!(reader.next_packet().unwrap().is_none());
     }
 }

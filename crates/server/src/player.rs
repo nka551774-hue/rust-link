@@ -78,6 +78,10 @@ struct State {
     closed: bool,
     /// Whether a thread is currently pacing frames.
     running: bool,
+    /// Whether the active `Frames` implementation accepts live DSP updates.
+    live_filters: bool,
+    /// Pending in-place volume/filter update for the active pump thread.
+    pending_filters: Option<rustlink_audio::FilterSet>,
     /// Bumped whenever playback is stopped, so a thread that is still unwinding
     /// knows it is no longer the current one.
     generation: u64,
@@ -130,6 +134,8 @@ impl Player {
                 started: false,
                 closed: false,
                 running: false,
+                live_filters: false,
+                pending_filters: None,
                 generation: 0,
                 connection: None,
                 voice_generation: 0,
@@ -213,18 +219,49 @@ impl Player {
             }
         }
         let mut connect = None;
+        let mut to_close: Option<Arc<dyn Connection>> = None;
+        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
         let result = {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return Err(PlayerError::Destroyed);
             }
-            let mut restart = update.volume.is_some_and(|volume| volume.get() != state.body.volume)
-                || update.filters.as_ref().is_some_and(|filters| *filters != state.body.filters);
+            let ignore = no_replace && state.body.track.is_some();
+            let mut need_stop = false;
+            let next_volume = update.volume.map_or(state.body.volume, |v| v.get());
+            let next_filters = update.filters.as_ref().unwrap_or(&state.body.filters);
+            let settings_changed = update.volume.is_some_and(|v| v.get() != state.body.volume)
+                || update.filters.as_ref().is_some_and(|f| *f != state.body.filters);
+            let mut live_filter_update = None;
+            if settings_changed {
+                let old_set =
+                    rustlink_audio::parse_filters(&state.body.filters, state.body.volume).ok();
+                let new_set = rustlink_audio::parse_filters(next_filters, next_volume).ok();
+                if state.running
+                    && state.live_filters
+                    && old_set
+                        .as_ref()
+                        .zip(new_set.as_ref())
+                        .is_some_and(|(old, new)| old.effective_time() == new.effective_time())
+                {
+                    live_filter_update = new_set;
+                } else {
+                    need_stop = true;
+                }
+            }
             if changes_track && !ignore {
-                self.stop(&mut state);
+                need_stop = true;
+                live_filter_update = None;
                 if let Some(previous) = state.body.track.take() {
                     let reason = if track.is_some() { "replaced" } else { "stopped" };
-                    self.event("track.ended", json!({ "track": previous, "reason": reason }));
+                    events.push(("track.ended", json!({ "track": previous, "reason": reason })));
+                }
+                if let Some(next) = track.as_mut() {
+                    let mut initial = next.metadata.position.max(0);
+                    if next.metadata.length > 0 && initial > next.metadata.length {
+                        initial = next.metadata.length;
+                    }
+                    next.metadata.position = initial;
                 }
                 state.body.state.position = match &track {
                     Some(next) => next.metadata.position,
@@ -233,7 +270,6 @@ impl Player {
                 state.body.track = track;
                 state.started = false;
                 state.end_time = None;
-                restart = true;
             }
             if let Some(user_data) = &change.user_data {
                 if !ignore {
@@ -249,7 +285,10 @@ impl Player {
                         if current.metadata.length > 0 && target > current.metadata.length {
                             target = current.metadata.length;
                         }
-                        restart |= target != state.body.state.position;
+                        if target != state.body.state.position {
+                            need_stop = true;
+                            live_filter_update = None;
+                        }
                         state.body.state.position = target;
                     }
                 }
@@ -271,32 +310,39 @@ impl Player {
             if let Some(filters) = &update.filters {
                 state.body.filters = filters.clone();
             }
-            if restart {
-                self.stop(&mut state);
-            }
             if let Some(voice) = &update.voice {
                 // The channel being left is the one the previous voice state
                 // named, which the update has not overwritten yet.
                 let left = state.body.voice.channel_id.clone();
                 state.body.voice = voice.clone();
-                self.stop(&mut state);
-                if let Some(connection) = state.connection.take() {
-                    connection.close();
-                }
+                need_stop = true;
+                live_filter_update = None;
+                to_close = state.connection.take();
                 if let Some(task) = state.connecting.take() {
                     task.abort();
                 }
                 if state.voice_up {
                     state.voice_up = false;
-                    self.event("voice.disconnected", voice_fields(left.as_deref(), "replaced"));
+                    events.push(("voice.disconnected", voice_fields(left.as_deref(), "replaced")));
                 }
                 state.voice_generation += 1;
                 connect = Some((state.voice_generation, voice.clone()));
+            }
+            if need_stop {
+                self.stop(&mut state);
+            } else if let Some(set) = live_filter_update {
+                state.pending_filters = Some(set);
             }
             self.start(&mut state);
             self.wake.notify_all();
             self.snapshot_locked(&state)
         };
+        if let Some(connection) = to_close {
+            connection.close();
+        }
+        for (kind, payload) in events {
+            self.event(kind, payload);
+        }
         if let Some((generation, voice)) = connect {
             self.open_voice(generation, voice);
         }
@@ -307,11 +353,15 @@ impl Player {
     /// work and the runtime must stay free to answer other clients meanwhile.
     async fn resolve(&self, identifier: String) -> Result<Track, PlayerError> {
         let loader = self.deps.loader.clone();
-        let result = tokio::task::spawn_blocking(move || loader.load_shared(&identifier))
+        let trimmed = identifier.trim().to_owned();
+        let work = tokio::task::spawn_blocking(move || loader.load_shared(&trimmed));
+        let result = tokio::time::timeout(Duration::from_secs(30), work)
             .await
+            .map_err(|_| PlayerError::Invalid("the source did not answer in time".into()))?
             .map_err(|error| PlayerError::Invalid(error.to_string()))??;
         match result.as_ref() {
             LoadResult::Track(track) => Ok(track.as_ref().clone()),
+            LoadResult::Error(error) => Err(PlayerError::Invalid(error.message.clone())),
             _ => Err(PlayerError::NotATrack),
         }
     }
@@ -352,49 +402,60 @@ impl Player {
             }
             return;
         }
-        match result {
+        let pending_event = match result {
             Ok(connection) => {
                 // A connection that reports itself ready is the moment the bot
                 // is actually in the channel, which is what a listener wants to
                 // know; one that died while it was being opened never gets
                 // announced.
-                if connection.connected() {
+                let event = if connection.connected() {
                     state.voice_up = true;
                     let channel = state.body.voice.channel_id.clone();
-                    self.event("voice.connected", voice_fields(channel.as_deref(), ""));
-                }
+                    Some(("voice.connected", voice_fields(channel.as_deref(), "")))
+                } else {
+                    None
+                };
                 state.connection = Some(connection);
                 self.start(&mut state);
+                event
             }
-            Err(error) => {
-                self.event(
-                    "voice.closed",
-                    json!({ "code": 4000, "reason": error.to_string(), "by_remote": false }),
-                );
-            }
+            Err(error) => Some((
+                "voice.closed",
+                json!({ "code": 4000, "reason": error.to_string(), "by_remote": false }),
+            )),
+        };
+        drop(state);
+        if let Some((kind, payload)) = pending_event {
+            self.event(kind, payload);
         }
     }
     /// Reports a voice connection that ended, whichever side ended it.
     fn connection_closed(&self, generation: u64, closed: Closed) {
-        let mut state = self.state.lock().unwrap();
-        if state.closed || state.voice_generation != generation {
-            return;
+        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.closed || state.voice_generation != generation {
+                return;
+            }
+            self.stop(&mut state);
+            // The bot leaving is reported before the protocol event that explains
+            // the close, so a channel reads as a departure followed by its cause.
+            if state.voice_up {
+                state.voice_up = false;
+                let channel = state.body.voice.channel_id.clone();
+                let mut fields = voice_fields(channel.as_deref(), "closed");
+                fields["code"] = json!(closed.code);
+                fields["by_remote"] = json!(closed.by_remote);
+                events.push(("voice.disconnected", fields));
+            }
+            events.push((
+                "voice.closed",
+                json!({ "code": closed.code, "reason": closed.reason, "by_remote": closed.by_remote }),
+            ));
         }
-        self.stop(&mut state);
-        // The bot leaving is reported before the protocol event that explains
-        // the close, so a channel reads as a departure followed by its cause.
-        if state.voice_up {
-            state.voice_up = false;
-            let channel = state.body.voice.channel_id.clone();
-            let mut fields = voice_fields(channel.as_deref(), "closed");
-            fields["code"] = json!(closed.code);
-            fields["by_remote"] = json!(closed.by_remote);
-            self.event("voice.disconnected", fields);
+        for (kind, payload) in events {
+            self.event(kind, payload);
         }
-        self.event(
-            "voice.closed",
-            json!({ "code": closed.code, "reason": closed.reason, "by_remote": closed.by_remote }),
-        );
     }
 
     /// Stops pacing frames. The thread notices at its next frame, which is at
@@ -402,6 +463,8 @@ impl Player {
     fn stop(&self, state: &mut State) {
         state.generation += 1;
         state.running = false;
+        state.live_filters = false;
+        state.pending_filters = None;
         self.wake.notify_all();
         if let Some(connection) = state.connection.as_ref() {
             if connection.connected() {
@@ -424,6 +487,8 @@ impl Player {
         }
         state.generation += 1;
         state.running = true;
+        state.live_filters = false;
+        state.pending_filters = None;
         let generation = state.generation;
         let position = state.body.state.position;
         let volume = state.body.volume;
@@ -448,14 +513,22 @@ impl Player {
         filters: Object,
         connection: Arc<dyn Connection>,
     ) {
-        let frames = match self.deps.engine.start(&track, position, volume, &filters) {
+        let mut frames = match self.deps.engine.start(&track, position, volume, &filters) {
             Ok(frames) => frames,
             Err(error) => {
                 self.finish(generation, Some(error));
                 return;
             }
         };
-        let mut frames = frames;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation == generation && !state.closed {
+                state.live_filters = frames.supports_live_filters();
+                if let Some(pending) = state.pending_filters.take() {
+                    let _ = frames.set_filters(&pending);
+                }
+            }
+        }
         let mut output = VoiceOutput { connection: &connection, speaking: false };
         self.pump(generation, &mut frames, position, volume, &filters, &mut output);
         let state = self.state.lock().unwrap();
@@ -482,8 +555,9 @@ impl Player {
         let mut frame = Vec::new();
         loop {
             // Pause consumes neither source data nor playback time.
+            let mut pending_update = None;
             {
-                let state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap();
                 if state.generation != generation || state.closed {
                     return;
                 }
@@ -504,6 +578,12 @@ impl Player {
                     next = Instant::now();
                     continue;
                 }
+                if let Some(set) = state.pending_filters.take() {
+                    pending_update = Some(set);
+                }
+            }
+            if let Some(set) = pending_update {
+                let _ = frames.set_filters(&set);
             }
             match frames.next_frame(&mut frame) {
                 Ok(true) => {}
@@ -521,44 +601,50 @@ impl Player {
                 if !wait.is_zero() {
                     thread::sleep(wait);
                 }
-                let mut state = self.state.lock().unwrap();
-                if state.generation != generation || state.closed {
-                    return;
-                }
-                if state.end_time.is_some_and(|end| state.body.state.position >= end) {
-                    drop(state);
-                    self.finish(generation, None);
-                    return;
-                }
-                if state.body.paused {
-                    if output.speaking {
-                        let _ = output.connection.speaking(false);
-                        output.speaking = false;
+                let started_track = {
+                    let mut state = self.state.lock().unwrap();
+                    if state.generation != generation || state.closed {
+                        return;
                     }
-                    drop(state);
-                    self.wait(generation);
-                    next = Instant::now();
-                    continue;
-                }
-                if !output.speaking {
-                    if let Err(error) = output.connection.speaking(true) {
+                    if state.end_time.is_some_and(|end| state.body.state.position >= end) {
+                        drop(state);
+                        self.finish(generation, None);
+                        return;
+                    }
+                    if state.body.paused {
+                        if output.speaking {
+                            let _ = output.connection.speaking(false);
+                            output.speaking = false;
+                        }
+                        drop(state);
+                        self.wait(generation);
+                        next = Instant::now();
+                        continue;
+                    }
+                    if !output.speaking {
+                        if let Err(error) = output.connection.speaking(true) {
+                            drop(state);
+                            self.finish(generation, Some(AudioError::Transport(error.to_string())));
+                            return;
+                        }
+                        output.speaking = true;
+                    }
+                    if let Err(error) = output.connection.write(&frame) {
                         drop(state);
                         self.finish(generation, Some(AudioError::Transport(error.to_string())));
                         return;
                     }
-                    output.speaking = true;
-                }
-                if let Err(error) = output.connection.write(&frame) {
-                    drop(state);
-                    self.finish(generation, Some(AudioError::Transport(error.to_string())));
-                    return;
-                }
-                self.counters.sent.fetch_add(1, Ordering::Relaxed);
-                position += FRAME_MILLIS * tempo;
-                state.body.state.position = position as i64;
-                if !state.started {
-                    state.started = true;
-                    let track = state.body.track.clone();
+                    self.counters.sent.fetch_add(1, Ordering::Relaxed);
+                    position += FRAME_MILLIS * tempo;
+                    state.body.state.position = position as i64;
+                    if !state.started {
+                        state.started = true;
+                        state.body.track.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(track) = started_track {
                     self.event("track.started", json!({ "track": track }));
                 }
                 break;
@@ -593,65 +679,77 @@ impl Player {
 
     /// Reports the end of a track, and stops the player from pacing more of it.
     fn finish(&self, generation: u64, error: Option<AudioError>) {
-        let mut state = self.state.lock().unwrap();
-        if state.generation != generation || state.closed || state.body.track.is_none() {
-            return;
-        }
-        let mut reason = "finished";
-        if let Some(error) = error {
-            reason = "load_failed";
-            self.counters.errors.fetch_add(1, Ordering::Relaxed);
-            let track = state.body.track.clone();
-            if matches!(error, AudioError::Stuck) {
-                self.event(
-                    "track.stalled",
-                    json!({ "track": track, "threshold_ms": STUCK_MILLIS }),
-                );
-            } else {
-                self.event(
-                    "track.failed",
-                    json!({
-                        "track": track,
-                        "exception": {
-                            "message": error.to_string(),
-                            "severity": "fault",
-                            "cause": "rustlink.audio",
-                        },
-                    }),
-                );
+        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation != generation || state.closed || state.body.track.is_none() {
+                return;
             }
+            let mut reason = "finished";
+            let track = state.body.track.take();
+            state.running = false;
+            state.live_filters = false;
+            state.pending_filters = None;
+            state.started = false;
+            if let Some(error) = error {
+                reason = "load_failed";
+                self.counters.errors.fetch_add(1, Ordering::Relaxed);
+                if matches!(error, AudioError::Stuck) {
+                    events.push((
+                        "track.stalled",
+                        json!({ "track": track.clone(), "threshold_ms": STUCK_MILLIS }),
+                    ));
+                } else {
+                    events.push((
+                        "track.failed",
+                        json!({
+                            "track": track.clone(),
+                            "exception": {
+                                "message": error.to_string(),
+                                "severity": "fault",
+                                "cause": "rustlink.audio",
+                            },
+                        }),
+                    ));
+                }
+            }
+            events.push(("track.ended", json!({ "track": track, "reason": reason })));
         }
-        let track = state.body.track.clone();
-        self.event("track.ended", json!({ "track": track, "reason": reason }));
-        state.body.track = None;
-        state.running = false;
-        state.started = false;
+        for (kind, payload) in events {
+            self.event(kind, payload);
+        }
     }
 
     /// Tears the player down: the track ends, the connection closes and the
     /// playback thread stops.
     pub fn destroy(&self) {
-        let mut state = self.state.lock().unwrap();
-        if state.closed {
-            return;
-        }
-        state.closed = true;
-        self.stop(&mut state);
-        if let Some(track) = state.body.track.take() {
-            self.event("track.ended", json!({ "track": track, "reason": "cleanup" }));
-        }
-        let connection = state.connection.take();
-        if let Some(task) = state.connecting.take() {
-            task.abort();
-        }
-        if state.voice_up {
-            state.voice_up = false;
-            let channel = state.body.voice.channel_id.clone();
-            self.event("voice.disconnected", voice_fields(channel.as_deref(), "destroyed"));
-        }
-        drop(state);
+        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let connection = {
+            let mut state = self.state.lock().unwrap();
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            self.stop(&mut state);
+            if let Some(track) = state.body.track.take() {
+                events.push(("track.ended", json!({ "track": track, "reason": "cleanup" })));
+            }
+            let connection = state.connection.take();
+            if let Some(task) = state.connecting.take() {
+                task.abort();
+            }
+            if state.voice_up {
+                state.voice_up = false;
+                let channel = state.body.voice.channel_id.clone();
+                events.push(("voice.disconnected", voice_fields(channel.as_deref(), "destroyed")));
+            }
+            connection
+        };
         if let Some(connection) = connection {
             connection.close();
+        }
+        for (kind, payload) in events {
+            self.event(kind, payload);
         }
     }
 

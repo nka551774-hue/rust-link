@@ -19,6 +19,79 @@ pub fn may_index_later(head: &[u8]) -> bool {
     head.get(4..8) == Some(b"ftyp")
 }
 
+/// Whether reading past `head` (up to `MAX_PROBE`) could yield metadata or a
+/// duration that `head` does not yet provide.
+///
+/// Formats whose probe does not inspect further bytes (Matroska/WebM, ADTS, or
+/// an Ogg larger than `MAX_PROBE`) stop after the initial 16 KiB read instead
+/// of downloading 8 MiB of audio only to discard it.
+pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
+    if size <= 0 || head.len() as i64 >= size {
+        return false;
+    }
+    if head.get(4..8) == Some(b"ftyp") {
+        return find_box(head, b"moov").is_none();
+    }
+    if head.starts_with(b"OggS") {
+        return size <= MAX_PROBE as i64;
+    }
+    if head.starts_with(b"fLaC") {
+        let mut at = 4usize;
+        while let Some(header) = head.get(at..at + 4) {
+            let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+            let Some(next) = at.checked_add(4).and_then(|n| n.checked_add(length)) else {
+                return false;
+            };
+            if next > head.len() {
+                return true;
+            }
+            if header[0] & 0x80 != 0 {
+                return false;
+            }
+            at = next;
+        }
+        return head.len() < 8;
+    }
+    if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WAVE") {
+        let mut saw_fmt = false;
+        let mut saw_data = false;
+        let mut at = 12usize;
+        while at + 8 <= head.len() {
+            let kind = &head[at..at + 4];
+            let length =
+                u32::from_le_bytes([head[at + 4], head[at + 5], head[at + 6], head[at + 7]])
+                    as usize;
+            if kind == b"fmt " {
+                saw_fmt = head.len() >= at + 24;
+            } else if kind == b"data" {
+                saw_data = true;
+            }
+            if saw_fmt && saw_data {
+                return false;
+            }
+            let Some(next) = at
+                .checked_add(8)
+                .and_then(|n| n.checked_add(length))
+                .and_then(|n| n.checked_add(length & 1))
+            else {
+                return false;
+            };
+            if next > head.len() {
+                return !(saw_fmt && saw_data);
+            }
+            at = next;
+        }
+        return !(saw_fmt && saw_data);
+    }
+    if head.starts_with(b"ID3") && head.len() >= 10 {
+        let length = synchsafe(&head[6..10]);
+        let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
+        return head.len()
+            < 10usize.saturating_add(length).saturating_add(footer).saturating_add(64);
+    }
+    false
+}
+
 /// What the header said.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probe {
@@ -97,20 +170,26 @@ fn for_each_box<'a>(mut data: &'a [u8], mut visit: impl FnMut(&[u8; 4], &'a [u8]
                 }
                 let large = u64::from_be_bytes([
                     data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-                ]) as usize;
-                (16, large.saturating_sub(16))
+                ]);
+                if large < 16 {
+                    return;
+                }
+                let Ok(large) = usize::try_from(large) else {
+                    return;
+                };
+                (16, large - 16)
             }
-            size => (8, size.saturating_sub(8)),
+            2..=7 => return,
+            size => (8, size - 8),
         };
-        let body_end = (body_start + body_len).min(data.len());
-        if body_end <= body_start {
+        let available = data.len() - body_start;
+        let truncated = body_len > available;
+        let take = body_len.min(available);
+        visit(&kind, &data[body_start..body_start + take]);
+        if truncated || body_start + take >= data.len() {
             return;
         }
-        visit(&kind, &data[body_start..body_end]);
-        if body_end >= data.len() {
-            return;
-        }
-        data = &data[body_end..];
+        data = &data[body_start + take..];
     }
 }
 
@@ -272,24 +351,35 @@ fn read_vorbis_comment(data: &[u8], out: &mut Probe) {
         return;
     }
     let vendor = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut at = 4 + vendor;
-    let Some(count) =
-        data.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    let Some(after_vendor) = 4usize.checked_add(vendor) else {
+        return;
+    };
+    let Some(count_end) = after_vendor.checked_add(4) else {
+        return;
+    };
+    let Some(count) = data
+        .get(after_vendor..count_end)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     else {
         return;
     };
-    at += 4;
+    let mut at = count_end;
     for _ in 0..count.min(1024) {
+        let Some(len_end) = at.checked_add(4) else {
+            return;
+        };
         let Some(length) =
-            data.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+            data.get(at..len_end).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
         else {
             return;
         };
-        at += 4;
-        let Some(field) = data.get(at..at + length) else {
+        let Some(field_end) = len_end.checked_add(length) else {
             return;
         };
-        at += length;
+        let Some(field) = data.get(len_end..field_end) else {
+            return;
+        };
+        at = field_end;
         let field = String::from_utf8_lossy(field);
         let Some((name, value)) = field.split_once('=') else {
             continue;
@@ -373,38 +463,65 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
     let mut rate = 0u32;
     let mut channels = 0u32;
     let mut bits = 0u32;
+    let mut avg_bytes_per_sec = 0u32;
     let mut data_len = 0i64;
+    let mut streaming_data = false;
     let mut at = 12usize;
     while at + 8 <= head.len() {
         let kind = &head[at..at + 4];
-        let length =
-            u32::from_le_bytes([head[at + 4], head[at + 5], head[at + 6], head[at + 7]]) as usize;
-        let body = head.get(at + 8..at + 8 + length).unwrap_or_default();
+        let raw_len = u32::from_le_bytes([head[at + 4], head[at + 5], head[at + 6], head[at + 7]]);
+        let length = raw_len as usize;
+        let body_end = at.saturating_add(8).saturating_add(length).min(head.len());
+        let body = head.get(at + 8..body_end).unwrap_or_default();
         match kind {
             b"fmt " => {
                 out.audio = true;
                 if body.len() >= 16 {
                     channels = u16::from_le_bytes([body[2], body[3]]) as u32;
                     rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                    avg_bytes_per_sec = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
                     bits = u16::from_le_bytes([body[14], body[15]]) as u32;
                 }
             }
             b"data" => {
                 out.audio = true;
-                data_len = length as i64;
+                if raw_len == u32::MAX {
+                    streaming_data = true;
+                } else {
+                    data_len = length as i64;
+                }
             }
             b"LIST" => read_riff_info(body, &mut out),
             _ => {}
         }
-        // A chunk is padded to an even length.
-        at += 8 + length + (length & 1);
-    }
-    if rate > 0 && channels > 0 && bits > 0 {
-        let bytes_per_frame = (channels * bits / 8) as i64;
-        let frames = if data_len > 0 { data_len } else { size.saturating_sub(44) };
-        if bytes_per_frame > 0 && frames > 0 {
-            out.duration_ms = milliseconds(frames as u128, bytes_per_frame as u64 * rate as u64);
+        // A chunk is padded to an even length; stop if the chunk runs past `head`.
+        let Some(next) = at
+            .checked_add(8)
+            .and_then(|n| n.checked_add(length))
+            .and_then(|n| n.checked_add(length & 1))
+        else {
+            break;
+        };
+        if next > head.len() {
+            break;
         }
+        at = next;
+    }
+    let bytes_per_sec =
+        if rate > 0 && channels > 0 && bits > 0 && (channels * bits).is_multiple_of(8) {
+            u64::from(channels * bits / 8) * u64::from(rate)
+        } else {
+            u64::from(avg_bytes_per_sec)
+        };
+    let payload_bytes = if data_len > 0 {
+        data_len
+    } else if streaming_data && size <= 0 {
+        0
+    } else {
+        size.saturating_sub(44)
+    };
+    if bytes_per_sec > 0 && payload_bytes > 0 {
+        out.duration_ms = milliseconds(payload_bytes as u128, bytes_per_sec);
     }
     out
 }
@@ -436,35 +553,78 @@ fn starts_mpeg_frame(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0xff && data[1] & 0xe0 == 0xe0 && data[1] & 0x06 != 0
 }
 
+fn valid_id3_header(head: &[u8]) -> bool {
+    head.len() >= 10
+        && head.starts_with(b"ID3")
+        && head[3] < 0xff
+        && head[4] < 0xff
+        && head[6..10].iter().all(|byte| byte & 0x80 == 0)
+}
+
 fn probe_mp3(head: &[u8], size: i64) -> Probe {
     let mut out = Probe::default();
     let mut audio_start = 0usize;
-    if head.starts_with(b"ID3") && head.len() >= 10 {
+    let mut saw_id3 = false;
+    if valid_id3_header(head) {
+        saw_id3 = true;
+        let flags = head[5];
         let length = synchsafe(&head[6..10]);
         // The footer, when there is one, is another ten bytes.
-        let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
-        read_id3(&head[10..(10 + length).min(head.len())], head[3], &mut out);
-        audio_start = 10 + length + footer;
+        let footer = if flags & 0x10 != 0 { 10 } else { 0 };
+        let tag_end = 10usize.saturating_add(length).min(head.len());
+        read_id3(&head[10..tag_end], head[3], flags, &mut out);
+        audio_start = 10usize.saturating_add(length).saturating_add(footer);
     }
-    let Some(frame) = head.get(audio_start..).filter(|rest| starts_mpeg_frame(rest)) else {
+    let Some(frame) = head.get(audio_start..).and_then(find_mpeg_sync) else {
         // A tag with no frame after it is still an MP3 with metadata, which is
         // all a stream needs to be described.
-        out.audio = out.audio || !out.title.is_empty() || head.starts_with(b"ID3");
+        out.audio = out.audio || !out.title.is_empty() || saw_id3;
         return out;
     };
     out.audio = true;
-    if let Some((bitrate, rate)) = parse_mpeg_frame(frame) {
-        if bitrate > 0 && size > audio_start as i64 {
-            out.duration_ms = milliseconds((size - audio_start as i64) as u128 * 8, bitrate as u64);
+    if let Some(mpeg) = parse_mpeg_frame(frame) {
+        if let Some(frames) = parse_vbr_frames(frame, &mpeg) {
+            out.duration_ms = milliseconds(
+                u128::from(frames) * u128::from(mpeg.samples_per_frame),
+                u64::from(mpeg.rate),
+            );
+        } else if mpeg.bitrate > 0 && size > audio_start as i64 {
+            out.duration_ms =
+                milliseconds((size - audio_start as i64) as u128 * 8, u64::from(mpeg.bitrate));
         }
-        let _ = rate;
     }
     out
 }
 
+fn find_mpeg_sync(data: &[u8]) -> Option<&[u8]> {
+    let limit = data.len().min(4096);
+    for offset in 0..limit {
+        if parse_mpeg_frame(&data[offset..]).is_some() {
+            return Some(&data[offset..]);
+        }
+    }
+    None
+}
+
 /// Reads the frames of an ID3v2 tag that name the track.
-fn read_id3(data: &[u8], version: u8, out: &mut Probe) {
+fn read_id3(data: &[u8], version: u8, flags: u8, out: &mut Probe) {
     let mut at = 0usize;
+    if flags & 0x40 != 0 {
+        let Some(ext_hdr) = data.get(..4) else {
+            return;
+        };
+        let ext_len = if version == 4 {
+            synchsafe(ext_hdr)
+        } else {
+            4usize.saturating_add(u32::from_be_bytes([
+                ext_hdr[0], ext_hdr[1], ext_hdr[2], ext_hdr[3],
+            ]) as usize)
+        };
+        if ext_len < 4 || ext_len > data.len() {
+            return;
+        }
+        at = ext_len;
+    }
     while at + 10 <= data.len() {
         let id = &data[at..at + 4];
         if !id.iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()) {
@@ -477,7 +637,10 @@ fn read_id3(data: &[u8], version: u8, out: &mut Probe) {
         } else {
             u32::from_be_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]) as usize
         };
-        let Some(body) = data.get(at + 10..at + 10 + length) else {
+        let Some(body_end) = at.checked_add(10).and_then(|n| n.checked_add(length)) else {
+            return;
+        };
+        let Some(body) = data.get(at + 10..body_end) else {
             return;
         };
         // The frame body opens with the encoding of the text it carries.
@@ -487,7 +650,7 @@ fn read_id3(data: &[u8], version: u8, out: &mut Probe) {
             b"TPE1" => out.artist = text,
             _ => {}
         }
-        at += 10 + length;
+        at = body_end;
     }
 }
 
@@ -516,8 +679,15 @@ fn decode_id3_text(body: &[u8]) -> String {
     }
 }
 
-/// Reads the bitrate and rate out of an MPEG audio frame header.
-fn parse_mpeg_frame(data: &[u8]) -> Option<(u32, u32)> {
+struct MpegFrame {
+    bitrate: u32,
+    rate: u32,
+    samples_per_frame: u32,
+    side_info_len: usize,
+}
+
+/// Reads the bitrate, sample rate and VBR header offset out of an MPEG frame.
+fn parse_mpeg_frame(data: &[u8]) -> Option<MpegFrame> {
     if data.len() < 4 || !starts_mpeg_frame(data) {
         return None;
     }
@@ -526,18 +696,69 @@ fn parse_mpeg_frame(data: &[u8]) -> Option<(u32, u32)> {
     let layer = (header >> 17) & 0x3;
     let bitrate_index = ((header >> 12) & 0xf) as usize;
     let rate_index = ((header >> 10) & 0x3) as usize;
-    // Version one, layer three, is the table that matters; the others are rare
-    // enough that a duration is not worth the extra tables.
-    let rates = [44_100u32, 48_000, 32_000];
-    let bitrates = [0u32, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-    if version != 0x3
-        || layer != 0x1
-        || rate_index >= rates.len()
-        || bitrate_index >= bitrates.len()
+    let channel_mode = (header >> 6) & 0x3;
+    if version == 0x1
+        || layer == 0x0
+        || rate_index >= 3
+        || bitrate_index == 0
+        || bitrate_index == 15
     {
         return None;
     }
-    Some((bitrates[bitrate_index] * 1000, rates[rate_index]))
+    let base_rates = [44_100u32, 48_000, 32_000];
+    let rate = match version {
+        0x3 => base_rates[rate_index],
+        0x2 => base_rates[rate_index] / 2,
+        0x0 => base_rates[rate_index] / 4,
+        _ => return None,
+    };
+    let kbps =
+        match (version, layer) {
+            (0x3, 0x1) => {
+                [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0][bitrate_index]
+            }
+            (0x3, 0x2) => [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0]
+                [bitrate_index],
+            (0x3, 0x3) => [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0]
+                [bitrate_index],
+            (_, 0x3) => [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0]
+                [bitrate_index],
+            _ => [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0][bitrate_index],
+        };
+    let samples_per_frame = match (version, layer) {
+        (_, 0x3) => 384,
+        (0x3, _) => 1152,
+        (_, 0x2) => 1152,
+        _ => 576,
+    };
+    let mono = channel_mode == 0x3;
+    let side_info_len = match (version == 0x3, mono) {
+        (true, false) => 32,
+        (true, true) | (false, false) => 17,
+        (false, true) => 9,
+    };
+    Some(MpegFrame { bitrate: kbps * 1000, rate, samples_per_frame, side_info_len })
+}
+
+fn parse_vbr_frames(frame: &[u8], mpeg: &MpegFrame) -> Option<u32> {
+    let xing_at = 4 + mpeg.side_info_len;
+    if let Some(tag) = frame.get(xing_at..xing_at + 12) {
+        if (&tag[..4] == b"Xing" || &tag[..4] == b"Info") && (tag[7] & 0x01 != 0) {
+            let frames = u32::from_be_bytes([tag[8], tag[9], tag[10], tag[11]]);
+            if frames > 0 {
+                return Some(frames);
+            }
+        }
+    }
+    if let Some(vbri) = frame.get(36..54) {
+        if &vbri[..4] == b"VBRI" {
+            let frames = u32::from_be_bytes([vbri[14], vbri[15], vbri[16], vbri[17]]);
+            if frames > 0 {
+                return Some(frames);
+            }
+        }
+    }
+    None
 }
 
 fn synchsafe(data: &[u8]) -> usize {
@@ -730,10 +951,26 @@ mod tests {
         head.extend_from_slice(&[0, 0, 0, 16]);
         head.extend_from_slice(b"ftypM4A ");
         head.extend_from_slice(&[0u8; 4]);
+        // Empty 8-byte `wide` / `free` boxes often sit between `ftyp` and `moov`.
+        head.extend_from_slice(&[0, 0, 0, 8]);
+        head.extend_from_slice(b"wide");
         head.extend_from_slice(&((moov.len() + 8) as u32).to_be_bytes());
         head.extend_from_slice(b"moov");
         head.extend_from_slice(&moov);
         let probe = probe(&head, head.len() as i64);
         assert_eq!(probe.duration_ms, 30_000);
+    }
+
+    #[test]
+    fn vbr_mp3_uses_xing_frame_count_instead_of_header_frame_bitrate() {
+        // 32 kbit/s silent Xing header frame followed by a 256 kbit/s body.
+        let mut head = vec![0xff, 0xfb, 0x10, 0x00];
+        head.resize(36, 0);
+        head.extend_from_slice(b"Xing\x00\x00\x00\x01");
+        head.extend_from_slice(&3828u32.to_be_bytes()); // ~100 seconds at 44.1 kHz
+        head.resize(1024, 0);
+        let probe = probe(&head, 3_200_000);
+        assert!(probe.audio);
+        assert!((99_900..=100_100).contains(&probe.duration_ms), "{}", probe.duration_ms);
     }
 }

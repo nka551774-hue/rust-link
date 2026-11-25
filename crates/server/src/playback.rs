@@ -71,6 +71,9 @@ impl Engine for Playback {
             // stream, so the fall back starts from a fresh one rather than a
             // half-read one.
             Err(AudioError::NeedsFfmpeg(_)) => {
+                if self.engine.ffmpeg.is_none() {
+                    return Err(AudioError::FfmpegMissing);
+                }
                 let body = self.open(track)?;
                 self.engine.start(track, body, position_ms, volume, filters, Preference::Ffmpeg)
             }

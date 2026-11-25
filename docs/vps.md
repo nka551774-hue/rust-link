@@ -81,7 +81,7 @@ swapon /swapfile
 useradd --system --home-dir /opt/rustlink --shell /usr/sbin/nologin rustlink
 install -d -o rustlink -g rustlink /opt/rustlink
 install -m 0755 target/release/rustlink /opt/rustlink/
-install -m 0644 config.yaml /opt/rustlink/
+install -m 0640 -o root -g rustlink config.yaml /opt/rustlink/
 ```
 
 節點把下載的 FFmpeg 寫進 `.tools`、每日日誌寫進 `logs`；下載暫存檔放在作業系統的暫存目錄，來源快取只在記憶體。

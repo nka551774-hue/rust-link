@@ -87,8 +87,9 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-opus
-            pkgconf
+            mingw-w64-ucrt-x86_64-pkgconf
             zip
 
       - name: build and package (Unix)
@@ -105,6 +106,7 @@ jobs:
           name="rustlink_${VERSION}_${PLATFORM}"
           mkdir -p "dist/${name}"
           cp "target/release/rustlink${EXT}" "dist/${name}/"
+          "dist/${name}/rustlink${EXT}" --version
           cp LICENSE NOTICE README.md config.example.yaml start.sh "dist/${name}/"
           cp -R docs "dist/${name}/"
           chmod +x "dist/${name}/start.sh"
@@ -133,6 +135,7 @@ jobs:
           for dll in libopus-0.dll libgcc_s_seh-1.dll libwinpthread-1.dll libstdc++-6.dll; do
             if [ -f "/ucrt64/bin/${dll}" ]; then cp "/ucrt64/bin/${dll}" "dist/${name}/"; fi
           done
+          "dist/${name}/rustlink.exe" --version
           mkdir -p "dist/${name}/licenses"
           for package in opus gcc-libs libwinpthread winpthreads; do
             if [ -d "/ucrt64/share/licenses/${package}" ]; then
@@ -160,6 +163,8 @@ jobs:
         with:
           merge-multiple: true
           path: dist
+      - name: generate checksums
+        run: (cd dist && sha256sum * > checksums.sha256)
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

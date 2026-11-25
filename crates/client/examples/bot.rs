@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut events = session.events().await?;
         println!("{}", events.next().await?.ok_or("missing session.ready")?);
         // Drain events throughout source resolution and playback.
-        let event_task = tokio::spawn(async move {
+        let mut event_task = tokio::spawn(async move {
             while let Some(event) = events.next().await? {
                 println!("{event}");
             }
@@ -40,7 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("no playable track".into()),
             };
             session.play(&guild, &track.token).await?;
-            tokio::signal::ctrl_c().await?;
+            tokio::select! {
+                res = tokio::signal::ctrl_c() => { res?; }
+                ended = &mut event_task => {
+                    ended??;
+                    return Err("Rustlink event stream closed".into());
+                }
+            }
             Ok::<_, Box<dyn std::error::Error>>(())
         }
         .await;

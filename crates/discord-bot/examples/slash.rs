@@ -7,6 +7,7 @@
 //! every guild the bot is in, so it appears without the global-command delay.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rustlink_client::{Client, LoadResult, Session, Track};
 use rustlink_discord_bot::{
@@ -21,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &std::env::var("RUSTLINK_URL").unwrap_or_else(|_| "http://127.0.0.1:2333".into()),
         std::env::var("RUSTLINK_PASSWORD")?,
     )?;
-    let rest = DiscordRest::new(token.clone())?;
+    let rest = Arc::new(DiscordRest::new(token.clone())?);
     let mut gateway = Gateway::connect(token, GUILDS | GUILD_VOICE_STATES).await?;
     let ready = loop {
         if let BotEvent::Ready(ready) =
@@ -37,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let session = rustlink.create_session(&ready.user_id, 60).await?;
     let mut rustlink_events = session.events().await?;
-    let event_task = tokio::spawn(async move {
+    let mut event_task = tokio::spawn(async move {
         while let Some(event) = rustlink_events.next().await? {
             println!("rustlink event: {event}");
         }
@@ -46,11 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let commands = json!([{
         "name": "play",
-        "description": "播放 YouTube 連結",
+        "description": "播放連結或搜尋關鍵字",
         "options": [{
             "type": 3,
             "name": "url",
-            "description": "YouTube 連結",
+            "description": "YouTube／SoundCloud／Spotify 連結或關鍵字",
             "required": true
         }]
     }]);
@@ -67,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = tokio::select! {
             result = &mut shutdown => { result?; break; }
+            ended = &mut event_task => { ended??; break; }
             event = gateway.next_event() => match event? { Some(event) => event, None => break },
         };
         if let Some(voice) = pairer.observe(&event)? {
@@ -84,17 +86,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match event {
             BotEvent::Other { name, data } if name == "GUILD_CREATE" => {
                 let Some(guild) = data["id"].as_str().map(str::to_owned) else { continue };
-                if let Err(error) =
-                    rest.set_guild_commands(&ready.application_id, &guild, &commands).await
-                {
-                    eprintln!("could not register /play in guild {guild}: {error}");
-                }
+                let rest_clone = Arc::clone(&rest);
+                let app_id = ready.application_id.clone();
+                let cmds = commands.clone();
+                let guild_for_cmds = guild.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        rest_clone.set_guild_commands(&app_id, &guild_for_cmds, &cmds).await
+                    {
+                        eprintln!("could not register /play in guild {guild_for_cmds}: {error}");
+                    }
+                });
+                channels.retain(|(g, _), _| g != &guild);
                 for state in data["voice_states"].as_array().into_iter().flatten() {
                     if let (Some(user), Some(channel)) =
                         (state["user_id"].as_str(), state["channel_id"].as_str())
                     {
                         channels.insert((guild.clone(), user.into()), channel.into());
                     }
+                }
+            }
+            BotEvent::Other { name, data } if name == "GUILD_DELETE" => {
+                if let Some(guild) = data["id"].as_str() {
+                    channels.retain(|(g, _), _| g != guild);
+                    voiced.remove(guild);
+                    waiting.remove(guild);
+                    let _ = pairer.clear(guild);
+                    let _ = session.destroy_player(guild).await;
                 }
             }
             BotEvent::VoiceStateUpdate(update) => {
@@ -108,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         channels.remove(&key);
                         if update.user_id == ready.user_id {
                             voiced.remove(&guild);
+                            waiting.remove(&guild);
                         }
                     }
                 }
@@ -166,13 +185,46 @@ async fn play(
 }
 
 async fn resolve(rustlink: &Client, query: &str) -> Result<Track, Box<dyn std::error::Error>> {
-    let track = match rustlink.resolve(query).await? {
+    let query = normalize_query(query);
+    if query.is_empty() {
+        return Err("請提供連結或關鍵字".into());
+    }
+    let track = match rustlink.resolve(&query).await? {
         LoadResult::Track(track) => Some(*track),
         LoadResult::Search(tracks) => tracks.into_iter().next(),
         LoadResult::Playlist(playlist) => playlist.tracks.into_iter().next(),
-        _ => None,
+        LoadResult::Error(error) => return Err(error.message.into()),
+        LoadResult::Empty => None,
     };
     track.ok_or_else(|| "連結沒有解析出曲目".into())
+}
+
+fn normalize_query(text: &str) -> String {
+    let text = text.trim();
+    const PREFIXES: [&str; 10] = [
+        "ytsearch:",
+        "ytmsearch:",
+        "scsearch:",
+        "spsearch:",
+        "dzsearch:",
+        "dzisrc:",
+        "spotify:",
+        "deezer:",
+        "soundcloud:",
+        "youtube:playlist:",
+    ];
+    let is_video_id = text.len() == 11
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if text.is_empty()
+        || text.contains("://")
+        || text.starts_with("<http")
+        || is_video_id
+        || PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+    {
+        text.to_string()
+    } else {
+        format!("ytsearch:{text}")
+    }
 }
 
 async fn reply(rest: &DiscordRest, application_id: &str, request: &Interaction, text: &str) {

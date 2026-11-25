@@ -55,6 +55,12 @@ pub struct Resolver {
     temp: Mutex<Option<PathBuf>>,
 }
 
+impl Drop for Resolver {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl Resolver {
     pub fn new(directory: &str, download: bool) -> Resolver {
         Resolver { directory: directory.to_string(), download, temp: Mutex::new(None) }
@@ -109,7 +115,6 @@ impl Resolver {
         let archive = self.fetch(&source)?;
         let target = Path::new(&self.directory).join(executable_name(name));
         extract(&archive, &source.member, &target)?;
-        make_executable(&target)?;
         log::info!(
             "media helper installed tool={name} path={} durationMs={}",
             target.display(),
@@ -134,15 +139,31 @@ impl Resolver {
         Err(last.unwrap_or_else(|| format!("{} has nowhere to be downloaded from", source.tool)))
     }
 
-    /// The directory downloads land in, created on first use.
+    /// The directory downloads land in, created on first use with private permissions.
     fn work_directory(&self) -> Result<PathBuf, String> {
         let mut temp = self.temp.lock().unwrap();
         if let Some(directory) = temp.as_ref() {
             return Ok(directory.clone());
         }
-        let directory = std::env::temp_dir().join(format!("rustlink-tools-{}", std::process::id()));
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
+        let mut nonce = [0u8; 8];
+        let _ = getrandom::fill(&mut nonce);
+        let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let directory =
+            std::env::temp_dir().join(format!("rustlink-tools-{}-{suffix}", std::process::id()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&directory)
+                .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(&directory)
+                .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
+        }
         *temp = Some(directory.clone());
         Ok(directory)
     }
@@ -238,11 +259,16 @@ fn agent() -> ureq::Agent {
 }
 /// Checks a download against a `<sha256>  <file>` listing.
 fn verify(agent: &ureq::Agent, sums_url: &str, asset: &str, file: &Path) -> Result<(), String> {
-    let list = agent
+    let response = agent
         .get(sums_url)
         .header("User-Agent", "rustlink")
         .call()
-        .map_err(|error| format!("checksum list {sums_url}: {error}"))?
+        .map_err(|error| format!("checksum list {sums_url}: {error}"))?;
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(format!("checksum list {sums_url} returned HTTP {status}"));
+    }
+    let list = response
         .into_body()
         .with_config()
         .limit(1 << 20)
@@ -257,13 +283,14 @@ fn verify(agent: &ureq::Agent, sums_url: &str, asset: &str, file: &Path) -> Resu
     Ok(())
 }
 
-/// Finds the hash a listing gives for one file. A line is a hash, whitespace,
-/// and a file name, which is the format every provider here publishes.
+/// Finds the hash a listing gives for one file. Accepts both `<sha256>  <file>`
+/// and GNU `sha256sum -b` `<sha256> *<file>`.
 fn lookup_sum(list: &str, asset: &str) -> Option<String> {
     for line in list.lines() {
         let mut fields = line.split_whitespace();
-        if let (Some(hash), Some(name), None) = (fields.next(), fields.next(), fields.next()) {
-            if name == asset {
+        if let (Some(hash), Some(raw_name), None) = (fields.next(), fields.next(), fields.next()) {
+            let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
+            if name == asset && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Some(hash.to_string());
             }
         }
@@ -299,7 +326,7 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
         zip::ZipArchive::new(file).map_err(|error| format!("{}: {error}", archive.display()))?;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index).map_err(|error| error.to_string())?;
-        if entry.is_dir() {
+        if entry.is_dir() || entry.is_symlink() {
             continue;
         }
         let name = Path::new(entry.name())
@@ -314,10 +341,10 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
     Err(format!("{member} is not part of {}", archive.display()))
 }
 
-/// Writes through a temporary file, so a target that is still in use is never
-/// left half written.
+/// Writes through a temporary file with executable permissions applied before
+/// atomic rename, so `target` is never half-written or non-executable.
 fn copy_into(source: &mut impl Read, target: &Path) -> Result<(), String> {
-    let temp = PathBuf::from(format!("{}.part", target.display()));
+    let temp = PathBuf::from(format!("{}.part-{}", target.display(), std::process::id()));
     let mut out =
         fs::File::create(&temp).map_err(|error| format!("{}: {error}", temp.display()))?;
     if let Err(error) = std::io::copy(source, &mut out) {
@@ -325,12 +352,16 @@ fn copy_into(source: &mut impl Read, target: &Path) -> Result<(), String> {
         let _ = fs::remove_file(&temp);
         return Err(format!("{}: {error}", target.display()));
     }
-    if let Err(error) = out.flush() {
+    if let Err(error) = out.sync_all() {
         drop(out);
         let _ = fs::remove_file(&temp);
         return Err(format!("{}: {error}", target.display()));
     }
     drop(out);
+    if let Err(error) = make_executable(&temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
     fs::rename(&temp, target).map_err(|error| {
         let _ = fs::remove_file(&temp);
         format!("{}: {error}", target.display())
@@ -373,23 +404,26 @@ fn absolute(path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-/// Finds a program the way a shell would. A name with a separator in it is used
-/// as a path; anything else is looked for on `PATH`.
+/// Validates an explicit helper path configured by the operator.
 fn look_up(program: &str) -> Option<String> {
-    if program.contains('/') || program.contains('\\') {
-        let path = Path::new(program);
-        return path.is_file().then(|| absolute(path));
-    }
-    let search = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&search) {
-        for name in executable_names(program) {
-            let candidate = directory.join(name);
-            if candidate.is_file() {
-                return Some(absolute(&candidate));
-            }
+    for candidate in executable_names(program) {
+        let path = Path::new(&candidate);
+        if path.is_file() && is_runnable(path) {
+            return Some(absolute(path));
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn is_runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_runnable(_path: &Path) -> bool {
+    true
 }
 
 /// The file names a program may have on this platform. Windows resolves a bare

@@ -32,6 +32,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 pub fn measure(name: &str, iterations: u32, mut operation: impl FnMut()) {
+    let iterations = iterations.max(1);
     for _ in 0..1000 {
         operation();
     }

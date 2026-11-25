@@ -20,9 +20,12 @@ mod state;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustlink_client::{Client, LoadResult, Session, Track, VoiceState};
+use rustlink_client::{
+    Client, LoadResult, Object, Patch, PlayerUpdate, Session, Track, TrackUpdate, VoiceState,
+};
 use rustlink_discord_bot::{
     BotEvent, DiscordRest, Gateway, Interaction, VoiceStatePairer, VoiceStateUpdate, GUILDS,
     GUILD_VOICE_STATES,
@@ -56,7 +59,7 @@ async fn run() -> Result<(), Failure> {
         .await
         .map_err(|error| format!("cannot reach Rustlink at {}: {error}", config.rustlink_url))?;
 
-    let rest = DiscordRest::new(config.token.clone())?;
+    let rest = Arc::new(DiscordRest::new(config.token.clone())?);
     let mut gateway = Gateway::connect(config.token.clone(), GUILDS | GUILD_VOICE_STATES).await?;
     let ready = loop {
         if let BotEvent::Ready(ready) =
@@ -143,7 +146,7 @@ struct Bot {
     config: Config,
     rustlink: Client,
     session: Session,
-    rest: DiscordRest,
+    rest: Arc<DiscordRest>,
     gateway: Gateway,
     pairer: VoiceStatePairer,
     application_id: String,
@@ -173,6 +176,13 @@ impl Bot {
             BotEvent::Other { name, data } if name == "GUILD_CREATE" => {
                 self.guild_create(data).await
             }
+            BotEvent::Other { name, data } if name == "GUILD_DELETE" => {
+                if let Some(guild) = data["id"].as_str() {
+                    self.channels.retain(|(g, _), _| g != guild);
+                    let _ = self.pairer.clear(guild);
+                    self.forget(guild).await;
+                }
+            }
             BotEvent::VoiceStateUpdate(update) => self.voice_state(update).await,
             BotEvent::Interaction(request) => self.command(request).await,
             _ => {}
@@ -183,12 +193,18 @@ impl Bot {
     async fn guild_create(&mut self, data: Value) {
         let Some(guild) = data["id"].as_str().map(str::to_owned) else { return };
         if self.config.serves(&guild) {
-            if let Err(error) =
-                self.rest.set_guild_commands(&self.application_id, &guild, &commands()).await
-            {
-                eprintln!("could not register the commands in guild {guild}: {error}");
-            }
+            let rest = Arc::clone(&self.rest);
+            let app_id = self.application_id.clone();
+            let guild_for_cmds = guild.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    rest.set_guild_commands(&app_id, &guild_for_cmds, &commands()).await
+                {
+                    eprintln!("could not register the commands in guild {guild_for_cmds}: {error}");
+                }
+            });
         }
+        self.channels.retain(|(g, _), _| g != &guild);
         let mut stale = false;
         for state in data["voice_states"].as_array().into_iter().flatten() {
             if let (Some(user), Some(channel)) =
@@ -249,7 +265,18 @@ impl Bot {
                 self.idle_since.insert(guild.to_string(), Instant::now());
                 return;
             };
-            match self.session.play(guild, &track.token).await {
+            let play_id = state.current_play_id().unwrap_or(0);
+            let mut user_data = Object::new();
+            user_data.insert("play_id".into(), json!(play_id));
+            let update = PlayerUpdate {
+                track: Patch::Value(TrackUpdate {
+                    token: Patch::Value(track.token.clone()),
+                    user_data: Some(user_data),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            match self.session.update_player(guild, &update, true).await {
                 Ok(_) => {
                     self.idle_since.remove(guild);
                     return;
@@ -270,15 +297,16 @@ impl Bot {
                 if !matches!(event["reason"].as_str(), Some("finished" | "load_failed")) {
                     return;
                 }
-                let ended = event.pointer("/track/metadata/identifier").and_then(Value::as_str);
+                let ended_play_id =
+                    event.pointer("/track/user_data/play_id").and_then(Value::as_u64);
                 let Some(state) = self.guilds.get_mut(&guild) else { return };
-                if state.current().map(|track| track.metadata.identifier.as_str()) != ended {
+                if state.current_play_id() != ended_play_id || ended_play_id.is_none() {
                     return;
                 }
                 state.finish();
                 if state.record(event["reason"] == "finished") {
                     eprintln!(
-                        "stopped the queue in guild {guild}: {} tracks in a row could not be                          loaded (see the error above)",
+                        "stopped the queue in guild {guild}: {} tracks in a row could not be loaded (see the error above)",
                         state::MAX_FAILURES_IN_A_ROW
                     );
                     self.idle_since.insert(guild.clone(), Instant::now());
@@ -290,7 +318,13 @@ impl Bot {
                 eprintln!("track failed in guild {guild}: {}", event["exception"]["message"]);
             }
             Some("voice.closed") => {
-                println!("voice closed in guild {guild}: code {}", event["code"]);
+                let code = event["code"].as_u64().unwrap_or(0);
+                println!("voice closed in guild {guild}: code {code}");
+                if code == 4014 {
+                    self.forget(&guild).await;
+                } else {
+                    self.voiced.remove(&guild);
+                }
             }
             _ => {}
         }

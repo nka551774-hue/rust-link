@@ -27,7 +27,7 @@ function Read-Secret([string]$Prompt) {
 
 # Reads `KEY=value` from the saved .env, so a later start can reuse it.
 function Get-Saved([string]$Key) {
-    foreach ($line in Get-Content -LiteralPath $EnvFile) {
+    foreach ($line in Get-Content -LiteralPath $EnvFile -Encoding UTF8) {
         if ($line -match "^$Key=(.*)$") { return $Matches[1] }
     }
     return ''
@@ -81,7 +81,7 @@ if ($reuse) {
     $Proxy = (Read-Host "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]").Trim()
     if (-not $Proxy) { $Proxy = $warp }
     if ($Proxy -match '["\\\s]') { Fail 'the proxy cannot contain quotes, backslashes or spaces' }
-    if ($Proxy -and $Proxy -notmatch '^(https?|socks4|socks5h?)://') { Fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' }
+    if ($Proxy -and $Proxy -notmatch '^(http|socks4|socks5h?)://') { Fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' }
     $proxyLine = if ($Proxy) { 'youtubeProxy: "' + $Proxy + '"' } else { '' }
 
     New-Item -ItemType Directory -Force -Path $Data | Out-Null
@@ -111,14 +111,22 @@ $env:RUSTLINK_PASSWORD = $Password
 $env:RUSTLINK_ADDRESS = "127.0.0.1:$Port"
 $env:DISCORD_BOT_TOKEN = $Token
 $env:RUSTLINK_URL = "http://127.0.0.1:$Port"
+$env:RUSTLINK_NO_PAUSE = '1'
 
 # --- Build ------------------------------------------------------------------
 
 # A windows-gnu toolchain builds and runs against MSYS2; use it when it is
 # installed but not on PATH.
-$msys = 'C:\msys64\ucrt64\bin'
-if (-not (Get-Command gcc -ErrorAction SilentlyContinue) -and (Test-Path $msys)) {
-    $env:PATH = "$msys;$env:PATH"
+$msysRoot = if ($env:RUSTLINK_MSYS2_ROOT) { $env:RUSTLINK_MSYS2_ROOT } else { 'C:\msys64' }
+$msys = Join-Path $msysRoot 'ucrt64\bin'
+$msysLib = Join-Path $msysRoot 'ucrt64\lib'
+if (Test-Path -LiteralPath $msys) {
+    if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+        $env:PATH = "$msys;$env:PATH"
+    }
+    if (-not $env:OPUS_LIB_DIR -and (Test-Path -LiteralPath (Join-Path $msysLib 'libopus.dll.a'))) {
+        $env:OPUS_LIB_DIR = $msysLib
+    }
 }
 
 $Node = Join-Path $Root 'target\release\rustlink.exe'
@@ -127,9 +135,9 @@ if (Get-Command cargo -ErrorAction SilentlyContinue) {
     Write-Host 'Building (the first build takes a few minutes)...'
     Push-Location $Root
     try {
-        cargo build --release -p rustlink --bin rustlink
+        cargo build --release --locked -p rustlink --bin rustlink
         if ($LASTEXITCODE -ne 0) { Fail 'building the node failed' }
-        cargo build --release -p rustlink-discord-bot --example music
+        cargo build --release --locked -p rustlink-discord-bot --example music
         if ($LASTEXITCODE -ne 0) { Fail 'building the music bot failed' }
     } finally { Pop-Location }
 } elseif (-not ((Test-Path $Node) -and (Test-Path $Bot))) {
@@ -151,7 +159,7 @@ try {
     $ready = $false
     while (-not $ready -and (Get-Date) -lt $deadline) {
         if ($nodeProcess.HasExited) {
-            Get-Content -LiteralPath "$NodeLog.err", $NodeLog -ErrorAction SilentlyContinue | Select-Object -Last 15
+            Get-Content -LiteralPath "$NodeLog.err", $NodeLog -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 15
             Fail "the node stopped; is port $Port already in use?"
         }
         try {

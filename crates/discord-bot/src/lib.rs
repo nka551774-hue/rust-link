@@ -68,6 +68,8 @@ impl From<RustlinkError> for BotError {
 pub(crate) fn validate_snowflake(value: &str, label: &str) -> Result<String, BotError> {
     let value = value.trim();
     if value.is_empty()
+        || value.len() > 20
+        || value.starts_with('0')
         || !value.bytes().all(|byte| byte.is_ascii_digit())
         || value.parse::<u64>().map_or(true, |id| id == 0)
     {

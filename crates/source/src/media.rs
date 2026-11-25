@@ -242,7 +242,7 @@ fn request_media(
     // Weak tags and unqualified modification dates cannot prove byte-for-byte
     // equality. Only use a strong entity tag for conditional continuation.
     let next_validator = header("ETag")
-        .filter(|value| value.starts_with('"') && value.ends_with('"'))
+        .filter(|value| value.len() >= 2 && value.starts_with('"') && value.ends_with('"'))
         .map(str::to_owned);
     let mut size = response
         .headers()
@@ -427,6 +427,9 @@ impl MediaBody {
         if self.size < 0 {
             self.size = size;
         }
+        if self.validator.is_none() {
+            self.validator = response.validator;
+        }
         self.reader = Some(response.body);
         self.response_start = self.offset;
         Ok(())
@@ -483,16 +486,18 @@ impl Read for MediaBody {
                     self.reader = None;
                     return Err(error);
                 }
-                Err(error) => (error, true),
+                Err(error) => (error, self.offset == self.response_start),
             };
             if stalled {
                 if self.attempts == 0 {
+                    self.reader = None;
                     return Err(error);
                 }
                 self.attempts -= 1;
                 std::thread::sleep(RESUME_DELAY);
             }
             if let Err(resume_error) = self.resume_with_retries() {
+                self.reader = None;
                 return Err(io::Error::other(resume_error));
             }
         }

@@ -47,7 +47,10 @@ pub struct SincResampler {
     scratch: Vec<f64>,
     /// Which row of the weight table the next output frame reads.
     phase: usize,
-    /// The weights of every phase, when the ratio repeats them.
+    /// Exact integer read frame used alongside `phases`, eliminating cumulative
+    /// floating-point phase drift across multi-hour streams.
+    centre_frame: usize,
+    /// Pre-normalised weights of every phase, when the ratio repeats them.
     phases: Option<Phases>,
     buffer: Vec<f32>,
 }
@@ -70,6 +73,7 @@ impl SincResampler {
             output_frames: 0,
             finished: false,
             phase: 0,
+            centre_frame: half,
             // The unity ratio has its own path that needs no weights at all.
             phases: if ratio == 1.0 { None } else { Phases::new(ratio, cutoff, half) },
             buffer: vec![0.0; half * CHANNELS],
@@ -160,11 +164,45 @@ impl SincResampler {
     /// The general case: a windowed sinc interpolation at the read position.
     fn produce_filtered(&mut self, limit: usize, out: &mut Vec<f32>) -> usize {
         let frames = self.buffer.len() / CHANNELS;
+        let width = 2 * self.half;
         let mut produced = 0;
+        if let Some(phases) = &self.phases {
+            out.reserve(limit.min(frames) * CHANNELS);
+            while produced < limit {
+                let centre = self.centre_frame;
+                let start = centre + 1 - self.half;
+                let end = centre + self.half + 1;
+                if end > frames {
+                    break;
+                }
+                let base = self.phase * width;
+                let row = &phases.weights[base..base + width];
+                let mut left = 0.0f64;
+                let mut right = 0.0f64;
+                let window_samples = &self.buffer[start * CHANNELS..end * CHANNELS];
+                for (pair, &tap_weight) in window_samples.as_chunks::<CHANNELS>().0.iter().zip(row)
+                {
+                    left += pair[0] as f64 * tap_weight;
+                    right += pair[1] as f64 * tap_weight;
+                }
+                out.push(left as f32);
+                out.push(right as f32);
+                self.centre_frame += phases.steps[self.phase];
+                self.phase += 1;
+                if self.phase == phases.period {
+                    self.phase = 0;
+                }
+                produced += 1;
+            }
+            self.position = self.centre_frame as f64 + phases.fractions[self.phase];
+            return produced;
+        }
+
         // Downsampling needs the filter narrowed to the new Nyquist, or the
         // content above it folds back as aliasing.
         let cutoff = if self.ratio > 1.0 { 1.0 / self.ratio } else { 1.0 };
         let mut weights = std::mem::take(&mut self.scratch);
+        weights.resize(width, 0.0);
         while produced < limit {
             let centre = self.position.floor() as usize;
             let start = centre + 1 - self.half;
@@ -172,56 +210,23 @@ impl SincResampler {
             if end > frames {
                 break;
             }
-            // The filter weights depend on the read position, not on the
-            // channel, so they are worked out once and used for both.
-            let width = 2 * self.half;
-            weights.resize(width, 0.0);
             let fraction = self.position.fract();
-            // The table's rows are indexed by the phase the read position is
-            // expected to be on, and a ratio that repeats is what keeps a
-            // 44.1 kHz source from paying for a sine and two cosines per tap.
-            // The position only ever drifts by a hair, but a hair either side
-            // of a whole frame pairs a row with the wrong samples, so a
-            // position that has drifted over one is worked out frame by frame
-            // instead.
-            let row = self
-                .phases
-                .as_ref()
-                .filter(|phases| (fraction - phases.fractions[self.phase]).abs() < 1e-3);
-            let weight = match row {
-                Some(phases) => {
-                    let base = self.phase * width;
-                    weights.copy_from_slice(&phases.weights[base..base + width]);
-                    phases.sums[self.phase]
-                }
-                None => {
-                    let mut weight = 0.0f64;
-                    for (tap_index, w) in weights.iter_mut().enumerate() {
-                        *w = tap(fraction, tap_offset(tap_index, self.half), cutoff);
-                        weight += *w;
-                    }
-                    weight
-                }
-            };
-            if let Some(phases) = &self.phases {
-                self.phase = (self.phase + 1) % phases.period;
+            let mut weight = 0.0f64;
+            for (tap_index, w) in weights.iter_mut().enumerate() {
+                *w = tap(fraction, tap_offset(tap_index, self.half), cutoff);
+                weight += *w;
             }
-            // Both channels are summed in one pass over the window: the input
-            // is then read in order rather than once per channel, and each
-            // weight is read once, which is what a source that is not at
-            // 48 kHz pays for on every output frame.
+            let inv_weight = if weight.abs() > 1e-9 { 1.0 / weight } else { 0.0 };
             let mut sums = [0.0f64; CHANNELS];
-            for (tap_index, index) in (start..end).enumerate() {
-                let tap_weight = weights[tap_index];
-                let at = index * CHANNELS;
-                for (channel, sum) in sums.iter_mut().enumerate() {
-                    *sum += self.buffer[at + channel] as f64 * tap_weight;
-                }
+            let window_samples = &self.buffer[start * CHANNELS..end * CHANNELS];
+            for (pair, &tap_weight) in
+                window_samples.as_chunks::<CHANNELS>().0.iter().zip(weights.iter())
+            {
+                sums[0] += pair[0] as f64 * tap_weight;
+                sums[1] += pair[1] as f64 * tap_weight;
             }
-            for sum in sums {
-                let value = if weight.abs() > 1e-9 { sum / weight } else { 0.0 };
-                out.push(value as f32);
-            }
+            out.push((sums[0] * inv_weight) as f32);
+            out.push((sums[1] * inv_weight) as f32);
             self.position += self.ratio;
             produced += 1;
         }
@@ -232,38 +237,37 @@ impl SincResampler {
     /// Drops the input behind the read position, which will never be read
     /// again because the filter only looks half a window back.
     fn compact(&mut self) {
+        let current_floor =
+            if self.phases.is_some() { self.centre_frame } else { self.position.floor() as usize };
         // Everything before the next read position's window is never read again.
-        let keep_from = (self.position.floor() as usize).saturating_sub(self.half + 1);
+        let keep_from = current_floor.saturating_sub(self.half + 1);
         // position is relative to the current buffer. Mixing an absolute
         // consumed count into it retained progressively more audio on long runs.
         if keep_from > 4096 {
             let keep_from = keep_from.min(self.buffer.len() / CHANNELS);
             let drop = keep_from * CHANNELS;
             self.buffer.drain(..drop);
-            self.position -= keep_from as f64;
+            self.centre_frame = self.centre_frame.saturating_sub(keep_from);
+            if let Some(phases) = &self.phases {
+                self.position = self.centre_frame as f64 + phases.fractions[self.phase];
+            } else {
+                self.position -= keep_from as f64;
+            }
         }
     }
 }
 
 /// The filter weights of every fractional read position a ratio repeats.
-///
-/// A ratio that comes from a whole sample rate is a ratio of two whole numbers,
-/// so the fractional position of the read pointer comes back to where it was
-/// every so many output frames. Tabulating those positions turns a sine and two
-/// cosines per tap into a lookup, which is what a 44.1 kHz source pays for on
-/// every frame otherwise. A ratio whose positions do not come round within
-/// `MAX_PHASES` is left to be worked out frame by frame.
 #[derive(Debug, Clone)]
 struct Phases {
     /// How many output frames the fractional position takes to come round.
     period: usize,
-    /// The fractional read position of each row, which is what says whether a
-    /// row still matches the position it is being read for.
+    /// Exact fractional read position `[0, 1)` of each row.
     fractions: Vec<f64>,
-    /// `period` sets of `2 * half` weights, in the order the taps are summed.
+    /// Exact integer input-frame step to take after producing each phase.
+    steps: Vec<usize>,
+    /// `period` sets of `2 * half` pre-normalised weights.
     weights: Vec<f64>,
-    /// The sum of each set, which normalises it.
-    sums: Vec<f64>,
 }
 
 impl Phases {
@@ -277,21 +281,31 @@ impl Phases {
             let turns = ratio * *period as f64;
             (turns - turns.round()).abs() < 1e-9
         })?;
+        let turns = (ratio * period as f64).round() as usize;
         let mut fractions = Vec::with_capacity(period);
+        let mut steps = Vec::with_capacity(period);
         let mut weights = Vec::with_capacity(period * width);
-        let mut sums = Vec::with_capacity(period);
         for phase in 0..period {
-            let fraction = (phase as f64 * ratio).fract();
+            let num = phase * turns;
+            let q_curr = num / period;
+            let rem = num % period;
+            let q_next = ((phase + 1) * turns) / period;
+            steps.push(q_next - q_curr);
+            let fraction = rem as f64 / period as f64;
             fractions.push(fraction);
+            let row_start = weights.len();
             let mut sum = 0.0f64;
             for tap_index in 0..width {
                 let w = tap(fraction, tap_offset(tap_index, half), cutoff);
                 weights.push(w);
                 sum += w;
             }
-            sums.push(sum);
+            let inv = if sum.abs() > 1e-9 { 1.0 / sum } else { 0.0 };
+            for w in &mut weights[row_start..row_start + width] {
+                *w *= inv;
+            }
         }
-        Some(Phases { period, fractions, weights, sums })
+        Some(Phases { period, fractions, steps, weights })
     }
 }
 
@@ -368,6 +382,8 @@ pub struct TimeStretcher {
     /// every frame and so is worked out once.
     fades: [f64; HOP],
     primed: bool,
+    total_input_frames: u64,
+    total_output_frames: u64,
 }
 
 /// Frame length in samples. At 48 kHz this is a little over 21 ms, which is long
@@ -405,11 +421,15 @@ impl TimeStretcher {
             sums: vec![0.0; search * 2 + hop],
             fades,
             primed: false,
+            total_input_frames: 0,
+            total_output_frames: 0,
         }
     }
 
     pub fn push(&mut self, input: &[f32]) {
-        let skipped = self.skip.min(input.len() / CHANNELS);
+        let frames = input.len() / CHANNELS;
+        self.total_input_frames += frames as u64;
+        let skipped = self.skip.min(frames);
         self.skip -= skipped;
         self.input.extend_from_slice(&input[skipped * CHANNELS..]);
     }
@@ -478,8 +498,35 @@ impl TimeStretcher {
     pub fn take_output_into(&mut self, out: &mut Vec<f32>) {
         let keep = TAIL.min(self.output.len());
         let ready = self.output.len() - keep;
+        self.total_output_frames += (ready / CHANNELS) as u64;
         out.extend_from_slice(&self.output[..ready]);
         self.output.drain(..ready);
+    }
+
+    /// Flushes the final buffered samples and overlap tail at stream end so
+    /// high stretch factors (`factor > 1.0`) neither swallow flush padding via
+    /// `self.skip` nor strand `TAIL` frames inside `self.output`.
+    pub fn finish(&mut self, factor: f64, out: &mut Vec<f32>) {
+        if self.total_input_frames == 0 {
+            return;
+        }
+        let factor = factor.clamp(0.05, 5.0);
+        let target_total = (self.total_input_frames as f64 / factor).round().max(1.0) as u64;
+        let remaining_target = target_total.saturating_sub(self.total_output_frames) as usize;
+        if !self.input.is_empty() || !self.primed {
+            self.skip = 0;
+            let pad_samples = (self.frame + self.search * 2) * CHANNELS;
+            self.input.resize(self.input.len() + pad_samples, 0.0);
+            self.produce(factor);
+        }
+        let take_tail = remaining_target.min(self.output.len() / CHANNELS) * CHANNELS;
+        if take_tail > 0 {
+            out.extend_from_slice(&self.output[..take_tail]);
+            self.total_output_frames += (take_tail / CHANNELS) as u64;
+        }
+        self.output.clear();
+        self.input.clear();
+        self.skip = 0;
     }
 
     /// Finds the offset within the search window where the next frame lines up
@@ -495,27 +542,32 @@ impl TimeStretcher {
                 *sum += self.tail[i * CHANNELS + channel] as f64;
             }
         }
-        // Neighbouring candidates share almost the whole of their window, so
-        // the summed channels of the input are worked out once for the search
-        // range rather than once per candidate.
         let frames = self.input.len() / CHANNELS;
         let last = frames.saturating_sub(read).min(self.sums.len());
+        if last < self.hop {
+            return best;
+        }
         for (i, sum) in self.sums[..last].iter_mut().enumerate() {
             *sum = 0.0;
             for channel in 0..CHANNELS {
                 *sum += self.input[(read + i) * CHANNELS + channel] as f64;
             }
         }
-        for offset in 0..=self.search * 2 {
-            if offset + self.hop > last {
-                break;
+        let max_offset = (self.search * 2).min(last - self.hop);
+        let mut energy: f64 = self.sums[..self.hop].iter().map(|a| a * a).sum();
+        for offset in 0..=max_offset {
+            if offset > 0 {
+                if offset % 64 == 0 {
+                    energy = self.sums[offset..offset + self.hop].iter().map(|a| a * a).sum();
+                } else {
+                    let prev = self.sums[offset - 1];
+                    let next = self.sums[offset + self.hop - 1];
+                    energy = (energy + next * next - prev * prev).max(0.0);
+                }
             }
             let mut dot = 0.0f64;
-            let mut energy = 0.0f64;
-            for (i, tail_sum) in tail.iter().enumerate() {
-                let a = self.sums[offset + i];
-                dot += a * tail_sum;
-                energy += a * a;
+            for (a, tail_sum) in self.sums[offset..offset + self.hop].iter().zip(tail.iter()) {
+                dot += *a * *tail_sum;
             }
             // Normalising by the energy keeps a loud passage from always
             // winning over a quiet one that fits better.
@@ -825,5 +877,32 @@ mod tests {
             .count();
         // 440 Hz over 8000 frames is 73 cycles.
         assert!((crossings as i64 - 73).abs() < 6, "{crossings} cycles, expected about 73");
+    }
+
+    #[test]
+    fn finish_flushes_short_clips_and_high_speed_tails() {
+        // Short clip (< 1536 frames) still produces output instead of dropping everything.
+        let short = tone(440.0, 600);
+        let mut stretcher = TimeStretcher::new();
+        let mut out = Vec::new();
+        stretcher.push(&short);
+        stretcher.produce(2.0);
+        stretcher.take_output_into(&mut out);
+        assert!(out.is_empty());
+        stretcher.finish(2.0, &mut out);
+        assert_eq!(out.len(), 300 * CHANNELS);
+
+        // Full 1-second clip at 5x stays within one WSOLA synthesis hop (512 frames) of 9600.
+        let input = tone(440.0, 48_000);
+        let mut fast = TimeStretcher::new();
+        let mut fast_out = Vec::new();
+        for chunk in input.chunks(700 * CHANNELS) {
+            fast.push(chunk);
+            fast.produce(5.0);
+            fast.take_output_into(&mut fast_out);
+        }
+        fast.finish(5.0, &mut fast_out);
+        let frames = fast_out.len() / CHANNELS;
+        assert!((frames as i64 - 9_600).abs() <= HOP as i64, "frames={frames}");
     }
 }

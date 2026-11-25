@@ -32,14 +32,23 @@ fn overlap(want: &HashSet<String>, got: &HashSet<String>) -> f64 {
     want.iter().filter(|word| got.contains(*word)).count() as f64 / want.len() as f64
 }
 
+pub fn is_unknown_artist(author: &str) -> bool {
+    let trimmed = author.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown artist")
+}
+
 /// Require title, artist and duration agreement before accepting a recording.
 /// Desired metadata is normalized once per search, and candidate title tokens
 /// are reused for artist matching without formatting another temporary string.
 pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Track> {
     let want_title = tokens(&want.metadata.title);
-    let want_artist = tokens(&want.metadata.author);
-    let artist_name = words(&want.metadata.author);
-    let short_artist = want_artist.iter().all(|word| word.chars().nth(1).is_none());
+    if want_title.is_empty() {
+        return None;
+    }
+    let has_artist = !is_unknown_artist(&want.metadata.author);
+    let want_artist = if has_artist { tokens(&want.metadata.author) } else { HashSet::new() };
+    let artist_name = if has_artist { words(&want.metadata.author) } else { HashSet::new() };
+    let short_artist = has_artist && want_artist.iter().all(|word| word.chars().nth(1).is_none());
     let mut best = None;
     let mut best_score = 0.0;
     for candidate in candidates {
@@ -82,19 +91,21 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
             continue;
         }
         let title = overlap(&want_title, &candidate_tokens);
-        if title < 0.6 {
+        if title < if has_artist { 0.6 } else { 0.8 } {
             continue;
         }
-        let author_tokens = words(&candidate.metadata.author);
-        let artist = if short_artist && named_title.is_none() {
+        let artist = if !has_artist {
+            0.0
+        } else if short_artist && named_title.is_none() {
+            let author_tokens = words(&candidate.metadata.author);
             // A short artist such as "A" cannot be proven by an article in
             // "A Song". Require the author field or an explicit artist prefix.
             overlap(&want_artist, &author_tokens)
         } else {
-            candidate_tokens.extend(author_tokens);
+            candidate_tokens.extend(words(&candidate.metadata.author));
             overlap(&want_artist, &candidate_tokens)
         };
-        if artist < 0.4 {
+        if has_artist && artist < 0.4 {
             continue;
         }
         let mut score = title + artist;

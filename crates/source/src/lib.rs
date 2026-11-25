@@ -264,6 +264,12 @@ impl Service {
         &self.agent
     }
 
+    /// The client configured for YouTube/YouTube Music requests (honouring
+    /// `youtubeProxy`), or `None` when `youtubeProxy` could not be constructed.
+    pub fn youtube_agent(&self) -> Option<&ureq::Agent> {
+        self.youtube_agent.as_ref().ok()
+    }
+
     /// How many loads were answered from the cache.
     pub fn cache_hits(&self) -> u64 {
         self.hits.load(std::sync::atomic::Ordering::Relaxed)
@@ -375,11 +381,19 @@ impl Service {
         let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
         let catalog = innertube::Catalog { agent, config: &self.config };
         if let Some(query) = identifier.strip_prefix("ytsearch:") {
-            let tracks = catalog.search(query.trim(), self.config.search_results as usize)?;
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(LoadResult::Empty);
+            }
+            let tracks = catalog.search(query, self.config.search_results as usize)?;
             return Ok(finish_search(tracks));
         }
         if let Some(query) = identifier.strip_prefix("ytmsearch:") {
-            let tracks = catalog.music_search(query.trim(), self.config.search_results as usize)?;
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(LoadResult::Empty);
+            }
+            let tracks = catalog.music_search(query, self.config.search_results as usize)?;
             return Ok(finish_search(tracks));
         }
         if youtube_id(identifier) {
@@ -423,6 +437,7 @@ impl Service {
         // The buffer is probed again only once it has doubled, so a long read
         // does not parse the same leading bytes thousands of times.
         let mut next_probe = probe::FIRST_PROBE;
+        let mut found = probe::Probe::default();
         while head.len() < probe::MAX_PROBE {
             let read =
                 body.read(&mut chunk).map_err(|error| SourceError::Http(error.to_string()))?;
@@ -431,7 +446,7 @@ impl Service {
             if !ended && head.len() > probe::FIRST_PROBE && head.len() < next_probe {
                 continue;
             }
-            let found = probe::probe(&head, size);
+            found = probe::probe(&head, size);
             next_probe = head.len().saturating_mul(2);
             if found.audio && (!found.title.is_empty() || found.duration_ms > 0) {
                 break;
@@ -439,12 +454,14 @@ impl Service {
             if ended {
                 break;
             }
-            let may_have_more = sized && (found.audio || probe::may_index_later(&head));
+            let may_have_more = sized && probe::can_gain_from_more(&head, size);
             if head.len() >= probe::FIRST_PROBE && !may_have_more {
                 break;
             }
         }
-        let found = probe::probe(&head, size);
+        if !found.audio && !head.is_empty() {
+            found = probe::probe(&head, size);
+        }
         if !found.audio {
             return Err(SourceError::NoAudio);
         }
@@ -461,7 +478,7 @@ impl Service {
             source_name: "http".into(),
             ..Default::default()
         };
-        let track = rustlink_protocol::encode_track(&info)
+        let track = rustlink_protocol::encode_track_owned(info)
             .map_err(|error| SourceError::Url(error.to_string()))?;
         Ok(LoadResult::Track(Box::new(track)))
     }
@@ -553,17 +570,26 @@ impl Service {
                 let uri = track
                     .metadata
                     .uri
-                    .clone()
+                    .as_deref()
                     .ok_or_else(|| SourceError::Url("track URI is missing".into()))?;
-                self.open_seekable(&uri, &Default::default())
+                if source_kind(uri) != "http" {
+                    return Err(SourceError::Url("track URI does not match its source".into()));
+                }
+                let deadline = Instant::now() + self.config.load_timeout();
+                let _permit = self.gate.enter(deadline)?;
+                let _scope = deadline::enter(deadline);
+                self.open_seekable(uri, &Default::default())
             }
             "spotify" | "deezer" => {
                 // A catalogue supplies metadata only; the audio is mirrored from
                 // a YouTube search for the same name.
                 let name =
                     if track.metadata.source_name == "deezer" { "Deezer" } else { "Spotify" };
-                let query =
-                    format!("ytsearch:{} - {} audio", track.metadata.author, track.metadata.title);
+                let query = if matching::is_unknown_artist(&track.metadata.author) {
+                    format!("ytsearch:{} audio", track.metadata.title)
+                } else {
+                    format!("ytsearch:{} - {} audio", track.metadata.author, track.metadata.title)
+                };
                 let result = self.load_shared(&query)?;
                 let LoadResult::Search(candidates) = result.as_ref() else {
                     return Err(SourceError::Url(format!("no playable match for {name} track")));
@@ -576,9 +602,11 @@ impl Service {
                 self.open(best)
             }
             "youtube" | "soundcloud" => {
-                let identifier =
-                    track.metadata.uri.as_deref().unwrap_or(&track.metadata.identifier);
-                if source_kind(identifier) != track.metadata.source_name {
+                if let Some(uri) = track.metadata.uri.as_deref() {
+                    if source_kind(uri) != track.metadata.source_name {
+                        return Err(SourceError::Url("track URI does not match its source".into()));
+                    }
+                } else if source_kind(&track.metadata.identifier) != track.metadata.source_name {
                     return Err(SourceError::Url("track URI does not match its source".into()));
                 }
                 let deadline = Instant::now() + self.config.load_timeout();

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use openmls::prelude::{hash_ref::ProposalRef, tls_codec::Serialize, *};
 use openmls_basic_credential::SignatureKeyPair;
@@ -10,6 +10,8 @@ use crate::{check, media::MediaSender, Error, Result};
 pub const MAX_PROTOCOL_VERSION: u16 = 1;
 const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
 const MAX_PENDING_TRANSITIONS: usize = 16;
+const MAX_CANCELLED_TRANSITIONS: usize = 32;
+const MAX_EXPECTED_MEMBERS: usize = 4096;
 
 /// Messages for the authenticated Discord voice gateway, without server sequence prefixes.
 pub enum Outbound {
@@ -41,8 +43,11 @@ pub struct Session {
     expected: HashSet<u64>,
     own_commit: Option<Vec<u8>>,
     active: Option<Sender>,
+    /// Encrypted sender temporarily displaced by a transport-only downgrade on the same epoch.
+    /// Preserves the monotonic frame nonce counter if the call upgrades back without a new commit.
+    parked: Option<((u64, u64), MediaSender)>,
     transitions: HashMap<u16, Transition>,
-    cancelled: HashSet<u16>,
+    cancelled: VecDeque<u16>,
     transition_order: u64,
     last_executed: u64,
     recovery_attempts: u8,
@@ -75,8 +80,9 @@ impl Session {
             expected: HashSet::from([user]),
             own_commit: None,
             active: None,
+            parked: None,
             transitions: HashMap::new(),
-            cancelled: HashSet::new(),
+            cancelled: VecDeque::with_capacity(MAX_CANCELLED_TRANSITIONS),
             transition_order: 0,
             last_executed: 0,
             recovery_attempts: 0,
@@ -130,7 +136,7 @@ impl Session {
             return Ok(false);
         }
         let sender = self.sender()?;
-        self.prepare(0, sender)?;
+        self.prepare(0, sender, false)?;
         Ok(true)
     }
 
@@ -169,24 +175,49 @@ impl Session {
                     .get("user_ids")
                     .and_then(Value::as_array)
                     .ok_or(Error::Protocol("invalid client list"))?;
+                if ids.len() > MAX_EXPECTED_MEMBERS {
+                    return Err(Error::Protocol("excessive client list"));
+                }
                 for id in ids {
-                    self.expected.insert(snowflake(id)?);
+                    let parsed = snowflake(id)?;
+                    if self.expected.len() >= MAX_EXPECTED_MEMBERS
+                        && !self.expected.contains(&parsed)
+                    {
+                        return Err(Error::Protocol("excessive client list"));
+                    }
+                    self.expected.insert(parsed);
                 }
             }
             13 => {
-                self.expected.remove(&snowflake(&data["user_id"])?);
+                let id = snowflake(&data["user_id"])?;
+                if id != self.user {
+                    self.expected.remove(&id);
+                }
             }
             21 => {
                 let version = number(data, "protocol_version")?;
                 validate_version(version)?;
                 let id = number(data, "transition_id")?;
-                let sender = if version == 0 { Sender::TransportOnly } else { self.sender()? };
-                return self.prepare(id, sender);
+                if version == 0 {
+                    return self.prepare(id, Sender::TransportOnly, false);
+                }
+                if self.group.is_some() {
+                    self.version = Some(1);
+                }
+                if matches!(self.active, Some(Sender::TransportOnly)) {
+                    let current = self.current_context();
+                    if self.parked.as_ref().is_some_and(|(ctx, _)| Some(*ctx) == current) {
+                        let (context, media) = self.parked.take().unwrap();
+                        return self.prepare(id, Sender::Encrypted { context, media }, true);
+                    }
+                }
+                let sender = self.sender()?;
+                return self.prepare(id, sender, false);
             }
             22 => {
                 let id = number(data, "transition_id")?;
                 // The gateway may execute a timed-out transition we explicitly rejected.
-                if self.cancelled.remove(&id) {
+                if self.take_cancelled(id) {
                     return Ok(vec![]);
                 }
                 let transition =
@@ -195,22 +226,35 @@ impl Session {
                     return Err(Error::Protocol("out-of-order transition"));
                 }
                 self.last_executed = transition.order;
-                self.active = Some(transition.sender);
+                self.activate(transition.sender);
                 self.recovery_attempts = 0;
             }
             24 => {
                 let version = number(data, "protocol_version")?;
-                if version != 1 {
-                    return Err(Error::Protocol("unsupported epoch protocol version"));
+                validate_version(version)?;
+                if version == 0 {
+                    let _ = data
+                        .get("epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or(Error::Protocol("invalid epoch"))?;
+                    self.version = Some(0);
+                    self.group = None;
+                    self.own_commit = None;
+                    self.parked = None;
+                    return Ok(vec![]);
                 }
                 let epoch = data
                     .get("epoch")
                     .and_then(Value::as_u64)
                     .filter(|e| *e > 0)
                     .ok_or(Error::Protocol("invalid epoch"))?;
-                self.version = Some(version);
+                self.version = Some(1);
                 if epoch == 1 {
+                    self.recovery_attempts = 0;
                     self.reset_group()?;
+                    if self.external.is_none() {
+                        return Ok(vec![]);
+                    }
                     return Ok(vec![self.key_package()?]);
                 }
                 if self.group.as_ref().map(|g| g.epoch().as_u64()) != Some(epoch) {
@@ -252,7 +296,7 @@ impl Session {
                 let result =
                     if opcode == 29 { self.commit(&data[2..]) } else { self.welcome(&data[2..]) };
                 match result.and_then(|_| self.sender()) {
-                    Ok(sender) => self.prepare(id, sender),
+                    Ok(sender) => self.prepare(id, sender, false),
                     Err(_) => {
                         self.recovery_attempts += 1;
                         if self.recovery_attempts > 3 {
@@ -260,11 +304,13 @@ impl Session {
                         }
                         // The existing sender is retained until a valid transition executes.
                         self.reset_group()?;
-                        self.cancelled.insert(id);
-                        Ok(vec![
-                            Outbound::Json(json!({"op":31,"d":{"transition_id":id}})),
-                            self.key_package()?,
-                        ])
+                        self.cancel_transition(id);
+                        let mut outbound =
+                            vec![Outbound::Json(json!({"op":31,"d":{"transition_id":id}}))];
+                        if self.external.is_some() {
+                            outbound.push(self.key_package()?);
+                        }
+                        Ok(outbound)
                     }
                 }
             }
@@ -272,24 +318,62 @@ impl Session {
         }
     }
 
-    fn prepare(&mut self, id: u16, sender: Sender) -> Result<Vec<Outbound>> {
+    fn current_context(&self) -> Option<(u64, u64)> {
+        self.group.as_ref().map(|g| (self.group_revision, g.epoch().as_u64()))
+    }
+
+    fn activate(&mut self, sender: Sender) {
+        match &sender {
+            Sender::TransportOnly => {
+                if let Some(Sender::Encrypted { context, media }) = self.active.take() {
+                    self.parked = Some((context, media));
+                }
+            }
+            Sender::Encrypted { .. } => {
+                self.parked = None;
+            }
+        }
+        self.active = Some(sender);
+    }
+
+    fn cancel_transition(&mut self, id: u16) {
+        if !self.cancelled.contains(&id) {
+            if self.cancelled.len() >= MAX_CANCELLED_TRANSITIONS {
+                self.cancelled.pop_front();
+            }
+            self.cancelled.push_back(id);
+        }
+    }
+
+    fn take_cancelled(&mut self, id: u16) -> bool {
+        if let Some(pos) = self.cancelled.iter().position(|&item| item == id) {
+            self.cancelled.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prepare(&mut self, id: u16, sender: Sender, resumed: bool) -> Result<Vec<Outbound>> {
         if self.transitions.len() >= MAX_PENDING_TRANSITIONS || self.transitions.contains_key(&id) {
             return Err(Error::Protocol("duplicate or excessive pending transitions"));
         }
         if let Sender::Encrypted { context, .. } = &sender {
-            if self.last_prepared.is_some_and(|previous| previous >= *context) {
+            if !resumed && self.last_prepared.is_some_and(|previous| previous >= *context) {
                 return Err(Error::Protocol("refusing to reuse an outgoing epoch key"));
             }
-            self.last_prepared = Some(*context);
+            if !resumed {
+                self.last_prepared = Some(*context);
+            }
         }
         self.transition_order = self
             .transition_order
             .checked_add(1)
             .ok_or(Error::Protocol("transition counter exhausted"))?;
-        self.cancelled.remove(&id);
+        self.take_cancelled(id);
         if id == 0 {
             self.last_executed = self.transition_order;
-            self.active = Some(sender);
+            self.activate(sender);
             self.recovery_attempts = 0;
             return Ok(vec![]);
         }
@@ -304,9 +388,10 @@ impl Session {
             .ok_or(Error::Protocol("group revision exhausted"))?;
         self.group = None;
         self.own_commit = None;
-        self.cancelled.extend(self.transitions.drain().map(|(id, _)| id));
-        if self.cancelled.len() > 32 {
-            return Err(Error::Protocol("too many abandoned transitions"));
+        self.parked = None;
+        let drained: Vec<u16> = self.transitions.drain().map(|(id, _)| id).collect();
+        for id in drained {
+            self.cancel_transition(id);
         }
         // Discard consumed key packages and obsolete MLS storage, retaining the signing identity.
         self.provider = OpenMlsRustCrypto::default();

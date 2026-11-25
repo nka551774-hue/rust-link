@@ -57,28 +57,30 @@ else
     read -r -p "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]: " PROXY
     PROXY=${PROXY:-$warp}
     case $PROXY in *[\"\\]* | *[[:space:]]*) fail 'the proxy cannot contain quotes, backslashes or spaces' ;; esac
-    case $PROXY in '' | http://* | https://* | socks4://* | socks5://* | socks5h://*) ;;
+    case $PROXY in '' | http://* | socks4://* | socks5://* | socks5h://*) ;;
         *) fail 'the proxy must start with http://, socks4://, socks5:// or socks5h://' ;; esac
-    PROXY_LINE=${PROXY:+"youtubeProxy: \"$PROXY\""}
 
-    mkdir -p "$DATA"
     umask 077
-    cat > "$CONFIG" <<EOF
-# Written by quickstart/start.sh. Run it again to change these.
-address: 127.0.0.1:$PORT
-password: "$PASSWORD"
-logLevel: info
-logDirectory: logs
-toolsDirectory: .tools
-autoDownload: true
-$PROXY_LINE
-EOF
-    cat > "$ENV_FILE" <<EOF
-# Written by quickstart/start.sh. Keep this file private.
-DISCORD_BOT_TOKEN=$TOKEN
-RUSTLINK_PASSWORD=$PASSWORD
-RUSTLINK_URL=http://127.0.0.1:$PORT
-EOF
+    mkdir -p "$DATA"
+    chmod 700 "$DATA"
+    {
+        printf '# Written by quickstart/start.sh. Run it again to change these.\n'
+        printf 'address: 127.0.0.1:%s\n' "$PORT"
+        printf 'password: "%s"\n' "$PASSWORD"
+        printf 'logLevel: info\n'
+        printf 'logDirectory: logs\n'
+        printf 'toolsDirectory: .tools\n'
+        printf 'autoDownload: true\n'
+        if [ -n "$PROXY" ]; then
+            printf 'youtubeProxy: "%s"\n' "$PROXY"
+        fi
+    } > "$CONFIG"
+    {
+        printf '# Written by quickstart/start.sh. Keep this file private.\n'
+        printf 'DISCORD_BOT_TOKEN=%s\n' "$TOKEN"
+        printf 'RUSTLINK_PASSWORD=%s\n' "$PASSWORD"
+        printf 'RUSTLINK_URL=http://127.0.0.1:%s\n' "$PORT"
+    } > "$ENV_FILE"
     echo "Settings saved to $DATA"
 fi
 
@@ -93,9 +95,9 @@ NODE=$ROOT/target/release/rustlink
 BOT=$ROOT/target/release/examples/music
 if command -v cargo >/dev/null 2>&1; then
     echo 'Building (the first build takes a few minutes)...'
-    (cd "$ROOT" && cargo build --release -p rustlink --bin rustlink) ||
+    (cd "$ROOT" && cargo build --release --locked -p rustlink --bin rustlink) ||
         fail 'building the node failed (it needs pkg-config and libopus; see install.sh)'
-    (cd "$ROOT" && cargo build --release -p rustlink-discord-bot --example music) ||
+    (cd "$ROOT" && cargo build --release --locked -p rustlink-discord-bot --example music) ||
         fail 'building the music bot failed'
 elif [ ! -x "$NODE" ] || [ ! -x "$BOT" ]; then
     fail 'Rust is not installed; get it from https://rustup.rs and run this again'
@@ -109,6 +111,7 @@ stop_node() {
     if [ -n "$NODE_PID" ] && kill -0 "$NODE_PID" 2>/dev/null; then
         echo 'Stopping the node...'
         kill "$NODE_PID" 2>/dev/null || true
+        wait "$NODE_PID" 2>/dev/null || true
     fi
 }
 trap stop_node EXIT

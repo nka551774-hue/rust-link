@@ -1,4 +1,7 @@
 target
+dist
+logs
+quickstart/data
 .git
 .github
 .tools
@@ -6,6 +9,8 @@ target
 config.yaml
 config.yml
 config.json
+config.local.*
 .env
+.env.*
 docs
 README.md

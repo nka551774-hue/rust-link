@@ -84,10 +84,19 @@ case $ADDRESS in '' | *[[:space:]]*) die "--address cannot be empty or contain s
 case $DIRECTORY in /*) ;; *) die "--dir needs an absolute path" ;; esac
 case $DIRECTORY in *[[:space:]\|]*) die "--dir cannot contain spaces or a pipe" ;; esac
 case ${DIRECTORY%/} in "" | /bin | /boot | /dev | /etc | /home | /lib | /lib64 | /opt | /proc | /root | /run | /sbin | /srv | /sys | /tmp | /usr | /usr/* | /var) die "--dir $DIRECTORY is a system directory; use a folder of its own such as /opt/rustlink" ;; esac
+if [ "$SERVICE" = 1 ]; then
+    case ${DIRECTORY%/} in /home/* | /root/*) die "--dir $DIRECTORY is hidden by ProtectHome=true in rustlink.service; use /opt/rustlink or /srv/rustlink" ;; esac
+fi
 case $SERVICE_USER in '' | *[!A-Za-z0-9_-]*) die "--user needs a plain name" ;; esac
 if [ -n "$PASSWORD" ]; then
     case $PASSWORD in *[\"\\]* | *[[:space:]]*) die "--password cannot contain quotes, backslashes or spaces" ;; esac
 fi
+
+case $ADDRESS in
+    \[*\]) LISTEN_ADDR="$ADDRESS:$PORT" ;;
+    *:*) LISTEN_ADDR="[$ADDRESS]:$PORT" ;;
+    *) LISTEN_ADDR="$ADDRESS:$PORT" ;;
+esac
 
 [ "$(id -u)" = 0 ] || die "this installer needs root: run it again with sudo"
 
@@ -193,9 +202,9 @@ build_node() {
     step "Building the node"
     if [ "$NATIVE" = 1 ]; then
         note "with -C target-cpu=native, which is right because the binary stays on this machine"
-        (cd "$SOURCE" && RUSTFLAGS="-C target-cpu=native" cargo build --release --locked)
+        (cd "$SOURCE" && RUSTFLAGS="-C target-cpu=native" cargo build --release --locked --bin rustlink)
     else
-        (cd "$SOURCE" && cargo build --release --locked)
+        (cd "$SOURCE" && cargo build --release --locked --bin rustlink)
     fi
 }
 
@@ -242,25 +251,35 @@ install_files() {
 write_config() {
     step "Writing the configuration"
     local template="$SOURCE/config.example.yaml"
-    local escaped_address escaped_password
-    escaped_address=$(sed_replacement "$ADDRESS")
+    local escaped_listen escaped_password ffmpeg_value auto_download_value
+    escaped_listen=$(sed_replacement "$LISTEN_ADDR")
     escaped_password=$(sed_replacement "$PASSWORD")
-    if [ -f "$template" ]; then
-        # The example is the configuration with the three values this run knows
-        # better, so every comment and every other default stays where it is.
-        sed -e "s|^address:.*|address: $escaped_address:$PORT|" \
-            -e "s|^password:.*|password: \"$escaped_password\"|" \
-            -e "s|^autoDownload:.*|autoDownload: true|" \
-            "$template" >"$DIRECTORY/config.yaml"
+    if [ -x /usr/bin/ffmpeg ]; then
+        ffmpeg_value=/usr/bin/ffmpeg
+        auto_download_value=false
     else
-        cat >"$DIRECTORY/config.yaml" <<TEXT
-address: $ADDRESS:$PORT
-password: "$PASSWORD"
-autoDownload: true
-logDirectory: logs
-logRetentionDays: 14
-TEXT
+        ffmpeg_value=ffmpeg
+        auto_download_value=true
     fi
+    (
+        umask 0027
+        if [ -f "$template" ]; then
+            sed -e "s|^address:.*|address: $escaped_listen|" \
+                -e "s|^password:.*|password: \"$escaped_password\"|" \
+                -e "s|^ffmpeg:.*|ffmpeg: $ffmpeg_value|" \
+                -e "s|^autoDownload:.*|autoDownload: $auto_download_value|" \
+                "$template" >"$DIRECTORY/config.yaml"
+        else
+            {
+                printf 'address: %s\n' "$LISTEN_ADDR"
+                printf 'password: "%s"\n' "$PASSWORD"
+                printf 'ffmpeg: %s\n' "$ffmpeg_value"
+                printf 'autoDownload: %s\n' "$auto_download_value"
+                printf 'logDirectory: logs\n'
+                printf 'logRetentionDays: 14\n'
+            } >"$DIRECTORY/config.yaml"
+        fi
+    )
     chown "$SERVICE_USER:$SERVICE_GROUP" "$DIRECTORY/config.yaml"
     chmod 0640 "$DIRECTORY/config.yaml"
 }
@@ -316,35 +335,24 @@ start_service() {
 
 summary() {
     step "Installed"
-    cat <<TEXT
-    binary         $DIRECTORY/rustlink
-    configuration  $DIRECTORY/config.yaml
-    address        $ADDRESS:$PORT
-TEXT
+    printf '    binary         %s/rustlink\n' "$DIRECTORY"
+    printf '    configuration  %s/config.yaml\n' "$DIRECTORY"
+    printf '    address        %s\n' "$LISTEN_ADDR"
     if [ "$SERVICE" = 1 ]; then
-        cat <<TEXT
-    logs           journalctl -u rustlink -f
-    restart        systemctl restart rustlink
-TEXT
+        printf '    logs           journalctl -u rustlink -f\n'
+        printf '    restart        systemctl restart rustlink\n'
     else
-        cat <<TEXT
-    start          cd $DIRECTORY && ./rustlink --config config.yaml
-TEXT
+        printf '    start          cd %s && ./rustlink --config config.yaml\n' "$DIRECTORY"
     fi
-    cat <<TEXT
-    update         git pull && sudo ./install.sh
-TEXT
+    printf '    update         git pull && sudo ./install.sh\n'
     if [ -n "$GENERATED_PASSWORD" ]; then
-        cat <<TEXT
-
-    The password for clients is $GENERATED_PASSWORD
-    It is in the configuration as well; change it if this node is reachable
-    from anywhere else.
-TEXT
+        printf '\n    The password for clients is %s\n' "$GENERATED_PASSWORD"
+        printf '    It is in the configuration as well; change it if this node is reachable\n'
+        printf '    from anywhere else.\n'
     fi
     case $ADDRESS in
-        127.0.0.1 | ::1 | localhost)
-            cat <<TEXT
+        127.0.0.1 | ::1 | \[::1\] | localhost)
+            cat <<'TEXT'
 
     The node listens on the loopback address, so only this machine reaches it.
     A bot on another machine wants --address 0.0.0.0 and a firewall rule;
@@ -352,21 +360,14 @@ TEXT
 TEXT
             ;;
         *)
-            cat <<TEXT
-
-    A bot on another machine joins at:
-
-        http://$(machine_address):$PORT/api/v1
-
-    with Authorization: Bearer <password>. Create a session with POST /api/v1/sessions.
-    The node is only as private
-    as the firewall around it, so let the bot through and nothing else:
-
-        ufw allow from <bot address> to any port $PORT proto tcp
-
-    For wss:// put a proxy in front; docs/vps.md has the Caddy and nginx
-    snippets and the sizing table for the machine this runs on.
-TEXT
+            printf '\n    A bot on another machine joins at:\n\n'
+            printf '        http://%s:%s/api/v1\n\n' "$(machine_address)" "$PORT"
+            printf '    with Authorization: Bearer <password>. Create a session with POST /api/v1/sessions.\n'
+            printf '    The node is only as private\n'
+            printf '    as the firewall around it, so let the bot through and nothing else:\n\n'
+            printf '        ufw allow from <bot address> to any port %s proto tcp\n\n' "$PORT"
+            printf '    For wss:// put a proxy in front; docs/vps.md has the Caddy and nginx\n'
+            printf '    snippets and the sizing table for the machine this runs on.\n'
             ;;
     esac
 }

@@ -61,6 +61,13 @@ pub struct FilterSet {
     pub low_pass: Option<LowPass>,
 }
 
+impl FilterSet {
+    /// Returns the active [`Timescale`] only when it alters speed, pitch, or rate.
+    pub fn effective_time(&self) -> Option<Timescale> {
+        self.time.filter(Timescale::changes_anything)
+    }
+}
+
 impl Default for FilterSet {
     fn default() -> Self {
         Self {
@@ -351,7 +358,14 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
                 Field::new("filterWidth", 100.0, 1.0, 24_000.0),
             ],
         )?;
-        set.karaoke = Some(Karaoke { filter_band: v[2], filter_width: v[3], gain: -v[0] * v[1] });
+        // Cap the effective centre frequency strictly below the 24 kHz Nyquist
+        // limit so FFmpeg's `bandpass` and the in-process biquad stay valid
+        // when a client sends `filterBand: 24000`.
+        set.karaoke = Some(Karaoke {
+            filter_band: v[2].min(23_999.0),
+            filter_width: v[3],
+            gain: -v[0] * v[1],
+        });
     }
     if let Some(raw) = filters.get("timescale") {
         let v = fields(
@@ -670,6 +684,8 @@ mod tests {
         assert_eq!(karaoke.gain, -0.5);
         assert_eq!(karaoke.filter_band, 220.0);
         assert_eq!(karaoke.filter_width, 100.0);
+        let nyquist = set(json!({"karaoke": {"filterBand": 24000}})).karaoke.unwrap();
+        assert!(nyquist.filter_band < 24_000.0);
     }
 
     #[test]

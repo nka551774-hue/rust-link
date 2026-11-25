@@ -21,8 +21,10 @@ pub const GUILD_MESSAGES: u64 = 1 << 9;
 pub const MESSAGE_CONTENT: u64 = 1 << 15;
 
 const API_BASE: &str = "https://discord.com/api/v10";
+const USER_AGENT_VALUE: &str =
+    concat!("DiscordBot (https://github.com/rustlink, ", env!("CARGO_PKG_VERSION"), ")");
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_GATEWAY_MESSAGE: usize = 2 * 1024 * 1024;
+const MAX_GATEWAY_MESSAGE: usize = 16 * 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -141,12 +143,18 @@ pub struct Gateway {
     /// The code Discord closed the connection with, once it has.
     close_code: Option<u16>,
     sequence: Option<u64>,
+    invalid_session_resumable: bool,
 }
 
 impl Gateway {
     /// Fetch Discord's gateway URL, receive HELLO, and send IDENTIFY.
     pub async fn connect(token: impl Into<String>, intents: u64) -> Result<Self, BotError> {
         let token = validate_gateway_token(&token.into())?;
+        let mut auth =
+            reqwest::header::HeaderValue::from_str(&format!("Bot {token}")).map_err(|_| {
+                BotError::Invalid("bot token contains invalid header characters".into())
+            })?;
+        auth.set_sensitive(true);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
@@ -154,7 +162,8 @@ impl Gateway {
             .build()?;
         let response = http
             .get(format!("{API_BASE}/gateway/bot"))
-            .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .header(reqwest::header::USER_AGENT, USER_AGENT_VALUE)
             .send()
             .await?;
         let status = response.status();
@@ -168,7 +177,40 @@ impl Gateway {
             });
         }
         let info: GatewayResponse = serde_json::from_slice(&body)?;
-        Self::connect_url(info.url, Zeroizing::new(token), intents).await
+        let mut gateway = Self::connect_url(info.url, Zeroizing::new(token), intents).await?;
+        // Per Discord Gateway v10, jitter the first heartbeat on production connections.
+        let jitter_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let factor = 0.25 + (f64::from(jitter_nanos % 7_500) / 10_000.0);
+        gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval.mul_f64(factor);
+        Ok(gateway)
+    }
+
+    /// Reconnects to `resume_gateway_url`, receives HELLO, and sends RESUME (`op: 6`).
+    pub async fn resume(
+        resume_gateway_url: impl AsRef<str>,
+        token: impl Into<String>,
+        session_id: impl AsRef<str>,
+        sequence: u64,
+        intents: u64,
+    ) -> Result<Self, BotError> {
+        let token = Zeroizing::new(validate_gateway_token(&token.into())?);
+        let session_id = crate::validate_text(session_id.as_ref(), "session ID")?;
+        let mut gateway = Self::open_hello(resume_gateway_url.as_ref(), token, intents).await?;
+        gateway.sequence = Some(sequence);
+        gateway
+            .send(json!({
+                "op": 6,
+                "d": {
+                    "token": gateway.token.as_str(),
+                    "session_id": session_id,
+                    "seq": sequence
+                }
+            }))
+            .await?;
+        Ok(gateway)
     }
 
     async fn connect_url(
@@ -176,7 +218,17 @@ impl Gateway {
         token: Zeroizing<String>,
         intents: u64,
     ) -> Result<Self, BotError> {
-        let url = gateway_url(&base)?;
+        let mut gateway = Self::open_hello(&base, token, intents).await?;
+        gateway.identify().await?;
+        Ok(gateway)
+    }
+
+    async fn open_hello(
+        base: &str,
+        token: Zeroizing<String>,
+        intents: u64,
+    ) -> Result<Self, BotError> {
+        let url = gateway_url(base)?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_GATEWAY_MESSAGE))
             .max_frame_size(Some(MAX_GATEWAY_MESSAGE));
@@ -195,21 +247,22 @@ impl Gateway {
             return Err(BotError::Protocol("first gateway payload was not HELLO".into()));
         }
         let interval_ms = hello["d"]["heartbeat_interval"]
-            .as_u64()
-            .filter(|interval| *interval >= 500)
+            .as_f64()
+            .filter(|interval| interval.is_finite() && *interval >= 500.0)
             .ok_or_else(|| BotError::Protocol("HELLO has invalid heartbeat interval".into()))?;
-        let mut gateway = Self {
+        let interval = Duration::try_from_secs_f64(interval_ms / 1000.0)
+            .map_err(|_| BotError::Protocol("HELLO has invalid heartbeat interval".into()))?;
+        Ok(Self {
             socket,
             token,
             intents,
-            heartbeat_interval: Duration::from_millis(interval_ms),
-            next_heartbeat: Instant::now() + Duration::from_millis(interval_ms),
+            heartbeat_interval: interval,
+            next_heartbeat: Instant::now() + interval,
             heartbeat_acknowledged: true,
             close_code: None,
             sequence: None,
-        };
-        gateway.identify().await?;
-        Ok(gateway)
+            invalid_session_resumable: false,
+        })
     }
 
     async fn identify(&mut self) -> Result<(), BotError> {
@@ -302,14 +355,22 @@ impl Gateway {
                                 Some(0) => return dispatch(&payload),
                                 Some(1) => self.send_heartbeat().await?,
                                 Some(7) => return Err(BotError::Reconnect),
-                                Some(9) => return Err(BotError::InvalidSession),
+                                Some(9) => {
+                                    self.invalid_session_resumable =
+                                        payload.get("d").and_then(Value::as_bool).unwrap_or(false);
+                                    return Err(BotError::InvalidSession);
+                                }
                                 Some(11) => self.heartbeat_acknowledged = true,
                                 Some(10) => {},
                                 Some(op) => return Err(BotError::Protocol(format!("unsupported gateway opcode {op}"))),
                                 None => return Err(BotError::Protocol("gateway payload has no opcode".into())),
                             }
                         }
-                        Message::Ping(bytes) => self.socket.send(Message::Pong(bytes)).await?,
+                        Message::Ping(_) => {
+                            tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
+                                .await
+                                .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
+                        }
                         Message::Close(frame) => {
                             self.close_code = frame.map(|frame| u16::from(frame.code));
                             return Ok(None);
@@ -333,6 +394,12 @@ impl Gateway {
     /// code at all, are worth a retry.
     pub fn close_code(&self) -> Option<u16> {
         self.close_code
+    }
+
+    /// Whether the most recent `OP 9` (`Invalid Session`) payload indicated that
+    /// resuming (`Gateway::resume`) is allowed (`d: true`).
+    pub fn invalid_session_resumable(&self) -> bool {
+        self.invalid_session_resumable
     }
 }
 
@@ -373,11 +440,7 @@ fn gateway_url(base: &str) -> Result<String, BotError> {
 }
 
 fn validate_gateway_token(token: &str) -> Result<String, BotError> {
-    if token.is_empty()
-        || token.len() > 512
-        || token.trim() != token
-        || token.bytes().any(|byte| byte.is_ascii_whitespace() || byte == 0)
-    {
+    if token.is_empty() || token.len() > 512 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(BotError::Invalid(
             "bot token is empty, too long, or contains whitespace".into(),
         ));

@@ -28,6 +28,7 @@ struct State {
     timeout: u32,
     connected: bool,
     has_connected: bool,
+    closing: bool,
     closed: bool,
     disconnected: Option<Instant>,
 }
@@ -45,6 +46,9 @@ pub struct Session {
     /// parked here while a session has no socket, so the events that arrive in
     /// the meantime are waiting for the client when it resumes.
     inbox: Mutex<Option<mpsc::Receiver<Value>>>,
+    /// One popped event whose WebSocket send failed mid-disconnect, preserved
+    /// so a resumed subscriber receives it ahead of newer events in `inbox`.
+    unsent: Mutex<Option<Value>>,
     /// How many events may wait, which the overflow warning names.
     buffer: usize,
     /// Set when the buffer overflowed, so the warning and the close happen
@@ -99,11 +103,13 @@ impl Session {
                 timeout: DEFAULT_TIMEOUT,
                 connected: false,
                 has_connected: false,
+                closing: false,
                 closed: false,
                 disconnected: Some(Instant::now()),
             }),
             events,
             inbox: Mutex::new(Some(inbox)),
+            unsent: Mutex::new(None),
             buffer,
             overflowed: AtomicBool::new(false),
             stop: Notify::new(),
@@ -120,6 +126,14 @@ impl Session {
     /// finds the events that were sent while it was disconnected.
     pub fn restore_inbox(&self, inbox: mpsc::Receiver<Value>) {
         *self.inbox.lock().unwrap() = Some(inbox);
+    }
+
+    pub fn take_unsent(&self) -> Option<Value> {
+        self.unsent.lock().unwrap().take()
+    }
+
+    pub fn restore_unsent(&self, event: Value) {
+        *self.unsent.lock().unwrap() = Some(event);
     }
 
     /// The callback a player delivers its events through. It holds the session
@@ -194,7 +208,7 @@ impl Session {
         create: impl FnOnce() -> Result<Arc<Player>, E>,
     ) -> Result<Option<(Arc<Player>, bool)>, E> {
         let mut state = self.state.lock().unwrap();
-        if state.closed {
+        if state.closing || state.closed {
             return Ok(None);
         }
         if let Some(player) = state.players.get(guild) {
@@ -238,7 +252,8 @@ impl Session {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.state.lock().unwrap().closed
+        let state = self.state.lock().unwrap();
+        state.closing || state.closed
     }
 
     pub fn resuming(&self) -> bool {
@@ -309,21 +324,22 @@ impl Session {
     pub fn destroy(&self) {
         let players = {
             let mut state = self.state.lock().unwrap();
-            if state.closed {
+            if state.closing || state.closed {
                 return;
             }
-            state.closed = true;
+            state.closing = true;
             std::mem::take(&mut state.players)
         };
-        // Notifying rather than notifying waiters leaves a permit behind, so a
-        // writer that starts after the session was destroyed sees it at once.
-        self.stop.notify_one();
         for (_, player) in players {
             player.destroy();
             if let Some(server) = self.server.upgrade() {
                 server.player_destroyed();
             }
         }
+        self.state.lock().unwrap().closed = true;
+        // Notifying rather than notifying waiters leaves a permit behind, so a
+        // writer that starts after the session was destroyed sees it at once.
+        self.stop.notify_one();
     }
 
     /// Wakes the writer loop, which then sees the session is closed and stops.

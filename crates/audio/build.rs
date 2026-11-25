@@ -9,6 +9,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=OPUS_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=RUSTLINK_MSYS2_ROOT");
     if std::env::var_os("CARGO_FEATURE_NATIVE_OPUS").is_none() {
         return;
     }
@@ -18,13 +19,27 @@ fn main() {
         return;
     }
     if let Some(flags) = pkg_config() {
+        let mut lib_name = "opus".to_string();
         for flag in flags {
             if let Some(path) = flag.strip_prefix("-L") {
                 println!("cargo:rustc-link-search=native={path}");
+            } else if let Some(name) = flag.strip_prefix("-l") {
+                if name.contains("opus") {
+                    lib_name = name.to_string();
+                }
             }
         }
-        println!("cargo:rustc-link-lib=opus");
+        println!("cargo:rustc-link-lib={lib_name}");
         return;
+    }
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        let msys_root = std::env::var_os("RUSTLINK_MSYS2_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\msys64"));
+        let ucrt_lib = msys_root.join("ucrt64").join("lib");
+        if ucrt_lib.join("libopus.dll.a").is_file() || ucrt_lib.join("libopus.a").is_file() {
+            println!("cargo:rustc-link-search=native={}", ucrt_lib.display());
+        }
     }
     // Nothing to ask, so let the linker find it the way it would for any other
     // system library.

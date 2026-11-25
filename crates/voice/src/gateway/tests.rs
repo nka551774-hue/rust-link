@@ -21,14 +21,14 @@ const OPUS: &[u8] = &[0xf8, 0x11, 0x22, 0x33, 0x44];
 
 fn connection_with_queue(capacity: usize) -> (DiscordConnection, mpsc::Receiver<Command>) {
     let (commands, receiver) = mpsc::channel(capacity);
-    let connection = DiscordConnection {
-        commands,
+    let shared = Arc::new(SharedState {
         ready: AtomicBool::new(true),
         closed: AtomicBool::new(false),
         ping: AtomicI64::new(-1),
         audio_buffers: Mutex::new(Vec::with_capacity(COMMAND_CAPACITY)),
         dropped_frames: AtomicU64::new(0),
-    };
+    });
+    let connection = DiscordConnection { commands, shared };
     (connection, receiver)
 }
 
@@ -42,8 +42,8 @@ fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
     // A gateway that is behind costs frames, not the track: the late frame is
     // dropped, counted and its buffer is recycled, and the caller sees no error.
     connection.write(OPUS).expect("a full queue drops the frame without failing the player");
-    assert_eq!(connection.dropped_frames.load(Ordering::Relaxed), 1);
-    assert_eq!(connection.audio_buffers.lock().unwrap().len(), 1);
+    assert_eq!(connection.shared.dropped_frames.load(Ordering::Relaxed), 1);
+    assert_eq!(connection.shared.audio_buffers.lock().unwrap().len(), 1);
     let Command::Audio(packet) = receiver.try_recv().unwrap() else { panic!("expected audio") };
     assert_eq!(packet, OPUS);
     let pointer = packet.as_ptr();
@@ -55,7 +55,7 @@ fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
     for _ in 0..COMMAND_CAPACITY * 2 {
         connection.recycle(Vec::with_capacity(1500));
     }
-    assert_eq!(connection.audio_buffers.lock().unwrap().len(), COMMAND_CAPACITY);
+    assert_eq!(connection.shared.audio_buffers.lock().unwrap().len(), COMMAND_CAPACITY);
     connection.close();
     assert!(matches!(connection.write(OPUS), Err(VoiceError::NotReady)));
 }
@@ -68,7 +68,7 @@ fn speaking_and_close_always_fit_however_far_behind_the_gateway_is() {
         connection.write(OPUS).unwrap();
     }
     assert_eq!(
-        connection.dropped_frames.load(Ordering::Relaxed) as usize,
+        connection.shared.dropped_frames.load(Ordering::Relaxed) as usize,
         COMMAND_CAPACITY * 2 + CONTROL_RESERVE
     );
     // Speaking(false) used to be refused here, leaving the user shown as talking.
@@ -365,4 +365,62 @@ fn malformed_transport_keys_are_rejected() {
     }
     assert!(read_key(None).is_err());
     assert_eq!(*read_key(Some(&json!(KEY))).unwrap(), KEY);
+}
+
+#[tokio::test]
+async fn dropping_connection_closes_gateway_task_and_null_seq_or_stray_udp_do_not_fail() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        send(&mut ws, json!({"op":8,"seq":null,"d":{"heartbeat_interval":250}})).await;
+        let _ = next_json(&mut ws, 0).await;
+        send(
+            &mut ws,
+            json!({"op":2,"seq":1,"d":{"ssrc":SSRC,"ip":"127.0.0.1","port":udp.local_addr().unwrap().port(),"modes":["aead_aes256_gcm_rtpsize"]}}),
+        )
+        .await;
+        let mut discovery = [0u8; 74];
+        let (_, client) = udp.recv_from(&mut discovery).await.unwrap();
+        // Send a stray non-discovery UDP datagram first; discover() must ignore it.
+        udp.send_to(b"stray rtcp packet", client).await.unwrap();
+        discovery[..2].copy_from_slice(&2u16.to_be_bytes());
+        discovery[8..17].copy_from_slice(b"127.0.0.1");
+        discovery[72..].copy_from_slice(&client.port().to_be_bytes());
+        udp.send_to(&discovery, client).await.unwrap();
+        let _ = next_json(&mut ws, 1).await;
+        send(
+            &mut ws,
+            json!({"op":4,"seq":2,"d":{"mode":"aead_aes256_gcm_rtpsize","secret_key":KEY,"dave_protocol_version":0,"audio_codec":"opus"}}),
+        )
+        .await;
+        // Wait for the client gateway task to close automatically when Arc<DiscordConnection> drops.
+        while let Some(Ok(msg)) = ws.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+    let (closed_tx, mut closed_rx) = mpsc::unbounded_channel();
+    let connection = connect_url(
+        &url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(move |reason| {
+            let _ = closed_tx.send(reason);
+        }),
+    )
+    .await
+    .unwrap();
+    // Drop without calling connection.close(): Drop must break the cycle and stop the task.
+    drop(connection);
+    let reason = tokio::time::timeout(Duration::from_secs(5), closed_rx.recv())
+        .await
+        .expect("gateway task leaked after dropping DiscordConnection")
+        .unwrap();
+    assert!(!reason.by_remote);
+    server.await.unwrap();
 }

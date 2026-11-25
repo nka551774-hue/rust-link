@@ -23,6 +23,29 @@ struct Bucket {
     at: Instant,
 }
 
+impl Bucket {
+    fn new(burst: f64, now: Instant) -> Self {
+        Self { tokens: burst, at: now }
+    }
+
+    fn allow(&mut self, rate: f64, burst: f64, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.at = now;
+        self.tokens = (self.tokens + elapsed * rate).min(burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn idle(&self, rate: f64, burst: f64, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens + elapsed * rate >= burst
+    }
+}
+
 impl Limiter {
     /// Builds a bucket that starts full, so a client that has been quiet is not
     /// made to wait before its first request.
@@ -31,31 +54,14 @@ impl Limiter {
         Limiter {
             rate: if rate > 0.0 { rate } else { 0.0 },
             burst,
-            inner: Mutex::new(Bucket { tokens: burst, at: Instant::now() }),
+            inner: Mutex::new(Bucket::new(burst, Instant::now())),
         }
     }
 
     /// Spends one token and reports whether there was one.
     pub fn allow(&self) -> bool {
         let mut bucket = self.inner.lock().unwrap();
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(bucket.at).as_secs_f64();
-        bucket.at = now;
-        bucket.tokens = (bucket.tokens + elapsed * self.rate).min(self.burst);
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Whether the bucket has refilled completely, which is when forgetting it
-    /// changes nothing for the client it belonged to.
-    fn idle(&self) -> bool {
-        let bucket = self.inner.lock().unwrap();
-        let elapsed = Instant::now().saturating_duration_since(bucket.at).as_secs_f64();
-        bucket.tokens + elapsed * self.rate >= self.burst
+        bucket.allow(self.rate, self.burst, Instant::now())
     }
 }
 
@@ -68,14 +74,14 @@ impl Limiter {
 /// instead of growing the table.
 pub struct Keyed {
     rate: f64,
-    burst: usize,
+    burst: f64,
     max_keys: usize,
     table: Mutex<Table>,
     overflow: Limiter,
 }
 
 struct Table {
-    buckets: HashMap<String, Limiter>,
+    buckets: HashMap<String, Bucket>,
     /// When refilled buckets were last forgotten, so a table that stays full
     /// of busy keys is not swept on every request.
     swept: Instant,
@@ -83,31 +89,39 @@ struct Table {
 
 impl Keyed {
     pub fn new(rate: f64, burst: usize, max_keys: usize) -> Keyed {
+        let sanitized_rate = if rate > 0.0 { rate } else { 0.0 };
+        let sanitized_burst = burst.max(1) as f64;
         Keyed {
-            rate,
-            burst,
+            rate: sanitized_rate,
+            burst: sanitized_burst,
             max_keys: max_keys.max(1),
             table: Mutex::new(Table { buckets: HashMap::new(), swept: Instant::now() }),
-            overflow: Limiter::new(rate, burst),
+            overflow: Limiter::new(sanitized_rate, burst),
         }
     }
 
     /// Spends a token from `key`'s bucket, creating it full on first use.
     pub fn allow(&self, key: &str) -> bool {
         let mut table = self.table.lock().unwrap();
-        if let Some(limiter) = table.buckets.get(key) {
-            return limiter.allow();
+        let now = Instant::now();
+        let rate = self.rate;
+        let burst = self.burst;
+        if let Some(bucket) = table.buckets.get_mut(key) {
+            return bucket.allow(rate, burst, now);
         }
-        if table.buckets.len() >= self.max_keys && table.swept.elapsed() >= Duration::from_secs(1) {
-            table.buckets.retain(|_, limiter| !limiter.idle());
-            table.swept = Instant::now();
+        if table.buckets.len() >= self.max_keys
+            && now.saturating_duration_since(table.swept) >= Duration::from_secs(1)
+        {
+            table.buckets.retain(|_, bucket| !bucket.idle(rate, burst, now));
+            table.swept = now;
         }
         if table.buckets.len() >= self.max_keys {
+            drop(table);
             return self.overflow.allow();
         }
-        let limiter = Limiter::new(self.rate, self.burst);
-        let allowed = limiter.allow();
-        table.buckets.insert(key.to_string(), limiter);
+        let mut bucket = Bucket::new(burst, now);
+        let allowed = bucket.allow(rate, burst, now);
+        table.buckets.insert(key.to_string(), bucket);
         allowed
     }
 

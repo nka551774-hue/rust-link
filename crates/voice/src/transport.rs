@@ -129,7 +129,7 @@ pub fn parse_ip_discovery_response(data: &[u8], ssrc: u32) -> Option<(String, u1
     let end = address.iter().position(|byte| *byte == 0)?;
     let address = std::str::from_utf8(&address[..end]).ok()?.parse::<IpAddr>().ok()?;
     let port = u16::from_be_bytes([data[72], data[73]]);
-    if port == 0 {
+    if port == 0 || address.is_unspecified() {
         return None;
     }
     Some((address.to_string(), port))
@@ -211,8 +211,26 @@ impl Transport {
 
 /// Errors a voice UDP socket reports for one lost datagram rather than a dead socket.
 pub(crate) fn transient_udp_error(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{ConnectionRefused, ConnectionReset, WouldBlock};
-    matches!(error.kind(), WouldBlock | ConnectionRefused | ConnectionReset)
+    use std::io::ErrorKind::{
+        ConnectionRefused, ConnectionReset, HostUnreachable, Interrupted, NetworkUnreachable,
+        WouldBlock,
+    };
+    if matches!(
+        error.kind(),
+        WouldBlock
+            | ConnectionRefused
+            | ConnectionReset
+            | HostUnreachable
+            | NetworkUnreachable
+            | Interrupted
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(10040 | 10052 | 10054)) {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

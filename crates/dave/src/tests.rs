@@ -399,3 +399,39 @@ fn the_key_package_waits_for_the_external_sender() {
     // A repeated external sender does not send a second key package.
     assert!(session.handle_binary(25, &host.external).unwrap().is_empty());
 }
+
+#[test]
+fn downgrade_and_reupgrade_on_unchanged_group_preserves_monotonic_nonces() {
+    let (_, mut session, mut peer) = established();
+    let first = session.encrypt_opus(OPUS).unwrap();
+    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &first).unwrap(), OPUS);
+
+    // Non-DAVE member joins: downgrade to transport-only.
+    session.handle_json(21, &json!({"protocol_version":0,"transition_id":10})).unwrap();
+    execute(&mut session, 10);
+    assert_eq!(session.active_version(), Some(0));
+    assert_eq!(session.encrypt_opus(OPUS).unwrap(), OPUS);
+
+    // Non-DAVE member leaves without changing MLS group: upgrade back on the same epoch.
+    session.handle_json(21, &json!({"protocol_version":1,"transition_id":11})).unwrap();
+    // Duplicate prepare while parked sender is already in flight must still fail closed.
+    assert!(session.handle_json(21, &json!({"protocol_version":1,"transition_id":12})).is_err());
+    execute(&mut session, 11);
+    assert_eq!(session.active_version(), Some(1));
+
+    let resumed = session.encrypt_opus(OPUS).unwrap();
+    assert_ne!(first, resumed, "resumed sender must continue advancing its frame counter");
+    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &resumed).unwrap(), OPUS);
+}
+
+#[test]
+fn more_than_32_abandoned_transitions_evict_fifo_instead_of_failing_session() {
+    let (_, mut session, _) = established();
+    for round in 1u16..=40 {
+        session.handle_json(21, &json!({"protocol_version":0,"transition_id":round})).unwrap();
+        session.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap();
+    }
+    assert_eq!(session.cancelled.len(), 32);
+    // Recent cancelled IDs are still ignored on late execute.
+    assert!(session.handle_json(22, &json!({"transition_id":40})).unwrap().is_empty());
+}

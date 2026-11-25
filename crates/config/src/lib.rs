@@ -150,9 +150,10 @@ impl std::fmt::Debug for Webhook {
 }
 
 /// Fields that hold credentials, by their serialized name.
-const SECRET_FIELDS: [&str; 6] = [
+const SECRET_FIELDS: [&str; 7] = [
     "password",
     "youtubePoToken",
+    "youtubeVisitorData",
     "youtubeProxy",
     "soundcloudClientId",
     "spotifyClientSecret",
@@ -307,12 +308,23 @@ pub const STARTER_FILE: &str = "config.yaml";
 /// and it is generated rather than fixed because a node that ships with a
 /// password ships with a hole in it.
 pub fn starter(password: &str) -> String {
+    let mut escaped = String::with_capacity(password.len());
+    for ch in password.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
     format!(
         "# Written by Rustlink because no configuration file was found. Every\n\
          # setting has a default, so this only states what a fresh node needs,\n\
          # and the environment overrides it.\n\
          address: 0.0.0.0:2333\n\
-         password: \"{password}\"\n\
+         password: \"{escaped}\"\n\
          logLevel: info\n\
          logDirectory: logs\n\
          # Fetch FFmpeg on first start for media formats the built-in\n\
@@ -407,6 +419,10 @@ mod tests {
         let config: Config =
             serde_yaml::from_str(&starter("12345678")).expect("the starter file parses");
         assert_eq!(config.password, "12345678");
+        let special = "p\"a\\s#s:word";
+        let config: Config =
+            serde_yaml::from_str(&starter(special)).expect("special characters parse safely");
+        assert_eq!(config.password, special);
     }
 
     #[test]
@@ -421,6 +437,7 @@ mod tests {
             spotify_client_secret: "spotify-secret".into(),
             spotify_refresh_token: "refresh-secret".into(),
             youtube_po_token: "po-secret".into(),
+            youtube_visitor_data: "visitor-secret".into(),
             youtube_proxy: "socks5://user:proxy-secret@127.0.0.1:1080".into(),
             soundcloud_client_id: "sc-secret".into(),
             ..Default::default()
@@ -432,6 +449,7 @@ mod tests {
                 "spotify-secret",
                 "refresh-secret",
                 "po-secret",
+                "visitor-secret",
                 "proxy-secret",
                 "sc-secret",
                 "hook-secret",

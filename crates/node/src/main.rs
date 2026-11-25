@@ -90,7 +90,11 @@ fn run() -> Result<(), String> {
     // than refused, because a node with no password cannot start and the window
     // it would say so in closes with the process.
     let mut starter = None;
-    if path.is_none() && arguments.config.is_none() && !password_from_environment() {
+    if !arguments.check
+        && path.is_none()
+        && arguments.config.is_none()
+        && !password_from_environment()
+    {
         starter = write_starter();
         path = starter.as_ref().map(|written| written.path.clone());
     }
@@ -114,11 +118,12 @@ fn run() -> Result<(), String> {
             println!();
         }
     }
+    let log_directory = if arguments.check { String::new() } else { config.log_directory.clone() };
     let logger = logging::install(&logging::Options {
         level: level(&config.log_level),
         format,
         color,
-        directory: config.log_directory.clone(),
+        directory: log_directory,
         retention: config.log_retention_days,
     })?;
     if let Some(file) = logger.path() {
@@ -127,10 +132,11 @@ fn run() -> Result<(), String> {
     // Helpers are resolved before anything starts: a copy in the tools
     // directory is used as it is, and a missing one is installed there, so a
     // fresh checkout needs no preparation step.
+    let explicit_ffmpeg_path = config.ffmpeg.contains('/') || config.ffmpeg.contains('\\');
     let resolver = tools::Resolver::new(&config.tools_directory, config.auto_download);
     // FFmpeg is the fall back for the formats the in-process pipeline does not
-    // take, so a node without it still plays everything else. Losing it costs
-    // those formats rather than the node, which is why this is a warning.
+    // take, so a node without it still plays everything else unless either
+    // inProcessAudio is off or an explicit FFmpeg path was configured.
     match resolve_ffmpeg(&resolver, &config) {
         Ok(Some(ffmpeg)) => {
             config.ffmpeg = ffmpeg;
@@ -140,6 +146,10 @@ fn run() -> Result<(), String> {
             // Not wanted at all, which is a choice rather than a failure.
             config.ffmpeg = String::new();
             log::info!("ffmpeg disabled; tracks in the formats the in-process pipeline does not take will fail to load");
+        }
+        Err(error) if !config.in_process_audio || explicit_ffmpeg_path => {
+            resolver.close();
+            return Err(error);
         }
         Err(error) => {
             config.ffmpeg = String::new();
@@ -175,13 +185,20 @@ fn run() -> Result<(), String> {
     let playback: Arc<dyn Engine> =
         Arc::new(Playback { engine, source: Arc::clone(&sources) as Arc<dyn Loader> });
     // Lyrics come from a public service, so the node only calls one when the
-    // configuration names it. The catalogue is a YouTube client, so it goes
-    // through the same guarded agent the sources use.
-    let lyrics =
-        rustlink_lyrics::Manager::from_config(&config, sources.agent().clone()).map(Arc::new);
+    // configuration names it. YouTube Music requests share the YouTube source
+    // agent (including youtubeProxy when configured).
+    let lyrics = rustlink_lyrics::Manager::from_config_with_youtube(
+        &config,
+        sources.agent().clone(),
+        sources.youtube_agent().cloned(),
+    )
+    .map(Arc::new);
     // A configured webhook gets its worker before the server starts, so it is
     // ready for the first event.
-    let webhook = rustlink_server::webhook::Client::new(&config.webhook);
+    let webhook = rustlink_server::webhook::Client::with_network_policy(
+        &config.webhook,
+        config.allow_private_networks,
+    );
     let deps = Dependencies {
         loader: Arc::clone(&sources) as Arc<dyn Loader>,
         engine: playback,
@@ -222,19 +239,27 @@ async fn interrupt() {
         let mut terminate = match signal(SignalKind::terminate()) {
             Ok(terminate) => terminate,
             Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
                 log::info!("shutdown signal received");
                 return;
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            res = tokio::signal::ctrl_c() => {
+                if res.is_err() {
+                    let _ = terminate.recv().await;
+                }
+            }
             _ = terminate.recv() => {}
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
     log::info!("shutdown signal received");
 }
@@ -343,6 +368,11 @@ fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
             path.map(|path| path.display().to_string()).unwrap_or_else(|| "defaults".into())
         ),
         format!("sources={}", source_summary(config)),
+        format!("inProcessAudio={}", config.in_process_audio),
+        format!(
+            "ffmpeg={}",
+            if config.ffmpeg.is_empty() { "disabled" } else { config.ffmpeg.as_str() }
+        ),
         format!("toolsDirectory={}", config.tools_directory),
         format!("autoDownload={}", config.auto_download),
         format!("maxPlayers={}", config.max_players),
@@ -461,7 +491,7 @@ mod tests {
     fn startup_fields_are_one_setting_per_line_in_a_stable_order() {
         let config = Config::default();
         let fields = startup_fields(&config, Some(Path::new("config.yaml")));
-        assert_eq!(fields.len(), 17);
+        assert_eq!(fields.len(), 19);
         assert_eq!(fields[0], format!("version={}", rustlink_server::VERSION));
         assert_eq!(fields[1], format!("apiVersion={}", rustlink_server::APIVERSION));
         assert_eq!(fields[2], "config=config.yaml");

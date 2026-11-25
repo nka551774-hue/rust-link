@@ -18,9 +18,9 @@ use crate::resample::{ratio_for, SincResampler, TimeStretcher};
 /// after every call, so this only bounds a single step.
 const PRODUCE_LIMIT: usize = 1 << 16;
 
-/// Silence pushed through the stretcher to flush the end of a track: a whole
-/// frame plus the search window the stretcher looks ahead by.
-const FLUSH_SILENCE: usize = (crate::resample::STRETCH_FRAME + 512) * crate::dsp::CHANNELS;
+fn effective_time(set: &FilterSet) -> Option<crate::filters::Timescale> {
+    set.time.filter(crate::filters::Timescale::changes_anything)
+}
 
 pub struct PureFrames {
     decoder: Decoder,
@@ -29,6 +29,7 @@ pub struct PureFrames {
     resampler: Option<SincResampler>,
     stretcher: Option<TimeStretcher>,
     stretch_factor: f64,
+    time: Option<crate::filters::Timescale>,
     dsp: DspChain,
     encoder: Encoder,
     /// Interleaved stereo at 48 kHz, ready to be cut into frames.
@@ -44,8 +45,6 @@ pub struct PureFrames {
     /// allocates nothing.
     frame: [f32; FRAME_SAMPLES_STEREO],
     pcm: [i16; FRAME_SAMPLES_STEREO],
-    /// The silence the flush at the end of a track pushes.
-    silence: Vec<f32>,
     /// Source frames to discard before playback starts, which is how a seek is
     /// performed on a stream that cannot be seeked.
     skip: u64,
@@ -70,8 +69,9 @@ impl PureFrames {
     ) -> Result<Self, AudioError> {
         let decoder = Decoder::new(body).map_err(|e| AudioError::NeedsFfmpeg(e.to_string()))?;
         let rate = decoder.rate();
+        let active_time = effective_time(set);
         let time =
-            set.time.unwrap_or(crate::filters::Timescale { speed: 1.0, pitch: 1.0, rate: 1.0 });
+            active_time.unwrap_or(crate::filters::Timescale { speed: 1.0, pitch: 1.0, rate: 1.0 });
         let ratio = ratio_for(48_000, time.pitch, time.rate);
         let stretch_factor = time.speed / time.pitch;
         // Each API control is bounded, but their quotient can reach 100.
@@ -84,9 +84,6 @@ impl PureFrames {
         }
         let stretcher =
             if (stretch_factor - 1.0).abs() > 1e-9 { Some(TimeStretcher::new()) } else { None };
-        // Only a track that stretches ever needs the flush silence, so a track
-        // that does not is not made to carry it.
-        let silence = if stretcher.is_some() { vec![0.0; FLUSH_SILENCE] } else { Vec::new() };
         let encoder = Encoder::new(bitrate, complexity)?;
         let skip = if position_ms > 0 {
             (position_ms as u128 * rate as u128 / 1000).min(u64::MAX as u128) as u64
@@ -102,6 +99,7 @@ impl PureFrames {
             resampler: (ratio != 1.0).then(|| SincResampler::new(ratio)),
             stretcher,
             stretch_factor,
+            time: active_time,
             dsp: DspChain::new(set),
             encoder,
             staging: Vec::new(),
@@ -110,7 +108,6 @@ impl PureFrames {
             resampled: Vec::new(),
             frame: [0.0; FRAME_SAMPLES_STEREO],
             pcm: [0; FRAME_SAMPLES_STEREO],
-            silence,
             skip,
             drained: false,
             flushed: false,
@@ -200,13 +197,8 @@ impl PureFrames {
                     && self.resampler.as_ref().is_none_or(SincResampler::is_drained)
                     && !self.flushed
                 {
-                    // The stretcher holds a frame and a search window back, so
-                    // the tail of the track is still inside it. Pushing silence
-                    // and producing once more flushes it.
-                    stretcher.push(&self.silence);
-                    stretcher.produce(self.stretch_factor);
                     let before = self.staging.len();
-                    stretcher.take_output_into(&mut self.staging);
+                    stretcher.finish(self.stretch_factor, &mut self.staging);
                     if self.staging.len() > before {
                         progressed = true;
                     }
@@ -263,8 +255,8 @@ impl Frames for PureFrames {
             crate::opus::to_i16(frame, &mut self.pcm);
         } else {
             self.frame[..take].copy_from_slice(&self.staging[from..from + take]);
+            self.dsp.process_post(&mut self.frame[..take]);
             self.frame[take..].fill(0.0);
-            self.dsp.process_post(&mut self.frame);
             crate::opus::to_i16(&self.frame, &mut self.pcm);
         }
         self.staging_at += take;
@@ -280,5 +272,17 @@ impl Frames for PureFrames {
         packet.extend_from_slice(self.encoder.encode(&self.pcm)?);
         self.encoded_any = true;
         Ok(true)
+    }
+
+    fn supports_live_filters(&self) -> bool {
+        true
+    }
+
+    fn set_filters(&mut self, set: &FilterSet) -> bool {
+        if set.effective_time() != self.time {
+            return false;
+        }
+        self.dsp.reconfigure(set);
+        true
     }
 }

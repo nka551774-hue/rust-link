@@ -25,7 +25,8 @@ COPY LICENSE NOTICE /usr/share/doc/rustlink/
 ENV RUSTLINK_ADDRESS="0.0.0.0:2333" \
     RUSTLINK_FFMPEG="/usr/bin/ffmpeg" \
     RUSTLINK_TOOLS_DIRECTORY="/app/.tools" \
-    RUSTLINK_AUTO_DOWNLOAD="false"
+    RUSTLINK_AUTO_DOWNLOAD="false" \
+    RUSTLINK_LOG_DIRECTORY=""
 WORKDIR /app
 USER rustlink
 EXPOSE 2333

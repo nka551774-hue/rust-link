@@ -280,13 +280,27 @@ impl FfmpegFrames {
         thread::Builder::new()
             .name("rustlink-ffmpeg-in".into())
             .spawn(move || {
+                use std::io::Write;
                 let mut body = body;
-                if let Err(error) = std::io::copy(&mut body, &mut stdin) {
-                    // Record the failure before closing stdin. FFmpeg can exit
-                    // successfully after decoding a truncated input, but that
-                    // must not turn a failed media connection into normal EOF.
-                    if let Ok(mut guard) = input_failure.lock() {
-                        *guard = Some(error);
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    let read = match body.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            // Record only source-read failures. FFmpeg closes
+                            // stdin early after finishing a self-delimited
+                            // audio chunk (`mdat` / `data`) before trailing
+                            // tags, which must not turn EOF into `BrokenPipe`.
+                            if let Ok(mut guard) = input_failure.lock() {
+                                *guard = Some(error);
+                            }
+                            break;
+                        }
+                    };
+                    if stdin.write_all(&buf[..read]).is_err() {
+                        break;
                     }
                 }
             })
@@ -364,6 +378,13 @@ impl Frames for FfmpegFrames {
             }
             Ok(Err(error)) => {
                 self.terminate();
+                if let Some(io_error) = self.input_error.lock().ok().and_then(|mut g| g.take()) {
+                    return Err(AudioError::Io(io_error));
+                }
+                let stderr = self.stderr.message();
+                if !stderr.is_empty() {
+                    return Err(AudioError::Ffmpeg(format!("{error} ({stderr})")));
+                }
                 Err(error)
             }
             Err(RecvTimeoutError::Timeout) => {

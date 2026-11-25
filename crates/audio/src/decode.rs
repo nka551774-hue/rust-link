@@ -70,7 +70,7 @@ impl MediaSource for Unseekable {
 pub struct Decoder {
     inner: Inner,
     rate: u32,
-    scratch: Vec<i16>,
+    scratch: Vec<f32>,
     /// The interleaving buffer of the symphonia path, kept between packets so
     /// that a steady stream does not allocate one per packet.
     samples: SampleBuffer<f32>,
@@ -85,6 +85,111 @@ enum Inner {
         mixer: Downmix,
     },
     OggOpus(Box<OggDecoder>),
+    ContainerOpus(Box<ContainerOpusDecoder>),
+}
+
+struct ContainerOpusDecoder {
+    format: Box<dyn FormatReader>,
+    decoder: opus_decode::Decoder,
+    track_id: u32,
+    skip: u32,
+    gain: f32,
+}
+
+impl ContainerOpusDecoder {
+    fn from_track(
+        format: Box<dyn FormatReader>,
+        track_id: u32,
+        params: &symphonia::core::codecs::CodecParameters,
+    ) -> Result<Self, AudioError> {
+        let channels = params.channels.map(|c| c.count()).unwrap_or(2);
+        if !(1..=2).contains(&channels) {
+            return Err(AudioError::Decode("unsupported Opus channel count".into()));
+        }
+        let mut skip = params.delay.unwrap_or(0);
+        let mut output_gain = 0i16;
+        if let Some(extra) = params.extra_data.as_deref() {
+            if extra.starts_with(b"OpusHead") {
+                if extra.len() < 19
+                    || extra[8] > 15
+                    || !(1..=2).contains(&extra[9])
+                    || extra[18] != 0
+                {
+                    return Err(AudioError::Decode("unsupported OpusHead in container".into()));
+                }
+                let head_skip = u16::from_le_bytes([extra[10], extra[11]]) as u32;
+                if skip == 0 {
+                    skip = head_skip;
+                }
+                output_gain = i16::from_le_bytes([extra[16], extra[17]]);
+            } else if extra.len() >= 11 && extra[0] == 0 {
+                // ISO-MP4 `dOps` OpusSpecificBox payload: version=0, OutputChannelCount,
+                // PreSkip (BE u16), InputSampleRate (BE u32), OutputGain (BE i16), MappingFamily.
+                if !(1..=2).contains(&extra[1]) || extra[10] != 0 {
+                    return Err(AudioError::Decode("unsupported dOps channel mapping".into()));
+                }
+                let box_skip = u16::from_be_bytes([extra[2], extra[3]]) as u32;
+                if skip == 0 {
+                    skip = box_skip;
+                }
+                output_gain = i16::from_be_bytes([extra[8], extra[9]]);
+            }
+        }
+        let gain = 10.0f32.powf(output_gain as f32 / (20.0 * 256.0));
+        Ok(Self {
+            format,
+            decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
+            track_id,
+            skip,
+            gain,
+        })
+    }
+
+    fn decode(&mut self, scratch: &mut Vec<f32>, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(packet) => packet,
+                Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Ok(false);
+                }
+                Err(SymphoniaError::ResetRequired) => continue,
+                Err(e) => return Err(AudioError::Decode(e.to_string())),
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            let buf = packet.buf();
+            let Some(expected) = opus_decode::packet_samples(buf) else {
+                continue;
+            };
+            let frames = match self.decoder.decode_float(buf, scratch) {
+                Ok(frames) => frames,
+                Err(_) => self
+                    .decoder
+                    .conceal_float(expected, scratch)
+                    .map_err(|e| AudioError::Decode(e.to_string()))?,
+            };
+            let pkt_trim_start = packet.trim_start() as usize;
+            let drop_pre = (self.skip as usize).min(frames);
+            self.skip -= drop_pre as u32;
+            let start = drop_pre.max(pkt_trim_start).min(frames);
+            let end = frames.saturating_sub(packet.trim_end() as usize).max(start);
+            if end == start {
+                continue;
+            }
+            out.reserve((end - start) * 2);
+            let gain = self.gain;
+            out.extend(scratch[start * 2..end * 2].iter().map(|s| {
+                let v = *s * gain;
+                if v.is_finite() {
+                    v
+                } else {
+                    0.0
+                }
+            }));
+            return Ok(true);
+        }
+    }
 }
 
 struct OggPacket {
@@ -108,14 +213,6 @@ struct OggDecoder {
     packets: VecDeque<OggPacket>,
     previous_granule: Option<u64>,
     ended: bool,
-}
-
-extern "C" {
-    fn opus_packet_get_nb_samples(
-        data: *const u8,
-        len: std::ffi::c_int,
-        fs: std::ffi::c_int,
-    ) -> std::ffi::c_int;
 }
 
 impl OggDecoder {
@@ -154,14 +251,8 @@ impl OggDecoder {
                     Err(AudioError::Decode("missing ogg page granule".into()))
                 };
             }
-            let length = i32::try_from(self.packet.len())
-                .map_err(|_| AudioError::Decode("opus packet too large".into()))?;
-            let frames =
-                unsafe { opus_packet_get_nb_samples(self.packet.as_ptr(), length, 48_000) };
-            if !(1..=5760).contains(&frames) {
-                return Err(AudioError::Decode("invalid opus packet duration".into()));
-            }
-            let frames = frames as usize;
+            let frames = opus_decode::packet_samples(&self.packet)
+                .ok_or_else(|| AudioError::Decode("invalid opus packet duration".into()))?;
             total += frames as u64;
             self.packets.push_back(OggPacket {
                 offset: self.page.len(),
@@ -223,7 +314,7 @@ impl OggDecoder {
         }
     }
 
-    fn decode(&mut self, scratch: &mut Vec<i16>, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+    fn decode(&mut self, scratch: &mut Vec<f32>, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         if self.packets.is_empty() && !self.read_page()? {
             return Ok(false);
         }
@@ -232,18 +323,28 @@ impl OggDecoder {
         self.skip -= drop as u32;
         let frames = match self
             .decoder
-            .decode(&self.page[packet.offset..packet.offset + packet.length], scratch)
+            .decode_float(&self.page[packet.offset..packet.offset + packet.length], scratch)
         {
             Ok(frames) => frames,
-            // The TOC gave a valid duration: a damaged payload still occupies
-            // its place on the page's clock and consumes the same pre-skip.
-            Err(_) => return Ok(true),
+            // The TOC gave a valid duration: conceal the damaged packet so it
+            // still occupies its exact duration on the page's clock.
+            Err(_) => self
+                .decoder
+                .conceal_float(packet.frames, scratch)
+                .map_err(|e| AudioError::Decode(e.to_string()))?,
         };
         let end = packet.keep.min(frames);
         let start = drop.min(end);
         out.reserve((end - start) * 2);
-        let scale = self.gain / 32768.0;
-        out.extend(scratch[start * 2..end * 2].iter().map(|sample| *sample as f32 * scale));
+        let gain = self.gain;
+        out.extend(scratch[start * 2..end * 2].iter().map(|sample| {
+            let v = *sample * gain;
+            if v.is_finite() {
+                v
+            } else {
+                0.0
+            }
+        }));
         Ok(true)
     }
 }
@@ -252,7 +353,7 @@ impl Decoder {
     /// Opens a decoder over a body, working out the container from its first
     /// bytes.
     pub fn new(mut body: Body) -> Result<Self, AudioError> {
-        body.peek(64)?;
+        body.peek(512)?;
 
         // Opus in Ogg is demuxed here rather than by symphonia, because
         // symphonia has no Opus decoder and libopus does.
@@ -284,6 +385,16 @@ impl Decoder {
             .default_track()
             .ok_or_else(|| AudioError::Decode("the stream holds no playable track".into()))?;
         let track_id = track.id;
+        if track.codec_params.codec == CODEC_TYPE_OPUS {
+            let params = track.codec_params.clone();
+            let opus = ContainerOpusDecoder::from_track(format, track_id, &params)?;
+            return Ok(Decoder {
+                inner: Inner::ContainerOpus(Box::new(opus)),
+                rate: 48_000,
+                scratch: Vec::new(),
+                samples: SampleBuffer::new(0, SignalSpec::new(48_000, Channels::FRONT_LEFT)),
+            });
+        }
         let rate = track.codec_params.sample_rate.unwrap_or(48_000);
         if rate == 0 {
             // A zero rate would make the resampler expand every frame ~10^6 times.
@@ -291,9 +402,8 @@ impl Decoder {
         }
         let channels =
             track.codec_params.channels.unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
-        if track.codec_params.codec == CODEC_TYPE_OPUS {
-            // Opus in a container symphonia demuxes but does not decode.
-            return Err(AudioError::Decode("Opus in this container is not supported".into()));
+        if channels.count() == 0 {
+            return Err(AudioError::Decode("the stream has zero audio channels".into()));
         }
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
@@ -334,13 +444,17 @@ impl Decoder {
     fn decode_next(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         match &mut self.inner {
             Inner::OggOpus(decoder) => decoder.decode(&mut self.scratch, out),
+            Inner::ContainerOpus(decoder) => decoder.decode(&mut self.scratch, out),
             Inner::Symphonia { format, decoder, track_id, spec, mixer } => loop {
                 let packet = match format.next_packet() {
                     Ok(packet) => packet,
                     Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                         return Ok(false)
                     }
-                    Err(SymphoniaError::ResetRequired) => return Ok(false),
+                    Err(SymphoniaError::ResetRequired) => {
+                        decoder.reset();
+                        continue;
+                    }
                     Err(e) => return Err(AudioError::Decode(e.to_string())),
                 };
                 if packet.track_id() != *track_id {
@@ -465,27 +579,40 @@ impl Downmix {
             1 => {
                 // A lone channel is mono content, not a positioned surround bed.
                 for sample in samples {
-                    out.push(*sample);
-                    out.push(*sample);
+                    let s = if sample.is_finite() { *sample } else { 0.0 };
+                    out.push(s);
+                    out.push(s);
                 }
             }
-            2 if self.stereo_layout => out.extend_from_slice(&samples[..frames * 2]),
+            2 if self.stereo_layout => {
+                out.extend(
+                    samples[..frames * 2].iter().map(|s| if s.is_finite() { *s } else { 0.0 }),
+                );
+            }
             _ if self.fallback_mix => {
                 for frame in samples.chunks_exact(self.count) {
-                    let mono = frame.iter().copied().sum::<f32>() / self.count as f32;
+                    let mono =
+                        frame.iter().map(|s| if s.is_finite() { *s } else { 0.0 }).sum::<f32>()
+                            / self.count as f32;
                     out.push(mono);
                     out.push(mono);
                 }
             }
             _ => {
                 for frame in samples.chunks_exact(self.count) {
-                    let mut l = 0.0;
-                    let mut r = 0.0;
+                    let mut l = 0.0f32;
+                    let mut r = 0.0f32;
                     for (index, weight) in &self.left {
-                        l += frame[*index] * weight;
+                        let s = frame[*index];
+                        if s.is_finite() {
+                            l += s * weight;
+                        }
                     }
                     for (index, weight) in &self.right {
-                        r += frame[*index] * weight;
+                        let s = frame[*index];
+                        if s.is_finite() {
+                            r += s * weight;
+                        }
                     }
                     out.push(l / self.left_gain);
                     out.push(r / self.right_gain);

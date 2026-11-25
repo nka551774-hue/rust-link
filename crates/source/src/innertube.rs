@@ -2,10 +2,13 @@
 //! Client identities are tried in order when a provider rejects one; failures
 //! report the native API error without launching an external extractor.
 
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashSet},
+};
 
 use rustlink_config::Config;
-use rustlink_protocol::{encode_track, LoadResult, Playlist, Track, TrackInfo};
+use rustlink_protocol::{encode_track_owned, LoadResult, Playlist, Track, TrackInfo};
 use serde_json::{json, Value};
 
 use crate::{deadline, netguard, youtube_id, SourceError};
@@ -239,22 +242,28 @@ impl Catalog<'_> {
 
     /// Searches the catalogue for videos.
     pub fn search(&self, query: &str, want: usize) -> Result<Vec<Track>, SourceError> {
+        if query.trim().is_empty() || want == 0 {
+            return Ok(Vec::new());
+        }
         let client = catalogue_client(self.config);
         let body = json!({ "query": query, "params": SEARCH_PARAMS });
         let answer = self.web_call(&client, "search", body)?;
         let mut found = Vec::new();
         collect_videos(&answer, &mut found);
-        Ok(found.into_iter().take(want).map(|media| media.track("youtube")).collect())
+        Ok(found.into_iter().filter_map(|media| media.into_track("youtube")).take(want).collect())
     }
 
     /// Searches YouTube Music, which finds the official recording where the
     /// ordinary catalogue finds a reupload.
     pub fn music_search(&self, query: &str, want: usize) -> Result<Vec<Track>, SourceError> {
+        if query.trim().is_empty() || want == 0 {
+            return Ok(Vec::new());
+        }
         let body = json!({ "query": query, "params": MUSIC_SONGS_PARAMS });
         let answer = self.music_call("search", body)?;
         let mut found = Vec::new();
         collect_videos(&answer, &mut found);
-        Ok(found.into_iter().take(want).map(|media| media.track("youtube")).collect())
+        Ok(found.into_iter().filter_map(|media| media.into_track("youtube")).take(want).collect())
     }
 
     /// Reads a playlist, up to the configured number of tracks.
@@ -266,9 +275,12 @@ impl Catalog<'_> {
     pub fn playlist(&self, playlist_id: &str) -> Result<LoadResult, SourceError> {
         let client = catalogue_client(self.config);
         let mut videos = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut seen_continuations = HashSet::new();
         let mut title = String::new();
         let mut continuation = String::new();
         let mut pages = 0;
+        let limit = self.config.max_playlist_tracks as usize;
         loop {
             let answer = if continuation.is_empty() {
                 self.web_call(&client, "browse", json!({ "browseId": format!("VL{playlist_id}") }))?
@@ -278,23 +290,26 @@ impl Catalog<'_> {
             if title.is_empty() {
                 title = header_title(&answer).unwrap_or_default();
             }
-            collect_videos(&answer, &mut videos);
+            let mut page_videos = Vec::new();
+            collect_videos(&answer, &mut page_videos);
+            for media in page_videos {
+                if seen_ids.insert(media.id.clone()) {
+                    videos.push(media);
+                }
+            }
             pages += 1;
-            if videos.len() >= self.config.max_playlist_tracks as usize
-                || pages >= MAX_PLAYLIST_PAGES
-            {
+            if videos.len() >= limit || pages >= MAX_PLAYLIST_PAGES {
                 break;
             }
             match next_continuation(&answer) {
-                Some(token) => continuation = token,
-                None => break,
+                Some(token) if seen_continuations.insert(token.clone()) => continuation = token,
+                _ => break,
             }
         }
-        dedupe(&mut videos);
         let tracks: Vec<Track> = videos
             .into_iter()
-            .take(self.config.max_playlist_tracks as usize)
-            .map(|media| media.track("youtube"))
+            .filter_map(|media| media.into_track("youtube"))
+            .take(limit)
             .collect();
         if tracks.is_empty() {
             return Ok(LoadResult::Empty);
@@ -407,7 +422,9 @@ impl Catalog<'_> {
             live: details.get("isLiveContent").and_then(Value::as_bool).unwrap_or(false),
             artwork: thumbnails(answer.pointer("/videoDetails/thumbnail")),
         };
-        Ok(media.track("youtube"))
+        media.into_track("youtube").ok_or_else(|| {
+            SourceError::Http("youtube described a video that cannot be encoded".into())
+        })
     }
 }
 
@@ -446,27 +463,31 @@ pub struct Media {
 }
 
 impl Media {
-    fn track(&self, source: &str) -> Track {
+    fn into_track(self, source: &str) -> Option<Track> {
         let author =
-            if self.author.is_empty() { "Unknown artist".to_string() } else { self.author.clone() };
+            if self.author.is_empty() { "Unknown artist".to_string() } else { self.author };
         let length = duration_millis(self.seconds);
+        let uri = Some(format!("https://www.youtube.com/watch?v={}", self.id));
         let info = TrackInfo {
-            identifier: self.id.clone(),
-            title: self.title.clone(),
+            identifier: self.id,
+            title: self.title,
             author,
             length,
             // Search and playlist items often omit their length, so an unknown
             // length is still a video: only the live flag makes a stream.
             is_stream: self.live,
             is_seekable: !self.live,
-            uri: Some(format!("https://www.youtube.com/watch?v={}", self.id)),
-            artwork_url: self.artwork.clone(),
+            uri,
+            artwork_url: self.artwork,
             source_name: source.to_string(),
             ..Default::default()
         };
-        // A track whose metadata cannot be encoded is one the node cannot send,
-        // and an empty encoding is what a client reads as a broken track.
-        encode_track(&info).unwrap_or_else(|_| Track::new(String::new(), info))
+        encode_track_owned(info).ok()
+    }
+
+    #[cfg(test)]
+    fn track(&self, source: &str) -> Track {
+        self.clone().into_track(source).expect("valid test media")
     }
 }
 
@@ -641,11 +662,13 @@ pub fn collect_videos(value: &Value, out: &mut Vec<Media>) {
                         if let Some(media) = video_from_renderer(child) {
                             out.push(media);
                         }
+                        continue;
                     }
                     "musicResponsiveListItemRenderer" => {
                         if let Some(media) = video_from_music_item(child) {
                             out.push(media);
                         }
+                        continue;
                     }
                     _ => {}
                 }
@@ -675,12 +698,8 @@ fn video_from_renderer(value: &Value) -> Option<Media> {
         .map(|field| runs_text(value.get(*field)))
         .find(|text| !text.is_empty())
         .unwrap_or_default();
-    let seconds = value
-        .get("lengthText")
-        .and_then(|text| text.get("simpleText"))
-        .and_then(Value::as_str)
-        .and_then(length_seconds)
-        .unwrap_or(0.0);
+    let length_raw = runs_text(value.get("lengthText"));
+    let seconds = length_seconds(&length_raw).unwrap_or(0.0);
     Some(Media {
         id: id.to_string(),
         title,
@@ -718,19 +737,21 @@ fn video_from_music_item(value: &Value) -> Option<Media> {
     if title.is_empty() {
         return None;
     }
-    // The second column lists the artist and then the album, separated by a
-    // middle dot, so the artist is the part before it.
+    // The second column lists the artist and then the album (and sometimes
+    // duration), separated by middle dots, so the artist is the part before it.
     let byline = columns
         .get(1)
         .map(|column| runs_text(column.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
         .unwrap_or_default();
     let author = byline.split('•').next().unwrap_or_default().trim().to_string();
-    let seconds = value
-        .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text")
-        .and_then(Value::as_str)
-        .and_then(length_seconds)
+    let fixed_len =
+        runs_text(value.pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text"));
+    let seconds = length_seconds(&fixed_len)
+        .or_else(|| byline.rsplit('•').next().and_then(length_seconds))
         .unwrap_or(0.0);
-    Some(Media { id: id.to_string(), title, author, seconds, live: false, artwork: None })
+    let artwork = thumbnails(value.pointer("/thumbnail/musicThumbnailRenderer/thumbnail"))
+        .or_else(|| thumbnails(value.get("thumbnail")));
+    Some(Media { id: id.to_string(), title, author, seconds, live: false, artwork })
 }
 
 /// Reads the title of a playlist page.
@@ -757,6 +778,8 @@ fn next_continuation(value: &Value) -> Option<String> {
                     .get("nextContinuationData")
                     .and_then(|data| data.get("continuation"))
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
                 {
                     return Some(token.to_string());
                 }
@@ -764,6 +787,8 @@ fn next_continuation(value: &Value) -> Option<String> {
                     .get("continuationCommand")
                     .and_then(|data| data.get("token"))
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
                 {
                     return Some(token.to_string());
                 }
@@ -774,11 +799,6 @@ fn next_continuation(value: &Value) -> Option<String> {
         }
     }
     walk(value)
-}
-
-fn dedupe(videos: &mut Vec<Media>) {
-    let mut seen = std::collections::HashSet::new();
-    videos.retain(|media| seen.insert(media.id.clone()));
 }
 
 #[cfg(test)]

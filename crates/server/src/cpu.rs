@@ -6,19 +6,21 @@
 
 use std::sync::Mutex;
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// The machine load and the process load, each as a fraction of one, with a
 /// flag that says whether a sample has been taken yet.
 pub struct Cpu {
-    inner: Mutex<Inner>,
+    /// Held only by the background `spawn_blocking` sampler so slow OS table
+    /// refreshes never block HTTP or WebSocket readers.
+    sampler: Mutex<(System, bool)>,
+    snapshot: Mutex<Snapshot>,
     /// Read once: on Linux each query walks the cgroup files.
     cores: usize,
 }
 
-struct Inner {
-    system: System,
-    sampled: bool,
+#[derive(Clone, Copy, Default)]
+struct Snapshot {
     system_load: f64,
     process_load: f64,
     available: bool,
@@ -32,15 +34,8 @@ struct Inner {
 impl Cpu {
     pub fn new() -> Self {
         Cpu {
-            inner: Mutex::new(Inner {
-                system: System::new(),
-                sampled: false,
-                system_load: 0.0,
-                process_load: 0.0,
-                available: false,
-                memory_used: 0,
-                memory_total: 0,
-            }),
+            sampler: Mutex::new((System::new(), false)),
+            snapshot: Mutex::new(Snapshot::default()),
             cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -51,34 +46,42 @@ impl Cpu {
     /// establishes the baseline and reports nothing: the values stay
     /// unavailable until there is a second one to compare against.
     pub fn sample(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.system.refresh_cpu_usage();
-        inner.system.refresh_memory();
+        let mut sampler = self.sampler.lock().unwrap();
+        let (system, sampled) = &mut *sampler;
+        system.refresh_cpu_usage();
+        system.refresh_memory();
         let pid = Pid::from_u32(std::process::id());
-        inner.system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
         let cores = self.cores as f64;
-        let system_load = inner.system.global_cpu_usage() as f64 / 100.0;
-        let process_load = inner
-            .system
+        let system_load = system.global_cpu_usage() as f64 / 100.0;
+        let process_load = system
             .process(pid)
             .map(|process| process.cpu_usage() as f64 / 100.0 / cores)
             .unwrap_or(0.0);
-        if inner.sampled {
-            inner.system_load = clamp(system_load);
-            inner.process_load = clamp(process_load);
-            inner.available = true;
+        let used = system.process(pid).map(|process| process.memory()).unwrap_or(0);
+        let total = system.total_memory();
+        let was_sampled = *sampled;
+        *sampled = true;
+        drop(sampler);
+
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if was_sampled {
+            snapshot.system_load = clamp(system_load);
+            snapshot.process_load = clamp(process_load);
+            snapshot.available = true;
         }
-        inner.sampled = true;
-        let used = inner.system.process(pid).map(|process| process.memory()).unwrap_or(0);
-        let total = inner.system.total_memory();
-        inner.memory_used = used;
-        inner.memory_total = total;
+        snapshot.memory_used = used;
+        snapshot.memory_total = total;
     }
 
     /// The two loads and whether they mean anything yet.
     pub fn values(&self) -> (f64, f64, bool) {
-        let inner = self.inner.lock().unwrap();
-        (inner.system_load, inner.process_load, inner.available)
+        let snapshot = *self.snapshot.lock().unwrap();
+        (snapshot.system_load, snapshot.process_load, snapshot.available)
     }
 
     /// The logical cores the process may run on.
@@ -92,8 +95,8 @@ impl Cpu {
     /// implementation reports, so what a client reads is the resident size of
     /// the process and the total it is competing for.
     pub fn memory(&self) -> (u64, u64) {
-        let inner = self.inner.lock().unwrap();
-        (inner.memory_used, inner.memory_total)
+        let snapshot = *self.snapshot.lock().unwrap();
+        (snapshot.memory_used, snapshot.memory_total)
     }
 }
 

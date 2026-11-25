@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
 use crate::BotError;
 
 const DEFAULT_BASE: &str = "https://discord.com/api/v10/";
+const USER_AGENT_VALUE: &str =
+    concat!("DiscordBot (https://github.com/rustlink, ", env!("CARGO_PKG_VERSION"), ")");
 const MAX_CONTENT_CHARS: usize = 2_000;
 const MAX_RESPONSE_BYTES: u64 = 2 << 20;
 
@@ -71,13 +73,16 @@ impl DiscordRest {
         channel_id: &str,
         content: &str,
     ) -> Result<SentMessage, BotError> {
-        validate_snowflake(channel_id, "channel_id")?;
+        let channel_id = crate::validate_snowflake(channel_id, "channel_id")?;
         validate_content(content)?;
         let body = self
             .call(
                 Method::POST,
                 &format!("channels/{channel_id}/messages"),
                 &json!({ "content": content }),
+                true,
+                MAX_RATE_LIMIT_WAIT,
+                Duration::from_secs(30),
             )
             .await?;
         serde_json::from_slice(&body).map_err(BotError::from)
@@ -91,10 +96,12 @@ impl DiscordRest {
         guild_id: &str,
         commands: &serde_json::Value,
     ) -> Result<(), BotError> {
-        validate_snowflake(application_id, "application_id")?;
-        validate_snowflake(guild_id, "guild_id")?;
+        let application_id = crate::validate_snowflake(application_id, "application_id")?;
+        let guild_id = crate::validate_snowflake(guild_id, "guild_id")?;
         let path = format!("applications/{application_id}/guilds/{guild_id}/commands");
-        self.call(Method::PUT, &path, commands).await.map(drop)
+        self.call(Method::PUT, &path, commands, true, MAX_RATE_LIMIT_WAIT, Duration::from_secs(30))
+            .await
+            .map(drop)
     }
 
     /// Acknowledges a slash command within Discord's 3-second window and shows
@@ -104,10 +111,19 @@ impl DiscordRest {
         interaction_id: &str,
         interaction_token: &str,
     ) -> Result<(), BotError> {
-        validate_snowflake(interaction_id, "interaction_id")?;
+        let interaction_id = crate::validate_snowflake(interaction_id, "interaction_id")?;
         validate_interaction_token(interaction_token)?;
         let path = format!("interactions/{interaction_id}/{interaction_token}/callback");
-        self.call(Method::POST, &path, &json!({ "type": 5 })).await.map(drop)
+        self.call(
+            Method::POST,
+            &path,
+            &json!({ "type": 5 }),
+            false,
+            Duration::from_millis(1000),
+            Duration::from_millis(2500),
+        )
+        .await
+        .map(drop)
     }
 
     /// Replaces the text of a deferred interaction response.
@@ -117,40 +133,61 @@ impl DiscordRest {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), BotError> {
-        validate_snowflake(application_id, "application_id")?;
+        let application_id = crate::validate_snowflake(application_id, "application_id")?;
         validate_interaction_token(interaction_token)?;
         validate_content(content)?;
         let path = format!("webhooks/{application_id}/{interaction_token}/messages/@original");
-        self.call(Method::PATCH, &path, &json!({ "content": content })).await.map(drop)
+        self.call(
+            Method::PATCH,
+            &path,
+            &json!({ "content": content }),
+            false,
+            MAX_RATE_LIMIT_WAIT,
+            Duration::from_secs(30),
+        )
+        .await
+        .map(drop)
     }
 
-    /// Sends one authenticated JSON request and returns the success body.
+    /// Sends one JSON request and returns the success body. Interaction
+    /// callback/webhook routes authenticate with `interaction_token` in the
+    /// path, so the bot token is omitted there.
     async fn call(
         &self,
         method: Method,
         path: &str,
         body: &serde_json::Value,
+        use_bot_auth: bool,
+        max_retry_wait: Duration,
+        request_timeout: Duration,
     ) -> Result<Vec<u8>, BotError> {
         let endpoint = self
             .base
             .join(path)
             .map_err(|error| BotError::Invalid(format!("invalid Discord endpoint: {error}")))?;
-        let authorization = HeaderValue::from_str(&format!("Bot {}", self.token.as_str()))
-            .map_err(|_| {
-                BotError::Invalid("bot token contains invalid header characters".into())
-            })?;
+        let authorization = if use_bot_auth {
+            let mut value = HeaderValue::from_str(&format!("Bot {}", self.token.as_str()))
+                .map_err(|_| {
+                    BotError::Invalid("bot token contains invalid header characters".into())
+                })?;
+            value.set_sensitive(true);
+            Some(value)
+        } else {
+            None
+        };
         let mut limited = 0;
         loop {
-            let response = self
+            let mut req = self
                 .client
                 .request(method.clone(), endpoint.clone())
-                .header(AUTHORIZATION, authorization.clone())
+                .timeout(request_timeout)
                 .header(CONTENT_TYPE, "application/json")
-                .header(USER_AGENT, "rustlink-discord-bot/0.1")
-                .json(body)
-                .send()
-                .await
-                .map_err(BotError::from)?;
+                .header(USER_AGENT, USER_AGENT_VALUE)
+                .json(body);
+            if let Some(auth) = &authorization {
+                req = req.header(AUTHORIZATION, auth.clone());
+            }
+            let response = req.send().await.map_err(BotError::from)?;
             let status = response.status();
             if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES) {
                 return Err(BotError::HttpStatus {
@@ -169,7 +206,9 @@ impl DiscordRest {
             // fault of its own; a long one is reported, since a caller cannot
             // sit on it (an interaction token expires within minutes).
             if status.as_u16() == 429 && limited < MAX_RATE_LIMIT_RETRIES {
-                if let Some(wait) = retry_wait(&body, retry_header.as_deref()) {
+                if let Some(wait) = retry_wait(&body, retry_header.as_deref())
+                    .filter(|wait| *wait <= max_retry_wait)
+                {
                     limited += 1;
                     tokio::time::sleep(wait).await;
                     continue;
@@ -209,9 +248,12 @@ fn retry_wait(body: &[u8], header: Option<&str>) -> Option<Duration> {
 }
 
 /// Interaction tokens are spliced into URL paths, so only URL-safe characters pass.
+/// Dot-segments (`.` and `..`) are explicitly refused so `Url::join` cannot traverse.
 fn validate_interaction_token(token: &str) -> Result<(), BotError> {
     if token.is_empty()
         || token.len() > 512
+        || token == "."
+        || token == ".."
         || !token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -273,26 +315,10 @@ fn parse_base(value: &str) -> Result<Url, BotError> {
 }
 
 fn validate_token(token: &str) -> Result<(), BotError> {
-    if token.is_empty()
-        || token.len() > 512
-        || token.bytes().any(|byte| byte.is_ascii_whitespace() || byte == 0)
-    {
+    if token.is_empty() || token.len() > 512 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(BotError::Invalid(
-            "bot token is empty, too long, or contains whitespace".into(),
+            "bot token is empty, too long, or contains invalid characters".into(),
         ));
-    }
-    if token.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-        return Err(BotError::Invalid("bot token contains invalid header characters".into()));
-    }
-    Ok(())
-}
-
-fn validate_snowflake(value: &str, name: &str) -> Result<(), BotError> {
-    if value.is_empty()
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || value.parse::<u64>().map_or(true, |id| id == 0)
-    {
-        return Err(BotError::Invalid(format!("{name} must be a nonzero Discord snowflake")));
     }
     Ok(())
 }
@@ -372,7 +398,7 @@ mod tests {
     #[test]
     fn interaction_tokens_cannot_escape_their_url_path() {
         assert!(validate_interaction_token("aW50ZXJhY3Rpb24.abc-DEF_123").is_ok());
-        for bad in ["", "a/../b", "a?b", "a b", "a%2Fb"] {
+        for bad in ["", ".", "..", "a/../b", "a?b", "a b", "a%2Fb"] {
             assert!(validate_interaction_token(bad).is_err(), "{bad}");
         }
     }

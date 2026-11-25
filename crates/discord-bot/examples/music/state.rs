@@ -8,6 +8,8 @@ use rustlink_client::Track;
 pub struct Guild {
     queue: VecDeque<Track>,
     current: Option<Track>,
+    current_play_id: Option<u64>,
+    next_play_id: u64,
     /// Tracks in a row that could not be loaded; a working one resets it.
     failures: u32,
     pub volume: i64,
@@ -20,7 +22,14 @@ pub const MAX_FAILURES_IN_A_ROW: u32 = 3;
 
 impl Guild {
     pub fn new(volume: i64) -> Guild {
-        Guild { queue: VecDeque::new(), current: None, failures: 0, volume }
+        Guild {
+            queue: VecDeque::new(),
+            current: None,
+            current_play_id: None,
+            next_play_id: 0,
+            failures: 0,
+            volume,
+        }
     }
 
     /// Adds tracks up to `max` waiting, and returns how many were accepted.
@@ -34,18 +43,30 @@ impl Guild {
     /// Moves the next waiting track into `current` and returns it.
     pub fn advance(&mut self) -> Option<Track> {
         self.current = self.queue.pop_front();
+        if self.current.is_some() {
+            self.next_play_id = self.next_play_id.wrapping_add(1).max(1);
+            self.current_play_id = Some(self.next_play_id);
+        } else {
+            self.current_play_id = None;
+        }
         self.current.clone()
+    }
+
+    pub fn current_play_id(&self) -> Option<u64> {
+        self.current_play_id
     }
 
     /// The current track is over (finished, failed or skipped).
     pub fn finish(&mut self) {
         self.current = None;
+        self.current_play_id = None;
     }
 
     /// Forgets everything, as `/stop` and being removed from the channel do.
     pub fn clear(&mut self) {
         self.queue.clear();
         self.current = None;
+        self.current_play_id = None;
     }
 
     /// Records how the current track ended. Returns true once
@@ -88,7 +109,7 @@ impl Guild {
 /// search, because Rustlink answers `empty` to text it cannot route.
 pub fn normalize_query(text: &str) -> String {
     let text = text.trim();
-    const PREFIXES: [&str; 9] = [
+    const PREFIXES: [&str; 10] = [
         "ytsearch:",
         "ytmsearch:",
         "scsearch:",
@@ -97,6 +118,7 @@ pub fn normalize_query(text: &str) -> String {
         "dzisrc:",
         "spotify:",
         "deezer:",
+        "soundcloud:",
         "youtube:playlist:",
     ];
     let is_video_id = text.len() == 11

@@ -26,7 +26,7 @@ pub fn parse(text: &str) -> Vec<Line> {
         let mut stamps: Vec<i64> = Vec::new();
         while let Some((taken, at)) = leading_stamp(rest) {
             stamps.push(at);
-            rest = &rest[taken..];
+            rest = rest[taken..].trim_start_matches([' ', '\t']);
         }
         if stamps.is_empty() {
             continue;
@@ -73,14 +73,21 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
     let minutes = decimal(body[..colon].trim())?;
     let mut seconds = body[colon + 1..].trim();
     let mut fraction = 0i64;
-    if let Some(dot) = seconds.find('.') {
-        let digits = &seconds[dot + 1..];
-        seconds = &seconds[..dot];
-        if digits.len() > 3 {
+    if let Some((sec_part, frac_part, colon_frac)) = seconds
+        .find(['.', ','])
+        .map(|dot| (&seconds[..dot], &seconds[dot + 1..], false))
+        .or_else(|| seconds.find(':').map(|sep| (&seconds[..sep], &seconds[sep + 1..], true)))
+    {
+        seconds = sec_part;
+        if frac_part.is_empty()
+            || !frac_part.bytes().all(|byte| byte.is_ascii_digit())
+            || (colon_frac && frac_part.len() != 2)
+        {
             return None;
         }
-        let value = decimal(digits)?;
-        fraction = match digits.len() {
+        let prefix = &frac_part[..frac_part.len().min(3)];
+        let value = decimal(prefix)?;
+        fraction = match prefix.len() {
             1 => value * 100,
             2 => value * 10,
             _ => value,

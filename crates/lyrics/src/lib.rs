@@ -11,7 +11,7 @@ mod ytmusic;
 pub use lrclib::{LRCLIB, LRCLIB_BASE};
 pub use ytmusic::{YTMusic, YTMUSIC_ENDPOINT};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,7 @@ pub struct Manager {
 #[derive(Default)]
 struct Cache {
     entries: HashMap<String, Entry>,
-    order: Vec<String>,
+    order: VecDeque<String>,
     /// The sum of every entry's weight.
     bytes: usize,
 }
@@ -129,6 +129,21 @@ struct Entry {
     weight: usize,
 }
 
+fn object_weight(object: &Object) -> usize {
+    object.iter().map(|(k, v)| k.len() + value_weight(v) + 32).fold(0usize, usize::saturating_add)
+}
+
+fn value_weight(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(items) => {
+            items.iter().map(value_weight).fold(items.len() * 16, usize::saturating_add)
+        }
+        serde_json::Value::Object(map) => object_weight(map),
+        _ => 16,
+    }
+}
+
 /// What an answer costs the cache: its text, its lines and the key it is kept
 /// under, with a little for the structure around them.
 fn weight(key: &str, lyrics: &Option<Lyrics>) -> usize {
@@ -137,14 +152,15 @@ fn weight(key: &str, lyrics: &Option<Lyrics>) -> usize {
         .lines
         .iter()
         .flatten()
-        .map(|line| line.line.len() + std::mem::size_of::<Line>())
-        .sum();
+        .map(|line| line.line.len() + object_weight(&line.plugin) + std::mem::size_of::<Line>())
+        .fold(0usize, usize::saturating_add);
     key.len()
-        + lyrics.source_name.len()
-        + lyrics.provider.len()
-        + lyrics.text.as_ref().map_or(0, String::len)
-        + lines
-        + 64
+        .saturating_add(lyrics.source_name.len())
+        .saturating_add(lyrics.provider.len())
+        .saturating_add(lyrics.text.as_ref().map_or(0, String::len))
+        .saturating_add(object_weight(&lyrics.plugin))
+        .saturating_add(lines)
+        .saturating_add(64)
 }
 
 /// What a lookup depends on. The providers search by title, author and length,
@@ -176,19 +192,35 @@ impl Manager {
     /// The database answers most tracks and the catalogue answers the ones it
     /// has nothing for, which is where timed lines come from.
     pub fn from_config(config: &Config, agent: ureq::Agent) -> Option<Self> {
+        let youtube_agent = config.youtube_native.then(|| agent.clone());
+        Self::from_config_with_youtube(config, agent, youtube_agent)
+    }
+
+    /// Builds the manager using a dedicated (potentially proxied) HTTP client
+    /// for YouTube Music when `youtubeNative` is enabled.
+    pub fn from_config_with_youtube(
+        config: &Config,
+        agent: ureq::Agent,
+        youtube_agent: Option<ureq::Agent>,
+    ) -> Option<Self> {
         if !config.lyrics_enabled() {
             return None;
         }
-        let catalogue = YTMusic {
-            agent: agent.clone(),
-            endpoint: config.youtube_music_endpoint.clone(),
-            version: config.youtube_client_version.clone(),
-            visitor_data: config.youtube_visitor_data.clone(),
-        };
-        Some(Manager::new(vec![
-            Box::new(LRCLIB { agent: agent.clone(), base: LRCLIB_BASE.to_string() }),
-            Box::new(catalogue),
-        ]))
+        let mut providers: Vec<Box<dyn Provider>> =
+            vec![Box::new(LRCLIB { agent, base: LRCLIB_BASE.to_string() })];
+        if config.youtube_native {
+            if let Some(yt_agent) = youtube_agent {
+                providers.push(Box::new(YTMusic {
+                    agent: yt_agent,
+                    endpoint: config.youtube_music_endpoint.clone(),
+                    // `youtubeClientVersion` configures the Android player client,
+                    // not WEB_REMIX; keep YTMusic's built-in web client version.
+                    version: String::new(),
+                    visitor_data: config.youtube_visitor_data.clone(),
+                }));
+            }
+        }
+        Some(Manager::new(providers))
     }
 
     /// Whether any provider is configured, so a caller can answer without
@@ -266,12 +298,12 @@ impl Manager {
         if let Some(previous) = cache.entries.remove(key) {
             cache.bytes -= previous.weight;
         } else {
-            cache.order.push(key.to_string());
+            cache.order.push_back(key.to_string());
         }
         // Oldest first, until both the count and the bytes are within bounds.
         while cache.order.len() > self.limit || cache.bytes + weight > CACHE_BYTES {
             let Some(oldest) = cache.order.iter().position(|held| held != key) else { break };
-            let oldest = cache.order.remove(oldest);
+            let Some(oldest) = cache.order.remove(oldest) else { break };
             if let Some(evicted) = cache.entries.remove(&oldest) {
                 cache.bytes -= evicted.weight;
             }

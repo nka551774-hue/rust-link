@@ -1,7 +1,6 @@
 //! A bounded, typed LRU. Hits only clone an Arc and unlink/relink two indices.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -118,41 +117,27 @@ impl Cache {
     }
 }
 
-/// Count encoded bytes without allocating a temporary JSON buffer. Also charge
-/// the typed representation's containers, capacities, and strings so switching
-/// away from JSON storage cannot silently defeat the memory bound.
+/// Charge the typed representation's containers, capacities, and strings so
+/// cached results remain strictly bounded by `MAX_CACHED_RESULT` and
+/// `MAX_CACHE_BYTES` without serializing the payload to JSON on every insert.
 pub(super) fn result_size(result: &LoadResult) -> Option<usize> {
-    struct Counter(usize);
-    impl Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            if self.0 > MAX_CACHED_RESULT {
-                return Err(io::Error::other("result exceeds cache entry budget"));
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, result).ok()?;
     let heap = match result {
-        LoadResult::Track(track) => size_of::<Track>() + track_heap(track),
-        LoadResult::Playlist(playlist) => {
-            size_of_val(playlist.as_ref())
-                + playlist.metadata.name.capacity()
-                + playlist.tracks.capacity() * size_of::<Track>()
-                + playlist.tracks.iter().map(track_heap).sum::<usize>()
-                + object_heap(&playlist.extra)
-        }
-        LoadResult::Search(tracks) => {
-            tracks.capacity() * size_of::<Track>() + tracks.iter().map(track_heap).sum::<usize>()
-        }
+        LoadResult::Track(track) => size_of::<Track>().saturating_add(track_heap(track)),
+        LoadResult::Playlist(playlist) => size_of_val(playlist.as_ref())
+            .saturating_add(playlist.metadata.name.capacity())
+            .saturating_add(playlist.tracks.capacity().saturating_mul(size_of::<Track>()))
+            .saturating_add(
+                playlist.tracks.iter().fold(0usize, |acc, t| acc.saturating_add(track_heap(t))),
+            )
+            .saturating_add(object_heap(&playlist.extra)),
+        LoadResult::Search(tracks) => tracks
+            .capacity()
+            .saturating_mul(size_of::<Track>())
+            .saturating_add(tracks.iter().fold(0usize, |acc, t| acc.saturating_add(track_heap(t)))),
         LoadResult::Empty => 0,
         LoadResult::Error(_) => return None,
     };
-    let bytes = counter.0.max(size_of::<LoadResult>() + heap + 2 * size_of::<usize>());
+    let bytes = size_of::<LoadResult>().saturating_add(heap).saturating_add(2 * size_of::<usize>());
     (bytes <= MAX_CACHED_RESULT).then_some(bytes)
 }
 

@@ -8,29 +8,45 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::c_int;
+#[cfg(feature = "native-opus")]
 use std::ptr;
 
+#[cfg(feature = "native-opus")]
 type OpusInt32 = c_int;
+#[cfg(feature = "native-opus")]
 type OpusInt16 = i16;
 
+#[cfg(feature = "native-opus")]
 #[repr(C)]
 struct OpusEncoder {
     _private: [u8; 0],
 }
 
+#[cfg(feature = "native-opus")]
 const OPUS_APPLICATION_AUDIO: c_int = 2049;
+#[cfg(feature = "native-opus")]
 const OPUS_SIGNAL_MUSIC: c_int = 3002;
 
+#[cfg(feature = "native-opus")]
 const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_VBR_REQUEST: c_int = 4006;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_COMPLEXITY_REQUEST: c_int = 4010;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_INBAND_FEC_REQUEST: c_int = 4012;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_PACKET_LOSS_PERC_REQUEST: c_int = 4014;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_VBR_CONSTRAINT_REQUEST: c_int = 4020;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_SIGNAL_REQUEST: c_int = 4024;
+#[cfg(feature = "native-opus")]
 const OPUS_GET_LOOKAHEAD_REQUEST: c_int = 4027;
+#[cfg(feature = "native-opus")]
 const OPUS_SET_LSB_DEPTH_REQUEST: c_int = 4036;
 
+#[cfg(feature = "native-opus")]
 const OPUS_OK: c_int = 0;
 
 /// A frame at 48 kHz is 20 ms, which is what Discord wants and what the pacing
@@ -40,6 +56,7 @@ pub const FRAME_SAMPLES: usize = 960;
 pub const FRAME_SAMPLES_STEREO: usize = FRAME_SAMPLES * 2;
 
 /// The largest packet libopus will produce for one frame, with room to spare.
+#[cfg(feature = "native-opus")]
 const MAX_PACKET: usize = 4_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +71,7 @@ pub enum OpusError {
     FrameSize,
 }
 
+#[cfg(feature = "native-opus")]
 extern "C" {
     fn opus_encoder_create(
         fs: OpusInt32,
@@ -73,15 +91,21 @@ extern "C" {
 }
 
 /// A stereo 48 kHz Opus encoder tuned for music.
+#[cfg(feature = "native-opus")]
 pub struct Encoder {
     state: *mut OpusEncoder,
     buffer: Vec<u8>,
     lookahead: i32,
 }
 
+#[cfg(not(feature = "native-opus"))]
+pub struct Encoder;
+
 // The encoder is only ever touched from the playback task that owns it.
+#[cfg(feature = "native-opus")]
 unsafe impl Send for Encoder {}
 
+#[cfg(feature = "native-opus")]
 impl Encoder {
     /// Creates an encoder at `bitrate` bits per second, running at
     /// `complexity` on the encoder's own scale of zero to ten. A machine with
@@ -161,6 +185,25 @@ impl Encoder {
     }
 }
 
+#[cfg(not(feature = "native-opus"))]
+impl Encoder {
+    pub fn new(_bitrate: i32, _complexity: i32) -> Result<Self, OpusError> {
+        Err(OpusError::Create(-7))
+    }
+
+    pub fn lookahead(&self) -> i32 {
+        312
+    }
+
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
+        if pcm.len() != FRAME_SAMPLES_STEREO {
+            return Err(OpusError::FrameSize);
+        }
+        Err(OpusError::Encode(-7))
+    }
+}
+
+#[cfg(feature = "native-opus")]
 impl Drop for Encoder {
     fn drop(&mut self) {
         if !self.state.is_null() {
@@ -176,7 +219,8 @@ impl Drop for Encoder {
 /// treats an out of range sample as undefined input.
 pub fn to_i16(samples: &[f32], out: &mut [i16]) {
     for (target, sample) in out.iter_mut().zip(samples.iter()) {
-        *target = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        *target =
+            if sample.is_finite() { (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16 } else { 0 };
     }
 }
 
@@ -184,65 +228,70 @@ pub fn to_i16(samples: &[f32], out: &mut [i16]) {
 mod tests {
     use super::*;
 
-    fn tone() -> Vec<i16> {
-        let mut pcm = Vec::with_capacity(FRAME_SAMPLES_STEREO);
-        for i in 0..FRAME_SAMPLES {
-            let value = (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin();
-            pcm.push((value * 16_000.0) as i16);
-            pcm.push((value * 16_000.0) as i16);
-        }
-        pcm
-    }
-
-    #[test]
-    fn an_encoder_produces_a_packet_for_each_frame() {
-        let mut encoder = Encoder::new(128_000, 10).expect("libopus is available");
-        let pcm = tone();
-        let mut sizes = Vec::new();
-        for _ in 0..10 {
-            let packet = encoder.encode(&pcm).unwrap();
-            assert!(!packet.is_empty());
-            assert!(packet.len() < 1500, "a 20 ms packet should not approach the MTU");
-            sizes.push(packet.len());
-        }
-        // A 128 kbps stream carries about 320 bytes in 20 ms.
-        let average = sizes.iter().sum::<usize>() / sizes.len();
-        assert!((200..500).contains(&average), "average packet was {average} bytes");
-    }
-
-    #[test]
-    fn a_frame_of_the_wrong_size_is_refused() {
-        let mut encoder = Encoder::new(64_000, 10).unwrap();
-        assert!(matches!(encoder.encode(&[0i16; 100]), Err(OpusError::FrameSize)));
-    }
-
-    #[test]
-    fn the_lookahead_is_reported() {
-        let encoder = Encoder::new(128_000, 10).unwrap();
-        // 6.5 ms at 48 kHz, the encoder's own delay.
-        assert_eq!(encoder.lookahead(), 312);
-    }
-
-    #[test]
-    fn a_lower_complexity_still_encodes_every_frame() {
-        let mut encoder = Encoder::new(128_000, 4).expect("libopus is available");
-        let pcm = tone();
-        for _ in 0..10 {
-            assert!(!encoder.encode(&pcm).unwrap().is_empty());
-        }
-    }
-
-    #[test]
-    fn invalid_controls_are_reported_instead_of_silently_using_defaults() {
-        assert!(matches!(Encoder::new(192_000, 11), Err(OpusError::Control { .. })));
-        assert!(matches!(Encoder::new(0, 10), Err(OpusError::Control { .. })));
-    }
-
     #[test]
     fn floats_are_clamped_before_they_become_integers() {
-        let samples = [2.0f32, -2.0, 0.5, -0.5];
-        let mut out = [0i16; 4];
+        let samples = [2.0f32, -2.0, 0.5, -0.5, f32::NAN, f32::INFINITY];
+        let mut out = [0i16; 6];
         to_i16(&samples, &mut out);
-        assert_eq!(out, [32767, -32767, 16384, -16384]);
+        assert_eq!(out, [32767, -32767, 16384, -16384, 0, 0]);
+    }
+
+    #[cfg(feature = "native-opus")]
+    mod native {
+        use super::*;
+
+        fn tone() -> Vec<i16> {
+            let mut pcm = Vec::with_capacity(FRAME_SAMPLES_STEREO);
+            for i in 0..FRAME_SAMPLES {
+                let value = (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin();
+                pcm.push((value * 16_000.0) as i16);
+                pcm.push((value * 16_000.0) as i16);
+            }
+            pcm
+        }
+
+        #[test]
+        fn an_encoder_produces_a_packet_for_each_frame() {
+            let mut encoder = Encoder::new(128_000, 10).expect("libopus is available");
+            let pcm = tone();
+            let mut sizes = Vec::new();
+            for _ in 0..10 {
+                let packet = encoder.encode(&pcm).unwrap();
+                assert!(!packet.is_empty());
+                assert!(packet.len() < 1500, "a 20 ms packet should not approach the MTU");
+                sizes.push(packet.len());
+            }
+            // A 128 kbps stream carries about 320 bytes in 20 ms.
+            let average = sizes.iter().sum::<usize>() / sizes.len();
+            assert!((200..500).contains(&average), "average packet was {average} bytes");
+        }
+
+        #[test]
+        fn a_frame_of_the_wrong_size_is_refused() {
+            let mut encoder = Encoder::new(64_000, 10).unwrap();
+            assert!(matches!(encoder.encode(&[0i16; 100]), Err(OpusError::FrameSize)));
+        }
+
+        #[test]
+        fn the_lookahead_is_reported() {
+            let encoder = Encoder::new(128_000, 10).unwrap();
+            // 6.5 ms at 48 kHz, the encoder's own delay.
+            assert_eq!(encoder.lookahead(), 312);
+        }
+
+        #[test]
+        fn a_lower_complexity_still_encodes_every_frame() {
+            let mut encoder = Encoder::new(128_000, 4).expect("libopus is available");
+            let pcm = tone();
+            for _ in 0..10 {
+                assert!(!encoder.encode(&pcm).unwrap().is_empty());
+            }
+        }
+
+        #[test]
+        fn invalid_controls_are_reported_instead_of_silently_using_defaults() {
+            assert!(matches!(Encoder::new(192_000, 11), Err(OpusError::Control { .. })));
+            assert!(matches!(Encoder::new(0, 10), Err(OpusError::Control { .. })));
+        }
     }
 }

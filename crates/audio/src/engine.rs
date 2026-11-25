@@ -34,13 +34,14 @@ impl Body {
         Body { head: Vec::new(), position: 0, inner }
     }
 
-    /// Reads up to `count` bytes ahead without consuming them.
+    /// Reads up to `count` unconsumed bytes ahead without consuming them.
     pub fn peek(&mut self, count: usize) -> io::Result<()> {
-        while self.head.len() < count {
+        let target = self.position.saturating_add(count);
+        while self.head.len() < target {
             // The bytes are read straight into the buffer that keeps them, so
             // peeking does not allocate a chunk every time it needs more.
             let start = self.head.len();
-            self.head.resize(count, 0);
+            self.head.resize(target, 0);
             match self.inner.read(&mut self.head[start..]) {
                 Ok(0) => {
                     self.head.truncate(start);
@@ -82,6 +83,20 @@ pub trait Frames: Send {
     /// for hours from allocating once per twenty milliseconds. `false` means the
     /// track has ended.
     fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError>;
+
+    /// Whether [`Frames::set_filters`] can update non-timescale DSP settings in
+    /// place without restarting the stream.
+    fn supports_live_filters(&self) -> bool {
+        false
+    }
+
+    /// Updates volume and filters in place without reopening or seeking the
+    /// stream when the active engine supports doing so (for example non-timescale
+    /// DSP changes in [`PureFrames`]). Returns `false` when a stream restart at
+    /// the current position is required.
+    fn set_filters(&mut self, _set: &FilterSet) -> bool {
+        false
+    }
 }
 
 /// Which engine to use for a track.
@@ -178,14 +193,17 @@ impl Engine {
         preference: Preference,
     ) -> Result<Box<dyn Frames>, AudioError> {
         let set = filters::parse(filters, volume)?;
-        if preference == Preference::Ffmpeg
+        if !cfg!(feature = "native-opus")
+            || preference == Preference::Ffmpeg
             || !self.in_process
             || !PureFrames::supports_timescale(&set)
         {
             return self.start_ffmpeg(body, position_ms, &set);
         }
         let mut body = body;
-        body.peek(64)?;
+        // An Ogg page header with 255 lacing segments takes 282 bytes before
+        // `OpusHead` or `\x01vorbis` starts; 512 bytes always covers it.
+        body.peek(512)?;
         if detect(body.head()) == Container::Unknown {
             return self.start_ffmpeg(body, position_ms, &set);
         }

@@ -26,6 +26,7 @@ pub const FRAME_SAMPLES: usize = (SAMPLE_RATE as usize / 1000) * FRAME_MILLIS as
 /// A filter chain for one playback.
 #[derive(Debug, Default)]
 pub struct DspChain {
+    config: FilterSet,
     pre: Vec<Stage>,
     post: Vec<Stage>,
     /// Samples seen so far, which is the time base the low frequency
@@ -33,27 +34,54 @@ pub struct DspChain {
     clock: u64,
 }
 
+fn same_non_volume(a: &FilterSet, b: &FilterSet) -> bool {
+    a.bands == b.bands
+        && a.karaoke == b.karaoke
+        && a.tremolo == b.tremolo
+        && a.vibrato == b.vibrato
+        && a.rotation == b.rotation
+        && a.distort == b.distort
+        && a.mix == b.mix
+        && a.low_pass == b.low_pass
+}
+
+fn is_identity_mix(mix: &ChannelMix) -> bool {
+    mix.left_to_left == 1.0
+        && mix.left_to_right == 0.0
+        && mix.right_to_left == 0.0
+        && mix.right_to_right == 1.0
+}
+
 impl DspChain {
     pub fn new(set: &FilterSet) -> Self {
+        let (pre, post) = Self::build_stages(set);
+        DspChain { config: set.clone(), pre, post, clock: 0 }
+    }
+
+    fn build_stages(set: &FilterSet) -> (Vec<Stage>, Vec<Stage>) {
         let mut pre = Vec::new();
         if set.gain != 1.0 {
             pre.push(Stage::Volume(set.gain));
         }
-        if !set.bands.is_empty() {
-            pre.push(Stage::Equalizer(EqualizerStage::new(
-                set.bands.iter().map(|b| (b.frequency, b.decibels)).collect(),
-            )));
+        let active_bands: Vec<(f64, f64)> = set
+            .bands
+            .iter()
+            .filter(|b| b.decibels.abs() > 1e-12)
+            .map(|b| (b.frequency, b.decibels))
+            .collect();
+        if !active_bands.is_empty() {
+            pre.push(Stage::Equalizer(EqualizerStage::new(active_bands)));
         }
-        if let Some(k) = set.karaoke {
+        if let Some(k) = set.karaoke.filter(|k| k.gain.abs() > 1e-12) {
             pre.push(Stage::Karaoke(KaraokeStage::new(k)));
         }
 
         let mut post = Vec::new();
-        if let Some(m) = set.tremolo {
+        if let Some(m) = set.tremolo.filter(|m| m.depth > 0.0) {
             post.push(Stage::Tremolo(TremoloStage::new(m)));
         }
-        if let Some(m) = set.vibrato {
-            post.push(Stage::Vibrato(VibratoStage::new(m)));
+        if let Some(m) = set.vibrato.filter(|m| m.depth > 0.0) {
+            post.push(Stage::Vibrato(Box::new(VibratoStage::new(m))));
         }
         if let Some(r) = set.rotation {
             post.push(Stage::Rotation(RotationStage::new(r)));
@@ -61,13 +89,34 @@ impl DspChain {
         if let Some(d) = set.distort {
             post.push(Stage::Distortion(DistortionStage::new(d)));
         }
-        if let Some(m) = set.mix {
+        if let Some(m) = set.mix.filter(|m| !is_identity_mix(m)) {
             post.push(Stage::ChannelMix(m));
         }
         if let Some(l) = set.low_pass {
             post.push(Stage::LowPass(OnePoleStereo::new(l)));
         }
-        DspChain { pre, post, clock: 0 }
+        (pre, post)
+    }
+
+    /// Updates volume and filters in place, preserving LFO phase (`clock`) and,
+    /// when only volume changed, keeping biquad/delay-line filter states intact.
+    pub fn reconfigure(&mut self, set: &FilterSet) {
+        if same_non_volume(&self.config, set) {
+            match (self.pre.first_mut(), set.gain != 1.0) {
+                (Some(Stage::Volume(gain)), true) => *gain = set.gain,
+                (Some(Stage::Volume(_)), false) => {
+                    self.pre.remove(0);
+                }
+                (_, true) => self.pre.insert(0, Stage::Volume(set.gain)),
+                (_, false) => {}
+            }
+            self.config.gain = set.gain;
+            return;
+        }
+        let (pre, post) = Self::build_stages(set);
+        self.pre = pre;
+        self.post = post;
+        self.config = set.clone();
     }
 
     /// Whether the chain does anything at all, which is how the engine knows it
@@ -100,7 +149,7 @@ enum Stage {
     Equalizer(EqualizerStage),
     Karaoke(KaraokeStage),
     Tremolo(TremoloStage),
-    Vibrato(VibratoStage),
+    Vibrato(Box<VibratoStage>),
     Rotation(RotationStage),
     Distortion(DistortionStage),
     ChannelMix(ChannelMix),
@@ -204,9 +253,20 @@ impl Biquad {
     }
 
     fn step(&mut self, x: f64) -> f64 {
-        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+        let x = if x.is_finite() { x } else { 0.0 };
+        let mut y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;
+        if !y.is_finite() {
+            self.x1 = 0.0;
+            self.x2 = 0.0;
+            self.y1 = 0.0;
+            self.y2 = 0.0;
+            return 0.0;
+        }
+        if y.abs() < 1e-20 {
+            y = 0.0;
+        }
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
@@ -297,9 +357,10 @@ impl TremoloStage {
     }
 
     fn process(&mut self, buf: &mut [f32], clock: u64) {
+        let rate_step = self.frequency / SAMPLE_RATE as f64;
         for (index, frame) in buf.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-            let seconds = (clock + index as u64) as f64 / SAMPLE_RATE as f64;
-            let gain = 1.0 - self.depth * (1.0 + (2.0 * PI * self.frequency * seconds).sin()) / 2.0;
+            let phase = ((clock + index as u64) as f64 * rate_step).fract();
+            let gain = 1.0 - self.depth * (1.0 + (2.0 * PI * phase).sin()) / 2.0;
             let gain = gain as f32;
             frame[0] *= gain;
             frame[1] *= gain;
@@ -307,39 +368,36 @@ impl TremoloStage {
     }
 }
 
+const VIBRATO_MAX_DELAY: usize = (5 * SAMPLE_RATE as usize) / 1000 + 2;
+const VIBRATO_HISTORY: usize = VIBRATO_MAX_DELAY + 2;
+
 /// Vibrato moves the read position of a short delay line, which is what makes a
 /// pitch wobble without changing the tempo.
 #[derive(Debug, Clone)]
 struct VibratoStage {
     frequency: f64,
     depth: f64,
-    max_delay: usize,
     write: usize,
-    history: [Vec<f32>; CHANNELS],
+    history: [[f32; VIBRATO_HISTORY]; CHANNELS],
 }
 
 impl VibratoStage {
     fn new(m: Modulation) -> Self {
-        // The deepest setting moves the read position by five milliseconds, the
-        // range a vibrato is heard over.
-        let max_delay = (0.005 * SAMPLE_RATE as f64) as usize + 2;
         VibratoStage {
             frequency: m.frequency,
             depth: m.depth,
-            max_delay,
             write: 0,
-            history: [vec![0.0; max_delay + 2], vec![0.0; max_delay + 2]],
+            history: [[0.0; VIBRATO_HISTORY]; CHANNELS],
         }
     }
 
     fn process(&mut self, buf: &mut [f32], clock: u64) {
-        let len = self.history[0].len();
+        let len = VIBRATO_HISTORY;
+        let rate_step = self.frequency / SAMPLE_RATE as f64;
         for (index, frame) in buf.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-            let seconds = (clock + index as u64) as f64 / SAMPLE_RATE as f64;
-            let delay = self.depth
-                * self.max_delay as f64
-                * (1.0 + (2.0 * PI * self.frequency * seconds).sin())
-                / 2.0;
+            let phase = ((clock + index as u64) as f64 * rate_step).fract();
+            let delay =
+                self.depth * VIBRATO_MAX_DELAY as f64 * (1.0 + (2.0 * PI * phase).sin()) / 2.0;
             let whole = delay.floor() as usize;
             let fraction = (delay - whole as f64) as f32;
             for (channel, sample) in frame.iter_mut().enumerate() {
@@ -366,11 +424,12 @@ impl RotationStage {
     }
 
     fn process(&mut self, buf: &mut [f32], clock: u64) {
+        let rate_step = self.hertz / SAMPLE_RATE as f64;
         for (index, frame) in buf.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-            let seconds = (clock + index as u64) as f64 / SAMPLE_RATE as f64;
-            let angle = 2.0 * PI * self.hertz * seconds;
-            frame[0] *= (0.5 + 0.5 * angle.cos()) as f32;
-            frame[1] *= (0.5 - 0.5 * angle.cos()) as f32;
+            let phase = ((clock + index as u64) as f64 * rate_step).fract();
+            let c = (2.0 * PI * phase).cos();
+            frame[0] *= (0.5 + 0.5 * c) as f32;
+            frame[1] *= (0.5 - 0.5 * c) as f32;
         }
     }
 }
@@ -390,13 +449,13 @@ impl DistortionStage {
     fn process(&mut self, buf: &mut [f32]) {
         let d = &self.d;
         for sample in buf.iter_mut() {
-            let x = *sample as f64;
+            let x = if sample.is_finite() { *sample as f64 } else { 0.0 };
             let y = d.scale
                 * ((x * d.sin_scale + d.sin_offset).sin()
                     * (x * d.cos_scale + d.cos_offset).cos()
                     * (x * d.tan_scale + d.tan_offset).tan())
                 + d.offset;
-            *sample = y.clamp(-1.0, 1.0) as f32;
+            *sample = if y.is_finite() { y.clamp(-1.0, 1.0) as f32 } else { 0.0 };
         }
     }
 }
@@ -417,9 +476,13 @@ impl OnePoleStereo {
     fn process(&mut self, buf: &mut [f32]) {
         for frame in buf.as_chunks_mut::<CHANNELS>().0 {
             for (channel, sample) in frame.iter_mut().enumerate() {
-                let x = *sample as f64;
-                self.state[channel] += self.alpha * (x - self.state[channel]);
-                *sample = self.state[channel] as f32;
+                let x = if sample.is_finite() { *sample as f64 } else { 0.0 };
+                let mut next = self.state[channel] + self.alpha * (x - self.state[channel]);
+                if !next.is_finite() || next.abs() < 1e-20 {
+                    next = 0.0;
+                }
+                self.state[channel] = next;
+                *sample = next as f32;
             }
         }
     }
@@ -584,5 +647,20 @@ mod tests {
         for sample in &buf {
             assert!(sample.abs() <= 1.0);
         }
+    }
+
+    #[test]
+    fn reconfigure_preserves_clock_and_recovers_from_nan_samples() {
+        let mut chain = chain(serde_json::json!({"equalizer": [{"band": 8, "gain": 0.5}]}));
+        let mut poison = vec![f32::NAN, f32::INFINITY, 0.25, -0.25];
+        chain.process_pre(&mut poison);
+        assert!(poison.iter().all(|s| s.is_finite()));
+
+        let mut next = parse(&Object::default(), 50).unwrap();
+        next.bands = chain.config.bands.clone();
+        chain.reconfigure(&next);
+        let mut clean = vec![0.5f32, -0.5];
+        chain.process_pre(&mut clean);
+        assert!(clean.iter().all(|s| s.is_finite()));
     }
 }

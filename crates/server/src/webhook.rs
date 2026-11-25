@@ -52,13 +52,27 @@ pub struct Client {
 }
 
 impl Client {
-    /// Builds a client for the configuration, or none when the webhook is off.
+    /// Builds a client for the configuration with private-network targets
+    /// refused unless explicitly permitted via [`Client::with_network_policy`].
     pub fn new(settings: &Settings) -> Option<Client> {
+        Self::with_network_policy(settings, false)
+    }
+
+    /// Builds a client for the configuration using `allow_private_networks` to
+    /// enforce the node's SSRF network policy on webhook DNS resolution.
+    pub fn with_network_policy(
+        settings: &Settings,
+        allow_private_networks: bool,
+    ) -> Option<Client> {
         let target = settings.url.trim().to_string();
         if !settings.enable || target.is_empty() {
             return None;
         }
+        if rustlink_source::netguard::validate_url(&target).is_err() {
+            return None;
+        }
         let discord = is_discord(&target);
+        let agent = rustlink_source::netguard::agent(allow_private_networks);
         let (queue, inbox) = sync_channel(QUEUE);
         let worker = target.clone();
         let dropped = Arc::new(AtomicU64::new(0));
@@ -67,9 +81,15 @@ impl Client {
             .name("webhook".into())
             .spawn(move || {
                 while let Ok(event) = inbox.recv() {
-                    if let Err(error) = deliver(|| post(&worker, discord, &event), thread::sleep) {
+                    if let Err((attempts, error)) =
+                        deliver(|| post(&agent, &worker, discord, &event), thread::sleep)
+                    {
                         let count = worker_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        log::warn!("webhook event dropped after {MAX_ATTEMPTS} attempts: {error} dropped={count}");
+                        if count == 1 || count.is_multiple_of(100) {
+                            log::warn!(
+                                "webhook event dropped after {attempts} attempt(s): {error} dropped={count}"
+                            );
+                        }
                     }
                 }
             })
@@ -133,9 +153,11 @@ fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
 fn deliver(
     mut attempt: impl FnMut() -> Result<(), Failure>,
     mut sleep: impl FnMut(Duration),
-) -> Result<(), String> {
+) -> Result<(), (u32, String)> {
     let mut last = String::new();
+    let mut attempts = 0;
     for tries in 0..MAX_ATTEMPTS {
+        attempts = tries + 1;
         match attempt() {
             Ok(()) => return Ok(()),
             Err(failure) => {
@@ -149,7 +171,7 @@ fn deliver(
             }
         }
     }
-    Err(last)
+    Err((attempts, last))
 }
 
 /// Removes fields that must not cross the webhook trust boundary.
@@ -225,23 +247,25 @@ fn redact_urls(text: &str) -> String {
 }
 
 fn find_http_scheme(text: &str) -> Option<usize> {
+    const SCHEMES: [&[u8]; 7] =
+        [b"http://", b"https://", b"ws://", b"wss://", b"socks4://", b"socks5://", b"socks5h://"];
     text.char_indices().find_map(|(index, _)| {
-        let tail = text.get(index..)?;
-        if tail.as_bytes().get(..7).is_some_and(|bytes| bytes.eq_ignore_ascii_case(b"http://"))
-            || tail.as_bytes().get(..8).is_some_and(|bytes| bytes.eq_ignore_ascii_case(b"https://"))
-        {
-            Some(index)
-        } else {
-            None
-        }
+        let tail = text.get(index..)?.as_bytes();
+        SCHEMES
+            .iter()
+            .any(|scheme| {
+                tail.get(..scheme.len()).is_some_and(|bytes| bytes.eq_ignore_ascii_case(scheme))
+            })
+            .then_some(index)
     })
 }
 
 /// Delivers one scrubbed event. A Discord endpoint gets an embed built from it;
 /// every other endpoint gets the scrubbed event as JSON.
-fn post(url: &str, discord: bool, event: &Value) -> Result<(), Failure> {
+fn post(agent: &ureq::Agent, url: &str, discord: bool, event: &Value) -> Result<(), Failure> {
     let body = if discord { discord_payload(event) } else { event.clone() };
-    let response = ureq::post(url)
+    let response = agent
+        .post(url)
         .header("Accept-Encoding", "identity")
         .header("Content-Type", "application/json")
         .header("User-Agent", "Rustlink")
@@ -659,8 +683,9 @@ mod tests {
     #[test]
     fn failed_delivery_does_not_put_the_webhook_token_in_logs() {
         // An invalid authority fails before any network request is attempted.
+        let agent = rustlink_source::netguard::agent(false);
         let target = "http://bad host/api/webhooks/123/private-webhook-token?key=private-key";
-        let error = post(target, false, &json!({ "type": "test" })).unwrap_err().message;
+        let error = post(&agent, target, false, &json!({ "type": "test" })).unwrap_err().message;
         assert!(error.contains("could not be reached"));
         assert!(!error.contains("private-webhook-token"));
         assert!(!error.contains("private-key"));
@@ -806,7 +831,7 @@ mod tests {
             },
             |wait| waits.push(wait),
         );
-        assert_eq!(result.unwrap_err(), "webhook answered 429");
+        assert_eq!(result.unwrap_err(), (MAX_ATTEMPTS, "webhook answered 429".into()));
         assert_eq!(calls, MAX_ATTEMPTS);
         assert_eq!(
             waits,
