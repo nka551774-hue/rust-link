@@ -1,0 +1,6 @@
+# YouTube Proof-of-Origin Token configuration (copy to potoken.yaml; auto-reloaded on save).
+# Open https://music.youtube.com or https://www.youtube.com in an incognito window, play any
+# track, press F12 -> Network -> v1/player -> Payload, and copy these two fields (or paste
+# the raw v1/player request JSON directly into potoken.json).
+poToken: ""
+visitorData: ""

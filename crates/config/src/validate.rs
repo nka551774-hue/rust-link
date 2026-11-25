@@ -117,6 +117,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
         return invalid("opusComplexity must be 0..10");
     }
     for (name, value) in [
+        ("youtubePoTokenFile", config.youtube_po_token_file.as_str()),
         ("youtubePoToken", config.youtube_po_token.as_str()),
         ("youtubeVisitorData", config.youtube_visitor_data.as_str()),
         ("soundcloudClientId", config.soundcloud_client_id.as_str()),
@@ -152,6 +153,16 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
         if !is_printable_ascii(value) {
             return invalid(format!("{name} must contain only printable ASCII characters"));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_youtube_tokens(pot: &str, vd: &str) -> Result<(), ConfigError> {
+    if has_control_bytes(pot) {
+        return invalid("youtubePoToken must not contain control characters");
+    }
+    if has_control_bytes(vd) || !is_printable_ascii(vd) {
+        return invalid("youtubeVisitorData must contain only printable ASCII characters");
     }
     Ok(())
 }

@@ -10,6 +10,7 @@ ROOT=$(CDPATH='' cd -P -- "$HERE/.." && pwd)
 DATA=$HERE/data
 CONFIG=$DATA/config.yaml
 ENV_FILE=$DATA/.env
+POTOKEN_FILE=$ROOT/potoken.yaml
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 as_root() {
@@ -41,6 +42,13 @@ ENV_POT=${RUSTLINK_YOUTUBE_PO_TOKEN-__unset__}
 ENV_VD=${RUSTLINK_YOUTUBE_VISITOR_DATA-__unset__}
 
 yaml_single() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
+write_potoken_file() {
+    (
+        umask 077
+        printf '# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\npoToken: %s\nvisitorData: %s\n' \
+            "$(yaml_single "$1")" "$(yaml_single "$2")" > "$POTOKEN_FILE"
+    )
+}
 
 reuse=0
 if [ -z "$ENV_TOKEN" ] && [ -f "$CONFIG" ] && [ -f "$ENV_FILE" ]; then
@@ -88,13 +96,15 @@ else
         fi
         if [ "$ENV_POT" != "__unset__" ]; then
             PO_TOKEN=$ENV_POT
+        elif [ ! -f "$POTOKEN_FILE" ]; then
+            read -r -p 'YouTube PO token for potoken.yaml (empty = fill potoken.yaml later): ' PO_TOKEN
         else
-            read -r -p 'YouTube PO token (empty = none): ' PO_TOKEN
+            PO_TOKEN=
         fi
         if [ "$ENV_VD" != "__unset__" ]; then
             VISITOR_DATA=$ENV_VD
         elif [ -n "$PO_TOKEN" ]; then
-            case $PO_TOKEN in \{* | *:*) VISITOR_DATA= ;; *) read -r -p 'YouTube visitorData (empty = auto): ' VISITOR_DATA ;; esac
+            case $PO_TOKEN in \{* | *:*) VISITOR_DATA= ;; *) read -r -p 'YouTube visitorData for potoken.yaml (empty = auto): ' VISITOR_DATA ;; esac
         else
             VISITOR_DATA=
         fi
@@ -110,21 +120,25 @@ else
     case $PROXY in '' | http://* | https://* | socks4://* | socks4a://* | socks5://* | socks5h://*) ;;
         *) fail 'proxy must start with http://, https://, socks4://, socks4a://, socks5:// or socks5h://' ;; esac
 
+    if [ -n "$PO_TOKEN" ] || [ -n "$VISITOR_DATA" ] || [ ! -f "$POTOKEN_FILE" ]; then
+        write_potoken_file "$PO_TOKEN" "$VISITOR_DATA"
+    fi
     umask 077
     mkdir -p "$DATA"
     chmod 700 "$DATA"
     {
-        printf 'address: 127.0.0.1:%s\npassword: "%s"\nlogLevel: info\nlogDirectory: logs\ntoolsDirectory: .tools\nautoDownload: true\n' "$PORT" "$PASSWORD"
+        printf 'address: 127.0.0.1:%s\npassword: "%s"\nlogLevel: info\nlogDirectory: logs\ntoolsDirectory: .tools\nautoDownload: true\nyoutubePoTokenFile: %s\nyoutubeRequirePoToken: true\n' \
+            "$PORT" "$PASSWORD" "$(yaml_single "$POTOKEN_FILE")"
         [ -z "$PROXY" ] || printf 'youtubeProxy: "%s"\n' "$PROXY"
-        [ -z "$PO_TOKEN" ] || printf 'youtubePoToken: %s\n' "$(yaml_single "$PO_TOKEN")"
-        [ -z "$VISITOR_DATA" ] || printf 'youtubeVisitorData: %s\n' "$(yaml_single "$VISITOR_DATA")"
     } > "$CONFIG"
     printf 'DISCORD_BOT_TOKEN=%s\nRUSTLINK_PASSWORD=%s\nRUSTLINK_URL=http://127.0.0.1:%s\n' "$TOKEN" "$PASSWORD" "$PORT" > "$ENV_FILE"
-    echo "Settings saved to $DATA"
+    echo "Settings saved to $DATA (YouTube PO token config: $POTOKEN_FILE)"
 fi
 
+[ -f "$POTOKEN_FILE" ] || write_potoken_file "" ""
 export RUSTLINK_PASSWORD="$PASSWORD" RUSTLINK_ADDRESS="127.0.0.1:$PORT"
 export DISCORD_BOT_TOKEN="$TOKEN" RUSTLINK_URL="http://127.0.0.1:$PORT"
+export RUSTLINK_YOUTUBE_PO_TOKEN_FILE="$POTOKEN_FILE" RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN=true
 unset RUSTLINK_YOUTUBE_PO_TOKEN RUSTLINK_YOUTUBE_VISITOR_DATA RUSTLINK_YOUTUBE_PROXY
 
 for p in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do

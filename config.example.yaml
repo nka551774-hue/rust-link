@@ -21,6 +21,8 @@ youtubeNative: true
 youtubeEndpoint: https://youtubei.googleapis.com
 youtubeMusicEndpoint: https://music.youtube.com
 youtubeClientVersion: ""
+youtubePoTokenFile: potoken.yaml           # dedicated PO token config (auto-reloaded on save)
+youtubeRequirePoToken: true                # always route YouTube through poToken
 youtubePoToken: ""
 youtubeVisitorData: ""
 youtubeProxy: ""                           # http://, https://, socks4://, socks5://, socks5h://

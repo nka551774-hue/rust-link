@@ -133,7 +133,7 @@ RUSTLINK_PASSWORD=... docker compose up -d --build
 - **控制平面與 SDK**：`/api/v1` REST API、常數時間 Bearer 驗證、工作階段專屬 WebSocket 事件流、斷線續傳（Session Resume）與非同步強型別 SDK `rustlink-client`。
 - **Discord 語音與 DAVE v1**：Voice Gateway v8、UDP IP 探索、**DAVE v1（OpenMLS P-256）E2EE**、`aead_aes256_gcm_rtpsize` 與 `aead_xchacha20_poly1305_rtpsize`。
 - **多平台原生音源**：
-  - **YouTube / YouTube Music**：純 Rust InnerTube 多用戶端自適應備援（首選自動引導匿名 `visitorData` 的 `VISIONOS` 取得 48 kHz WebM Opus `itag 251`，搭配 `IOS_PRODUCER` 備援與尾端區間防截斷預檢）、預解析串流快取（省去重複 `/player` 請求）、512 KiB 分段 + 2 MiB 背景預讀、48 kHz Opus 零轉碼直通、壓縮封包快轉與 `?t=` 時間戳起播。高風控機房 IP 可設定 `youtubeProxy`（見 [YouTube 指南](docs/youtube.md)）。
+  - **YouTube / YouTube Music**：純 Rust InnerTube 搭配獨立 `potoken.yaml` 憑證檔（存檔即免重啟自動熱載入，預設強制全鏈路走 `poToken`，見 [`potoken.example.yaml`](potoken.example.yaml) 與 [YouTube 指南](docs/youtube.md)）、優先以 `VISIONOS` 與 `ANDROID` 取得 48 kHz WebM Opus `itag 251`、預解析串流快取、512 KiB 分段 + 2 MiB 背景預讀、48 kHz Opus 零轉碼直通、壓縮封包快轉與 `?t=` 時間戳起播，亦支援 `youtubeProxy` 分流。
   - **SoundCloud**：API v2 解析、漸進式串流與 `client_id` 自動快取輪替。
   - **Spotify / Deezer**：官方中繼資料擷取 + ISRC 優先雙向詞彙比對至可播放音源。
   - **Direct HTTP(S)**：MP3（ID3v2）、FLAC、Ogg Opus/Vorbis、MP4/M4A、WebM/Matroska、WAV 探測與嚴格 SSRF 防護。

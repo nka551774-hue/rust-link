@@ -8,6 +8,15 @@ $Root = (Get-Item -LiteralPath $PSScriptRoot).Parent.FullName
 $Data = Join-Path $PSScriptRoot 'data'
 $ConfigFile = Join-Path $Data 'config.yaml'
 $EnvFile = Join-Path $Data '.env'
+$PoTokenFile = Join-Path $Root 'potoken.yaml'
+$Utf8 = New-Object Text.UTF8Encoding $false
+
+function Write-PoTokenConfig([string]$Pot, [string]$Vd) {
+    $p = $Pot.Replace("'", "''")
+    $v = $Vd.Replace("'", "''")
+    $body = "# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).`npoToken: '$p'`nvisitorData: '$v'`n"
+    [IO.File]::WriteAllText($PoTokenFile, $body, $Utf8)
+}
 
 function Fail([string]$Message) {
     Write-Host "error: $Message" -ForegroundColor Red
@@ -89,11 +98,11 @@ if ($reuse) {
             $Proxy = (Read-Host "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]").Trim()
             if (-not $Proxy) { $Proxy = $warp }
         }
-        $PoToken = if ($null -ne $env:RUSTLINK_YOUTUBE_PO_TOKEN) { $env:RUSTLINK_YOUTUBE_PO_TOKEN.Trim() } else { (Read-Host 'YouTube PO token (empty = none)').Trim() }
+        $PoToken = if ($null -ne $env:RUSTLINK_YOUTUBE_PO_TOKEN) { $env:RUSTLINK_YOUTUBE_PO_TOKEN.Trim() } elseif (!(Test-Path -LiteralPath $PoTokenFile)) { (Read-Host 'YouTube PO token for potoken.yaml (empty = fill potoken.yaml later)').Trim() } else { '' }
         $VisitorData = if ($null -ne $env:RUSTLINK_YOUTUBE_VISITOR_DATA) {
             $env:RUSTLINK_YOUTUBE_VISITOR_DATA.Trim()
         } elseif ($PoToken -and $PoToken -notmatch ':' -and -not $PoToken.StartsWith('{')) {
-            (Read-Host 'YouTube visitorData (empty = auto)').Trim()
+            (Read-Host 'YouTube visitorData for potoken.yaml (empty = auto)').Trim()
         } else { '' }
     }
 
@@ -103,22 +112,26 @@ if ($reuse) {
     if ($Proxy -match '["\\\s]') { Fail 'proxy cannot contain quotes, backslashes or spaces' }
     if ($Proxy -and $Proxy -notmatch '^(https?|socks4a?|socks5h?)://') { Fail 'proxy must start with http://, https://, socks4://, socks4a://, socks5:// or socks5h://' }
 
-    $extraYaml = @()
+    if ($PoToken -or $VisitorData -or !(Test-Path -LiteralPath $PoTokenFile)) {
+        Write-PoTokenConfig $PoToken $VisitorData
+    }
+    $escapedPotFile = $PoTokenFile.Replace("'", "''")
+    $extraYaml = @("youtubePoTokenFile: '$escapedPotFile'", 'youtubeRequirePoToken: true')
     if ($Proxy) { $extraYaml += "youtubeProxy: `"$Proxy`"" }
-    if ($PoToken) { $extraYaml += "youtubePoToken: '$($PoToken.Replace(`"'`", `"''`"))'" }
-    if ($VisitorData) { $extraYaml += "youtubeVisitorData: '$($VisitorData.Replace(`"'`", `"''`"))'" }
-    $extraBlock = if ($extraYaml.Count -gt 0) { ($extraYaml -join "`n") + "`n" } else { '' }
+    $extraBlock = ($extraYaml -join "`n") + "`n"
     [IO.Directory]::CreateDirectory($Data) | Out-Null
-    $utf8 = New-Object Text.UTF8Encoding $false
-    [IO.File]::WriteAllText($ConfigFile, "address: 127.0.0.1:$Port`npassword: `"$Password`"`nlogLevel: info`nlogDirectory: logs`ntoolsDirectory: .tools`nautoDownload: true`n$extraBlock", $utf8)
-    [IO.File]::WriteAllText($EnvFile, "DISCORD_BOT_TOKEN=$Token`nRUSTLINK_PASSWORD=$Password`nRUSTLINK_URL=http://127.0.0.1:$Port`n", $utf8)
-    Write-Host "Settings saved to $Data"
+    [IO.File]::WriteAllText($ConfigFile, "address: 127.0.0.1:$Port`npassword: `"$Password`"`nlogLevel: info`nlogDirectory: logs`ntoolsDirectory: .tools`nautoDownload: true`n$extraBlock", $Utf8)
+    [IO.File]::WriteAllText($EnvFile, "DISCORD_BOT_TOKEN=$Token`nRUSTLINK_PASSWORD=$Password`nRUSTLINK_URL=http://127.0.0.1:$Port`n", $Utf8)
+    Write-Host "Settings saved to $Data (YouTube PO token config: $PoTokenFile)"
 }
 
+if (!(Test-Path -LiteralPath $PoTokenFile)) { Write-PoTokenConfig '' '' }
 $env:RUSTLINK_PASSWORD = $Password
 $env:RUSTLINK_ADDRESS = "127.0.0.1:$Port"
 $env:DISCORD_BOT_TOKEN = $Token
 $env:RUSTLINK_URL = "http://127.0.0.1:$Port"
+$env:RUSTLINK_YOUTUBE_PO_TOKEN_FILE = $PoTokenFile
+$env:RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN = 'true'
 $env:RUSTLINK_NO_PAUSE = '1'
 Remove-Item Env:RUSTLINK_YOUTUBE_PO_TOKEN, Env:RUSTLINK_YOUTUBE_VISITOR_DATA, Env:RUSTLINK_YOUTUBE_PROXY -ErrorAction SilentlyContinue
 

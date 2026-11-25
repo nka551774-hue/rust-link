@@ -257,9 +257,34 @@ set_yaml_single() {
     fi
 }
 
+set_yaml_raw() {
+    local file=$1 key=$2 val=$3 esc
+    esc=$(sed_replacement "$val")
+    if grep -q "^${key}:" "$file"; then
+        sed -i -e "s|^${key}:.*|${key}: ${esc}|" "$file"
+    else
+        printf '\n%s: %s\n' "$key" "$val" >>"$file"
+    fi
+}
+
 apply_youtube_settings() {
-    [ -z "$PO_TOKEN" ] || set_yaml_single "$DIRECTORY/config.yaml" youtubePoToken "$PO_TOKEN"
-    [ -z "$VISITOR_DATA" ] || set_yaml_single "$DIRECTORY/config.yaml" youtubeVisitorData "$VISITOR_DATA"
+    local pot_file="$DIRECTORY/potoken.yaml"
+    set_yaml_single "$DIRECTORY/config.yaml" youtubePoTokenFile "$pot_file"
+    set_yaml_raw "$DIRECTORY/config.yaml" youtubeRequirePoToken true
+    if [ ! -f "$pot_file" ]; then
+        (
+            umask 0027
+            if [ -f "$SOURCE/potoken.yaml" ]; then
+                cp "$SOURCE/potoken.yaml" "$pot_file"
+            else
+                printf '# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\npoToken: ""\nvisitorData: ""\n' >"$pot_file"
+            fi
+        )
+    fi
+    [ -z "$PO_TOKEN" ] || set_yaml_single "$pot_file" poToken "$PO_TOKEN"
+    [ -z "$VISITOR_DATA" ] || set_yaml_single "$pot_file" visitorData "$VISITOR_DATA"
+    chown "root:$SERVICE_GROUP" "$pot_file"
+    chmod 0640 "$pot_file"
     [ -z "$YOUTUBE_PROXY" ] || set_yaml_single "$DIRECTORY/config.yaml" youtubeProxy "$YOUTUBE_PROXY"
 }
 
@@ -358,6 +383,7 @@ summary() {
     step "Installed"
     printf '    node binary    %s/rustlink\n' "$DIRECTORY"
     printf '    node config    %s/config.yaml\n' "$DIRECTORY"
+    printf '    potoken config %s/potoken.yaml\n' "$DIRECTORY"
     printf '    listen         %s\n' "$LISTEN_ADDR"
     if [ "$INSTALL_BOT" = 1 ]; then
         printf '    bot binary     %s/rustlink-bot\n' "$DIRECTORY"

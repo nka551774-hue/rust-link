@@ -167,6 +167,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     log_startup(&config, path.as_deref());
+    ensure_potoken_starter(&config);
     let sources = Arc::new(rustlink_source::Service::new(config.clone()));
     let engine = rustlink_audio::Engine {
         ffmpeg: (!config.ffmpeg.trim().is_empty()).then(|| config.ffmpeg.clone()),
@@ -176,11 +177,12 @@ fn run() -> Result<(), String> {
     };
     let playback: Arc<dyn Engine> =
         Arc::new(Playback { engine, source: Arc::clone(&sources) as Arc<dyn Loader> });
-    let lyrics = rustlink_lyrics::Manager::from_config_with_youtube_visitor(
+    let lyrics = rustlink_lyrics::Manager::from_config_with_youtube_auth(
         &config,
         sources.agent().clone(),
         sources.youtube_agent().cloned(),
         Some(sources.youtube_visitor_bridge()),
+        Some(sources.youtube_po_token_reader()),
     )
     .map(Arc::new);
     let webhook = rustlink_server::webhook::Client::with_network_policy(
@@ -398,10 +400,38 @@ fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
     ]
 }
 
+fn ensure_potoken_starter(config: &Config) {
+    let raw = config.youtube_po_token_file.trim();
+    if raw.is_empty() {
+        return;
+    }
+    let path = Path::new(raw);
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut nonce = [0u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let temp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(OsStr::to_str).unwrap_or("potoken.yaml"),
+        tools::hex_encode(&nonce)
+    ));
+    if write_starter_at(path, &temp, rustlink_config::starter_potoken()).is_ok() {
+        log::info!("created starter YouTube poToken file path={}", path.display());
+    }
+}
+
 fn source_summary(config: &Config) -> String {
     let mut active = Vec::with_capacity(6);
     if config.youtube_native {
-        active.push("youtube(native)");
+        if config.youtube_require_po_token || !config.youtube_po_token_file.trim().is_empty() {
+            active.push("youtube(native+potoken)");
+        } else {
+            active.push("youtube(native)");
+        }
     }
     if config.soundcloud_native {
         active.push("soundcloud(native)");

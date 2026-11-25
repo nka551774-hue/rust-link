@@ -9,6 +9,11 @@ use rustlink_source::{innertube, Service};
 fn live_service() -> Service {
     let mut config = Config::default();
     apply_env(&mut config);
+    if config.youtube_po_token_file.trim().is_empty() {
+        if let Some(found) = rustlink_config::discover_potoken(None) {
+            config.youtube_po_token_file = found.to_string_lossy().into_owned();
+        }
+    }
     Service::new(config)
 }
 

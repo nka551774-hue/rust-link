@@ -34,26 +34,27 @@ Rustlink 以 100% 純 Rust 原生 InnerTube 協定解析與串流 YouTube / YouT
 3. **48 kHz Opus 零轉碼直通**：音量 100% 且無濾鏡時，`itag 251` 經 `opus_packet_parse` 校驗後直接送往 Discord RTP（每音框僅 **445.2 ns**）；中途啟用音量或濾鏡時，透過最近兩包完成零相位預熱並無縫切入 32-tap Sinc 重取樣與 24-bit `opus_encode_float` 管線。
 4. **壓縮封包快轉（Fast Compressed Seek）**：`seek` 直接跳過目標前的壓縮封包，僅解碼收斂預熱視窗（Opus 80 ms `SeekPreRoll`、AAC-LC 8 個音框）。
 
-## 遭遇機房 IP 限制時：啟用 PO Token（推薦）或代理
+## PO Token 專屬設定檔模式（`potoken.yaml`，預設強制啟用）
 
 > [!NOTE]
-> **安全邊界說明**：Rustlink 不會內建 BotGuard 虛擬機求解器或無頭瀏覽器來自動代算反機器人驗證挑戰；當所處網路位址遭 YouTube 要求驗證時，請提供您自己瀏覽器工作階段產生的 `youtubePoToken` 與 `youtubeVisitorData`，節點會自動將其注入所有 InnerTube 請求（`/player`、`/search`、`/browse`、`/next`）與 `googlevideo.com` 音訊網址（`&pot=`），並自動將原生支援 `poToken` 與 **48 kHz WebM Opus（`itag 251`）** 的 `VISIONOS` 與 `ANDROID` 列為第一、第二順位。
+> **全鏈路強制 PO Token 與免重啟自動熱載入**：啟動腳本、預設 `config.yaml` 與 `install.sh` 皆預設啟用 `youtubePoTokenFile: potoken.yaml` 與 `youtubeRequirePoToken: true`。所有 YouTube / YouTube Music 請求（`/player`、`/search`、`/browse`、`/next`、歌詞與 `googlevideo.com` 音訊網址 `&pot=`）一律強制走 `poToken` 驗證（優先採用原生支援 `poToken` 與 **48 kHz WebM Opus `itag 251`** 的 `VISIONOS` 與 `ANDROID`），未設定時拒絕匿名直連以避免觸發風控。檔案存檔後節點會**自動偵測變更並即時熱更新、清空舊快取**，全程無須重啟節點或中斷語音通話。
 
 ### 1. 從瀏覽器取得 `poToken` 與 `visitorData`（30 秒步驟）
 1. 在自己的瀏覽器開啟無痕視窗前往 `https://music.youtube.com` 或 `https://www.youtube.com` 隨意播放一首歌。
 2. 按 `F12` 開啟開發者工具 -> **Network（網路）** -> 篩選 `v1/player` -> 點開任一筆請求的 **Payload（載荷）**。
-3. 複製以下兩個欄位：
-   - `serviceIntegrityDimensions.poToken` -> 對應 `youtubePoToken`
-   - `context.client.visitorData` -> 對應 `youtubeVisitorData`
-   - （`youtubePoToken` 亦直接支援 `<visitorData>:<poToken>` 合併字串或 `{"poToken":"...","visitorData":"..."}` JSON 格式）
+3. 複製以下兩個欄位填入專案根目錄（或 `/opt/rustlink/`）的 **`potoken.yaml`**（範本見 [`potoken.example.yaml`](../potoken.example.yaml)）：
+   ```yaml
+   poToken: "<serviceIntegrityDimensions.poToken>"
+   visitorData: "<context.client.visitorData>"
+   ```
+   - 亦支援將整個 `v1/player` Request Payload JSON 直接貼入 `potoken.json`、使用 `{"poToken":"...","visitorData":"..."}` JSON，或 `<visitorData>:<poToken>` 合併字串。
 
-### 2. 四種帶入與免重啟熱更新方式
-- **設定檔（`config.yaml`）**：填入 `youtubePoToken` 與 `youtubeVisitorData`（或環境變數 `RUSTLINK_YOUTUBE_PO_TOKEN`、`RUSTLINK_YOUTUBE_VISITOR_DATA`）。
-- **一鍵腳本（`quickstart/` 或 `install.sh`）**：
-  - 本機 `quickstart/start.bat` / `quickstart/start.sh` 互動詢問時直接貼入，或預先設定上述環境變數。
-  - Linux VPS：`sudo DISCORD_BOT_TOKEN=... RUSTLINK_YOUTUBE_PO_TOKEN='...' RUSTLINK_YOUTUBE_VISITOR_DATA='...' ./install.sh --with-bot`（或使用 `--po-token` / `--visitor-data` 旗標）。
-  - Docker Compose：`RUSTLINK_PASSWORD=... DISCORD_BOT_TOKEN=... RUSTLINK_YOUTUBE_PO_TOKEN='...' RUSTLINK_YOUTUBE_VISITOR_DATA='...' docker compose --profile bot up -d --build`
-- **零中斷線上熱更新（`PATCH /api/v1/youtube`）**：當 `poToken` 數小時後過期時，無須重啟節點或中斷語音通話，直接呼叫管理端點（或 `rustlink_client::Client::set_youtube_tokens`）即可即時替換並自動清空舊快取：
+### 2. 部署與免重啟更新方式
+- **直接編輯 `potoken.yaml`（推薦）**：
+  - 本機 `start.bat` / `start.sh` 與 `quickstart/start.bat` / `quickstart/start.sh` 皆自動建立並監聽專案根目錄下的 `potoken.yaml`。
+  - Linux VPS `sudo ./install.sh --with-bot` 自動建立 `/opt/rustlink/potoken.yaml`（權限 `0640`；若原始碼目錄已有 `potoken.yaml` 會自動帶入）。
+  - 權杖數小時後過期時，直接修改 `potoken.yaml` 存檔，下一次解析或切歌即自動套用新權杖。
+- **REST API 線上熱更新（`PATCH /api/v1/youtube`）**：適合唯讀容器或遠端自動化腳本推送：
   ```sh
   curl -X PATCH http://127.0.0.1:2333/api/v1/youtube \
     -H "Authorization: Bearer <RUSTLINK_PASSWORD>" \
@@ -61,4 +62,4 @@ Rustlink 以 100% 純 Rust 原生 InnerTube 協定解析與串流 YouTube / YouT
     -d '{"po_token":"<PO_TOKEN>","visitor_data":"<VISITOR_DATA>"}'
   ```
 - **搭配 `youtubeProxy`**：支援 `http(s)://`、`socks4(a)://`、`socks5(h)://`（如本機 Cloudflare WARP `socks5://127.0.0.1:40000`），僅路由 YouTube API 與音訊流量，不影響其他音源與 Discord UDP。
-- **驗證指令**：`cargo test -p rustlink-source --test live_youtube -- --ignored --nocapture`（支援讀取 `RUSTLINK_YOUTUBE_PO_TOKEN`、`RUSTLINK_YOUTUBE_VISITOR_DATA` 與 `RUSTLINK_YOUTUBE_PROXY` 實測）。
+- **驗證指令**：`cargo test -p rustlink-source --test live_youtube -- --ignored --nocapture`（自動讀取根目錄 `potoken.yaml` 或 `RUSTLINK_YOUTUBE_*` 環境變數實測）。

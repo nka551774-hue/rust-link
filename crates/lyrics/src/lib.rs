@@ -392,6 +392,16 @@ impl Manager {
         youtube_agent: Option<ureq::Agent>,
         visitor_bridge: Option<VisitorBridge>,
     ) -> Option<Self> {
+        Self::from_config_with_youtube_auth(config, agent, youtube_agent, visitor_bridge, None)
+    }
+
+    pub fn from_config_with_youtube_auth(
+        config: &Config,
+        agent: ureq::Agent,
+        youtube_agent: Option<ureq::Agent>,
+        visitor_bridge: Option<VisitorBridge>,
+        po_token_reader: Option<VisitorReader>,
+    ) -> Option<Self> {
         if !config.lyrics_enabled() {
             return None;
         }
@@ -400,13 +410,21 @@ impl Manager {
         if let Some(yt_agent) = youtube_agent.filter(|_| config.youtube_native) {
             let (visitor_reader, visitor_writer) =
                 visitor_bridge.map_or((None, None), |(r, w)| (Some(r), Some(w)));
+            let (pot, vd) = rustlink_config::split_pot_pair(
+                &config.youtube_po_token,
+                &config.youtube_visitor_data,
+            );
             providers.push(Box::new(YTMusic {
                 agent: yt_agent,
                 endpoint: config.youtube_music_endpoint.clone(),
                 version: String::new(),
-                visitor_data: config.youtube_visitor_data.clone(),
+                visitor_data: vd,
+                po_token: pot,
+                require_po_token: config.youtube_require_po_token
+                    || !config.youtube_po_token_file.trim().is_empty(),
                 visitor_reader,
                 visitor_writer,
+                po_token_reader,
             }));
         }
         Some(Self::new(providers))

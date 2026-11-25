@@ -28,8 +28,11 @@ pub struct YTMusic {
     pub endpoint: String,
     pub version: String,
     pub visitor_data: String,
+    pub po_token: String,
+    pub require_po_token: bool,
     pub visitor_reader: Option<VisitorReader>,
     pub visitor_writer: Option<VisitorWriter>,
+    pub po_token_reader: Option<VisitorReader>,
 }
 
 struct Client {
@@ -152,6 +155,11 @@ impl YTMusic {
             client.version
         };
         let visitor = visitor_data.trim();
+        let live_pot = self.po_token_reader.as_ref().and_then(|r| r()).unwrap_or_default();
+        let pot = if !live_pot.trim().is_empty() { live_pot.trim() } else { self.po_token.trim() };
+        if self.require_po_token && pot.is_empty() {
+            return Err(LyricsError::NotFound);
+        }
         if !crate::valid_header_value(version) || !crate::valid_header_value(visitor) {
             return Err(LyricsError::Failed("lyrics: invalid YouTube Music header value".into()));
         }
@@ -159,13 +167,17 @@ impl YTMusic {
             if self.endpoint.trim().is_empty() { YTMUSIC_ENDPOINT } else { self.endpoint.trim() };
         let base = crate::validate_base_url(raw_base, "youtube music")?;
         #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct Envelope<'a> {
             context: Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            service_integrity_dimensions: Option<Value>,
             #[serde(flatten)]
             body: &'a Value,
         }
         let payload = Envelope {
             context: json!({ "client": client_context(client, version, visitor) }),
+            service_integrity_dimensions: (!pot.is_empty()).then(|| json!({ "poToken": pot })),
             body,
         };
         let mut req = self
@@ -512,8 +524,11 @@ mod tests {
             endpoint,
             version: String::new(),
             visitor_data: String::new(),
+            po_token: String::new(),
+            require_po_token: false,
             visitor_reader: None,
             visitor_writer: None,
+            po_token_reader: None,
         };
         let lyrics = provider.fetch(&track("youtube", "dQw4w9WgXcQ")).unwrap();
         server.join().unwrap();
@@ -524,8 +539,11 @@ mod tests {
             endpoint: "https://music.youtube.com".into(),
             version: "1.0\r\nX-Injected: 1".into(),
             visitor_data: String::new(),
+            po_token: String::new(),
+            require_po_token: false,
             visitor_reader: None,
             visitor_writer: None,
+            po_token_reader: None,
         };
         assert!(matches!(
             bad_header.fetch(&track("youtube", "dQw4w9WgXcQ")),

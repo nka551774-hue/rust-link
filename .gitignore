@@ -12,6 +12,12 @@ config.yaml
 config.yml
 config.json
 config.local.*
+potoken.yaml
+potoken.yml
+potoken.json
+po-token.yaml
+po-token.yml
+po-token.json
 .env
 .env.*
 !.env.example

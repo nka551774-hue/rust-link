@@ -79,6 +79,8 @@ define_config! {
     [plain, d_yt_ep = "d_yt_ep"] youtube_endpoint: String = "https://youtubei.googleapis.com".into();
     [plain, d_ytm_ep = "d_ytm_ep"] youtube_music_endpoint: String = "https://music.youtube.com".into();
     [plain] youtube_client_version: String = String::new();
+    [plain] youtube_po_token_file: String = String::new();
+    [plain] youtube_require_po_token: bool = false;
     [secret] youtube_po_token: String = String::new();
     [secret] youtube_visitor_data: String = String::new();
     [secret] youtube_proxy: String = String::new();
@@ -202,6 +204,15 @@ pub const LOG_COLORS: [&str; 3] = ["auto", "always", "never"];
 pub const LYRICS_SOURCES: [&str; 2] = ["lrclib", "none"];
 pub const CANDIDATES: [&str; 3] = ["config.yaml", "config.yml", "config.json"];
 pub const STARTER_FILE: &str = "config.yaml";
+pub const POTOKEN_CANDIDATES: [&str; 6] = [
+    "potoken.yaml",
+    "potoken.yml",
+    "potoken.json",
+    "po-token.yaml",
+    "po-token.yml",
+    "po-token.json",
+];
+pub const STARTER_POTOKEN_FILE: &str = "potoken.yaml";
 
 impl Config {
     #[inline]
@@ -236,6 +247,27 @@ pub fn discover(explicit: Option<&Path>) -> Option<PathBuf> {
     })
 }
 
+pub fn discover_potoken(base_dir: Option<&Path>) -> Option<PathBuf> {
+    base_dir
+        .filter(|d| !d.as_os_str().is_empty())
+        .and_then(|dir| POTOKEN_CANDIDATES.into_iter().map(|n| dir.join(n)).find(|p| p.is_file()))
+        .or_else(|| {
+            POTOKEN_CANDIDATES
+                .into_iter()
+                .map(Path::new)
+                .find(|p| p.is_file())
+                .map(Path::to_path_buf)
+        })
+}
+
+pub const fn starter_potoken() -> &'static str {
+    "# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\n\
+     # Copy serviceIntegrityDimensions.poToken and context.client.visitorData from a browser\n\
+     # F12 Network -> v1/player request on https://music.youtube.com or https://www.youtube.com.\n\
+     poToken: \"\"\n\
+     visitorData: \"\"\n"
+}
+
 pub fn starter(password: &str) -> String {
     const PREFIX: &str = "# Written by Rustlink because no configuration file was found. Every\n\
         # setting has a default, so this only states what a fresh node needs,\n\
@@ -245,6 +277,8 @@ pub fn starter(password: &str) -> String {
     const SUFFIX: &str = "\"\n\
         logLevel: info\n\
         logDirectory: logs\n\
+        youtubePoTokenFile: potoken.yaml\n\
+        youtubeRequirePoToken: true\n\
         # Fetch FFmpeg on first start for media formats the built-in\n\
         # decoders do not support. Source resolution runs in Rust.\n\
         autoDownload: true\n";
@@ -299,10 +333,91 @@ fn read_bounded_config(path: &Path) -> Result<String, ConfigError> {
     })
 }
 
+pub fn split_pot_pair(raw_pot: &str, raw_vd: &str) -> (String, String) {
+    let (pot, vd) = (raw_pot.trim(), raw_vd.trim());
+    if pot.starts_with('{') {
+        if let Ok((parsed_pot, parsed_vd)) = parse_potoken_mapping_str(pot) {
+            return (parsed_pot, if vd.is_empty() { parsed_vd } else { vd.to_owned() });
+        }
+    }
+    if vd.is_empty() && !pot.contains("://") {
+        if let Some((left, right)) = pot.split_once(':') {
+            let (left, right) = (left.trim(), right.trim());
+            if !left.is_empty() && !right.is_empty() {
+                return (right.to_owned(), left.to_owned());
+            }
+        }
+    }
+    (pot.to_owned(), vd.to_owned())
+}
+
+fn parse_potoken_mapping_str(text: &str) -> Result<(String, String), serde_yaml::Error> {
+    let val: serde_yaml::Value = serde_yaml::from_str(text)?;
+    Ok(extract_potoken_value(&val).unwrap_or_default())
+}
+
+fn pick_str<'a>(map: &'a serde_yaml::Mapping, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| map.get(*k)?.as_str()).map(str::trim)
+}
+
+fn extract_potoken_value(val: &serde_yaml::Value) -> Option<(String, String)> {
+    match val {
+        serde_yaml::Value::Null => Some((String::new(), String::new())),
+        serde_yaml::Value::String(s) => Some(split_pot_pair(s, "")),
+        serde_yaml::Value::Mapping(m) => {
+            let pot = pick_str(m, &["poToken", "po_token", "youtubePoToken", "youtube_po_token"])
+                .or_else(|| {
+                    m.get("serviceIntegrityDimensions")?
+                        .as_mapping()
+                        .and_then(|s| pick_str(s, &["poToken", "po_token"]))
+                })
+                .unwrap_or_default();
+            let vd = pick_str(
+                m,
+                &["visitorData", "visitor_data", "youtubeVisitorData", "youtube_visitor_data"],
+            )
+            .or_else(|| {
+                m.get("context")?
+                    .as_mapping()?
+                    .get("client")?
+                    .as_mapping()
+                    .and_then(|c| pick_str(c, &["visitorData", "visitor_data"]))
+            })
+            .unwrap_or_default();
+            Some(split_pot_pair(pot, vd))
+        }
+        _ => None,
+    }
+}
+
+pub fn parse_potoken_text(text: &str) -> Result<(String, String), ConfigError> {
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text).trim();
+    if body.is_empty() {
+        return Ok((String::new(), String::new()));
+    }
+    let val: serde_yaml::Value = serde_yaml::from_str(body)
+        .map_err(|e| ConfigError::Invalid(format!("invalid poToken file: {e}")))?;
+    let (pot, vd) = extract_potoken_value(&val).ok_or_else(|| {
+        ConfigError::Invalid("poToken file must be a YAML/JSON mapping or string".into())
+    })?;
+    validate::validate_youtube_tokens(&pot, &vd)?;
+    Ok((pot, vd))
+}
+
+pub fn load_potoken_file(path: &Path) -> Result<(String, String), ConfigError> {
+    let mut text = read_bounded_config(path)?;
+    let parsed = parse_potoken_text(&text);
+    wipe_string(&mut text);
+    parsed
+}
+
 pub fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
-    let mut config = match discover(explicit) {
+    let config_path = discover(explicit);
+    let base_dir =
+        config_path.as_deref().and_then(Path::parent).filter(|p| !p.as_os_str().is_empty());
+    let mut config = match &config_path {
         Some(path) => {
-            let mut text = read_bounded_config(&path)?;
+            let mut text = read_bounded_config(path)?;
             let parsed = parse_configuration(&text);
             wipe_string(&mut text);
             parsed
@@ -311,8 +426,38 @@ pub fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
         None => Config::default(),
     };
     apply_env(&mut config);
+    resolve_potoken_file(&mut config, base_dir)?;
     validate(&config)?;
     Ok(config)
+}
+
+fn resolve_potoken_file(config: &mut Config, base_dir: Option<&Path>) -> Result<(), ConfigError> {
+    let configured = config.youtube_po_token_file.trim();
+    if configured.is_empty() {
+        if let Some(found) = discover_potoken(base_dir) {
+            config.youtube_po_token_file = found.to_string_lossy().into_owned();
+        }
+    } else if Path::new(configured).is_relative() {
+        if let Some(dir) = base_dir {
+            let candidate = dir.join(configured);
+            if candidate.is_file() || !Path::new(configured).is_file() {
+                config.youtube_po_token_file = candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    let pot_path = config.youtube_po_token_file.trim();
+    if !pot_path.is_empty() && Path::new(pot_path).is_file() {
+        let (mut pot, mut vd) = load_potoken_file(Path::new(pot_path))?;
+        if config.youtube_po_token.trim().is_empty() {
+            std::mem::swap(&mut config.youtube_po_token, &mut pot);
+        }
+        if config.youtube_visitor_data.trim().is_empty() {
+            std::mem::swap(&mut config.youtube_visitor_data, &mut vd);
+        }
+        wipe_string(&mut pot);
+        wipe_string(&mut vd);
+    }
+    Ok(())
 }
 
 fn parse_configuration(text: &str) -> Result<Config, serde_yaml::Error> {
@@ -376,7 +521,9 @@ mod tests {
         let config: Config = serde_yaml::from_str(&starter("4f2a9c")).unwrap();
         assert_eq!(config.password, "4f2a9c");
         assert_eq!(config.address, "0.0.0.0:2333");
-        assert!(config.auto_download);
+        assert_eq!(config.youtube_po_token_file, STARTER_POTOKEN_FILE);
+        assert!(config.youtube_require_po_token && config.auto_download);
+        assert_eq!(parse_potoken_text(starter_potoken()).unwrap(), (String::new(), String::new()));
     }
 
     #[test]
@@ -448,5 +595,37 @@ mod tests {
         let err = load(Some(&path)).unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(err.to_string().contains("exceeds 1 MiB"), "{err}");
+    }
+
+    #[test]
+    fn potoken_file_parses_yaml_json_player_payload_and_resolves_relative_to_config() {
+        for (raw, expected) in [
+            ("poToken: MnSYaml==\nvisitorData: CgtYaml==\n", ("MnSYaml==", "CgtYaml==")),
+            (r#"{"po_token":"MnSJson==","visitor_data":"CgtJson=="}"#, ("MnSJson==", "CgtJson==")),
+            (
+                r#"{"context":{"client":{"visitorData":"CgtPlayer=="}},"serviceIntegrityDimensions":{"poToken":"MnSPlayer=="}}"#,
+                ("MnSPlayer==", "CgtPlayer=="),
+            ),
+            ("CgtPair==:MnSPair==", ("MnSPair==", "CgtPair==")),
+        ] {
+            let (pot, vd) = parse_potoken_text(raw).unwrap();
+            assert_eq!((pot.as_str(), vd.as_str()), expected);
+        }
+        assert!(parse_potoken_text("poToken: \"bad\u{0007}\"").is_err());
+        assert!(parse_potoken_text("visitorData: \"non-ascii-測試\"").is_err());
+
+        let dir = std::env::temp_dir().join(format!("rustlink-pot-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.yaml");
+        let pot_path = dir.join("potoken.yaml");
+        std::fs::write(&cfg_path, "password: secret12\nyoutubeRequirePoToken: true\n").unwrap();
+        std::fs::write(&pot_path, "poToken: MnSFromFile==\nvisitorData: CgtFromFile==\n").unwrap();
+        let loaded = load(Some(&cfg_path)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(Path::new(&loaded.youtube_po_token_file), pot_path.as_path());
+        assert!(loaded.youtube_require_po_token);
+        assert_eq!(loaded.youtube_po_token, "MnSFromFile==");
+        assert_eq!(loaded.youtube_visitor_data, "CgtFromFile==");
     }
 }

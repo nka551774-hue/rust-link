@@ -34,6 +34,7 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
         "RUSTLINK_YOUTUBE_ENDPOINT" => config.youtube_endpoint,
         "RUSTLINK_YOUTUBE_MUSIC_ENDPOINT" => config.youtube_music_endpoint,
         "RUSTLINK_YOUTUBE_CLIENT_VERSION" => config.youtube_client_version,
+        "RUSTLINK_YOUTUBE_PO_TOKEN_FILE" => config.youtube_po_token_file,
         "RUSTLINK_YOUTUBE_PO_TOKEN" => config.youtube_po_token,
         "RUSTLINK_YOUTUBE_VISITOR_DATA" => config.youtube_visitor_data,
         "RUSTLINK_YOUTUBE_PROXY" => config.youtube_proxy,
@@ -58,6 +59,7 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
 
     env_map!(flag:
         "RUSTLINK_YOUTUBE_NATIVE" => config.youtube_native,
+        "RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN" => config.youtube_require_po_token,
         "RUSTLINK_SOUNDCLOUD" => config.soundcloud_native,
         "RUSTLINK_SOUNDCLOUD_NATIVE" => config.soundcloud_native,
         "RUSTLINK_AUTO_DOWNLOAD" => config.auto_download,

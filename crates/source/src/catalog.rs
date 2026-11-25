@@ -38,6 +38,15 @@ impl Drop for YoutubeAuth {
     }
 }
 
+type FileStamp = Option<(Option<SystemTime>, u64)>;
+
+#[derive(Default)]
+pub(crate) struct PoTokenWatch {
+    initialized: bool,
+    stamp: FileStamp,
+    manual_override: bool,
+}
+
 /// Long-lived provider credentials, YouTube stream cache, and client health state.
 #[derive(Default)]
 pub struct State {
@@ -47,6 +56,80 @@ pub struct State {
     pub(crate) youtube_streams: Arc<YoutubeStreamCache>,
     pub(crate) youtube_health: Arc<YoutubeClientHealth>,
     pub(crate) youtube_auth: Mutex<Option<YoutubeAuth>>,
+    pub(crate) youtube_pot_watch: Mutex<PoTokenWatch>,
+}
+
+fn potoken_path(config: &Config) -> Option<std::path::PathBuf> {
+    let explicit = config.youtube_po_token_file.trim();
+    if !explicit.is_empty() {
+        Some(std::path::PathBuf::from(explicit))
+    } else {
+        rustlink_config::discover_potoken(None)
+    }
+}
+
+fn stat_file(path: &std::path::Path) -> FileStamp {
+    std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| (m.modified().ok(), m.len()))
+}
+
+impl State {
+    pub(crate) fn record_manual_youtube_auth(&self, config: &Config, pot: String, vd: String) {
+        let stamp = potoken_path(config).and_then(|p| stat_file(&p));
+        {
+            let mut watch = lock(&self.youtube_pot_watch);
+            watch.initialized = true;
+            watch.stamp = stamp;
+            watch.manual_override = true;
+        }
+        *lock(&self.youtube_auth) = Some(YoutubeAuth { po_token: pot, visitor_data: vd });
+        self.youtube_streams.clear();
+        self.youtube_health.clear();
+    }
+
+    /// Checks the configured or discovered `potoken` file and reloads credentials if modified.
+    /// Returns `true` when effective credentials changed and caches were invalidated.
+    pub(crate) fn sync_potoken_file(&self, config: &Config) -> bool {
+        let Some(path) = potoken_path(config) else { return false };
+        let stamp = stat_file(&path);
+        {
+            let mut watch = lock(&self.youtube_pot_watch);
+            if !watch.initialized {
+                watch.initialized = true;
+                watch.stamp = stamp;
+                if stamp.is_none() || watch.manual_override {
+                    return false;
+                }
+            } else if watch.stamp == stamp {
+                return false;
+            } else {
+                watch.stamp = stamp;
+                watch.manual_override = false;
+            }
+        }
+        let (pot, vd) = if stamp.is_some() {
+            let Ok(pair) = rustlink_config::load_potoken_file(&path) else { return false };
+            pair
+        } else {
+            rustlink_config::split_pot_pair(&config.youtube_po_token, &config.youtube_visitor_data)
+        };
+        let changed = {
+            let mut held = lock(&self.youtube_auth);
+            let prev = held.as_ref().map(|a| (a.po_token.as_str(), a.visitor_data.as_str()));
+            let fallback = rustlink_config::split_pot_pair(
+                &config.youtube_po_token,
+                &config.youtube_visitor_data,
+            );
+            let cur = prev.unwrap_or((fallback.0.as_str(), fallback.1.as_str()));
+            let diff = cur != (pot.as_str(), vd.as_str());
+            *held = Some(YoutubeAuth { po_token: pot, visitor_data: vd });
+            diff
+        };
+        if changed {
+            self.youtube_streams.clear();
+            self.youtube_health.clear();
+        }
+        changed
+    }
 }
 
 fn wipe_string(secret: &mut String) {

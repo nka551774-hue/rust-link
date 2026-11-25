@@ -243,13 +243,43 @@ impl Service {
         self.youtube_agent.as_ref().ok()
     }
 
-    pub fn youtube_visitor_bridge(&self) -> VisitorBridge {
-        let r = Arc::clone(&self.catalog_state.youtube_visitor);
-        let w = Arc::clone(&r);
+    pub fn youtube_visitor_bridge(self: &Arc<Self>) -> VisitorBridge {
+        let svc = Arc::clone(self);
+        let writer_cache = Arc::clone(&self.catalog_state.youtube_visitor);
         (
-            Arc::new(move || r.peek()),
-            Arc::new(move |s| w.store_if_empty(s, Duration::from_secs(3600))),
+            Arc::new(move || {
+                svc.sync_potoken_file();
+                let (_, vd) = svc.active_youtube_auth();
+                if !vd.is_empty() {
+                    Some(vd)
+                } else {
+                    svc.catalog_state.youtube_visitor.peek()
+                }
+            }),
+            Arc::new(move |s| writer_cache.store_if_empty(s, Duration::from_secs(3600))),
         )
+    }
+
+    pub fn youtube_po_token_reader(self: &Arc<Self>) -> VisitorReader {
+        let svc = Arc::clone(self);
+        Arc::new(move || {
+            svc.sync_potoken_file();
+            let (pot, _) = svc.active_youtube_auth();
+            (!pot.is_empty()).then_some(pot)
+        })
+    }
+
+    fn active_youtube_auth(&self) -> (String, String) {
+        if let Some(auth) = lock(&self.catalog_state.youtube_auth).as_ref() {
+            return (auth.po_token.clone(), auth.visitor_data.clone());
+        }
+        innertube::parse_pot_pair(&self.config.youtube_po_token, &self.config.youtube_visitor_data)
+    }
+
+    fn sync_potoken_file(&self) {
+        if self.catalog_state.sync_potoken_file(&self.config) {
+            lock(&self.cache).clear();
+        }
     }
 
     /// Hot-reloads YouTube `poToken` and `visitorData` in memory without restarting
@@ -272,12 +302,8 @@ impl Service {
                 "youtubeVisitorData must contain only printable ASCII characters".into(),
             ));
         }
-        let has_pot = !pot.is_empty();
-        let has_vd = !vd.is_empty();
-        *lock(&self.catalog_state.youtube_auth) =
-            Some(catalog::YoutubeAuth { po_token: pot, visitor_data: vd });
-        self.catalog_state.youtube_streams.clear();
-        self.catalog_state.youtube_health.clear();
+        let (has_pot, has_vd) = (!pot.is_empty(), !vd.is_empty());
+        self.catalog_state.record_manual_youtube_auth(&self.config, pot, vd);
         lock(&self.cache).clear();
         Ok((has_pot, has_vd))
     }
@@ -308,6 +334,9 @@ impl Service {
         let identifier = identifier_text(identifier);
         if identifier.is_empty() || identifier.len() > MAX_IDENTIFIER {
             return Err(SourceError::Url("identifier must contain 1..8192 bytes".into()));
+        }
+        if matches!(source_kind(identifier), "youtube" | "spotify" | "deezer") {
+            self.sync_potoken_file();
         }
         if let Some(result) = self.cached(identifier) {
             return Ok(result);
@@ -540,6 +569,7 @@ impl Service {
                     if !youtube_id(&track.metadata.identifier) {
                         return Err(SourceError::Url("invalid YouTube video identifier".into()));
                     }
+                    self.sync_potoken_file();
                     let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
                     innertube::Catalog::with_state(agent, &self.config, &self.catalog_state)
                         .with_media_url(&track.metadata.identifier, |url, headers| {
@@ -1177,5 +1207,64 @@ mod tests {
         };
         server.join().unwrap();
         assert_eq!(track.metadata.title, "Hot Reloaded");
+    }
+
+    #[test]
+    fn potoken_config_file_enforces_po_token_and_hot_reloads_on_save() {
+        let mut call = 0;
+        let (base, server) = test_http::serve(2, move |_, headers, body| {
+            call += 1;
+            let expected_pot = if call == 1 { "MnSFileV1==" } else { "MnSFileV2Updated==" };
+            let expected_vd = if call == 1 { "cgtfilev1==" } else { "cgtfilev2==" };
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains(&format!("x-goog-visitor-id: {expected_vd}")));
+            assert_eq!(
+                body.pointer("/serviceIntegrityDimensions/poToken")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_pot)
+            );
+            serde_json::json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {
+                    "videoId": "dQw4w9WgXcQ",
+                    "title": format!("Token v{call}"),
+                    "lengthSeconds": "213"
+                }
+            })
+        });
+        let dir = std::env::temp_dir().join(format!("rustlink-source-pot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pot_file = dir.join("potoken.yaml");
+        std::fs::write(&pot_file, rustlink_config::starter_potoken()).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        cfg.youtube_po_token_file = pot_file.to_string_lossy().into_owned();
+        cfg.youtube_require_po_token = true;
+        let service = Service::new(cfg);
+
+        // Empty potoken.yaml refuses YouTube without hitting the network.
+        let blocked = service.load("dQw4w9WgXcQ").unwrap_err();
+        assert!(blocked.to_string().contains("requires a poToken"), "{blocked}");
+
+        // Saving v1 into potoken.yaml immediately enables poToken resolution without restart.
+        std::fs::write(&pot_file, "poToken: MnSFileV1==\nvisitorData: CgtFileV1==\n").unwrap();
+        let LoadResult::Track(t1) = service.load("dQw4w9WgXcQ").unwrap() else {
+            panic!("expected track v1");
+        };
+        assert_eq!(t1.metadata.title, "Token v1");
+
+        // Saving v2 into potoken.yaml flushes cache and uses the updated token immediately.
+        std::fs::write(&pot_file, "poToken: MnSFileV2Updated==\nvisitorData: CgtFileV2==\n")
+            .unwrap();
+        let LoadResult::Track(t2) = service.load("dQw4w9WgXcQ").unwrap() else {
+            panic!("expected track v2");
+        };
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(t2.metadata.title, "Token v2");
     }
 }

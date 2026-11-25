@@ -129,36 +129,7 @@ pub fn clients(config: &Config) -> [Client; 4] {
 /// Parses operator-supplied `poToken` and `visitorData`, supporting separate strings,
 /// JSON `{"poToken":"...","visitorData":"..."}`, or combined `<visitorData>:<poToken>`.
 pub(crate) fn parse_pot_pair(raw_pot: &str, raw_vd: &str) -> (String, String) {
-    let (pot, vd) = (raw_pot.trim(), raw_vd.trim());
-    if pot.starts_with('{') {
-        if let Ok(obj) = serde_json::from_str::<Value>(pot) {
-            let parsed_pot = obj
-                .get("poToken")
-                .or_else(|| obj.get("po_token"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            let parsed_vd = if !vd.is_empty() {
-                vd
-            } else {
-                obj.get("visitorData")
-                    .or_else(|| obj.get("visitor_data"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .unwrap_or_default()
-            };
-            return (parsed_pot.to_owned(), parsed_vd.to_owned());
-        }
-    }
-    if vd.is_empty() && !pot.contains("://") {
-        if let Some((left, right)) = pot.split_once(':') {
-            let (left, right) = (left.trim(), right.trim());
-            if !left.is_empty() && !right.is_empty() {
-                return (right.to_owned(), left.to_owned());
-            }
-        }
-    }
-    (pot.to_owned(), vd.to_owned())
+    rustlink_config::split_pot_pair(raw_pot, raw_vd)
 }
 
 fn catalogue_client(config: &Config) -> Client {
@@ -453,11 +424,40 @@ impl<'a> Catalog<'a> {
 
     fn configured_auth(&self) -> (String, String) {
         if let Some(state) = self.state {
+            state.sync_potoken_file(self.config);
             if let Some(auth) = crate::lock(&state.youtube_auth).as_ref() {
                 return (auth.po_token.clone(), auth.visitor_data.clone());
             }
+        } else {
+            let file = self.config.youtube_po_token_file.trim();
+            if !file.is_empty() && std::path::Path::new(file).is_file() {
+                if let Ok((pot, vd)) =
+                    rustlink_config::load_potoken_file(std::path::Path::new(file))
+                {
+                    if !pot.is_empty() || !vd.is_empty() {
+                        return (pot, vd);
+                    }
+                }
+            }
         }
         parse_pot_pair(&self.config.youtube_po_token, &self.config.youtube_visitor_data)
+    }
+
+    pub(crate) fn ensure_po_token(&self) -> Result<(), SourceError> {
+        let require = self.config.youtube_require_po_token
+            || !self.config.youtube_po_token_file.trim().is_empty();
+        if !require {
+            return Ok(());
+        }
+        let (pot, _) = self.configured_auth();
+        if pot.is_empty() {
+            let file = self.config.youtube_po_token_file.trim();
+            let target = if file.is_empty() { rustlink_config::STARTER_POTOKEN_FILE } else { file };
+            return Err(SourceError::Disabled(format!(
+                "YouTube requires a poToken; set poToken and visitorData in {target}"
+            )));
+        }
+        Ok(())
     }
 
     fn ordered_clients(&self) -> [Client; 4] {
@@ -470,13 +470,18 @@ impl<'a> Catalog<'a> {
     }
 
     fn ordered_catalogue_clients(&self) -> [Client; 2] {
-        let (android, visionos) = (catalogue_client(self.config), visionos_client());
-        if self.https_state().is_some_and(|s| {
-            !s.youtube_health.is_healthy(android.name) && s.youtube_health.is_healthy(visionos.name)
-        }) {
-            [visionos, android]
+        let (pot, _) = self.configured_auth();
+        let (first, second) = if !pot.is_empty() {
+            (visionos_client(), catalogue_client(self.config))
         } else {
-            [android, visionos]
+            (catalogue_client(self.config), visionos_client())
+        };
+        if self.https_state().is_some_and(|s| {
+            !s.youtube_health.is_healthy(first.name) && s.youtube_health.is_healthy(second.name)
+        }) {
+            [second, first]
+        } else {
+            [first, second]
         }
     }
 
@@ -662,6 +667,7 @@ impl<'a> Catalog<'a> {
         if query.trim().is_empty() || want == 0 {
             return Ok(Vec::new());
         }
+        self.ensure_po_token()?;
         let [primary, fallback] = self.ordered_catalogue_clients();
         let req = SearchRequest { query, params: SEARCH_PARAMS };
         let answer = match self.web_call(&primary, "search", &req) {
@@ -684,6 +690,7 @@ impl<'a> Catalog<'a> {
         if query.trim().is_empty() || want == 0 {
             return Ok(Vec::new());
         }
+        self.ensure_po_token()?;
         let answer =
             self.music_call("search", &SearchRequest { query, params: MUSIC_SONGS_PARAMS })?;
         Ok(tracks_from_answer(&answer, want))
@@ -694,6 +701,7 @@ impl<'a> Catalog<'a> {
         if limit == 0 {
             return Ok(LoadResult::Empty);
         }
+        self.ensure_po_token()?;
         let [mut client, fallback_client] = self.ordered_catalogue_clients();
         let browse_id = format!("VL{playlist_id}");
         let (mut videos, mut page_videos) = (Vec::new(), Vec::new());
@@ -833,6 +841,7 @@ impl<'a> Catalog<'a> {
         video_id: &str,
         mut open: impl FnMut(String, BTreeMap<String, String>) -> Result<T, SourceError>,
     ) -> Result<T, SourceError> {
+        self.ensure_po_token()?;
         let (mut first, mut stream_error, mut skip_recent) = (None, None, None);
         let (pot, _) = self.configured_auth();
         let no_pot = pot.is_empty();
@@ -953,12 +962,14 @@ impl<'a> Catalog<'a> {
     }
 
     pub fn player(&self, client: &Client, video_id: &str) -> Result<Option<Format>, SourceError> {
+        self.ensure_po_token()?;
         let answer = self.player_call(client, video_id)?;
         check_video_id(&answer, video_id)?;
         Ok(pick_format(&answer))
     }
 
     pub fn video(&self, video_id: &str) -> Result<Track, SourceError> {
+        self.ensure_po_token()?;
         let mut first = None;
         for client in self.ordered_clients() {
             match self.video_with_client(&client, video_id) {
