@@ -110,17 +110,24 @@ impl StderrCollector {
 
 fn collect_stderr<R: Read>(mut stderr: R, errors: Arc<Mutex<Vec<u8>>>, done: SyncSender<()>) {
     let mut chunk = [0u8; 4096];
-    while let Ok(read) = stderr.read(&mut chunk) {
-        if read == 0 {
-            break;
-        }
-        if let Ok(mut guard) = errors.lock() {
-            // Keep the invariant true even if a test or future caller seeded
-            // the shared buffer before collection began.
-            guard.truncate(STDERR_LIMIT);
-            let remaining = STDERR_LIMIT.saturating_sub(guard.len());
-            if remaining > 0 {
-                guard.extend_from_slice(&chunk[..read.min(remaining)]);
+    let mut full = false;
+    loop {
+        let read = match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if !full {
+            if let Ok(mut guard) = errors.lock() {
+                // Keep the invariant true even if a test or future caller seeded
+                // the shared buffer before collection began.
+                guard.truncate(STDERR_LIMIT);
+                let remaining = STDERR_LIMIT.saturating_sub(guard.len());
+                if remaining > 0 {
+                    guard.extend_from_slice(&chunk[..read.min(remaining)]);
+                }
+                full = guard.len() >= STDERR_LIMIT;
             }
         }
     }
@@ -179,61 +186,66 @@ impl FfmpegFrames {
         complexity: i32,
     ) -> Result<Self, AudioError> {
         let mut command = Command::new(program);
-        command
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-nostdin")
-            .arg("-threads")
-            .arg("1")
-            .arg("-filter_threads")
-            .arg("1")
-            .arg("-probesize")
-            .arg("1048576")
-            .arg("-analyzeduration")
-            .arg("3000000")
-            .arg("-i")
-            .arg("pipe:0");
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-probesize",
+            "1048576",
+            "-analyzeduration",
+            "3000000",
+            "-i",
+            "pipe:0",
+        ]);
         if position_ms > 0 {
             // Seeking a pipe requires decoding and discarding earlier samples.
-            command.arg("-ss").arg(output_seek_seconds(position_ms, set));
+            command.args(["-ss", &output_seek_seconds(position_ms, set)]);
         }
+        let bitrate_arg = bitrate.to_string();
+        let complexity_arg = complexity.to_string();
+        let graph = set.render_ffmpeg();
         command
-            .arg("-map")
-            .arg("0:a:0")
-            .arg("-vn")
-            .arg("-sn")
-            .arg("-dn")
-            .arg("-af")
-            .arg(set.render_ffmpeg())
-            .arg("-ac")
-            .arg("2")
-            .arg("-ar")
-            .arg("48000")
-            .arg("-c:a")
-            .arg("libopus")
-            .arg("-b:a")
-            .arg(bitrate.to_string())
-            .arg("-application")
-            .arg("audio")
-            .arg("-compression_level")
-            .arg(complexity.to_string())
-            .arg("-vbr")
-            .arg("on")
-            .arg("-fec")
-            .arg("1")
-            .arg("-packet_loss")
-            .arg("10");
-        command
-            .arg("-frame_duration")
-            .arg("20")
-            .arg("-f")
-            .arg("opus")
-            .arg("-page_duration")
-            .arg("20000")
-            .arg("-flush_packets")
-            .arg("1")
-            .arg("pipe:1")
+            .args([
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-sn",
+                "-dn",
+                "-af",
+                &graph,
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                &bitrate_arg,
+                "-application",
+                "audio",
+                "-compression_level",
+                &complexity_arg,
+                "-vbr",
+                "on",
+                "-fec",
+                "1",
+                "-packet_loss",
+                "10",
+                "-frame_duration",
+                "20",
+                "-f",
+                "opus",
+                "-page_duration",
+                "20000",
+                "-flush_packets",
+                "1",
+                "pipe:1",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -318,6 +330,10 @@ impl FfmpegFrames {
         })
     }
 
+    fn take_input_error(&self) -> Option<std::io::Error> {
+        self.input_error.lock().ok().and_then(|mut guard| guard.take())
+    }
+
     /// Waits for the child and turns a failure into the message FFmpeg printed.
     fn finish(&mut self) -> Result<(), AudioError> {
         self.finish_with_wait(Child::wait)
@@ -337,7 +353,7 @@ impl FfmpegFrames {
         self.finished = true;
         self.stderr.finish();
         if status.success() {
-            if let Some(error) = self.input_error.lock().ok().and_then(|mut guard| guard.take()) {
+            if let Some(error) = self.take_input_error() {
                 return Err(AudioError::Io(error));
             }
             return Ok(());
@@ -378,7 +394,7 @@ impl Frames for FfmpegFrames {
             }
             Ok(Err(error)) => {
                 self.terminate();
-                if let Some(io_error) = self.input_error.lock().ok().and_then(|mut g| g.take()) {
+                if let Some(io_error) = self.take_input_error() {
                     return Err(AudioError::Io(io_error));
                 }
                 let stderr = self.stderr.message();

@@ -84,8 +84,9 @@ impl Engine for Playback {
 
 impl Playback {
     fn open(&self, track: &Track) -> Result<Body, AudioError> {
-        let body =
-            self.source.open(track).map_err(|error| AudioError::Decode(error.to_string()))?;
-        Ok(Body::new(body))
+        self.source
+            .open(track)
+            .map(Body::new)
+            .map_err(|error| AudioError::Decode(error.to_string()))
     }
 }

@@ -18,14 +18,9 @@ use crate::resample::{ratio_for, SincResampler, TimeStretcher};
 /// after every call, so this only bounds a single step.
 const PRODUCE_LIMIT: usize = 1 << 16;
 
-fn effective_time(set: &FilterSet) -> Option<crate::filters::Timescale> {
-    set.time.filter(crate::filters::Timescale::changes_anything)
-}
-
 pub struct PureFrames {
     decoder: Decoder,
     source_resampler: Option<SincResampler>,
-    prepared: Vec<f32>,
     resampler: Option<SincResampler>,
     stretcher: Option<TimeStretcher>,
     stretch_factor: f64,
@@ -39,11 +34,8 @@ pub struct PureFrames {
     /// left no longer pays for the move, which is what keeps the steady state
     /// from shuffling the whole buffer on every frame.
     staging_at: usize,
-    decoded: Vec<f32>,
-    resampled: Vec<f32>,
-    /// One frame of samples, reused for every packet so that the steady state
-    /// allocates nothing.
-    frame: [f32; FRAME_SAMPLES_STEREO],
+    /// Shared temporary PCM buffer for resampling/stretching stages.
+    scratch: Vec<f32>,
     pcm: [i16; FRAME_SAMPLES_STEREO],
     /// Source frames to discard before playback starts, which is how a seek is
     /// performed on a stream that cannot be seeked.
@@ -69,7 +61,7 @@ impl PureFrames {
     ) -> Result<Self, AudioError> {
         let decoder = Decoder::new(body).map_err(|e| AudioError::NeedsFfmpeg(e.to_string()))?;
         let rate = decoder.rate();
-        let active_time = effective_time(set);
+        let active_time = set.effective_time();
         let time =
             active_time.unwrap_or(crate::filters::Timescale { speed: 1.0, pitch: 1.0, rate: 1.0 });
         let ratio = ratio_for(48_000, time.pitch, time.rate);
@@ -93,7 +85,6 @@ impl PureFrames {
         Ok(PureFrames {
             decoder,
             source_resampler: (rate != 48_000).then(|| SincResampler::new(rate as f64 / 48_000.0)),
-            prepared: Vec::new(),
             // A unity conversion needs neither a history window nor another
             // PCM buffer. This also preserves the first and last samples.
             resampler: (ratio != 1.0).then(|| SincResampler::new(ratio)),
@@ -104,9 +95,7 @@ impl PureFrames {
             encoder,
             staging: Vec::new(),
             staging_at: 0,
-            decoded: Vec::new(),
-            resampled: Vec::new(),
-            frame: [0.0; FRAME_SAMPLES_STEREO],
+            scratch: Vec::new(),
             pcm: [0; FRAME_SAMPLES_STEREO],
             skip,
             drained: false,
@@ -118,54 +107,76 @@ impl PureFrames {
 
     /// Reads one step of the pipeline, reporting whether anything moved.
     fn pump(&mut self) -> Result<bool, AudioError> {
+        // Zero-copy fast path for 48 kHz sources without timescale (>95% of tracks):
+        // decode straight onto the tail of `self.staging` and run pre-DSP in place.
+        if self.source_resampler.is_none() && self.resampler.is_none() && self.stretcher.is_none() {
+            if self.drained {
+                return Ok(false);
+            }
+            let start = self.staging.len();
+            if !self.decoder.decode(&mut self.staging)? {
+                self.drained = true;
+                return Ok(false);
+            }
+            if self.skip > 0 {
+                let frames = (self.staging.len() - start) / 2;
+                let drop = self.skip.min(frames as u64) as usize;
+                self.staging.drain(start..start + drop * 2);
+                self.skip -= drop as u64;
+            }
+            if self.staging.len() > start {
+                self.dsp.process_pre(&mut self.staging[start..]);
+            }
+            return Ok(true);
+        }
+
         let mut progressed = false;
         // Drain the furthest downstream converter before fetching more input.
         // Slow combined pitch/rate can expand one chunk hundreds of times;
         // decoding another chunk on every pump would retain an entire song.
         let time_ready = self.resampler.as_ref().is_some_and(|r| r.available() > 0);
         let source_ready = self.source_resampler.as_ref().is_some_and(|r| r.available() > 0);
+        self.scratch.clear();
         if !self.drained && !source_ready && !time_ready {
-            self.decoded.clear();
-            if self.decoder.decode(&mut self.decoded)? {
+            if self.decoder.decode(&mut self.scratch)? {
                 // A chunk that falls entirely inside the seek is still progress:
                 // the rest of the track is still to come, so the caller has to
                 // keep pumping rather than read this as the end of the stream.
                 progressed = true;
                 if self.skip > 0 {
-                    let frames = self.decoded.len() / 2;
+                    let frames = self.scratch.len() / 2;
                     let drop = self.skip.min(frames as u64) as usize;
-                    self.decoded.drain(..drop * 2);
+                    self.scratch.drain(..drop * 2);
                     self.skip -= drop as u64;
                 }
             } else {
                 self.drained = true;
             }
-        } else {
-            self.decoded.clear();
         }
 
-        self.prepared.clear();
         if let Some(resampler) = &mut self.source_resampler {
-            if !self.decoded.is_empty() {
-                resampler.push(&self.decoded);
+            if !self.scratch.is_empty() {
+                resampler.push(&self.scratch);
+                self.scratch.clear();
             }
             if self.drained {
                 resampler.finish();
             }
             if !time_ready {
-                progressed |= resampler.produce(PRODUCE_LIMIT, &mut self.prepared) > 0;
+                progressed |= resampler.produce(PRODUCE_LIMIT, &mut self.scratch) > 0;
             }
-        } else {
-            std::mem::swap(&mut self.prepared, &mut self.decoded);
         }
-        if !self.prepared.is_empty() {
-            self.dsp.process_pre(&mut self.prepared);
+
+        if !self.scratch.is_empty() {
+            self.dsp.process_pre(&mut self.scratch);
             match (&mut self.resampler, &mut self.stretcher) {
-                (Some(resampler), _) => resampler.push(&self.prepared),
-                (None, Some(stretcher)) => stretcher.push(&self.prepared),
-                (None, None) => self.staging.extend_from_slice(&self.prepared),
+                (Some(resampler), _) => resampler.push(&self.scratch),
+                (None, Some(stretcher)) => stretcher.push(&self.scratch),
+                (None, None) => self.staging.extend_from_slice(&self.scratch),
             }
+            self.scratch.clear();
         }
+
         let source_finished =
             self.drained && self.source_resampler.as_ref().is_none_or(SincResampler::is_drained);
         if source_finished {
@@ -177,12 +188,11 @@ impl PureFrames {
         match &mut self.stretcher {
             Some(stretcher) => {
                 if let Some(resampler) = &mut self.resampler {
-                    self.resampled.clear();
-                    if resampler.produce(PRODUCE_LIMIT, &mut self.resampled) > 0 {
+                    self.scratch.clear();
+                    if resampler.produce(PRODUCE_LIMIT, &mut self.scratch) > 0 {
                         progressed = true;
-                    }
-                    if !self.resampled.is_empty() {
-                        stretcher.push(&self.resampled);
+                        stretcher.push(&self.scratch);
+                        self.scratch.clear();
                     }
                 }
                 stretcher.produce(self.stretch_factor);
@@ -243,22 +253,13 @@ impl Frames for PureFrames {
         if take == 0 {
             return Ok(false);
         }
-        // The sample buffer is reused: this runs every 20 ms for the life of a
-        // track, so an allocation here would be an allocation forever. The last
-        // frame of a track is usually short, and padding it with silence is what
-        // every encoder does; it is also what keeps the final frame's duration
-        // honest.
+        // Process post-DSP in place on `staging`, quantise directly into `pcm`,
+        // and zero-pad the final short frame's remainder.
         let from = self.staging_at;
-        if take == FRAME_SAMPLES_STEREO {
-            let frame = &mut self.staging[from..from + take];
-            self.dsp.process_post(frame);
-            crate::opus::to_i16(frame, &mut self.pcm);
-        } else {
-            self.frame[..take].copy_from_slice(&self.staging[from..from + take]);
-            self.dsp.process_post(&mut self.frame[..take]);
-            self.frame[take..].fill(0.0);
-            crate::opus::to_i16(&self.frame, &mut self.pcm);
-        }
+        let slice = &mut self.staging[from..from + take];
+        self.dsp.process_post(slice);
+        crate::opus::to_i16(slice, &mut self.pcm[..take]);
+        self.pcm[take..].fill(0);
         self.staging_at += take;
         // Walk the cursor back once what has been used outweighs what is left,
         // so the move happens every many frames rather than on every frame.
@@ -266,10 +267,8 @@ impl Frames for PureFrames {
             self.staging.drain(..self.staging_at);
             self.staging_at = 0;
         }
-        // The packet goes into the caller's buffer, which is the one the
-        // transport encrypts from, so no frame is allocated at all.
-        packet.clear();
-        packet.extend_from_slice(self.encoder.encode(&self.pcm)?);
+        // Encode directly into the caller's packet buffer with zero extra copies.
+        self.encoder.encode_into(&self.pcm, packet)?;
         self.encoded_any = true;
         Ok(true)
     }

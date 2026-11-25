@@ -37,15 +37,29 @@ pub struct LRCLIB {
     pub base: String,
 }
 
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// The part of a response this uses.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Entry {
+    #[serde(deserialize_with = "null_default")]
     track_name: String,
+    #[serde(deserialize_with = "null_default")]
     artist_name: String,
+    #[serde(deserialize_with = "null_default")]
     duration: f64,
+    #[serde(deserialize_with = "null_default")]
     instrumental: bool,
+    #[serde(deserialize_with = "null_default")]
     synced_lyrics: String,
+    #[serde(deserialize_with = "null_default")]
     plain_lyrics: String,
 }
 
@@ -67,7 +81,11 @@ impl Provider for LRCLIB {
         // refusal would turn a plain miss into an uncached failure.
         if !artist.is_empty() {
             match self.get(&artist, &title, track.metadata.length) {
-                Ok(entry) => return build(track, &entry),
+                Ok(entry) => {
+                    if let Ok(lyrics) = build(track, &entry) {
+                        return Ok(lyrics);
+                    }
+                }
                 Err(LyricsError::NotFound) => {}
                 Err(error) => last = Some(error),
             }
@@ -105,21 +123,22 @@ impl Provider for LRCLIB {
 impl LRCLIB {
     fn get(&self, artist: &str, title: &str, length: i64) -> Result<Entry, LyricsError> {
         let url = format!("{}/get", self.base_or_default());
-        let mut params = vec![
-            ("artist_name".to_string(), artist.to_string()),
-            ("track_name".to_string(), title.to_string()),
-        ];
         if length > 0 {
             // The database files a track to the second, so the length is
             // rounded to the nearest one rather than truncated.
-            params.push(("duration".to_string(), rounded_seconds(length).to_string()));
+            let duration = rounded_seconds(length).to_string();
+            let params =
+                [("artist_name", artist), ("track_name", title), ("duration", duration.as_str())];
+            decode(&self.do_request(&url, &params)?)
+        } else {
+            let params = [("artist_name", artist), ("track_name", title)];
+            decode(&self.do_request(&url, &params)?)
         }
-        decode(&self.do_request(&url, &params)?)
     }
 
     fn search(&self, query: &str) -> Result<Vec<Entry>, LyricsError> {
         let url = format!("{}/search", self.base_or_default());
-        decode(&self.do_request(&url, &[("q".to_string(), query.to_string())])?)
+        decode(&self.do_request(&url, &[("q", query)])?)
     }
 
     fn base_or_default(&self) -> &str {
@@ -135,7 +154,7 @@ impl LRCLIB {
     /// The service is free and shared, so a single dropped request should not
     /// become a track the client shows no lyrics for. A 404 is the service
     /// answering that it has nothing, which is not a failure and is not retried.
-    fn do_request(&self, url: &str, params: &[(String, String)]) -> Result<Vec<u8>, LyricsError> {
+    fn do_request(&self, url: &str, params: &[(&str, &str)]) -> Result<Vec<u8>, LyricsError> {
         match self.once(url, params) {
             Err(LyricsError::NotFound) => Err(LyricsError::NotFound),
             Err(error) => {
@@ -146,9 +165,9 @@ impl LRCLIB {
         }
     }
 
-    fn once(&self, url: &str, params: &[(String, String)]) -> Result<Vec<u8>, LyricsError> {
+    fn once(&self, url: &str, params: &[(&str, &str)]) -> Result<Vec<u8>, LyricsError> {
         let mut request = self.agent.get(url);
-        for (key, value) in params {
+        for &(key, value) in params {
             request = request.query(key, value);
         }
         let response = request
@@ -229,7 +248,7 @@ fn queries(track: &Track, artist: &str, title: &str) -> Vec<String> {
 /// find nothing.
 fn bracketed(title: &str) -> String {
     const PAIRS: [(&str, &str); 4] = [("【", "】"), ("（", "）"), ("(", ")"), ("[", "]")];
-    let mut parts: Vec<String> = Vec::new();
+    let mut out = String::new();
     for (open, close) in PAIRS {
         let mut rest = title;
         while let Some(at) = rest.find(open) {
@@ -237,12 +256,15 @@ fn bracketed(title: &str) -> String {
             let Some(end) = after.find(close) else { break };
             let inner = after[..end].trim();
             if !inner.is_empty() && !contains_noise(inner) {
-                parts.push(inner.to_string());
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(inner);
             }
             rest = &after[end + close.len()..];
         }
     }
-    parts.join(" ")
+    out
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -251,6 +273,19 @@ fn words(text: &str) -> Vec<String> {
         .filter(|w| !w.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn shares_word(want: &[String], candidate: &str) -> bool {
+    candidate.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).any(|token| {
+        if token.is_ascii() {
+            want.iter().any(|w| token.eq_ignore_ascii_case(w))
+        } else if want.iter().any(|w| w == token) {
+            true
+        } else {
+            let lower = token.to_lowercase();
+            want.iter().any(|w| w == &lower)
+        }
+    })
 }
 
 /// Picks the entry that is most likely to be the same recording.
@@ -273,24 +308,24 @@ fn best_for<'a>(
     let mut best: Option<&Entry> = None;
     let mut best_score = -1;
     for entry in found {
-        let has_synced = !entry.synced_lyrics.trim().is_empty()
-            && !lrc::parse(entry.synced_lyrics.trim()).is_empty();
+        if !title_words.is_empty()
+            && !entry.track_name.trim().is_empty()
+            && !shares_word(&title_words, &entry.track_name)
+        {
+            continue;
+        }
+        let synced = entry.synced_lyrics.trim();
+        let has_synced = !synced.is_empty() && lrc::has_lines(synced);
         let has_plain = !entry.plain_lyrics.trim().is_empty();
         if !has_synced && !has_plain {
             continue;
         }
-        if !title_words.is_empty() && !entry.track_name.trim().is_empty() {
-            let entry_title = words(&entry.track_name);
-            if !title_words.iter().any(|w| entry_title.contains(w)) {
-                continue;
-            }
-        }
         let mut score = 0;
-        if !artist_words.is_empty() && !entry.artist_name.trim().is_empty() {
-            let entry_artist = words(&entry.artist_name);
-            if artist_words.iter().any(|w| entry_artist.contains(w)) {
-                score += 2;
-            }
+        if !artist_words.is_empty()
+            && !entry.artist_name.trim().is_empty()
+            && shares_word(&artist_words, &entry.artist_name)
+        {
+            score += 2;
         }
         if entry.instrumental {
             score -= 1;
@@ -411,19 +446,36 @@ pub(crate) fn names(track: &Track) -> (String, String) {
     (artist, title)
 }
 
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
 /// Cuts a title at the featured artist, which is not part of the name the
 /// database was given.
 fn strip_featured(title: &str) -> String {
-    // Credit markers are ASCII. Unicode case folding can change byte lengths
-    // (for example K -> k), so its offsets cannot slice the original title.
-    let lower = title.to_ascii_lowercase();
+    // Credit markers are ASCII. Match on raw bytes with ASCII case folding so
+    // Unicode characters (such as K or İ) never shift byte offsets.
+    let bytes = title.as_bytes();
     let mut cut = title.len();
     for marker in FEATURED {
-        if let Some(at) = lower.find(marker).filter(|at| *at > 0) {
+        let m = marker.as_bytes();
+        if let Some(at) = bytes
+            .windows(m.len())
+            .enumerate()
+            .skip(1)
+            .find_map(|(idx, window)| window.eq_ignore_ascii_case(m).then_some(idx))
+        {
             cut = cut.min(at);
         }
     }
-    title[..cut].split_whitespace().collect::<Vec<_>>().join(" ")
+    collapse_whitespace(&title[..cut])
 }
 
 /// Takes the description off the end of a title, such as the "Official Music
@@ -432,15 +484,21 @@ fn strip_featured(title: &str) -> String {
 /// Words come off only while every one of them is description, so a title that
 /// is nothing else is left as it is.
 fn strip_trailer(title: &str) -> String {
-    let words: Vec<&str> = title.split_whitespace().collect();
-    let mut keep = words.len();
-    while keep > 0 && TRAILER.contains(&words[keep - 1].to_lowercase().as_str()) {
-        keep -= 1;
+    let mut rest = title.trim();
+    loop {
+        let Some(last) = rest.split_whitespace().next_back() else {
+            return title.to_string();
+        };
+        if !TRAILER.iter().any(|trailer| last.eq_ignore_ascii_case(trailer)) {
+            break;
+        }
+        let next = rest[..rest.len() - last.len()].trim_end();
+        if next.is_empty() {
+            return title.to_string();
+        }
+        rest = next;
     }
-    if keep == 0 {
-        return title.to_string();
-    }
-    words[..keep].join(" ")
+    collapse_whitespace(rest)
 }
 
 /// Removes the emoji and other decoration a video title carries, which a lyrics
@@ -451,16 +509,21 @@ fn strip_trailer(title: &str) -> String {
 fn strip_symbols(text: &str) -> String {
     const KEPT: &str = "-'&!?.,:;/()[]";
     let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
     for character in text.chars() {
-        if character.is_alphanumeric() || character.is_whitespace() || KEPT.contains(character) {
+        if character.is_alphanumeric() || KEPT.contains(character) {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
             out.push(character);
         } else {
-            // A dropped character becomes a space rather than nothing, so
-            // decoration sitting between two words does not run them together.
-            out.push(' ');
+            // Whitespace and dropped decoration both collapse to a single
+            // separator space between adjacent words.
+            pending_space = true;
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out
 }
 
 /// Removes the bracketed parts of a title that describe the video.
@@ -493,24 +556,30 @@ fn strip_title_noise(title: &str) -> String {
         }
         rest = &rest[total..];
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    collapse_whitespace(&out)
 }
 
 fn contains_noise(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    if lower.contains("m/v") || lower.contains("color coded") {
+    let bytes = text.as_bytes();
+    if bytes.windows(3).any(|w| w.eq_ignore_ascii_case(b"m/v"))
+        || bytes.windows(11).any(|w| w.eq_ignore_ascii_case(b"color coded"))
+    {
         return true;
     }
-    for token in lower.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+    for token in text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
         for noise in NOISE {
             if matches!(noise, "m/v" | "color coded") {
                 continue;
             }
             if noise.len() <= 3 {
-                if token == noise {
+                if token.eq_ignore_ascii_case(noise) {
                     return true;
                 }
-            } else if token.starts_with(noise) {
+            } else if token
+                .as_bytes()
+                .get(..noise.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(noise.as_bytes()))
+            {
                 return true;
             }
         }
@@ -731,5 +800,22 @@ mod tests {
     #[test]
     fn an_entry_with_nothing_is_not_lyrics() {
         assert!(build(&track("a", "b"), &Entry::default()).is_err());
+    }
+
+    #[test]
+    fn explicit_null_fields_from_lrclib_deserialize_cleanly() {
+        let raw = r#"{
+            "trackName": "Song",
+            "artistName": null,
+            "duration": null,
+            "instrumental": null,
+            "plainLyrics": "words",
+            "syncedLyrics": null
+        }"#;
+        let entry: Entry = serde_json::from_str(raw).expect("nullable fields must deserialize");
+        assert_eq!(entry.plain_lyrics, "words");
+        assert!(entry.synced_lyrics.is_empty());
+        assert_eq!(entry.duration, 0.0);
+        assert!(!entry.instrumental);
     }
 }

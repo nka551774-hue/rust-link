@@ -34,29 +34,42 @@ impl Flight {
         let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
         if held.is_none() {
             *held = Some(outcome);
+            drop(held);
             self.ready.notify_all();
         }
     }
 }
 
 pub(super) struct Leader<'a> {
-    pub(super) flight: Arc<Flight>,
-    pub(super) key: &'a str,
-    pub(super) inflight: &'a Mutex<HashMap<String, Arc<Flight>>>,
+    flight: Arc<Flight>,
+    key: &'a str,
+    inflight: &'a Mutex<HashMap<String, Arc<Flight>>>,
+    done: bool,
 }
 
-impl Leader<'_> {
-    pub(super) fn finish(self, outcome: Outcome) -> Outcome {
+impl<'a> Leader<'a> {
+    pub(super) fn new(
+        flight: Arc<Flight>,
+        key: &'a str,
+        inflight: &'a Mutex<HashMap<String, Arc<Flight>>>,
+    ) -> Self {
+        Self { flight, key, inflight, done: false }
+    }
+
+    pub(super) fn finish(mut self, outcome: Outcome) -> Outcome {
         self.flight.publish(outcome.clone());
+        self.done = true;
         outcome
     }
 }
 
 impl Drop for Leader<'_> {
     fn drop(&mut self) {
-        // Unwinding must not leave callers sleeping until timeout or a key
-        // permanently registered. A completed result is never overwritten.
-        self.flight.publish(Err(SourceError::Http("source resolver was interrupted".into())));
+        if !self.done {
+            // Unwinding must not leave callers sleeping until timeout or a key
+            // permanently registered. A completed result is never overwritten.
+            self.flight.publish(Err(SourceError::Http("source resolver was interrupted".into())));
+        }
         let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
         if inflight.get(self.key).is_some_and(|flight| Arc::ptr_eq(flight, &self.flight)) {
             inflight.remove(self.key);
@@ -83,7 +96,7 @@ mod tests {
     fn dropping_a_leader_wakes_waiters_with_an_error() {
         let flight = Arc::new(Flight::default());
         let inflight = Mutex::new(HashMap::from([("key".to_string(), Arc::clone(&flight))]));
-        drop(Leader { flight: Arc::clone(&flight), key: "key", inflight: &inflight });
+        drop(Leader::new(Arc::clone(&flight), "key", &inflight));
         assert!(flight.wait(Instant::now() + Duration::from_secs(1)).is_err());
         assert!(inflight.lock().unwrap().is_empty());
     }

@@ -32,6 +32,7 @@ impl AudioError {
     ///
     /// The in-process pipeline reads before it can reject, so a decline is only
     /// recoverable if the body can be fetched again.
+    #[inline]
     pub fn needs_ffmpeg(&self) -> bool {
         matches!(self, AudioError::NeedsFfmpeg(_) | AudioError::FfmpegMissing)
     }

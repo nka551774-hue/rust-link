@@ -52,7 +52,22 @@ impl Config {
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
         let get = |name: &str| {
-            lookup(name).map(|value| value.trim().to_string()).filter(|v| !v.is_empty())
+            lookup(name).and_then(|mut value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if trimmed.len() == value.len() {
+                    return Some(value);
+                }
+                let leading = value.len() - value.trim_start().len();
+                let len = trimmed.len();
+                if leading > 0 {
+                    value.drain(..leading);
+                }
+                value.truncate(len);
+                Some(value)
+            })
         };
         let required = |name: &str| get(name).ok_or_else(|| format!("{name} is required"));
         let number = |name: &str, default: i64, low: i64, high: i64| -> Result<i64, String> {
@@ -70,7 +85,11 @@ impl Config {
             Some(list) => {
                 let mut ids = HashSet::new();
                 for id in list.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-                    if id.len() > 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                    if id.len() > 20
+                        || id.starts_with('0')
+                        || !id.bytes().all(|byte| byte.is_ascii_digit())
+                        || !id.parse::<u64>().is_ok_and(|value| value > 0)
+                    {
                         return Err(format!("DISCORD_GUILD_IDS has an invalid guild ID: {id:?}"));
                     }
                     ids.insert(id.to_string());

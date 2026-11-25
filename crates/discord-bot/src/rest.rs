@@ -6,8 +6,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::Method;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -17,7 +16,7 @@ const DEFAULT_BASE: &str = "https://discord.com/api/v10/";
 const USER_AGENT_VALUE: &str =
     concat!("DiscordBot (https://github.com/rustlink, ", env!("CARGO_PKG_VERSION"), ")");
 const MAX_CONTENT_CHARS: usize = 2_000;
-const MAX_RESPONSE_BYTES: u64 = 2 << 20;
+const MAX_RESPONSE_BYTES: usize = 2 << 20;
 
 /// The subset of Discord's message object needed after a send.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -28,11 +27,23 @@ pub struct SentMessage {
     pub content: String,
 }
 
+#[derive(Serialize)]
+struct ContentBody<'a> {
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct DeferBody {
+    #[serde(rename = "type")]
+    kind: u8,
+}
+
 /// Authenticated Discord REST access for a bot token.
 pub struct DiscordRest {
     client: reqwest::Client,
     base: Url,
     token: Zeroizing<String>,
+    auth: HeaderValue,
 }
 
 impl fmt::Debug for DiscordRest {
@@ -56,15 +67,21 @@ impl DiscordRest {
     /// for local protocol tests, so a bot token cannot be sent to an arbitrary
     /// proxy by accident.
     pub fn with_base(token: impl Into<String>, base: &str) -> Result<Self, BotError> {
-        let token = token.into();
+        let token = Zeroizing::new(token.into());
         validate_token(&token)?;
+        let auth_text = Zeroizing::new(format!("Bot {}", token.as_str()));
+        let mut auth = HeaderValue::from_str(&auth_text).map_err(|_| {
+            BotError::Invalid("bot token contains invalid header characters".into())
+        })?;
+        auth.set_sensitive(true);
         let base = parse_base(base)?;
         let client = reqwest::Client::builder()
+            .tcp_nodelay(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .redirect(Policy::none())
             .build()?;
-        Ok(Self { client, base, token: Zeroizing::new(token) })
+        Ok(Self { client, base, token, auth })
     }
 
     /// Sends a plain text message to a channel.
@@ -79,7 +96,7 @@ impl DiscordRest {
             .call(
                 Method::POST,
                 &format!("channels/{channel_id}/messages"),
-                &json!({ "content": content }),
+                &ContentBody { content },
                 true,
                 MAX_RATE_LIMIT_WAIT,
                 Duration::from_secs(30),
@@ -117,7 +134,7 @@ impl DiscordRest {
         self.call(
             Method::POST,
             &path,
-            &json!({ "type": 5 }),
+            &DeferBody { kind: 5 },
             false,
             Duration::from_millis(1000),
             Duration::from_millis(2500),
@@ -140,7 +157,7 @@ impl DiscordRest {
         self.call(
             Method::PATCH,
             &path,
-            &json!({ "content": content }),
+            &ContentBody { content },
             false,
             MAX_RATE_LIMIT_WAIT,
             Duration::from_secs(30),
@@ -152,11 +169,11 @@ impl DiscordRest {
     /// Sends one JSON request and returns the success body. Interaction
     /// callback/webhook routes authenticate with `interaction_token` in the
     /// path, so the bot token is omitted there.
-    async fn call(
+    async fn call<B: Serialize + ?Sized>(
         &self,
         method: Method,
         path: &str,
-        body: &serde_json::Value,
+        body: &B,
         use_bot_auth: bool,
         max_retry_wait: Duration,
         request_timeout: Duration,
@@ -165,16 +182,7 @@ impl DiscordRest {
             .base
             .join(path)
             .map_err(|error| BotError::Invalid(format!("invalid Discord endpoint: {error}")))?;
-        let authorization = if use_bot_auth {
-            let mut value = HeaderValue::from_str(&format!("Bot {}", self.token.as_str()))
-                .map_err(|_| {
-                    BotError::Invalid("bot token contains invalid header characters".into())
-                })?;
-            value.set_sensitive(true);
-            Some(value)
-        } else {
-            None
-        };
+        let payload = serde_json::to_vec(body)?;
         let mut limited = 0;
         loop {
             let mut req = self
@@ -183,30 +191,34 @@ impl DiscordRest {
                 .timeout(request_timeout)
                 .header(CONTENT_TYPE, "application/json")
                 .header(USER_AGENT, USER_AGENT_VALUE)
-                .json(body);
-            if let Some(auth) = &authorization {
-                req = req.header(AUTHORIZATION, auth.clone());
+                .body(payload.clone());
+            if use_bot_auth {
+                req = req.header(AUTHORIZATION, self.auth.clone());
             }
             let response = req.send().await.map_err(BotError::from)?;
             let status = response.status();
-            if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES) {
-                return Err(BotError::HttpStatus {
-                    status: status.as_u16(),
-                    message: "Discord response exceeded the configured limit".into(),
-                });
-            }
-            let retry_header = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = read_response_body(response, status).await?;
+            let retry_header = if status.as_u16() == 429 {
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            let response_body = crate::read_limited_body(
+                response,
+                status,
+                MAX_RESPONSE_BYTES,
+                "Discord response exceeded the configured limit",
+            )
+            .await?;
             // Discord rate-limits per route and says how long to wait. A short
             // wait is worth taking, because the request is otherwise lost for no
             // fault of its own; a long one is reported, since a caller cannot
             // sit on it (an interaction token expires within minutes).
             if status.as_u16() == 429 && limited < MAX_RATE_LIMIT_RETRIES {
-                if let Some(wait) = retry_wait(&body, retry_header.as_deref())
+                if let Some(wait) = retry_wait(&response_body, retry_header.as_deref())
                     .filter(|wait| *wait <= max_retry_wait)
                 {
                     limited += 1;
@@ -217,10 +229,10 @@ impl DiscordRest {
             if !status.is_success() {
                 return Err(BotError::HttpStatus {
                     status: status.as_u16(),
-                    message: redact(&discord_error_message(&body), self.token.as_str()),
+                    message: redact(&discord_error_message(&response_body), self.token.as_str()),
                 });
             }
-            return Ok(body);
+            return Ok(response_body);
         }
     }
 }
@@ -263,23 +275,6 @@ fn validate_interaction_token(token: &str) -> Result<(), BotError> {
     Ok(())
 }
 
-async fn read_response_body(
-    mut response: reqwest::Response,
-    status: reqwest::StatusCode,
-) -> Result<Vec<u8>, BotError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(BotError::from)? {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES as usize {
-            return Err(BotError::HttpStatus {
-                status: status.as_u16(),
-                message: "Discord response exceeded the configured limit".into(),
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 fn parse_base(value: &str) -> Result<Url, BotError> {
     let mut base = Url::parse(value)
         .map_err(|error| BotError::Invalid(format!("invalid Discord API base: {error}")))?;
@@ -295,9 +290,14 @@ fn parse_base(value: &str) -> Result<Url, BotError> {
                 .into(),
         ));
     }
-    let host = base.host_str().unwrap_or_default().to_ascii_lowercase();
-    let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]");
-    let discord = host == "discord.com" || host.ends_with(".discord.com");
+    let host = base.host_str().unwrap_or_default();
+    let loopback =
+        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1" | "[::1]");
+    let discord = host.eq_ignore_ascii_case("discord.com")
+        || host
+            .as_bytes()
+            .get(host.len().wrapping_sub(".discord.com".len())..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(b".discord.com"));
     if !loopback && !discord {
         return Err(BotError::Invalid(
             "Discord API base must use discord.com or a loopback test host".into(),
@@ -309,7 +309,9 @@ fn parse_base(value: &str) -> Result<Url, BotError> {
         ));
     }
     if !base.path().ends_with('/') {
-        base.set_path(&format!("{}/", base.path()));
+        let mut path = base.path().to_owned();
+        path.push('/');
+        base.set_path(&path);
     }
     Ok(base)
 }
@@ -324,8 +326,10 @@ fn validate_token(token: &str) -> Result<(), BotError> {
 }
 
 fn validate_content(content: &str) -> Result<(), BotError> {
-    let length = content.chars().count();
-    if content.is_empty() || length > MAX_CONTENT_CHARS || content.contains('\0') {
+    if content.is_empty()
+        || content.contains('\0')
+        || content.chars().nth(MAX_CONTENT_CHARS).is_some()
+    {
         return Err(BotError::Invalid(format!(
             "message content must contain 1..{MAX_CONTENT_CHARS} characters and no NUL"
         )));
@@ -347,14 +351,14 @@ fn discord_error_message(body: &[u8]) -> String {
     };
     let message = error.message.unwrap_or_else(|| "Discord request failed".into());
     match error.code {
-        Some(code) if !code.is_null() => format!("{} (code {})", message, code),
+        Some(code) if !code.is_null() => format!("{message} (code {code})"),
         _ => message,
     }
 }
 
 fn redact(value: &str, token: &str) -> String {
-    if token.is_empty() {
-        value.to_string()
+    if token.is_empty() || !value.contains(token) {
+        value.to_owned()
     } else {
         value.replace(token, "<redacted-token>")
     }

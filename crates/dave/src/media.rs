@@ -39,15 +39,12 @@ impl MediaSender {
         Ok(frame)
     }
 
-    /// Reuses the gateway's owned packet. A DAVE footer needs at most 16 bytes.
-    pub(crate) fn encrypt_in_place(&mut self, frame: &mut Vec<u8>) -> Result<()> {
-        // Increment before use, and never reuse a nonce even if sending fails.
-        self.frame = self.frame.checked_add(1).ok_or(Error::Protocol("media counter exhausted"))?;
-        let generation = self.frame >> 24;
-        if generation > u32::MAX as u64 {
+    #[cold]
+    fn advance_ratchet(&mut self, target_generation: u64) -> Result<()> {
+        if target_generation > u32::MAX as u64 {
             return Err(Error::Protocol("media ratchet exhausted"));
         }
-        while self.next_generation <= generation {
+        while self.next_generation <= target_generation {
             let generation = self.next_generation as u32;
             let secret = &self.next_secret[..self.secret_len as usize];
             let key = expand(secret, b"key", generation, 16);
@@ -61,6 +58,17 @@ impl MediaSender {
             self.secret_len = 32;
             self.next_generation += 1;
         }
+        Ok(())
+    }
+
+    /// Reuses the gateway's owned packet. A DAVE footer needs at most 16 bytes.
+    pub(crate) fn encrypt_in_place(&mut self, frame: &mut Vec<u8>) -> Result<()> {
+        // Increment before use, and never reuse a nonce even if sending fails.
+        self.frame = self.frame.checked_add(1).ok_or(Error::Protocol("media counter exhausted"))?;
+        let generation = self.frame >> 24;
+        if self.next_generation <= generation {
+            self.advance_ratchet(generation)?;
+        }
         let truncated = self.frame as u32;
         let mut nonce = [0u8; 12];
         nonce[8..].copy_from_slice(&truncated.to_le_bytes());
@@ -71,22 +79,27 @@ impl MediaSender {
             .ok_or(Error::NotReady)?
             .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], frame)
             .map_err(|_| Error::Protocol("media encryption failed"))?;
-        frame.extend_from_slice(&tag[..8]);
+        let mut footer = [0u8; 16];
+        footer[..8].copy_from_slice(&tag[..8]);
+        let mut pos = 8usize;
         let mut value = truncated;
-        let mut nonce_len = 0;
         loop {
             let mut byte = (value & 0x7f) as u8;
             value >>= 7;
             if value != 0 {
                 byte |= 0x80;
             }
-            frame.push(byte);
-            nonce_len += 1;
+            footer[pos] = byte;
+            pos += 1;
             if value == 0 {
                 break;
             }
         }
-        frame.extend_from_slice(&[8 + nonce_len + 1 + 2, 0xfa, 0xfa]);
+        let nonce_len = (pos - 8) as u8;
+        footer[pos] = 8 + nonce_len + 1 + 2;
+        footer[pos + 1] = 0xfa;
+        footer[pos + 2] = 0xfa;
+        frame.extend_from_slice(&footer[..pos + 3]);
         Ok(())
     }
 }

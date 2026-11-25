@@ -6,7 +6,7 @@ mod session;
 
 pub use session::{Outbound, Session, MAX_PROTOCOL_VERSION};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error("DAVE: {0}")]
     Protocol(&'static str),

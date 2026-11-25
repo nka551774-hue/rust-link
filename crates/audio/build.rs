@@ -5,11 +5,13 @@
 //! rather than compile a second copy. `OPUS_LIB_DIR` overrides the search for a
 //! tree that is not on the usual paths.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=OPUS_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=RUSTLINK_MSYS2_ROOT");
+    for var in ["OPUS_LIB_DIR", "RUSTLINK_MSYS2_ROOT", "PKG_CONFIG_PATH", "PKG_CONFIG"] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
     if std::env::var_os("CARGO_FEATURE_NATIVE_OPUS").is_none() {
         return;
     }
@@ -19,14 +21,12 @@ fn main() {
         return;
     }
     if let Some(flags) = pkg_config() {
-        let mut lib_name = "opus".to_string();
-        for flag in flags {
+        let mut lib_name = "opus";
+        for flag in flags.split_whitespace() {
             if let Some(path) = flag.strip_prefix("-L") {
                 println!("cargo:rustc-link-search=native={path}");
-            } else if let Some(name) = flag.strip_prefix("-l") {
-                if name.contains("opus") {
-                    lib_name = name.to_string();
-                }
+            } else if let Some(name) = flag.strip_prefix("-l").filter(|n| n.contains("opus")) {
+                lib_name = name;
             }
         }
         println!("cargo:rustc-link-lib={lib_name}");
@@ -34,8 +34,7 @@ fn main() {
     }
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let msys_root = std::env::var_os("RUSTLINK_MSYS2_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\msys64"));
+            .map_or_else(|| PathBuf::from(r"C:\msys64"), PathBuf::from);
         let ucrt_lib = msys_root.join("ucrt64").join("lib");
         if ucrt_lib.join("libopus.dll.a").is_file() || ucrt_lib.join("libopus.a").is_file() {
             println!("cargo:rustc-link-search=native={}", ucrt_lib.display());
@@ -48,16 +47,9 @@ fn main() {
 
 /// Asks pkg-config where libopus is, which is how a Unix system normally answers
 /// and how MSYS2 answers on Windows.
-fn pkg_config() -> Option<Vec<String>> {
-    for program in ["pkg-config", "pkgconf"] {
-        let Ok(output) = Command::new(program).args(["--libs", "opus"]).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        return Some(text.split_whitespace().map(str::to_string).collect());
-    }
-    None
+fn pkg_config() -> Option<String> {
+    ["pkg-config", "pkgconf"].into_iter().find_map(|program| {
+        let output = Command::new(program).args(["--libs", "opus"]).output().ok()?;
+        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    })
 }

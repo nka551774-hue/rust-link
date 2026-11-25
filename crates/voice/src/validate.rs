@@ -14,16 +14,16 @@ use crate::VoiceError;
 /// so an empty or invented value is refused rather than turned into a plausible
 /// one.
 pub fn valid_id(raw: &str) -> bool {
-    if raw.is_empty() || raw.len() > 20 {
-        return false;
-    }
-    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    match raw.parse::<u64>() {
-        Ok(value) => value != 0,
-        Err(_) => false,
-    }
+    !raw.is_empty()
+        && raw.len() <= 20
+        && raw.bytes().all(|byte| byte.is_ascii_digit())
+        && raw.parse::<u64>().is_ok_and(|value| value != 0)
+}
+
+fn has_ascii_suffix(text: &str, suffix: &str) -> bool {
+    text.as_bytes()
+        .get(text.len().wrapping_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix.as_bytes()))
 }
 
 /// Checks a voice state before the node acts on it.
@@ -45,8 +45,7 @@ pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
     let Some(host) = voice_host(endpoint) else {
         return Err(VoiceError::Invalid(format!("invalid Discord voice endpoint {endpoint:?}")));
     };
-    let host = host.to_ascii_lowercase();
-    if !host.ends_with(".discord.media") && !host.ends_with(".discord.gg") {
+    if !has_ascii_suffix(host, ".discord.media") && !has_ascii_suffix(host, ".discord.gg") {
         return Err(VoiceError::Invalid(format!(
             "voice endpoint {endpoint:?} must be a Discord voice hostname"
         )));
@@ -63,17 +62,20 @@ fn voice_host(endpoint: &str) -> Option<&str> {
     if endpoint.contains(['/', '?', '#', '@', ' ', '\t']) {
         return None;
     }
-    let (host, port) = match endpoint.rsplit_once(':') {
+    let host = match endpoint.rsplit_once(':') {
         // A bare IPv6 literal is not a Discord hostname, and a host with a port
-        // has to keep the port numeric.
+        // has to keep the port numeric and non-zero.
         Some((host, port)) => {
-            if host.is_empty() || port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())
+            if host.is_empty()
+                || port.is_empty()
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || !port.parse::<u16>().is_ok_and(|value| value != 0)
             {
                 return None;
             }
-            (host, Some(port))
+            host
         }
-        None => (endpoint, None),
+        None => endpoint,
     };
     // Validate DNS labels before the suffix check. An endpoint that cannot be
     // connected must be refused before a player tears down its current voice
@@ -88,11 +90,6 @@ fn voice_host(endpoint: &str) -> Option<&str> {
         })
     {
         return None;
-    }
-    if let Some(port) = port {
-        if port.parse::<u16>().map(|value| value == 0).unwrap_or(true) {
-            return None;
-        }
     }
     Some(host)
 }

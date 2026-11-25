@@ -167,18 +167,16 @@ pub struct LowPass {
 
 impl FilterSet {
     /// The rate the track advances at, which the player uses to pace frames.
+    #[inline]
     pub fn tempo(&self) -> f64 {
-        match self.time {
-            Some(t) => t.speed * t.rate,
-            None => 1.0,
-        }
+        self.tempo_factor()
     }
 
     /// The filters a request actually asked for, in the order the graph applies
     /// them. A filter whose settings amount to doing nothing is left out, so the
     /// list is what has to be honoured rather than what was mentioned.
     pub fn active(&self) -> Vec<&'static str> {
-        let mut names = Vec::new();
+        let mut names = Vec::with_capacity(9);
         if !self.bands.is_empty() {
             names.push("equalizer");
         }
@@ -212,103 +210,40 @@ impl FilterSet {
     /// How many seconds of source go into one second of output: above one the
     /// track plays faster, below one slower. Pitch does not appear because the
     /// graph undoes its effect on length, so only speed and rate count.
+    #[inline]
     pub fn tempo_factor(&self) -> f64 {
         self.time.map_or(1.0, |time| time.speed * time.rate)
     }
 
-    /// Renders the FFmpeg filter graph.
+    /// Renders the FFmpeg filter graph in a single allocation.
     ///
     /// The node order is fixed, so the same request always produces the same
     /// graph whatever order the fields arrived in.
     pub fn render_ffmpeg(&self) -> String {
-        let mut parts: Vec<String> = vec![
-            "aformat=sample_rates=48000:channel_layouts=stereo".into(),
-            format!("volume={}", number(self.gain)),
-        ];
-        for band in &self.bands {
-            parts.push(format!(
-                "equalizer=f={}:t=o:w=0.666667:g={}",
-                band.frequency as i64,
-                number(band.decibels)
-            ));
-        }
-        if let Some(k) = self.karaoke {
-            parts.push(format!(
-                "asplit=2[kdry][kmid];[kmid]pan=mono|c0=0.5*c0+0.5*c1,bandpass=f={}:t=h:w={},volume={},pan=stereo|c0=c0|c1=c0[kcut];[kdry][kcut]amix=inputs=2:normalize=0:duration=first",
-                number(k.filter_band),
-                number(k.filter_width),
-                number(k.gain)
-            ));
-        }
-        if let Some(t) = self.time {
-            parts.push(format!("asetrate={}", number(48_000.0 * t.pitch * t.rate)));
-            parts.push("aresample=48000".into());
-            parts.extend(tempo_chain(t.speed / t.pitch));
-        }
-        if let Some(m) = self.tremolo {
-            parts.push(format!("tremolo=f={}:d={}", number(m.frequency), number(m.depth)));
-        }
-        if let Some(m) = self.vibrato {
-            parts.push(format!("vibrato=f={}:d={}", number(m.frequency), number(m.depth)));
-        }
-        if let Some(r) = self.rotation {
-            let hz = number(r.hertz);
-            parts.push(format!(
-                "aeval=exprs='val(0)*(0.5+0.5*cos(2*PI*{hz}*t))|val(1)*(0.5-0.5*cos(2*PI*{hz}*t))'"
-            ));
-        }
-        if let Some(d) = self.distort {
-            let channel = |ch: usize| {
-                let x = format!("val({ch})");
-                format!(
-                    "clip({}*(sin({x}*{}+{})*cos({x}*{}+{})*tan({x}*{}+{}))+{},-1,1)",
-                    number(d.scale),
-                    number(d.sin_scale),
-                    number(d.sin_offset),
-                    number(d.cos_scale),
-                    number(d.cos_offset),
-                    number(d.tan_scale),
-                    number(d.tan_offset),
-                    number(d.offset)
-                )
-            };
-            parts.push(format!("aeval=exprs='{}|{}'", channel(0), channel(1)));
-        }
-        if let Some(m) = self.mix {
-            parts.push(format!(
-                "pan=stereo|c0={}*c0+{}*c1|c1={}*c0+{}*c1",
-                number(m.left_to_left),
-                number(m.right_to_left),
-                number(m.left_to_right),
-                number(m.right_to_right)
-            ));
-        }
-        if let Some(l) = self.low_pass {
-            parts.push(format!("lowpass=f={}:p=1", number(l.frequency)));
-        }
-        parts.join(",")
+        use fmt::Write;
+        let mut out = String::with_capacity(128);
+        let _ = write!(out, "{self}");
+        out
     }
 }
 
-/// Renders one tempo change as the sequence of `atempo` stages FFmpeg needs,
-/// because a single stage only covers 0.5 to 2.
-fn tempo_chain(mut value: f64) -> Vec<String> {
-    let mut out = Vec::new();
+fn write_tempo_chain(mut value: f64, mut emit: impl FnMut(fmt::Arguments<'_>)) {
     while value < 0.5 {
-        out.push("atempo=0.5".to_string());
+        emit(format_args!("atempo=0.5"));
         value /= 0.5;
     }
     while value > 2.0 {
-        out.push("atempo=2".to_string());
+        emit(format_args!("atempo=2"));
         value /= 2.0;
     }
-    out.push(format!("atempo={}", number(value)));
-    out
+    emit(format_args!("atempo={value:.8}"));
 }
 
-/// Formats a number the way the graph wants it: fixed point, eight decimals.
-fn number(value: f64) -> String {
-    format!("{value:.8}")
+#[cfg(test)]
+fn tempo_chain(value: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    write_tempo_chain(value, |args| out.push(args.to_string()));
+    out
 }
 
 /// Reports disabled filters in the stable order of Rustlink's filter registry.
@@ -349,7 +284,7 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
         set.bands = parse_equalizer(raw)?;
     }
     if let Some(raw) = filters.get("karaoke") {
-        let v = fields(
+        let [level, mono_level, filter_band, filter_width] = fields(
             raw,
             &[
                 Field::new("level", 1.0, 0.0, 1.0),
@@ -362,13 +297,13 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
         // limit so FFmpeg's `bandpass` and the in-process biquad stay valid
         // when a client sends `filterBand: 24000`.
         set.karaoke = Some(Karaoke {
-            filter_band: v[2].min(23_999.0),
-            filter_width: v[3],
-            gain: -v[0] * v[1],
+            filter_band: filter_band.min(23_999.0),
+            filter_width,
+            gain: -level * mono_level,
         });
     }
     if let Some(raw) = filters.get("timescale") {
-        let v = fields(
+        let [speed, pitch, rate] = fields(
             raw,
             &[
                 Field::new("speed", 1.0, 0.05, 5.0),
@@ -376,15 +311,15 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
                 Field::new("rate", 1.0, 0.05, 5.0),
             ],
         )?;
-        set.time = Some(Timescale { speed: v[0], pitch: v[1], rate: v[2] });
+        set.time = Some(Timescale { speed, pitch, rate });
     }
     for name in ["tremolo", "vibrato"] {
         let Some(raw) = filters.get(name) else { continue };
-        let v = fields(
+        let [frequency, depth] = fields(
             raw,
             &[Field::new("frequency", 2.0, 0.1, 20.0), Field::new("depth", 0.5, 0.0, 1.0)],
         )?;
-        let m = Modulation { frequency: v[0], depth: v[1] };
+        let m = Modulation { frequency, depth };
         if name == "tremolo" {
             set.tremolo = Some(m);
         } else {
@@ -392,38 +327,39 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
         }
     }
     if let Some(raw) = filters.get("rotation") {
-        let v = fields(raw, &[Field::new("rotationHz", 0.2, -20.0, 20.0)])?;
-        if v[0] != 0.0 {
-            set.rotation = Some(Rotation { hertz: v[0] });
+        let [hertz] = fields(raw, &[Field::new("rotationHz", 0.2, -20.0, 20.0)])?;
+        if hertz != 0.0 {
+            set.rotation = Some(Rotation { hertz });
         }
     }
     if let Some(raw) = filters.get("distortion") {
-        let v = fields(
-            raw,
-            &[
-                Field::new("sinOffset", 0.0, -10.0, 10.0),
-                Field::new("sinScale", 1.0, -10.0, 10.0),
-                Field::new("cosOffset", 0.0, -10.0, 10.0),
-                Field::new("cosScale", 1.0, -10.0, 10.0),
-                Field::new("tanOffset", 0.0, -10.0, 10.0),
-                Field::new("tanScale", 1.0, -10.0, 10.0),
-                Field::new("offset", 0.0, -10.0, 10.0),
-                Field::new("scale", 1.0, -10.0, 10.0),
-            ],
-        )?;
+        let [sin_offset, sin_scale, cos_offset, cos_scale, tan_offset, tan_scale, offset, scale] =
+            fields(
+                raw,
+                &[
+                    Field::new("sinOffset", 0.0, -10.0, 10.0),
+                    Field::new("sinScale", 1.0, -10.0, 10.0),
+                    Field::new("cosOffset", 0.0, -10.0, 10.0),
+                    Field::new("cosScale", 1.0, -10.0, 10.0),
+                    Field::new("tanOffset", 0.0, -10.0, 10.0),
+                    Field::new("tanScale", 1.0, -10.0, 10.0),
+                    Field::new("offset", 0.0, -10.0, 10.0),
+                    Field::new("scale", 1.0, -10.0, 10.0),
+                ],
+            )?;
         set.distort = Some(Distortion {
-            sin_offset: v[0],
-            sin_scale: v[1],
-            cos_offset: v[2],
-            cos_scale: v[3],
-            tan_offset: v[4],
-            tan_scale: v[5],
-            offset: v[6],
-            scale: v[7],
+            sin_offset,
+            sin_scale,
+            cos_offset,
+            cos_scale,
+            tan_offset,
+            tan_scale,
+            offset,
+            scale,
         });
     }
     if let Some(raw) = filters.get("channelMix") {
-        let v = fields(
+        let [left_to_left, left_to_right, right_to_left, right_to_right] = fields(
             raw,
             &[
                 Field::new("leftToLeft", 1.0, 0.0, 1.0),
@@ -432,18 +368,13 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
                 Field::new("rightToRight", 1.0, 0.0, 1.0),
             ],
         )?;
-        set.mix = Some(ChannelMix {
-            left_to_left: v[0],
-            left_to_right: v[1],
-            right_to_left: v[2],
-            right_to_right: v[3],
-        });
+        set.mix = Some(ChannelMix { left_to_left, left_to_right, right_to_left, right_to_right });
     }
     if let Some(raw) = filters.get("lowPass") {
-        let v = fields(raw, &[Field::new("smoothing", 20.0, 1.0001, 1000.0)])?;
+        let [smoothing] = fields(raw, &[Field::new("smoothing", 20.0, 1.0001, 1000.0)])?;
         set.low_pass = Some(LowPass {
-            smoothing: v[0],
-            frequency: 48_000.0 / (2.0 * std::f64::consts::PI * v[0]),
+            smoothing,
+            frequency: 48_000.0 / (2.0 * std::f64::consts::PI * smoothing),
         });
     }
     Ok(set)
@@ -498,23 +429,25 @@ impl Field {
     }
 }
 
-/// Reads a filter object's numeric parameters, rejecting anything else.
-///
-/// The values come back in the order the fields were declared, so callers index
-/// them positionally rather than through a map.
-fn fields(raw: &Value, wanted: &[Field]) -> Result<Vec<f64>, FilterError> {
+/// Reads a filter object's numeric parameters into a fixed stack array,
+/// rejecting unknown or non-numeric fields in O(1) extra work.
+fn fields<const N: usize>(raw: &Value, wanted: &[Field; N]) -> Result<[f64; N], FilterError> {
     let Some(map) = raw.as_object() else {
         return Err(FilterError::new("filter must be an object with numeric values"));
     };
-    let mut out = Vec::with_capacity(wanted.len());
-    for field in wanted {
+    let mut out = [0.0f64; N];
+    let mut matched = 0usize;
+    for (slot, field) in out.iter_mut().zip(wanted) {
         let value = match map.get(field.name) {
-            Some(v) => v
-                .as_f64()
-                .ok_or_else(|| FilterError::new("filter must be an object with numeric values"))?,
+            Some(v) => {
+                matched += 1;
+                v.as_f64().ok_or_else(|| {
+                    FilterError::new("filter must be an object with numeric values")
+                })?
+            }
             None => field.default,
         };
-        if value.is_nan() || value.is_infinite() || value < field.min || value > field.max {
+        if !value.is_finite() || value < field.min || value > field.max {
             return Err(FilterError::new(format!(
                 "{} must be in [{}, {}]",
                 field.name,
@@ -522,9 +455,9 @@ fn fields(raw: &Value, wanted: &[Field]) -> Result<Vec<f64>, FilterError> {
                 bound(field.max)
             )));
         }
-        out.push(value);
+        *slot = value;
     }
-    if map.keys().any(|key| !wanted.iter().any(|f| f.name == key)) {
+    if map.len() != matched {
         return Err(FilterError::new("unknown filter parameter"));
     }
     Ok(out)
@@ -541,7 +474,73 @@ fn bound(value: f64) -> String {
 
 impl fmt::Display for FilterSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render_ffmpeg())
+        write!(f, "aformat=sample_rates=48000:channel_layouts=stereo,volume={:.8}", self.gain)?;
+        for band in &self.bands {
+            write!(
+                f,
+                ",equalizer=f={}:t=o:w=0.666667:g={:.8}",
+                band.frequency as i64, band.decibels
+            )?;
+        }
+        if let Some(k) = self.karaoke {
+            write!(
+                f,
+                ",asplit=2[kdry][kmid];[kmid]pan=mono|c0=0.5*c0+0.5*c1,bandpass=f={:.8}:t=h:w={:.8},volume={:.8},pan=stereo|c0=c0|c1=c0[kcut];[kdry][kcut]amix=inputs=2:normalize=0:duration=first",
+                k.filter_band, k.filter_width, k.gain
+            )?;
+        }
+        if let Some(t) = self.effective_time() {
+            write!(f, ",asetrate={:.8},aresample=48000", 48_000.0 * t.pitch * t.rate)?;
+            let mut status = Ok(());
+            write_tempo_chain(t.speed / t.pitch, |args| {
+                if status.is_ok() {
+                    status = write!(f, ",{args}");
+                }
+            });
+            status?;
+        }
+        if let Some(m) = self.tremolo {
+            write!(f, ",tremolo=f={:.8}:d={:.8}", m.frequency, m.depth)?;
+        }
+        if let Some(m) = self.vibrato {
+            write!(f, ",vibrato=f={:.8}:d={:.8}", m.frequency, m.depth)?;
+        }
+        if let Some(r) = self.rotation {
+            write!(
+                f,
+                ",aeval=exprs='val(0)*(0.5+0.5*cos(2*PI*{hz:.8}*t))|val(1)*(0.5-0.5*cos(2*PI*{hz:.8}*t))'",
+                hz = r.hertz
+            )?;
+        }
+        if let Some(d) = self.distort {
+            write!(f, ",aeval=exprs='")?;
+            for (ch, sep) in [(0, ""), (1, "|")] {
+                write!(
+                    f,
+                    "{sep}clip({:.8}*(sin(val({ch})*{:.8}+{:.8})*cos(val({ch})*{:.8}+{:.8})*tan(val({ch})*{:.8}+{:.8}))+{:.8},-1,1)",
+                    d.scale,
+                    d.sin_scale,
+                    d.sin_offset,
+                    d.cos_scale,
+                    d.cos_offset,
+                    d.tan_scale,
+                    d.tan_offset,
+                    d.offset
+                )?;
+            }
+            write!(f, "'")?;
+        }
+        if let Some(m) = self.mix {
+            write!(
+                f,
+                ",pan=stereo|c0={:.8}*c0+{:.8}*c1|c1={:.8}*c0+{:.8}*c1",
+                m.left_to_left, m.right_to_left, m.left_to_right, m.right_to_right
+            )?;
+        }
+        if let Some(l) = self.low_pass {
+            write!(f, ",lowpass=f={:.8}:p=1", l.frequency)?;
+        }
+        Ok(())
     }
 }
 

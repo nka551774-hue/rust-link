@@ -1,6 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use openmls::prelude::{hash_ref::ProposalRef, tls_codec::Serialize, *};
+use openmls::prelude::{
+    hash_ref::ProposalRef,
+    tls_codec::{Serialize, Size},
+    *,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use serde_json::{json, Value};
@@ -127,6 +131,7 @@ impl Session {
     pub fn start_alone(&mut self) -> Result<bool> {
         let alone = self.version == Some(1)
             && self.active.is_none()
+            && self.transitions.is_empty()
             && self.expected.iter().all(|&member| member == self.user)
             && self
                 .group
@@ -225,8 +230,31 @@ impl Session {
                 if transition.order <= self.last_executed {
                     return Err(Error::Protocol("out-of-order transition"));
                 }
+                let current = self.current_context();
+                let mut salvaged = None;
+                self.transitions.retain(|_, pending| {
+                    if pending.order < transition.order {
+                        if matches!(transition.sender, Sender::TransportOnly) && salvaged.is_none()
+                        {
+                            let dummy = Transition { order: 0, sender: Sender::TransportOnly };
+                            if let Sender::Encrypted { context, media } =
+                                std::mem::replace(pending, dummy).sender
+                            {
+                                if Some(context) == current {
+                                    salvaged = Some((context, media));
+                                }
+                            }
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.last_executed = transition.order;
                 self.activate(transition.sender);
+                if self.parked.is_none() {
+                    self.parked = salvaged;
+                }
                 self.recovery_attempts = 0;
             }
             24 => {
@@ -237,10 +265,18 @@ impl Session {
                         .get("epoch")
                         .and_then(Value::as_u64)
                         .ok_or(Error::Protocol("invalid epoch"))?;
+                    self.group_revision = self
+                        .group_revision
+                        .checked_add(1)
+                        .ok_or(Error::Protocol("group revision exhausted"))?;
                     self.version = Some(0);
                     self.group = None;
                     self.own_commit = None;
                     self.parked = None;
+                    for (id, _) in self.transitions.drain() {
+                        push_cancelled(&mut self.cancelled, id);
+                    }
+                    self.provider = OpenMlsRustCrypto::default();
                     return Ok(vec![]);
                 }
                 let epoch = data
@@ -289,12 +325,13 @@ impl Session {
                 if self.version != Some(1) {
                     return Err(Error::Protocol("MLS message before DAVE negotiation"));
                 }
-                if data.len() < 3 {
+                let Some((id_bytes, body)) =
+                    data.split_first_chunk::<2>().filter(|(_, body)| !body.is_empty())
+                else {
                     return Err(Error::Protocol("truncated commit or welcome"));
-                }
-                let id = u16::from_be_bytes([data[0], data[1]]);
-                let result =
-                    if opcode == 29 { self.commit(&data[2..]) } else { self.welcome(&data[2..]) };
+                };
+                let id = u16::from_be_bytes(*id_bytes);
+                let result = if opcode == 29 { self.commit(body) } else { self.welcome(body) };
                 match result.and_then(|_| self.sender()) {
                     Ok(sender) => self.prepare(id, sender, false),
                     Err(_) => {
@@ -337,12 +374,7 @@ impl Session {
     }
 
     fn cancel_transition(&mut self, id: u16) {
-        if !self.cancelled.contains(&id) {
-            if self.cancelled.len() >= MAX_CANCELLED_TRANSITIONS {
-                self.cancelled.pop_front();
-            }
-            self.cancelled.push_back(id);
-        }
+        push_cancelled(&mut self.cancelled, id);
     }
 
     fn take_cancelled(&mut self, id: u16) -> bool {
@@ -389,9 +421,8 @@ impl Session {
         self.group = None;
         self.own_commit = None;
         self.parked = None;
-        let drained: Vec<u16> = self.transitions.drain().map(|(id, _)| id).collect();
-        for id in drained {
-            self.cancel_transition(id);
+        for (id, _) in self.transitions.drain() {
+            push_cancelled(&mut self.cancelled, id);
         }
         // Discard consumed key packages and obsolete MLS storage, retaining the signing identity.
         self.provider = OpenMlsRustCrypto::default();
@@ -440,11 +471,11 @@ impl Session {
             "key package creation failed",
         )?;
         // A bare KeyPackage, as libdave and davey send it (the clients Discord ships).
-        let bytes = check(
-            bundle.key_package().tls_serialize_detached(),
-            "key package serialization failed",
-        )?;
-        Ok(binary(26, bytes))
+        let kp = bundle.key_package();
+        let mut bytes = Vec::with_capacity(1 + kp.tls_serialized_len());
+        bytes.push(26);
+        check(kp.tls_serialize(&mut bytes), "key package serialization failed")?;
+        Ok(Outbound::Binary(bytes))
     }
 
     fn proposals(&mut self, data: &[u8]) -> Result<Vec<Outbound>> {
@@ -453,11 +484,10 @@ impl Session {
         };
         let (&operation, bytes) =
             data.split_first().ok_or(Error::Protocol("missing proposal operation"))?;
-        let encoded: Vec<u8> =
-            check(VLBytes::tls_deserialize_exact_bytes(bytes), "invalid proposal vector")?.into();
+        let mut remaining =
+            read_vlbytes_exact(bytes).ok_or(Error::Protocol("invalid proposal vector"))?;
         check(group.clear_pending_commit(self.provider.storage()), "cannot clear pending commit")?;
         self.own_commit = None;
-        let mut remaining = encoded.as_slice();
         match operation {
             0 => {
                 while !remaining.is_empty() {
@@ -537,17 +567,21 @@ impl Session {
             group.commit_to_pending_proposals(&self.provider, &self.signer),
             "commit creation failed",
         )?;
-        let commit = check(commit.tls_serialize_detached(), "commit serialization failed")?;
-        self.own_commit = Some(commit.clone());
-        let mut payload = commit;
-        if let Some(welcome) = welcome {
-            let MlsMessageBodyOut::Welcome(welcome) = welcome.body() else {
-                return Err(Error::Protocol("invalid welcome format"));
-            };
-            payload
-                .extend(check(welcome.tls_serialize_detached(), "welcome serialization failed")?);
+        let welcome_body = match welcome.as_ref().map(MlsMessageOut::body) {
+            Some(MlsMessageBodyOut::Welcome(welcome)) => Some(welcome),
+            Some(_) => return Err(Error::Protocol("invalid welcome format")),
+            None => None,
+        };
+        let total_len =
+            1 + commit.tls_serialized_len() + welcome_body.map_or(0, Size::tls_serialized_len);
+        let mut payload = Vec::with_capacity(total_len);
+        payload.push(28);
+        check(commit.tls_serialize(&mut payload), "commit serialization failed")?;
+        self.own_commit = Some(payload[1..].to_vec());
+        if let Some(welcome) = welcome_body {
+            check(welcome.tls_serialize(&mut payload), "welcome serialization failed")?;
         }
-        Ok(vec![binary(28, payload)])
+        Ok(vec![Outbound::Binary(payload)])
     }
 
     fn commit(&mut self, bytes: &[u8]) -> Result<()> {
@@ -585,18 +619,20 @@ impl Session {
             else {
                 return Err(Error::Protocol("expected commit"));
             };
-            let known: HashSet<_> =
-                group.pending_proposals().map(|p| p.proposal_reference_ref().clone()).collect();
-            let mut included = HashSet::new();
-            for proposal in staged.queued_proposals() {
-                validate_proposal(proposal, &self.expected)?;
-                let reference = proposal.proposal_reference_ref();
-                if !known.contains(reference) || !included.insert(reference.clone()) {
-                    return Err(Error::Protocol("uncached or duplicate commit proposal"));
+            {
+                let known: HashSet<&ProposalRef> =
+                    group.pending_proposals().map(|p| p.proposal_reference_ref()).collect();
+                let mut included: HashSet<&ProposalRef> = HashSet::with_capacity(known.len());
+                for proposal in staged.queued_proposals() {
+                    validate_proposal(proposal, &self.expected)?;
+                    let reference = proposal.proposal_reference_ref();
+                    if !known.contains(reference) || !included.insert(reference) {
+                        return Err(Error::Protocol("uncached or duplicate commit proposal"));
+                    }
                 }
-            }
-            if known.is_empty() || known != included {
-                return Err(Error::Protocol("commit omitted proposals"));
+                if known.is_empty() || known.len() != included.len() {
+                    return Err(Error::Protocol("commit omitted proposals"));
+                }
             }
             check(group.merge_staged_commit(&self.provider, *staged), "commit merge failed")?;
         }
@@ -747,11 +783,33 @@ fn capabilities() -> Capabilities {
         .build()
 }
 
-fn binary(opcode: u8, payload: Vec<u8>) -> Outbound {
-    let mut bytes = Vec::with_capacity(payload.len() + 1);
-    bytes.push(opcode);
-    bytes.extend(payload);
-    Outbound::Binary(bytes)
+fn push_cancelled(cancelled: &mut VecDeque<u16>, id: u16) {
+    if !cancelled.contains(&id) {
+        if cancelled.len() >= MAX_CANCELLED_TRANSITIONS {
+            cancelled.pop_front();
+        }
+        cancelled.push_back(id);
+    }
+}
+
+/// Decodes a canonical RFC 9420 §2.1.2 variable-length byte slice without copying.
+fn read_vlbytes_exact(bytes: &[u8]) -> Option<&[u8]> {
+    let &first = bytes.first()?;
+    let (header_len, len, min_len): (usize, usize, usize) = match first >> 6 {
+        0 => (1, usize::from(first & 0x3f), 0),
+        1 => (2, usize::from(u16::from_be_bytes([first & 0x3f, *bytes.get(1)?])), 1 << 6),
+        2 => (
+            4,
+            u32::from_be_bytes([first & 0x3f, *bytes.get(1)?, *bytes.get(2)?, *bytes.get(3)?])
+                as usize,
+            1 << 14,
+        ),
+        _ => return None,
+    };
+    if len < min_len || bytes.len() != header_len.checked_add(len)? {
+        return None;
+    }
+    Some(&bytes[header_len..])
 }
 
 #[cfg(test)]

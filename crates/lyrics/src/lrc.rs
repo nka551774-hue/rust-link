@@ -12,18 +12,45 @@ use rustlink_protocol::Object;
 const MAX_LINES: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 8 << 20;
 
+/// Fast zero-allocation check for whether `text` contains at least one valid
+/// LRC timestamped line within resource bounds.
+pub(crate) fn has_lines(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut line_count = 0usize;
+    let mut text_bytes = 0usize;
+    for raw in text.split('\n') {
+        let mut rest = raw.trim_end_matches('\r').trim_start_matches([' ', '\t']);
+        let mut stamps = 0usize;
+        while let Some((taken, _)) = leading_stamp(rest) {
+            stamps += 1;
+            rest = rest[taken..].trim_start_matches([' ', '\t']);
+        }
+        if stamps == 0 {
+            continue;
+        }
+        let words_len = rest.trim().len();
+        line_count = line_count.saturating_add(stamps);
+        text_bytes = text_bytes.saturating_add(stamps.saturating_mul(words_len));
+        if line_count > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
+            return false;
+        }
+    }
+    line_count > 0
+}
+
 /// Turns the text a timed provider returns into lines.
 ///
 /// A tag that names a field rather than a time, such as `[ar:...]`, carries no
 /// lyrics and ends the scan for that line, so a header is skipped rather than
 /// read as a line at time zero.
 pub fn parse(text: &str) -> Vec<Line> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines: Vec<Line> = Vec::new();
+    let mut stamps: Vec<i64> = Vec::new();
     let mut text_bytes = 0usize;
     for raw in text.split('\n') {
-        let raw = raw.trim_end_matches('\r');
-        let mut rest = raw;
-        let mut stamps: Vec<i64> = Vec::new();
+        let mut rest = raw.trim_end_matches('\r').trim_start_matches([' ', '\t']);
+        stamps.clear();
         while let Some((taken, at)) = leading_stamp(rest) {
             stamps.push(at);
             rest = rest[taken..].trim_start_matches([' ', '\t']);
@@ -31,16 +58,16 @@ pub fn parse(text: &str) -> Vec<Line> {
         if stamps.is_empty() {
             continue;
         }
-        let words = rest.trim().to_string();
+        let words = rest.trim();
         text_bytes = text_bytes.saturating_add(stamps.len().saturating_mul(words.len()));
         if lines.len().saturating_add(stamps.len()) > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
             return Vec::new();
         }
-        for at in stamps {
+        for &at in &stamps {
             lines.push(Line {
                 timestamp: at,
                 duration: None,
-                line: words.clone(),
+                line: words.to_owned(),
                 plugin: Object::new(),
             });
         }
@@ -106,9 +133,20 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
 /// stays on screen. The provider does not say, and the gap is what a line by
 /// line display wants.
 fn fill_durations(lines: &mut [Line]) {
-    for index in 0..lines.len().saturating_sub(1) {
-        let gap = (lines[index + 1].timestamp - lines[index].timestamp).max(0);
-        lines[index].duration = Some(gap);
+    let mut current_group_ts: Option<i64> = None;
+    let mut next_distinct_ts: Option<i64> = None;
+    for line in lines.iter_mut().rev() {
+        match current_group_ts {
+            None => current_group_ts = Some(line.timestamp),
+            Some(group_ts) if line.timestamp < group_ts => {
+                next_distinct_ts = Some(group_ts);
+                current_group_ts = Some(line.timestamp);
+            }
+            Some(_) => {}
+        }
+        if let Some(next_ts) = next_distinct_ts {
+            line.duration = Some((next_ts - line.timestamp).max(0));
+        }
     }
 }
 
@@ -191,5 +229,17 @@ mod tests {
         assert!(large_line.len() < 1 << 20);
         assert!(parse(&large_line).is_empty());
         assert!(parse(&format!("{}words", "[00:01]".repeat(MAX_LINES + 1))).is_empty());
+    }
+
+    #[test]
+    fn utf8_bom_and_bilingual_equal_timestamps_share_next_distinct_duration() {
+        let lines = parse("\u{feff}[00:01.00]jp\n[00:01.00]en\n[00:04.00]next");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].line, "jp");
+        assert_eq!(lines[0].duration, Some(3_000));
+        assert_eq!(lines[1].line, "en");
+        assert_eq!(lines[1].duration, Some(3_000));
+        assert_eq!(lines[2].line, "next");
+        assert_eq!(lines[2].duration, None);
     }
 }

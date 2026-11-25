@@ -12,7 +12,9 @@
 
 use std::f64::consts::PI;
 
-use crate::filters::{ChannelMix, Distortion, FilterSet, Karaoke, LowPass, Modulation, Rotation};
+use crate::filters::{
+    ChannelMix, Distortion, EqBand, FilterSet, Karaoke, LowPass, Modulation, Rotation,
+};
 
 /// The sample rate the node plays at.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -63,14 +65,8 @@ impl DspChain {
         if set.gain != 1.0 {
             pre.push(Stage::Volume(set.gain));
         }
-        let active_bands: Vec<(f64, f64)> = set
-            .bands
-            .iter()
-            .filter(|b| b.decibels.abs() > 1e-12)
-            .map(|b| (b.frequency, b.decibels))
-            .collect();
-        if !active_bands.is_empty() {
-            pre.push(Stage::Equalizer(EqualizerStage::new(active_bands)));
+        if let Some(eq) = EqualizerStage::new(&set.bands) {
+            pre.push(Stage::Equalizer(eq));
         }
         if let Some(k) = set.karaoke.filter(|k| k.gain.abs() > 1e-12) {
             pre.push(Stage::Karaoke(KaraokeStage::new(k)));
@@ -156,12 +152,15 @@ enum Stage {
     LowPass(OnePoleStereo),
 }
 
+const LFO_CHUNK: usize = 1024;
+
 impl Stage {
     fn apply(&mut self, buf: &mut [f32], clock: u64) {
         match self {
             Stage::Volume(gain) => {
+                let gain = *gain as f32;
                 for sample in buf.iter_mut() {
-                    *sample = (*sample as f64 * *gain) as f32;
+                    *sample *= gain;
                 }
             }
             Stage::Equalizer(stage) => stage.process(buf),
@@ -177,10 +176,8 @@ impl Stage {
                     mix.right_to_left as f32,
                     mix.right_to_right as f32,
                 );
-                for frame in buf.as_chunks_mut::<CHANNELS>().0 {
-                    let (l, r) = (frame[0], frame[1]);
-                    frame[0] = ll * l + rl * r;
-                    frame[1] = lr * l + rr * r;
+                for [l, r] in buf.as_chunks_mut::<CHANNELS>().0 {
+                    (*l, *r) = (ll * *l + rl * *r, lr * *l + rr * *r);
                 }
             }
             Stage::LowPass(stage) => stage.process(buf),
@@ -200,6 +197,12 @@ struct Biquad {
     x2: f64,
     y1: f64,
     y2: f64,
+}
+
+#[inline(always)]
+fn within_f32(v: f64) -> bool {
+    const LIMIT: f64 = f32::MAX as f64;
+    (-LIMIT..=LIMIT).contains(&v)
 }
 
 impl Biquad {
@@ -252,12 +255,13 @@ impl Biquad {
         .normalized(1.0 + alpha)
     }
 
+    #[inline]
     fn step(&mut self, x: f64) -> f64 {
         let x = if x.is_finite() { x } else { 0.0 };
         let mut y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;
-        if !y.is_finite() {
+        if !within_f32(y) {
             self.x1 = 0.0;
             self.x2 = 0.0;
             self.y1 = 0.0;
@@ -275,20 +279,72 @@ impl Biquad {
     }
 }
 
-/// One biquad section per channel, so a filter has independent state on each
-/// side.
+/// Shared biquad coefficients with 2-lane stereo `[f64; 2]` state so L and R
+/// map directly to one 128-bit SIMD register (`__m128d` / `float64x2_t`).
 #[derive(Debug, Clone, Copy, Default)]
 struct BiquadStereo {
-    channels: [Biquad; CHANNELS],
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: [f64; CHANNELS],
+    x2: [f64; CHANNELS],
+    y1: [f64; CHANNELS],
+    y2: [f64; CHANNELS],
 }
 
 impl BiquadStereo {
+    fn from_biquad(b: Biquad) -> Self {
+        Self { b0: b.b0, b1: b.b1, b2: b.b2, a1: b.a1, a2: b.a2, ..Default::default() }
+    }
+
     fn process(&mut self, buf: &mut [f32]) {
-        for frame in buf.as_chunks_mut::<CHANNELS>().0 {
-            for (channel, sample) in self.channels.iter_mut().zip(frame.iter_mut()) {
-                *sample = channel.step(*sample as f64) as f32;
+        let (b0, b1, b2, a1, a2) = (self.b0, self.b1, self.b2, self.a1, self.a2);
+        let (mut x1, mut x2, mut y1, mut y2) = (self.x1, self.x2, self.y1, self.y2);
+        for [l, r] in buf.as_chunks_mut::<CHANNELS>().0 {
+            let x = [
+                if l.is_finite() { *l as f64 } else { 0.0 },
+                if r.is_finite() { *r as f64 } else { 0.0 },
+            ];
+            let mut y = [
+                b0 * x[0] + b1 * x1[0] + b2 * x2[0] - a1 * y1[0] - a2 * y2[0],
+                b0 * x[1] + b1 * x1[1] + b2 * x2[1] - a1 * y1[1] - a2 * y2[1],
+            ];
+            if within_f32(y[0]) && within_f32(y[1]) {
+                if y[0].abs() < 1e-20 {
+                    y[0] = 0.0;
+                }
+                if y[1].abs() < 1e-20 {
+                    y[1] = 0.0;
+                }
+                x2 = x1;
+                x1 = x;
+                y2 = y1;
+                y1 = y;
+            } else {
+                for ch in 0..CHANNELS {
+                    if !within_f32(y[ch]) {
+                        x1[ch] = 0.0;
+                        x2[ch] = 0.0;
+                        y1[ch] = 0.0;
+                        y2[ch] = 0.0;
+                        y[ch] = 0.0;
+                    } else {
+                        if y[ch].abs() < 1e-20 {
+                            y[ch] = 0.0;
+                        }
+                        x2[ch] = x1[ch];
+                        x1[ch] = x[ch];
+                        y2[ch] = y1[ch];
+                        y1[ch] = y[ch];
+                    }
+                }
             }
+            *l = y[0] as f32;
+            *r = y[1] as f32;
         }
+        (self.x1, self.x2, self.y1, self.y2) = (x1, x2, y1, y2);
     }
 }
 
@@ -301,15 +357,13 @@ struct EqualizerStage {
 }
 
 impl EqualizerStage {
-    fn new(bands: Vec<(f64, f64)>) -> Self {
-        let sections = bands
-            .into_iter()
-            .map(|(frequency, decibels)| {
-                let section = Biquad::peaking(frequency, 0.666_667, decibels);
-                BiquadStereo { channels: [section; CHANNELS] }
-            })
+    fn new(bands: &[EqBand]) -> Option<Self> {
+        let sections: Vec<BiquadStereo> = bands
+            .iter()
+            .filter(|b| b.decibels.abs() > 1e-12)
+            .map(|b| BiquadStereo::from_biquad(Biquad::peaking(b.frequency, 0.666_667, b.decibels)))
             .collect();
-        EqualizerStage { sections }
+        (!sections.is_empty()).then_some(EqualizerStage { sections })
     }
 
     fn process(&mut self, buf: &mut [f32]) {
@@ -323,22 +377,24 @@ impl EqualizerStage {
 /// is the `asplit`/`pan=mono`/`amix` chain in the FFmpeg graph.
 #[derive(Debug, Clone, Copy)]
 struct KaraokeStage {
-    band: [Biquad; CHANNELS],
+    band: Biquad,
     gain: f64,
 }
 
 impl KaraokeStage {
     fn new(k: Karaoke) -> Self {
-        let band = Biquad::bandpass(k.filter_band, k.filter_width);
-        KaraokeStage { band: [band; CHANNELS], gain: k.gain }
+        KaraokeStage { band: Biquad::bandpass(k.filter_band, k.filter_width), gain: k.gain }
     }
 
     fn process(&mut self, buf: &mut [f32]) {
-        for frame in buf.as_chunks_mut::<CHANNELS>().0 {
-            let mid = 0.5 * (frame[0] as f64 + frame[1] as f64);
-            let cut = (self.band[0].step(mid) * self.gain) as f32;
-            frame[0] += cut;
-            frame[1] += cut;
+        for [l, r] in buf.as_chunks_mut::<CHANNELS>().0 {
+            let l0 = if l.is_finite() { *l } else { 0.0 };
+            let r0 = if r.is_finite() { *r } else { 0.0 };
+            let mid = 0.5 * (l0 as f64 + r0 as f64);
+            let cut =
+                (self.band.step(mid) * self.gain).clamp(-(f32::MAX as f64), f32::MAX as f64) as f32;
+            *l = l0 + cut;
+            *r = r0 + cut;
         }
     }
 }
@@ -358,18 +414,28 @@ impl TremoloStage {
 
     fn process(&mut self, buf: &mut [f32], clock: u64) {
         let rate_step = self.frequency / SAMPLE_RATE as f64;
-        for (index, frame) in buf.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-            let phase = ((clock + index as u64) as f64 * rate_step).fract();
-            let gain = 1.0 - self.depth * (1.0 + (2.0 * PI * phase).sin()) / 2.0;
-            let gain = gain as f32;
-            frame[0] *= gain;
-            frame[1] *= gain;
+        let (step_s, step_c) = (2.0 * PI * rate_step).sin_cos();
+        let half_depth = 0.5 * self.depth;
+        for (chunk_idx, chunk) in
+            buf.as_chunks_mut::<CHANNELS>().0.chunks_mut(LFO_CHUNK).enumerate()
+        {
+            let phase0 = ((clock + (chunk_idx * LFO_CHUNK) as u64) as f64 * rate_step).fract();
+            let (mut s, mut c) = (2.0 * PI * phase0).sin_cos();
+            for [l, r] in chunk {
+                let gain = (1.0 - half_depth * (1.0 + s)) as f32;
+                *l *= gain;
+                *r *= gain;
+                (s, c) = (s * step_c + c * step_s, c * step_c - s * step_s);
+            }
         }
     }
 }
 
 const VIBRATO_MAX_DELAY: usize = (5 * SAMPLE_RATE as usize) / 1000 + 2;
-const VIBRATO_HISTORY: usize = VIBRATO_MAX_DELAY + 2;
+/// Power-of-two ring buffer (`256 >= VIBRATO_MAX_DELAY + 2 = 244`) so index
+/// wrapping compiles to `& VIBRATO_MASK` with zero integer divisions or bounds checks.
+const VIBRATO_RING: usize = 256;
+const VIBRATO_MASK: usize = VIBRATO_RING - 1;
 
 /// Vibrato moves the read position of a short delay line, which is what makes a
 /// pitch wobble without changing the tempo.
@@ -378,7 +444,7 @@ struct VibratoStage {
     frequency: f64,
     depth: f64,
     write: usize,
-    history: [[f32; VIBRATO_HISTORY]; CHANNELS],
+    history: [[f32; CHANNELS]; VIBRATO_RING],
 }
 
 impl VibratoStage {
@@ -387,27 +453,38 @@ impl VibratoStage {
             frequency: m.frequency,
             depth: m.depth,
             write: 0,
-            history: [[0.0; VIBRATO_HISTORY]; CHANNELS],
+            history: [[0.0; CHANNELS]; VIBRATO_RING],
         }
     }
 
     fn process(&mut self, buf: &mut [f32], clock: u64) {
-        let len = VIBRATO_HISTORY;
         let rate_step = self.frequency / SAMPLE_RATE as f64;
-        for (index, frame) in buf.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-            let phase = ((clock + index as u64) as f64 * rate_step).fract();
-            let delay =
-                self.depth * VIBRATO_MAX_DELAY as f64 * (1.0 + (2.0 * PI * phase).sin()) / 2.0;
-            let whole = delay.floor() as usize;
-            let fraction = (delay - whole as f64) as f32;
-            for (channel, sample) in frame.iter_mut().enumerate() {
-                self.history[channel][self.write] = *sample;
-                let a = self.history[channel][(self.write + len - whole) % len];
-                let b = self.history[channel][(self.write + len - whole - 1) % len];
-                *sample = a + (b - a) * fraction;
+        let (step_s, step_c) = (2.0 * PI * rate_step).sin_cos();
+        let scale = 0.5 * self.depth * VIBRATO_MAX_DELAY as f64;
+        let mut w = self.write;
+        for (chunk_idx, chunk) in
+            buf.as_chunks_mut::<CHANNELS>().0.chunks_mut(LFO_CHUNK).enumerate()
+        {
+            let phase0 = ((clock + (chunk_idx * LFO_CHUNK) as u64) as f64 * rate_step).fract();
+            let (mut s, mut c) = (2.0 * PI * phase0).sin_cos();
+            for frame in chunk {
+                let delay = scale * (1.0 + s);
+                let whole = delay.floor() as usize;
+                let fraction = (delay - whole as f64) as f32;
+                let clean = [
+                    if frame[0].is_finite() { frame[0] } else { 0.0 },
+                    if frame[1].is_finite() { frame[1] } else { 0.0 },
+                ];
+                self.history[w & VIBRATO_MASK] = clean;
+                let [a0, a1] = self.history[w.wrapping_sub(whole) & VIBRATO_MASK];
+                let [b0, b1] = self.history[w.wrapping_sub(whole + 1) & VIBRATO_MASK];
+                frame[0] = a0 + (b0 - a0) * fraction;
+                frame[1] = a1 + (b1 - a1) * fraction;
+                w = (w + 1) & VIBRATO_MASK;
+                (s, c) = (s * step_c + c * step_s, c * step_c - s * step_s);
             }
-            self.write = (self.write + 1) % len;
         }
+        self.write = w;
     }
 }
 
@@ -425,36 +502,71 @@ impl RotationStage {
 
     fn process(&mut self, buf: &mut [f32], clock: u64) {
         let rate_step = self.hertz / SAMPLE_RATE as f64;
-        for (index, frame) in buf.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-            let phase = ((clock + index as u64) as f64 * rate_step).fract();
-            let c = (2.0 * PI * phase).cos();
-            frame[0] *= (0.5 + 0.5 * c) as f32;
-            frame[1] *= (0.5 - 0.5 * c) as f32;
+        let (step_s, step_c) = (2.0 * PI * rate_step).sin_cos();
+        for (chunk_idx, chunk) in
+            buf.as_chunks_mut::<CHANNELS>().0.chunks_mut(LFO_CHUNK).enumerate()
+        {
+            let phase0 = ((clock + (chunk_idx * LFO_CHUNK) as u64) as f64 * rate_step).fract();
+            let (mut s, mut c) = (2.0 * PI * phase0).sin_cos();
+            for [l, r] in chunk {
+                *l *= (0.5 + 0.5 * c) as f32;
+                *r *= (0.5 - 0.5 * c) as f32;
+                (s, c) = (s * step_c + c * step_s, c * step_c - s * step_s);
+            }
         }
     }
 }
 
 /// The waveshaper the protocol exposes, evaluated the way the FFmpeg `aeval`
-/// expression is.
+/// expression is, with track-constant zero-scale trig factors pre-folded.
 #[derive(Debug, Clone, Copy)]
 struct DistortionStage {
     d: Distortion,
+    eff_scale: f64,
+    const_out: f32,
+    shared_sin_cos: bool,
 }
 
 impl DistortionStage {
     fn new(d: Distortion) -> Self {
-        DistortionStage { d }
+        let mut eff_scale = d.scale;
+        if d.sin_scale == 0.0 {
+            eff_scale *= d.sin_offset.sin();
+        }
+        if d.cos_scale == 0.0 {
+            eff_scale *= d.cos_offset.cos();
+        }
+        if d.tan_scale == 0.0 {
+            eff_scale *= d.tan_offset.tan();
+        }
+        let const_y = eff_scale * 0.0 + d.offset;
+        let const_out = if const_y.is_finite() { const_y.clamp(-1.0, 1.0) as f32 } else { 0.0 };
+        let shared_sin_cos =
+            d.sin_scale != 0.0 && d.sin_scale == d.cos_scale && d.sin_offset == d.cos_offset;
+        DistortionStage { d, eff_scale, const_out, shared_sin_cos }
     }
 
     fn process(&mut self, buf: &mut [f32]) {
+        if self.eff_scale == 0.0 {
+            buf.fill(self.const_out);
+            return;
+        }
         let d = &self.d;
+        let eff_scale = self.eff_scale;
         for sample in buf.iter_mut() {
             let x = if sample.is_finite() { *sample as f64 } else { 0.0 };
-            let y = d.scale
-                * ((x * d.sin_scale + d.sin_offset).sin()
-                    * (x * d.cos_scale + d.cos_offset).cos()
-                    * (x * d.tan_scale + d.tan_offset).tan())
-                + d.offset;
+            let sc = if self.shared_sin_cos {
+                let (s, c) = (x * d.sin_scale + d.sin_offset).sin_cos();
+                s * c
+            } else {
+                let s =
+                    if d.sin_scale != 0.0 { (x * d.sin_scale + d.sin_offset).sin() } else { 1.0 };
+                let c =
+                    if d.cos_scale != 0.0 { (x * d.cos_scale + d.cos_offset).cos() } else { 1.0 };
+                s * c
+            };
+            let t = if d.tan_scale != 0.0 { (x * d.tan_scale + d.tan_offset).tan() } else { 1.0 };
+            let y = eff_scale * (sc * t) + d.offset;
             *sample = if y.is_finite() { y.clamp(-1.0, 1.0) as f32 } else { 0.0 };
         }
     }
@@ -474,17 +586,23 @@ impl OnePoleStereo {
     }
 
     fn process(&mut self, buf: &mut [f32]) {
-        for frame in buf.as_chunks_mut::<CHANNELS>().0 {
-            for (channel, sample) in frame.iter_mut().enumerate() {
-                let x = if sample.is_finite() { *sample as f64 } else { 0.0 };
-                let mut next = self.state[channel] + self.alpha * (x - self.state[channel]);
-                if !next.is_finite() || next.abs() < 1e-20 {
-                    next = 0.0;
-                }
-                self.state[channel] = next;
-                *sample = next as f32;
+        let alpha = self.alpha;
+        let [mut s0, mut s1] = self.state;
+        for [l, r] in buf.as_chunks_mut::<CHANNELS>().0 {
+            let x0 = if l.is_finite() { *l as f64 } else { 0.0 };
+            let x1 = if r.is_finite() { *r as f64 } else { 0.0 };
+            s0 += alpha * (x0 - s0);
+            s1 += alpha * (x1 - s1);
+            if !within_f32(s0) || s0.abs() < 1e-20 {
+                s0 = 0.0;
             }
+            if !within_f32(s1) || s1.abs() < 1e-20 {
+                s1 = 0.0;
+            }
+            *l = s0 as f32;
+            *r = s1 as f32;
         }
+        self.state = [s0, s1];
     }
 }
 

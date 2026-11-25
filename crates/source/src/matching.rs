@@ -1,35 +1,61 @@
 //! Recording matching for metadata-only catalogues.
 
-use std::collections::HashSet;
-
 use rustlink_protocol::Track;
 
-fn words(text: &str) -> HashSet<String> {
-    text.to_lowercase()
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_owned)
-        .collect()
+const VERSIONS: [&str; 12] = [
+    "cover",
+    "karaoke",
+    "remix",
+    "live",
+    "nightcore",
+    "slowed",
+    "sped",
+    "instrumental",
+    "acoustic",
+    "preview",
+    "snippet",
+    "teaser",
+];
+
+fn split_words(lower: &str) -> impl Iterator<Item = &str> {
+    lower.split(|character: char| !character.is_alphanumeric()).filter(|word| !word.is_empty())
 }
 
-fn tokens(text: &str) -> HashSet<String> {
-    let all = words(text);
-    let meaningful: HashSet<String> =
-        all.iter().filter(|word| word.chars().nth(1).is_some()).cloned().collect();
+fn words(lower: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = split_words(lower).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn tokens_from_words<'a>(all: &[&'a str]) -> Vec<&'a str> {
     // Articles and initials add noise to long titles, but a recording or
     // artist can legitimately be named "X", "愛", or "A B".
-    if meaningful.is_empty() {
-        all
+    if all.iter().any(|word| word.chars().nth(1).is_some()) {
+        all.iter().copied().filter(|word| word.chars().nth(1).is_some()).collect()
     } else {
-        meaningful
+        all.to_vec()
     }
 }
 
-fn overlap(want: &HashSet<String>, got: &HashSet<String>) -> f64 {
+fn tokens(lower: &str) -> Vec<&str> {
+    let mut all = words(lower);
+    if all.iter().any(|word| word.chars().nth(1).is_some()) {
+        all.retain(|word| word.chars().nth(1).is_some());
+    }
+    all
+}
+
+#[inline]
+fn has_word(sorted: &[&str], word: &str) -> bool {
+    sorted.binary_search(&word).is_ok()
+}
+
+fn overlap(want: &[&str], got: &[&str]) -> f64 {
     if want.is_empty() {
         return 0.0;
     }
-    want.iter().filter(|word| got.contains(*word)).count() as f64 / want.len() as f64
+    want.iter().filter(|&&word| has_word(got, word)).count() as f64 / want.len() as f64
 }
 
 pub fn is_unknown_artist(author: &str) -> bool {
@@ -38,16 +64,19 @@ pub fn is_unknown_artist(author: &str) -> bool {
 }
 
 /// Require title, artist and duration agreement before accepting a recording.
-/// Desired metadata is normalized once per search, and candidate title tokens
-/// are reused for artist matching without formatting another temporary string.
+/// Desired metadata is normalized once per search, and candidate tokens borrow
+/// from one lowercased string per field without per-word heap allocations.
 pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Track> {
-    let want_title = tokens(&want.metadata.title);
+    let want_title_lower = want.metadata.title.to_lowercase();
+    let want_title = tokens(&want_title_lower);
     if want_title.is_empty() {
         return None;
     }
     let has_artist = !is_unknown_artist(&want.metadata.author);
-    let want_artist = if has_artist { tokens(&want.metadata.author) } else { HashSet::new() };
-    let artist_name = if has_artist { words(&want.metadata.author) } else { HashSet::new() };
+    let want_author_lower =
+        if has_artist { want.metadata.author.to_lowercase() } else { String::new() };
+    let artist_name = if has_artist { words(&want_author_lower) } else { Vec::new() };
+    let want_artist = if has_artist { tokens_from_words(&artist_name) } else { Vec::new() };
     let short_artist = has_artist && want_artist.iter().all(|word| word.chars().nth(1).is_none());
     let mut best = None;
     let mut best_score = 0.0;
@@ -62,32 +91,23 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
         {
             continue;
         }
-        let mut candidate_tokens = words(&candidate.metadata.title);
+        let title_lower = candidate.metadata.title.to_lowercase();
+        let candidate_tokens = words(&title_lower);
         // A named artist prefix is metadata, not a version label: the band
         // Live must not be mistaken for a live performance of every song.
         let named_title = [" - ", " – ", " — ", " | ", ": "].iter().find_map(|separator| {
-            let (artist, title) = candidate.metadata.title.split_once(*separator)?;
+            let (artist, title) = title_lower.split_once(*separator)?;
             (!artist_name.is_empty() && words(artist) == artist_name).then_some(title)
         });
-        let version_tokens = named_title.map(words);
-        let version_tokens = version_tokens.as_ref().unwrap_or(&candidate_tokens);
-        if [
-            "cover",
-            "karaoke",
-            "remix",
-            "live",
-            "nightcore",
-            "slowed",
-            "sped",
-            "instrumental",
-            "acoustic",
-            "preview",
-            "snippet",
-            "teaser",
-        ]
-        .iter()
-        .any(|version| version_tokens.contains(*version) && !want_title.contains(*version))
-        {
+        let unrequested_version = match named_title {
+            Some(rest) => {
+                split_words(rest).any(|w| VERSIONS.contains(&w) && !has_word(&want_title, w))
+            }
+            None => VERSIONS
+                .iter()
+                .any(|&v| has_word(&candidate_tokens, v) && !has_word(&want_title, v)),
+        };
+        if unrequested_version {
             continue;
         }
         let title = overlap(&want_title, &candidate_tokens);
@@ -96,14 +116,22 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
         }
         let artist = if !has_artist {
             0.0
-        } else if short_artist && named_title.is_none() {
-            let author_tokens = words(&candidate.metadata.author);
-            // A short artist such as "A" cannot be proven by an article in
-            // "A Song". Require the author field or an explicit artist prefix.
-            overlap(&want_artist, &author_tokens)
         } else {
-            candidate_tokens.extend(words(&candidate.metadata.author));
-            overlap(&want_artist, &candidate_tokens)
+            let author_lower = candidate.metadata.author.to_lowercase();
+            let author_tokens = words(&author_lower);
+            if short_artist && named_title.is_none() {
+                // A short artist such as "A" cannot be proven by an article in
+                // "A Song". Require the author field or an explicit artist prefix.
+                overlap(&want_artist, &author_tokens)
+            } else if want_artist.is_empty() {
+                0.0
+            } else {
+                want_artist
+                    .iter()
+                    .filter(|&&w| has_word(&candidate_tokens, w) || has_word(&author_tokens, w))
+                    .count() as f64
+                    / want_artist.len() as f64
+            }
         };
         if has_artist && artist < 0.4 {
             continue;
@@ -147,8 +175,11 @@ mod tests {
         let want = track("夜空之歌", "歌手名稱", 200_000);
         let candidates = [track("歌手名稱 夜空之歌", "Official channel", 200_001)];
         assert!(match_track(&want, &candidates).is_some());
-        assert_eq!(overlap(&tokens("A Song"), &tokens("a SONG")), 1.0);
-        assert_eq!(overlap(&tokens("A Song"), &tokens("nothing alike")), 0.0);
+        assert_eq!(
+            overlap(&tokens(&"A Song".to_lowercase()), &tokens(&"a SONG".to_lowercase())),
+            1.0
+        );
+        assert_eq!(overlap(&tokens(&"A Song".to_lowercase()), &tokens("nothing alike")), 0.0);
     }
 
     #[test]

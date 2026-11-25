@@ -40,10 +40,7 @@ pub fn tune_memory() {
 /// `MALLOC_ARENA_MAX=` means "not set", not the "no limit at all" that glibc
 /// would read into an empty string.
 fn arenas(configured: Option<&OsStr>) -> Option<i32> {
-    match configured.and_then(OsStr::to_str).map(str::trim) {
-        None | Some("") => Some(ARENAS),
-        Some(_) => None,
-    }
+    configured.is_none_or(|v| v.as_encoded_bytes().trim_ascii().is_empty()).then_some(ARENAS)
 }
 
 #[cfg(test)]

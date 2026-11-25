@@ -73,11 +73,11 @@ if ($reuse) {
     # bot"); a proxy such as Cloudflare WARP gives it another one. A WARP proxy
     # already listening on its default port is offered as the default.
     $warp = ''
+    $probe = New-Object Net.Sockets.TcpClient
     try {
-        $probe = New-Object Net.Sockets.TcpClient
         if ($probe.ConnectAsync('127.0.0.1', 40000).Wait(500)) { $warp = 'socks5://127.0.0.1:40000' }
-        $probe.Close()
     } catch { }
+    finally { $probe.Close() }
     $Proxy = (Read-Host "YouTube proxy, e.g. socks5://127.0.0.1:40000 (empty = none) [$warp]").Trim()
     if (-not $Proxy) { $Proxy = $warp }
     if ($Proxy -match '["\\\s]') { Fail 'the proxy cannot contain quotes, backslashes or spaces' }

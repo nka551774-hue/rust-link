@@ -22,7 +22,7 @@ use crate::{deadline, netguard, youtube_id, SourceError};
 #[derive(Debug, Clone)]
 pub struct Client {
     pub name: &'static str,
-    pub version: String,
+    pub version: Cow<'static, str>,
     pub user_agent: Cow<'static, str>,
     pub sdk: Option<u32>,
     pub device_make: Option<&'static str>,
@@ -31,20 +31,43 @@ pub struct Client {
     pub os_version: Option<&'static str>,
 }
 
+fn android_client(config: &Config) -> Client {
+    // This version still returns directly usable audio for videos newer Android
+    // identities expose only through SABR. Keep the HTTP identity consistent
+    // with a configured version override.
+    let custom = config.youtube_client_version.trim();
+    let (version, user_agent) = if custom.is_empty() {
+        (
+            Cow::Borrowed("20.10.38"),
+            Cow::Borrowed("com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"),
+        )
+    } else {
+        (
+            Cow::Owned(custom.to_owned()),
+            Cow::Owned(format!("com.google.android.youtube/{custom} (Linux; U; Android 11) gzip")),
+        )
+    };
+    Client {
+        name: "ANDROID",
+        version,
+        user_agent,
+        sdk: Some(30),
+        device_make: None,
+        device_model: None,
+        os_name: Some("Android"),
+        os_version: Some("11"),
+    }
+}
+
 /// The clients tried in order.
 pub fn clients(config: &Config) -> Vec<Client> {
-    let android_version = if config.youtube_client_version.trim().is_empty() {
-        "20.10.38".to_string()
-    } else {
-        config.youtube_client_version.trim().to_string()
-    };
     vec![
         Client {
             name: "IOS_PRODUCER",
             // Measured 2026-11-22 to serve whole files with no proof of origin,
             // even to an address the other identities answer with a bot check.
             // It offers AAC (itag 140) only.
-            version: "0.147.945".into(),
+            version: Cow::Borrowed("0.147.945"),
             user_agent: Cow::Borrowed("com.google.ios.youtubeproducer/0.147.945 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"),
             sdk: None,
             device_make: Some("Apple"),
@@ -57,7 +80,7 @@ pub fn clients(config: &Config) -> Vec<Client> {
             // Serves whole files with no proof of origin to an address YouTube
             // trusts; newer VR versions stop after ~900 KiB like the others.
             // It sends only these fields, as Lavalink's client does.
-            version: "1.60.19".into(),
+            version: Cow::Borrowed("1.60.19"),
             user_agent: Cow::Borrowed("com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
             sdk: Some(32),
             device_make: None,
@@ -65,24 +88,10 @@ pub fn clients(config: &Config) -> Vec<Client> {
             os_name: None,
             os_version: None,
         },
-        Client {
-            name: "ANDROID",
-            // This version still returns directly usable audio for videos
-            // newer Android identities expose only through SABR. Keep the
-            // HTTP identity consistent with a configured version override.
-            user_agent: Cow::Owned(format!(
-                "com.google.android.youtube/{android_version} (Linux; U; Android 11) gzip"
-            )),
-            version: android_version,
-            sdk: Some(30),
-            device_make: None,
-            device_model: None,
-            os_name: Some("Android"),
-            os_version: Some("11"),
-        },
+        android_client(config),
         Client {
             name: "IOS",
-            version: "21.26.4".into(),
+            version: Cow::Borrowed("21.26.4"),
             user_agent: Cow::Borrowed("com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"),
             sdk: None,
             device_make: Some("Apple"),
@@ -96,16 +105,14 @@ pub fn clients(config: &Config) -> Vec<Client> {
 /// The client searches and playlists are read with: Android answers them in
 /// the shape the parsers expect, whichever client plays best right now.
 fn catalogue_client(config: &Config) -> Client {
-    let mut all = clients(config);
-    let android = all.iter().position(|client| client.name == "ANDROID").unwrap_or(0);
-    all.swap_remove(android)
+    android_client(config)
 }
 
 /// The client the catalogue is searched with. It needs no player script because
 /// a search result carries a plain video id.
 const MUSIC_CLIENT: Client = Client {
     name: "WEB_REMIX",
-    version: String::new(),
+    version: Cow::Borrowed("1.20250101.01.00"),
     user_agent: Cow::Borrowed("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
     sdk: None,
     device_make: None,
@@ -113,8 +120,6 @@ const MUSIC_CLIENT: Client = Client {
     os_name: None,
     os_version: None,
 };
-
-const MUSIC_VERSION: &str = "1.20250101.01.00";
 
 /// Restricts a search to videos. Without it YouTube mixes in channels,
 /// playlists and shorts, which have no length and are dropped anyway.
@@ -144,19 +149,19 @@ fn call(
     agent: &ureq::Agent,
     base: &str,
     client: &Client,
-    version: &str,
     visitor_data: &str,
     endpoint: &str,
     mut body: Value,
 ) -> Result<Value, SourceError> {
+    let visitor = visitor_data.trim();
     let mut identity = json!({
         "clientName": client.name,
-        "clientVersion": version,
+        "clientVersion": client.version.as_ref(),
         "hl": "en",
         "gl": "US",
     });
-    if !visitor_data.trim().is_empty() {
-        identity["visitorData"] = json!(visitor_data.trim());
+    if !visitor.is_empty() {
+        identity["visitorData"] = json!(visitor);
     }
     if let Some(sdk) = client.sdk {
         identity["androidSdkVersion"] = json!(sdk);
@@ -181,8 +186,8 @@ fn call(
         .header("Content-Type", "application/json")
         .header("User-Agent", client.user_agent.as_ref())
         .header("Accept-Language", "en-US,en;q=0.9");
-    if !visitor_data.trim().is_empty() {
-        request = request.header("X-Goog-Visitor-Id", visitor_data.trim());
+    if !visitor.is_empty() {
+        request = request.header("X-Goog-Visitor-Id", visitor);
     }
     let response = request
         .config()
@@ -217,15 +222,7 @@ impl Catalog<'_> {
     }
 
     fn web_call(&self, client: &Client, endpoint: &str, body: Value) -> Result<Value, SourceError> {
-        call(
-            self.agent,
-            &self.config.youtube_endpoint,
-            client,
-            &client.version,
-            self.visitor_data(),
-            endpoint,
-            body,
-        )
+        call(self.agent, &self.config.youtube_endpoint, client, self.visitor_data(), endpoint, body)
     }
 
     fn music_call(&self, endpoint: &str, body: Value) -> Result<Value, SourceError> {
@@ -233,7 +230,6 @@ impl Catalog<'_> {
             self.agent,
             &self.config.youtube_music_endpoint,
             &MUSIC_CLIENT,
-            MUSIC_VERSION,
             self.visitor_data(),
             endpoint,
             body,
@@ -275,6 +271,7 @@ impl Catalog<'_> {
     pub fn playlist(&self, playlist_id: &str) -> Result<LoadResult, SourceError> {
         let client = catalogue_client(self.config);
         let mut videos = Vec::new();
+        let mut page_videos = Vec::new();
         let mut seen_ids = HashSet::new();
         let mut seen_continuations = HashSet::new();
         let mut title = String::new();
@@ -285,14 +282,14 @@ impl Catalog<'_> {
             let answer = if continuation.is_empty() {
                 self.web_call(&client, "browse", json!({ "browseId": format!("VL{playlist_id}") }))?
             } else {
-                self.web_call(&client, "browse", json!({ "continuation": continuation }))?
+                self.web_call(&client, "browse", json!({ "continuation": continuation.as_str() }))?
             };
             if title.is_empty() {
                 title = header_title(&answer).unwrap_or_default();
             }
-            let mut page_videos = Vec::new();
+            page_videos.clear();
             collect_videos(&answer, &mut page_videos);
-            for media in page_videos {
+            for media in page_videos.drain(..) {
                 if seen_ids.insert(media.id.clone()) {
                     videos.push(media);
                 }
@@ -302,7 +299,11 @@ impl Catalog<'_> {
                 break;
             }
             match next_continuation(&answer) {
-                Some(token) if seen_continuations.insert(token.clone()) => continuation = token,
+                Some(token) if !seen_continuations.contains(token) => {
+                    seen_continuations.insert(token.to_owned());
+                    continuation.clear();
+                    continuation.push_str(token);
+                }
                 _ => break,
             }
         }
@@ -410,16 +411,20 @@ impl Catalog<'_> {
         let details = answer
             .pointer("/videoDetails")
             .ok_or_else(|| SourceError::Http("youtube described no video".into()))?;
+        let seconds = details
+            .get("lengthSeconds")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0.0);
+        let live = details.get("isLive").and_then(Value::as_bool).unwrap_or_else(|| {
+            details.get("isLiveContent").and_then(Value::as_bool).unwrap_or(false) && seconds <= 0.0
+        });
         let media = Media {
             id: details.get("videoId").and_then(Value::as_str).unwrap_or(video_id).to_string(),
             title: details.get("title").and_then(Value::as_str).unwrap_or_default().to_string(),
             author: details.get("author").and_then(Value::as_str).unwrap_or_default().to_string(),
-            seconds: details
-                .get("lengthSeconds")
-                .and_then(Value::as_str)
-                .and_then(|text| text.parse().ok())
-                .unwrap_or(0.0),
-            live: details.get("isLiveContent").and_then(Value::as_bool).unwrap_or(false),
+            seconds,
+            live,
             artwork: thumbnails(answer.pointer("/videoDetails/thumbnail")),
         };
         media.into_track("youtube").ok_or_else(|| {
@@ -527,9 +532,17 @@ fn duration_millis(seconds: f64) -> i64 {
 /// bytes for the same sound; an adaptive audio-only format is what a node that
 /// never shows a picture wants.
 fn pick_format(answer: &Value) -> Option<Format> {
+    #[derive(Clone, Copy)]
+    struct Candidate<'a> {
+        entry: &'a Value,
+        url: &'a str,
+        mime: &'a str,
+        bitrate: i64,
+        rank: (bool, bool, bool, i64),
+    }
+
     let formats = answer.pointer("/streamingData/adaptiveFormats").and_then(Value::as_array)?;
-    let mut best: Option<Format> = None;
-    let mut best_rank = None;
+    let mut best: Option<Candidate<'_>> = None;
     for entry in formats {
         let mime = entry.get("mimeType").and_then(Value::as_str).unwrap_or_default();
         if !mime.starts_with("audio/") || !has_audio_codec(mime) {
@@ -552,31 +565,31 @@ fn pick_format(answer: &Value) -> Option<Format> {
             .is_some_and(|name| name.ends_with(" original"));
         let drc = entry.get("isDrc").and_then(Value::as_bool).unwrap_or(false);
         let rank = (!dubbed, original, !drc, bitrate);
-        if best_rank.is_some_and(|held| held >= rank) {
+        if best.is_some_and(|held| held.rank >= rank) {
             continue;
         }
-        best_rank = Some(rank);
-        let mut headers = BTreeMap::new();
-        if let Some(extra) = entry.get("httpHeaders").and_then(Value::as_object) {
-            for (name, value) in extra {
-                if let Some(value) = value.as_str() {
-                    headers.insert(name.clone(), value.to_string());
-                }
+        best = Some(Candidate { entry, url, mime, bitrate, rank });
+    }
+    let Candidate { entry, url, mime, bitrate, .. } = best?;
+    let mut headers = BTreeMap::new();
+    if let Some(extra) = entry.get("httpHeaders").and_then(Value::as_object) {
+        for (name, value) in extra {
+            if let Some(value) = value.as_str() {
+                headers.insert(name.clone(), value.to_owned());
             }
         }
-        best = Some(Format {
-            url: url.to_string(),
-            mime_type: mime.to_string(),
-            bitrate,
-            content_length: entry
-                .get("contentLength")
-                .and_then(|value| value.as_str())
-                .and_then(|text| text.parse().ok())
-                .unwrap_or(0),
-            headers,
-        });
     }
-    best
+    Some(Format {
+        url: url.to_owned(),
+        mime_type: mime.to_owned(),
+        bitrate,
+        content_length: entry
+            .get("contentLength")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0),
+        headers,
+    })
 }
 
 /// Whether a MIME type names a codec the node can decode.
@@ -585,9 +598,11 @@ fn pick_format(answer: &Value) -> Option<Format> {
 /// handing one to the decoder would fail a track that has a playable format next
 /// to it.
 fn has_audio_codec(mime: &str) -> bool {
-    const PLAYABLE: [&str; 5] = ["opus", "vorbis", "mp4a", "flac", "aac"];
-    let lower = mime.to_ascii_lowercase();
-    PLAYABLE.iter().any(|codec| lower.contains(codec))
+    const PLAYABLE: [&[u8]; 5] = [b"opus", b"vorbis", b"mp4a", b"flac", b"aac"];
+    let bytes = mime.as_bytes();
+    PLAYABLE
+        .iter()
+        .any(|codec| bytes.windows(codec.len()).any(|window| window.eq_ignore_ascii_case(codec)))
 }
 
 fn thumbnails(value: Option<&Value>) -> Option<String> {
@@ -598,42 +613,58 @@ fn thumbnails(value: Option<&Value>) -> Option<String> {
 
 /// Reads a written duration such as "3:45" or "1:02:03" into seconds.
 fn length_seconds(text: &str) -> Option<f64> {
-    let parts: Vec<&str> = text.trim().split(':').collect();
-    if parts.is_empty() || parts.len() > 3 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let mut total = 0f64;
-    for part in parts {
-        let value: f64 = part.trim().parse().ok()?;
-        if !value.is_finite() || value < 0.0 {
+    let mut count = 0usize;
+    let mut total = 0u64;
+    for part in trimmed.split(':') {
+        count += 1;
+        if count > 3 {
             return None;
         }
-        total = total * 60.0 + value;
-        if !total.is_finite() {
+        let part = part.trim();
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
+        let value: u64 = part.parse().ok()?;
+        if count > 1 && value >= 60 {
+            return None;
+        }
+        total = total.checked_mul(60)?.checked_add(value)?;
     }
-    Some(total)
+    if count < 2 {
+        return None;
+    }
+    Some(total as f64)
 }
 
-/// Reads the words of a renderer field that may be one run or a simple string.
-fn runs_text(value: Option<&Value>) -> String {
+/// Reads the words of a renderer field, borrowing when possible.
+fn runs_cow(value: Option<&Value>) -> Cow<'_, str> {
     let Some(value) = value else {
-        return String::new();
+        return Cow::Borrowed("");
     };
     if let Some(text) = value.get("simpleText").and_then(Value::as_str) {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if let Some(runs) = value.get("runs").and_then(Value::as_array) {
-        return runs
-            .iter()
-            .filter_map(|run| run.get("text").and_then(Value::as_str))
-            .collect::<String>();
+        return match runs.as_slice() {
+            [] => Cow::Borrowed(""),
+            [single] => Cow::Borrowed(single.get("text").and_then(Value::as_str).unwrap_or("")),
+            many => Cow::Owned(
+                many.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect(),
+            ),
+        };
     }
     if let Some(text) = value.as_str() {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
-    String::new()
+    Cow::Borrowed("")
+}
+
+fn runs_text(value: Option<&Value>) -> String {
+    runs_cow(value).into_owned()
 }
 
 /// Walks an answer and collects every video it names.
@@ -694,11 +725,11 @@ fn video_from_renderer(value: &Value) -> Option<Media> {
         return None;
     }
     let author = ["ownerText", "longBylineText", "shortBylineText"]
-        .iter()
-        .map(|field| runs_text(value.get(*field)))
+        .into_iter()
+        .map(|field| runs_cow(value.get(field)))
         .find(|text| !text.is_empty())
-        .unwrap_or_default();
-    let length_raw = runs_text(value.get("lengthText"));
+        .map_or_else(String::new, Cow::into_owned);
+    let length_raw = runs_cow(value.get("lengthText"));
     let seconds = length_seconds(&length_raw).unwrap_or(0.0);
     Some(Media {
         id: id.to_string(),
@@ -741,11 +772,11 @@ fn video_from_music_item(value: &Value) -> Option<Media> {
     // duration), separated by middle dots, so the artist is the part before it.
     let byline = columns
         .get(1)
-        .map(|column| runs_text(column.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
+        .map(|column| runs_cow(column.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
         .unwrap_or_default();
     let author = byline.split('•').next().unwrap_or_default().trim().to_string();
     let fixed_len =
-        runs_text(value.pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text"));
+        runs_cow(value.pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text"));
     let seconds = length_seconds(&fixed_len)
         .or_else(|| byline.rsplit('•').next().and_then(length_seconds))
         .unwrap_or(0.0);
@@ -756,49 +787,44 @@ fn video_from_music_item(value: &Value) -> Option<Media> {
 
 /// Reads the title of a playlist page.
 fn header_title(value: &Value) -> Option<String> {
-    for path in [
+    [
         "/header/playlistHeaderRenderer/title",
         "/header/pageHeaderRenderer/pageTitle",
         "/metadata/playlistMetadataRenderer/title",
-    ] {
-        let text = runs_text(value.pointer(path));
-        if !text.is_empty() {
-            return Some(text);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .map(|path| runs_cow(value.pointer(path)))
+    .find(|text| !text.is_empty())
+    .map(Cow::into_owned)
 }
 
 /// Finds the token that names the next page of a list.
-fn next_continuation(value: &Value) -> Option<String> {
-    fn walk(value: &Value) -> Option<String> {
-        match value {
-            Value::Object(map) => {
-                if let Some(token) = map
-                    .get("nextContinuationData")
-                    .and_then(|data| data.get("continuation"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|token| !token.is_empty())
-                {
-                    return Some(token.to_string());
-                }
-                if let Some(token) = map
-                    .get("continuationCommand")
-                    .and_then(|data| data.get("token"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|token| !token.is_empty())
-                {
-                    return Some(token.to_string());
-                }
-                map.values().find_map(walk)
+fn next_continuation(value: &Value) -> Option<&str> {
+    match value {
+        Value::Object(map) => {
+            if let Some(token) = map
+                .get("nextContinuationData")
+                .and_then(|data| data.get("continuation"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                return Some(token);
             }
-            Value::Array(items) => items.iter().find_map(walk),
-            _ => None,
+            if let Some(token) = map
+                .get("continuationCommand")
+                .and_then(|data| data.get("token"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                return Some(token);
+            }
+            map.values().find_map(next_continuation)
         }
+        Value::Array(items) => items.iter().find_map(next_continuation),
+        _ => None,
     }
-    walk(value)
 }
 
 #[cfg(test)]
@@ -1186,7 +1212,7 @@ mod tests {
     fn the_token_that_names_the_next_page_is_found_wherever_it_sits() {
         let answer =
             json!({"contents": {"a": [{"b": {"continuationCommand": {"token": "next"}}}]}});
-        assert_eq!(next_continuation(&answer).as_deref(), Some("next"));
+        assert_eq!(next_continuation(&answer), Some("next"));
     }
 
     #[test]

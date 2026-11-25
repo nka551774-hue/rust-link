@@ -1,10 +1,13 @@
 //! Pair Discord's two out-of-order voice events.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use rustlink_protocol::VoiceState;
 
 use crate::{BotError, BotEvent};
+
+const LATE_SERVER_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Pending {
@@ -12,10 +15,11 @@ struct Pending {
     channel_id: Option<String>,
     token: Option<String>,
     endpoint: Option<String>,
-    emitted: Option<(String, String, String, String)>,
-    /// A different server arrived after a pairing was emitted. The next state
-    /// change belongs with that server, not with the one it replaced.
-    late_server: bool,
+    emitted: bool,
+    /// When a newer server arrived after a pairing was emitted. A state change
+    /// arriving shortly afterwards pairs with that server rather than clearing
+    /// it, while an old server migration never leaks into a much later move.
+    late_server_at: Option<Instant>,
 }
 
 /// Correlates `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE` for one bot user.
@@ -27,7 +31,8 @@ pub struct VoiceStatePairer {
 
 impl VoiceStatePairer {
     pub fn new(bot_user_id: impl Into<String>) -> Result<Self, BotError> {
-        let bot_user_id = crate::validate_snowflake(&bot_user_id.into(), "bot user ID")?;
+        let raw = bot_user_id.into();
+        let bot_user_id = crate::validate_snowflake(&raw, "bot user ID")?.to_owned();
         Ok(Self { bot_user_id, guild_filter: None, pending: HashMap::new() })
     }
 
@@ -40,8 +45,10 @@ impl VoiceStatePairer {
         bot_user_id: impl Into<String>,
         guild_id: impl Into<String>,
     ) -> Result<Self, BotError> {
-        let bot_user_id = crate::validate_snowflake(&bot_user_id.into(), "bot user ID")?;
-        let guild_filter = crate::validate_snowflake(&guild_id.into(), "guild ID")?;
+        let raw_user = bot_user_id.into();
+        let raw_guild = guild_id.into();
+        let bot_user_id = crate::validate_snowflake(&raw_user, "bot user ID")?.to_owned();
+        let guild_filter = crate::validate_snowflake(&raw_guild, "guild ID")?.to_owned();
         Ok(Self { bot_user_id, guild_filter: Some(guild_filter), pending: HashMap::new() })
     }
 
@@ -66,7 +73,14 @@ impl VoiceStatePairer {
                 if update.session_id.trim().is_empty() {
                     return Err(BotError::Protocol("voice state has no session ID".into()));
                 }
-                let pending = self.pending.entry(guild_id.clone()).or_default();
+                if update.channel_id.is_none() {
+                    self.pending.remove(guild_id);
+                    return Ok(None);
+                }
+                let pending = match self.pending.get_mut(guild_id) {
+                    Some(existing) => existing,
+                    None => self.pending.entry(guild_id.to_owned()).or_default(),
+                };
                 // Discord may send a new state before the matching server
                 // event. Never combine that new session/channel with the
                 // previous voice token or endpoint.
@@ -75,57 +89,59 @@ impl VoiceStatePairer {
                     || pending.channel_id.as_ref() != update.channel_id.as_ref();
                 if (pending.session_id.is_some() || pending.channel_id.is_some()) && state_changed {
                     // The token on hand belongs to the previous channel, unless
-                    // a newer server arrived first and is the one this state
-                    // was waiting for.
-                    if !pending.late_server {
+                    // a newer server arrived moments ago and is the one this
+                    // state was waiting for.
+                    let fresh_server = pending
+                        .late_server_at
+                        .take()
+                        .is_some_and(|at| at.elapsed() <= LATE_SERVER_WINDOW);
+                    if !fresh_server {
                         pending.token = None;
                         pending.endpoint = None;
                     }
-                    pending.emitted = None;
-                    pending.late_server = false;
+                    pending.emitted = false;
                 }
                 pending.session_id = Some(update.session_id.clone());
                 pending.channel_id = update.channel_id.clone();
-                if pending.channel_id.is_none() {
-                    self.pending.remove(&guild_id);
-                    return Ok(None);
-                }
-                self.ready(&guild_id)
+                self.ready(guild_id)
             }
             BotEvent::VoiceServerUpdate(update) => {
                 let guild_id = crate::validate_snowflake(&update.guild_id, "guild ID")?;
                 if self.guild_filter.as_deref().is_some_and(|expected| expected != guild_id) {
                     return Ok(None);
                 }
-                let pending = self.pending.entry(guild_id.clone()).or_default();
+                let pending = match self.pending.get_mut(guild_id) {
+                    Some(existing) => existing,
+                    None => self.pending.entry(guild_id.to_owned()).or_default(),
+                };
                 // Discord reports an unavailable server with a null endpoint
                 // while it reallocates one. Preserve the current voice state
                 // across that null event and the first usable endpoint after
                 // it, because failover does not guarantee another state event.
                 let reallocating = update.endpoint.is_none() || pending.endpoint.is_none();
-                let changed_server = pending.emitted.is_some()
+                let token_changed =
+                    pending.token.as_deref().is_some_and(|prev| prev != update.token.as_str());
+                let changed_server = pending.emitted
                     && !reallocating
-                    && (pending.token.as_deref() != Some(update.token.as_str())
-                        || pending.endpoint.as_ref() != update.endpoint.as_ref());
+                    && (token_changed || pending.endpoint.as_ref() != update.endpoint.as_ref());
                 if changed_server {
-                    // A server migration (a region change, say) sends a new
-                    // token and endpoint and nothing else: the voice session
-                    // and channel are still the ones in use, so they are kept
-                    // and the connection is rebuilt on the new server. Waiting
-                    // for a state update here would wait forever. If a state
-                    // update for a different channel does follow, it pairs with
-                    // this server (see `late_server`).
-                    pending.emitted = None;
-                    pending.late_server = true;
+                    pending.emitted = false;
+                    pending.late_server_at = Some(Instant::now());
+                } else if reallocating
+                    && update.endpoint.is_some()
+                    && pending.session_id.is_some()
+                    && token_changed
+                {
+                    pending.late_server_at = Some(Instant::now());
                 }
                 if update.endpoint.is_none() {
                     // An unavailable server invalidates the active connection,
                     // even when its replacement reuses the exact same fields.
-                    pending.emitted = None;
+                    pending.emitted = false;
                 }
                 pending.token = Some(update.token.clone());
                 pending.endpoint = update.endpoint.clone();
-                self.ready(&guild_id)
+                self.ready(guild_id)
             }
             _ => Ok(None),
         }
@@ -133,7 +149,7 @@ impl VoiceStatePairer {
 
     pub fn clear(&mut self, guild_id: &str) -> Result<(), BotError> {
         let guild_id = crate::validate_snowflake(guild_id, "guild ID")?;
-        self.pending.remove(&guild_id);
+        self.pending.remove(guild_id);
         Ok(())
     }
 
@@ -142,33 +158,38 @@ impl VoiceStatePairer {
             .pending
             .get_mut(guild_id)
             .ok_or_else(|| BotError::Protocol("voice pairing state disappeared".into()))?;
+        if pending.emitted {
+            return Ok(None);
+        }
         let (Some(session_id), Some(channel_id), Some(token), Some(endpoint)) = (
-            pending.session_id.clone(),
-            pending.channel_id.clone(),
-            pending.token.clone(),
-            pending.endpoint.clone(),
+            pending.session_id.as_deref(),
+            pending.channel_id.as_deref(),
+            pending.token.as_deref(),
+            pending.endpoint.as_deref(),
         ) else {
             return Ok(None);
         };
-        let session_id = crate::validate_text(&session_id, "voice session ID")?;
+        let session_id = crate::validate_text(session_id, "voice session ID")?;
         if session_id.len() > 256 {
             return Err(BotError::Invalid("voice session ID is too long".into()));
         }
-        let channel_id = crate::validate_snowflake(&channel_id, "channel ID")?;
-        let token = crate::validate_text(&token, "voice token")?;
+        let channel_id = crate::validate_snowflake(channel_id, "channel ID")?;
+        let token = crate::validate_text(token, "voice token")?;
         if token.len() > 512 {
             return Err(BotError::Invalid("voice token is too long".into()));
         }
-        let endpoint = crate::validate_text(&endpoint, "voice endpoint")?;
+        let endpoint = crate::validate_text(endpoint, "voice endpoint")?;
         if endpoint.len() > 512 {
             return Err(BotError::Invalid("voice endpoint is too long".into()));
         }
-        let signature = (session_id.clone(), channel_id.clone(), token.clone(), endpoint.clone());
-        if pending.emitted.as_ref() == Some(&signature) {
-            return Ok(None);
-        }
-        pending.emitted = Some(signature);
-        Ok(Some(VoiceState { token, endpoint, session_id, channel_id: Some(channel_id) }))
+        let out = VoiceState {
+            token: token.to_owned(),
+            endpoint: endpoint.to_owned(),
+            session_id: session_id.to_owned(),
+            channel_id: Some(channel_id.to_owned()),
+        };
+        pending.emitted = true;
+        Ok(Some(out))
     }
 }
 

@@ -9,7 +9,7 @@
 
 use std::ffi::c_int;
 #[cfg(feature = "native-opus")]
-use std::ptr;
+use std::ptr::NonNull;
 
 #[cfg(feature = "native-opus")]
 type OpusInt32 = c_int;
@@ -51,9 +51,9 @@ const OPUS_OK: c_int = 0;
 
 /// A frame at 48 kHz is 20 ms, which is what Discord wants and what the pacing
 /// loop counts in.
-pub const FRAME_SAMPLES: usize = 960;
+pub const FRAME_SAMPLES: usize = crate::dsp::FRAME_SAMPLES;
 /// Two channels, so a frame carries 960 samples on each side.
-pub const FRAME_SAMPLES_STEREO: usize = FRAME_SAMPLES * 2;
+pub const FRAME_SAMPLES_STEREO: usize = FRAME_SAMPLES * crate::dsp::CHANNELS;
 
 /// The largest packet libopus will produce for one frame, with room to spare.
 #[cfg(feature = "native-opus")]
@@ -93,7 +93,7 @@ extern "C" {
 /// A stereo 48 kHz Opus encoder tuned for music.
 #[cfg(feature = "native-opus")]
 pub struct Encoder {
-    state: *mut OpusEncoder,
+    state: NonNull<OpusEncoder>,
     buffer: Vec<u8>,
     lookahead: i32,
 }
@@ -113,32 +113,32 @@ impl Encoder {
     /// frame, which is the knob the operator has for a busy node.
     pub fn new(bitrate: i32, complexity: i32) -> Result<Self, OpusError> {
         let mut error: c_int = OPUS_OK;
-        let state = unsafe { opus_encoder_create(48_000, 2, OPUS_APPLICATION_AUDIO, &mut error) };
-        if state.is_null() || error != OPUS_OK {
+        let raw = unsafe { opus_encoder_create(48_000, 2, OPUS_APPLICATION_AUDIO, &mut error) };
+        let Some(state) = NonNull::new(raw).filter(|_| error == OPUS_OK) else {
+            if !raw.is_null() {
+                unsafe { opus_encoder_destroy(raw) };
+            }
             return Err(OpusError::Create(error));
+        };
+        let mut encoder = Encoder { state, buffer: Vec::new(), lookahead: 0 };
+        for (request, value) in [
+            // Music, not speech, and variable bitrate so quiet passages spend fewer bits.
+            (OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC),
+            (OPUS_SET_VBR_REQUEST, 1),
+            (OPUS_SET_VBR_CONSTRAINT_REQUEST, 0),
+            (OPUS_SET_BITRATE_REQUEST, bitrate),
+            // 16-bit integer input lets libopus avoid spending bits below quantisation noise.
+            (OPUS_SET_LSB_DEPTH_REQUEST, 16),
+            (OPUS_SET_COMPLEXITY_REQUEST, complexity),
+            // Request the same loss allowance as the FFmpeg path.
+            (OPUS_SET_INBAND_FEC_REQUEST, 1),
+            (OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10),
+        ] {
+            encoder.control(request, value)?;
         }
-        let mut encoder = Encoder { state, buffer: vec![0u8; MAX_PACKET], lookahead: 0 };
-        // Music, not speech, and a bitrate the operator chose. Variable bitrate
-        // is what keeps a quiet passage from costing as much as a loud one.
-        encoder.control(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC)?;
-        encoder.control(OPUS_SET_VBR_REQUEST, 1)?;
-        encoder.control(OPUS_SET_VBR_CONSTRAINT_REQUEST, 0)?;
-        encoder.control(OPUS_SET_BITRATE_REQUEST, bitrate)?;
-        // The samples handed in are 16-bit integers, and saying so is what lets
-        // the encoder tell near-silence from detail below the quantisation
-        // noise instead of spending bits on the noise.
-        encoder.control(OPUS_SET_LSB_DEPTH_REQUEST, 16)?;
-        // The default is the encoder's own maximum, because a node is not short
-        // of CPU the way a phone is; an operator with more players than cores
-        // asks for less, and says so once for the whole node.
-        encoder.control(OPUS_SET_COMPLEXITY_REQUEST, complexity)?;
-        // Request the same loss allowance as the FFmpeg path. Actual in-band
-        // recovery depends on the Opus mode and the receiving decoder.
-        encoder.control(OPUS_SET_INBAND_FEC_REQUEST, 1)?;
-        encoder.control(OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10)?;
         let code = unsafe {
             opus_encoder_ctl(
-                encoder.state,
+                encoder.state.as_ptr(),
                 OPUS_GET_LOOKAHEAD_REQUEST,
                 &mut encoder.lookahead as *mut c_int,
             )
@@ -150,7 +150,7 @@ impl Encoder {
     }
 
     fn control(&self, request: c_int, value: c_int) -> Result<(), OpusError> {
-        let code = unsafe { opus_encoder_ctl(self.state, request, value) };
+        let code = unsafe { opus_encoder_ctl(self.state.as_ptr(), request, value) };
         if code == OPUS_OK {
             Ok(())
         } else {
@@ -160,28 +160,49 @@ impl Encoder {
 
     /// How many samples the encoder holds back, which a caller needs if it is
     /// aligning output with a source position.
+    #[inline]
     pub fn lookahead(&self) -> i32 {
         self.lookahead
     }
 
-    /// Encodes one 20 ms frame of interleaved stereo samples.
-    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
+    /// Encodes one 20 ms frame of interleaved stereo samples directly into `out`,
+    /// reusing `out`'s allocation without an intermediate copy or zero-fill.
+    #[inline]
+    pub fn encode_into(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), OpusError> {
         if pcm.len() != FRAME_SAMPLES_STEREO {
             return Err(OpusError::FrameSize);
         }
+        out.clear();
+        out.reserve(MAX_PACKET);
+        // SAFETY: `out.reserve(MAX_PACKET)` guarantees at least `MAX_PACKET`
+        // writable bytes in `spare_capacity_mut()`, and `opus_encode` initializes
+        // `0..written` bytes (`0 <= written <= MAX_PACKET`) without reading `data`.
         let written = unsafe {
             opus_encode(
-                self.state,
+                self.state.as_ptr(),
                 pcm.as_ptr(),
                 FRAME_SAMPLES as c_int,
-                self.buffer.as_mut_ptr(),
+                out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
                 MAX_PACKET as OpusInt32,
             )
         };
         if written < 0 {
             return Err(OpusError::Encode(written));
         }
-        Ok(&self.buffer[..written as usize])
+        unsafe {
+            out.set_len(written as usize);
+        }
+        Ok(())
+    }
+
+    /// Encodes one 20 ms frame of interleaved stereo samples.
+    #[inline]
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let result = self.encode_into(pcm, &mut buffer);
+        self.buffer = buffer;
+        result?;
+        Ok(&self.buffer)
     }
 }
 
@@ -191,25 +212,30 @@ impl Encoder {
         Err(OpusError::Create(-7))
     }
 
+    #[inline]
     pub fn lookahead(&self) -> i32 {
         312
     }
 
-    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
+    #[inline]
+    pub fn encode_into(&mut self, pcm: &[i16], _out: &mut Vec<u8>) -> Result<(), OpusError> {
         if pcm.len() != FRAME_SAMPLES_STEREO {
             return Err(OpusError::FrameSize);
         }
         Err(OpusError::Encode(-7))
+    }
+
+    #[inline]
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
+        self.encode_into(pcm, &mut Vec::new())?;
+        Ok(&[])
     }
 }
 
 #[cfg(feature = "native-opus")]
 impl Drop for Encoder {
     fn drop(&mut self) {
-        if !self.state.is_null() {
-            unsafe { opus_encoder_destroy(self.state) };
-            self.state = ptr::null_mut();
-        }
+        unsafe { opus_encoder_destroy(self.state.as_ptr()) };
     }
 }
 
@@ -217,10 +243,12 @@ impl Drop for Encoder {
 ///
 /// The clamp is not cosmetic: a filter chain is free to overshoot, and libopus
 /// treats an out of range sample as undefined input.
+#[inline]
 pub fn to_i16(samples: &[f32], out: &mut [i16]) {
-    for (target, sample) in out.iter_mut().zip(samples.iter()) {
-        *target =
-            if sample.is_finite() { (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16 } else { 0 };
+    for (target, &sample) in out.iter_mut().zip(samples) {
+        let clean = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
+        let scaled = clean * 32767.0;
+        *target = (scaled + 0.5f32.copysign(scaled)) as i16;
     }
 }
 

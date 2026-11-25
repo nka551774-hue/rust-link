@@ -52,7 +52,7 @@ impl Limiter {
     pub fn new(rate: f64, burst: usize) -> Limiter {
         let burst = burst.max(1) as f64;
         Limiter {
-            rate: if rate > 0.0 { rate } else { 0.0 },
+            rate: if rate.is_finite() && rate > 0.0 { rate } else { 0.0 },
             burst,
             inner: Mutex::new(Bucket::new(burst, Instant::now())),
         }
@@ -89,7 +89,7 @@ struct Table {
 
 impl Keyed {
     pub fn new(rate: f64, burst: usize, max_keys: usize) -> Keyed {
-        let sanitized_rate = if rate > 0.0 { rate } else { 0.0 };
+        let sanitized_rate = if rate.is_finite() && rate > 0.0 { rate } else { 0.0 };
         let sanitized_burst = burst.max(1) as f64;
         Keyed {
             rate: sanitized_rate,
@@ -119,10 +119,10 @@ impl Keyed {
             drop(table);
             return self.overflow.allow();
         }
-        let mut bucket = Bucket::new(burst, now);
-        let allowed = bucket.allow(rate, burst, now);
-        table.buckets.insert(key.to_string(), bucket);
-        allowed
+        // Burst is clamped to >= 1.0 in `new`, so a brand-new bucket always
+        // starts full and immediately spends one token.
+        table.buckets.insert(key.to_owned(), Bucket { tokens: burst - 1.0, at: now });
+        true
     }
 
     #[cfg(test)]

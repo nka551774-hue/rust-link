@@ -14,6 +14,75 @@ type FlagField = fn(&mut Config) -> &mut bool;
 /// A numeric field, which is only written when the value parses.
 type NumberField = fn(&mut Config) -> &mut u32;
 
+const STRINGS: &[(&str, StringField)] = &[
+    ("RUSTLINK_ADDRESS", |c| &mut c.address),
+    ("RUSTLINK_PASSWORD", |c| &mut c.password),
+    ("RUSTLINK_FFMPEG", |c| &mut c.ffmpeg),
+    ("RUSTLINK_TOOLS_DIRECTORY", |c| &mut c.tools_directory),
+    ("RUSTLINK_LOG_LEVEL", |c| &mut c.log_level),
+    ("RUSTLINK_LOG_FORMAT", |c| &mut c.log_format),
+    ("RUSTLINK_LOG_COLOR", |c| &mut c.log_color),
+    ("RUSTLINK_LOG_DIRECTORY", |c| &mut c.log_directory),
+    ("RUSTLINK_YOUTUBE_ENDPOINT", |c| &mut c.youtube_endpoint),
+    ("RUSTLINK_YOUTUBE_MUSIC_ENDPOINT", |c| &mut c.youtube_music_endpoint),
+    ("RUSTLINK_YOUTUBE_CLIENT_VERSION", |c| &mut c.youtube_client_version),
+    ("RUSTLINK_YOUTUBE_PO_TOKEN", |c| &mut c.youtube_po_token),
+    ("RUSTLINK_YOUTUBE_VISITOR_DATA", |c| &mut c.youtube_visitor_data),
+    ("RUSTLINK_YOUTUBE_PROXY", |c| &mut c.youtube_proxy),
+    ("RUSTLINK_SOUNDCLOUD_API_ENDPOINT", |c| &mut c.soundcloud_api_endpoint),
+    ("RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT", |c| &mut c.soundcloud_web_endpoint),
+    ("RUSTLINK_SOUNDCLOUD_CLIENT_ID", |c| &mut c.soundcloud_client_id),
+    ("RUSTLINK_DEEZER_API_ENDPOINT", |c| &mut c.deezer_api_endpoint),
+    ("RUSTLINK_LYRICS_SOURCE", |c| &mut c.lyrics_source),
+    ("RUSTLINK_WEBHOOK_URL", |c| &mut c.webhook.url),
+];
+
+// Spotify keeps its own variable names, because they are the ones the
+// Spotify dashboard hands out. Empty values (for instance `${SPOTIFY_*: -}`
+// in container templates) leave `config.yaml` intact instead of wiping it.
+const SPOTIFY_STRINGS: &[(&str, StringField)] = &[
+    ("SPOTIFY_CLIENT_ID", |c| &mut c.spotify_client_id),
+    ("RUSTLINK_SPOTIFY_CLIENT_ID", |c| &mut c.spotify_client_id),
+    ("SPOTIFY_CLIENT_SECRET", |c| &mut c.spotify_client_secret),
+    ("RUSTLINK_SPOTIFY_CLIENT_SECRET", |c| &mut c.spotify_client_secret),
+    ("SPOTIFY_REFRESH_TOKEN", |c| &mut c.spotify_refresh_token),
+    ("RUSTLINK_SPOTIFY_REFRESH_TOKEN", |c| &mut c.spotify_refresh_token),
+    ("SPOTIFY_MARKET", |c| &mut c.spotify_market),
+    ("RUSTLINK_SPOTIFY_MARKET", |c| &mut c.spotify_market),
+];
+
+const FLAGS: &[(&str, FlagField)] = &[
+    ("RUSTLINK_YOUTUBE_NATIVE", |c| &mut c.youtube_native),
+    ("RUSTLINK_SOUNDCLOUD", |c| &mut c.soundcloud_native),
+    ("RUSTLINK_SOUNDCLOUD_NATIVE", |c| &mut c.soundcloud_native),
+    ("RUSTLINK_AUTO_DOWNLOAD", |c| &mut c.auto_download),
+    ("RUSTLINK_IN_PROCESS_AUDIO", |c| &mut c.in_process_audio),
+    ("RUSTLINK_PRIVATE_NETWORKS", |c| &mut c.allow_private_networks),
+    ("RUSTLINK_ALLOW_PRIVATE_NETWORKS", |c| &mut c.allow_private_networks),
+    ("RUSTLINK_RATELIMITS_ENABLE", |c| &mut c.ratelimits.enable),
+    ("RUSTLINK_WEBHOOK_ENABLED", |c| &mut c.webhook.enable),
+    ("RUSTLINK_WEBHOOK_ENABLE", |c| &mut c.webhook.enable),
+];
+
+const NUMBERS: &[(&str, NumberField)] = &[
+    ("RUSTLINK_MAX_PLAYERS", |c| &mut c.max_players),
+    ("RUSTLINK_MAX_SESSIONS", |c| &mut c.max_sessions),
+    ("RUSTLINK_MAX_CONCURRENT_LOADS", |c| &mut c.max_concurrent_loads),
+    ("RUSTLINK_MAX_PLAYLIST_TRACKS", |c| &mut c.max_playlist_tracks),
+    ("RUSTLINK_SEARCH_RESULTS", |c| &mut c.search_results),
+    ("RUSTLINK_CACHE_ENTRIES", |c| &mut c.cache_entries),
+    ("RUSTLINK_CACHE_TTL_SECONDS", |c| &mut c.cache_ttl_seconds),
+    ("RUSTLINK_LOAD_TIMEOUT_SECONDS", |c| &mut c.load_timeout_seconds),
+    ("RUSTLINK_PLAYER_UPDATE_SECONDS", |c| &mut c.player_update_seconds),
+    ("RUSTLINK_STATS_SECONDS", |c| &mut c.stats_seconds),
+    ("RUSTLINK_EVENT_BUFFER", |c| &mut c.event_buffer),
+    ("RUSTLINK_OPUS_BITRATE", |c| &mut c.opus_bitrate),
+    ("RUSTLINK_OPUS_COMPLEXITY", |c| &mut c.opus_complexity),
+    ("RUSTLINK_LOG_RETENTION_DAYS", |c| &mut c.log_retention_days),
+    ("RUSTLINK_SOUNDCLOUD_CLIENT_ID_TTL_SECONDS", |c| &mut c.soundcloud_client_id_ttl_seconds),
+    ("RUSTLINK_WEBHOOK_STATE_LATENCY_SECONDS", |c| &mut c.webhook.state_latency_seconds),
+];
+
 /// Applies the process environment on top of a configuration.
 pub fn apply_env(config: &mut Config) {
     apply_env_with(config, |name| std::env::var(name).ok());
@@ -22,99 +91,30 @@ pub fn apply_env(config: &mut Config) {
 /// Applies overrides read from `lookup`, which is separated from the process
 /// environment so the rules can be tested without touching global state.
 pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<String>) {
-    let strings: [(&str, StringField); 20] = [
-        ("RUSTLINK_ADDRESS", |c| &mut c.address),
-        ("RUSTLINK_PASSWORD", |c| &mut c.password),
-        ("RUSTLINK_FFMPEG", |c| &mut c.ffmpeg),
-        ("RUSTLINK_TOOLS_DIRECTORY", |c| &mut c.tools_directory),
-        ("RUSTLINK_LOG_LEVEL", |c| &mut c.log_level),
-        ("RUSTLINK_LOG_FORMAT", |c| &mut c.log_format),
-        ("RUSTLINK_LOG_COLOR", |c| &mut c.log_color),
-        ("RUSTLINK_LOG_DIRECTORY", |c| &mut c.log_directory),
-        ("RUSTLINK_YOUTUBE_ENDPOINT", |c| &mut c.youtube_endpoint),
-        ("RUSTLINK_YOUTUBE_MUSIC_ENDPOINT", |c| &mut c.youtube_music_endpoint),
-        ("RUSTLINK_YOUTUBE_CLIENT_VERSION", |c| &mut c.youtube_client_version),
-        ("RUSTLINK_YOUTUBE_PO_TOKEN", |c| &mut c.youtube_po_token),
-        ("RUSTLINK_YOUTUBE_VISITOR_DATA", |c| &mut c.youtube_visitor_data),
-        ("RUSTLINK_YOUTUBE_PROXY", |c| &mut c.youtube_proxy),
-        ("RUSTLINK_SOUNDCLOUD_API_ENDPOINT", |c| &mut c.soundcloud_api_endpoint),
-        ("RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT", |c| &mut c.soundcloud_web_endpoint),
-        ("RUSTLINK_SOUNDCLOUD_CLIENT_ID", |c| &mut c.soundcloud_client_id),
-        ("RUSTLINK_DEEZER_API_ENDPOINT", |c| &mut c.deezer_api_endpoint),
-        ("RUSTLINK_LYRICS_SOURCE", |c| &mut c.lyrics_source),
-        ("RUSTLINK_WEBHOOK_URL", |c| &mut c.webhook.url),
-    ];
-    for (name, field) in strings {
+    for &(name, field) in STRINGS {
         if let Some(value) = lookup(name) {
             *field(config) = value;
         }
     }
 
-    // Spotify keeps its own variable names, because they are the ones the
-    // Spotify dashboard hands out. Empty values (for instance `${SPOTIFY_*: -}`
-    // in container templates) leave `config.yaml` intact instead of wiping it.
-    let spotify_strings: [(&str, StringField); 8] = [
-        ("RUSTLINK_SPOTIFY_CLIENT_ID", |c| &mut c.spotify_client_id),
-        ("SPOTIFY_CLIENT_ID", |c| &mut c.spotify_client_id),
-        ("RUSTLINK_SPOTIFY_CLIENT_SECRET", |c| &mut c.spotify_client_secret),
-        ("SPOTIFY_CLIENT_SECRET", |c| &mut c.spotify_client_secret),
-        ("RUSTLINK_SPOTIFY_REFRESH_TOKEN", |c| &mut c.spotify_refresh_token),
-        ("SPOTIFY_REFRESH_TOKEN", |c| &mut c.spotify_refresh_token),
-        ("RUSTLINK_SPOTIFY_MARKET", |c| &mut c.spotify_market),
-        ("SPOTIFY_MARKET", |c| &mut c.spotify_market),
-    ];
-    for (name, field) in spotify_strings {
-        if let Some(value) = lookup(name) {
-            if !value.trim().is_empty() {
-                *field(config) = value;
-            }
+    for &(name, field) in SPOTIFY_STRINGS {
+        if let Some(value) = lookup(name).filter(|v| !v.trim().is_empty()) {
+            *field(config) = value;
         }
     }
 
-    let flags: [(&str, FlagField); 10] = [
-        ("RUSTLINK_YOUTUBE_NATIVE", |c| &mut c.youtube_native),
-        ("RUSTLINK_SOUNDCLOUD", |c| &mut c.soundcloud_native),
-        ("RUSTLINK_SOUNDCLOUD_NATIVE", |c| &mut c.soundcloud_native),
-        ("RUSTLINK_AUTO_DOWNLOAD", |c| &mut c.auto_download),
-        ("RUSTLINK_IN_PROCESS_AUDIO", |c| &mut c.in_process_audio),
-        ("RUSTLINK_PRIVATE_NETWORKS", |c| &mut c.allow_private_networks),
-        ("RUSTLINK_ALLOW_PRIVATE_NETWORKS", |c| &mut c.allow_private_networks),
-        ("RUSTLINK_RATELIMITS_ENABLE", |c| &mut c.ratelimits.enable),
-        ("RUSTLINK_WEBHOOK_ENABLED", |c| &mut c.webhook.enable),
-        ("RUSTLINK_WEBHOOK_ENABLE", |c| &mut c.webhook.enable),
-    ];
-    for (name, field) in flags {
+    for &(name, field) in FLAGS {
         if let Some(value) = lookup(name).as_deref().and_then(switch) {
             *field(config) = value;
         }
     }
 
-    let numbers: [(&str, NumberField); 16] = [
-        ("RUSTLINK_MAX_PLAYERS", |c| &mut c.max_players),
-        ("RUSTLINK_MAX_SESSIONS", |c| &mut c.max_sessions),
-        ("RUSTLINK_MAX_CONCURRENT_LOADS", |c| &mut c.max_concurrent_loads),
-        ("RUSTLINK_MAX_PLAYLIST_TRACKS", |c| &mut c.max_playlist_tracks),
-        ("RUSTLINK_SEARCH_RESULTS", |c| &mut c.search_results),
-        ("RUSTLINK_CACHE_ENTRIES", |c| &mut c.cache_entries),
-        ("RUSTLINK_CACHE_TTL_SECONDS", |c| &mut c.cache_ttl_seconds),
-        ("RUSTLINK_LOAD_TIMEOUT_SECONDS", |c| &mut c.load_timeout_seconds),
-        ("RUSTLINK_PLAYER_UPDATE_SECONDS", |c| &mut c.player_update_seconds),
-        ("RUSTLINK_STATS_SECONDS", |c| &mut c.stats_seconds),
-        ("RUSTLINK_EVENT_BUFFER", |c| &mut c.event_buffer),
-        ("RUSTLINK_OPUS_BITRATE", |c| &mut c.opus_bitrate),
-        ("RUSTLINK_OPUS_COMPLEXITY", |c| &mut c.opus_complexity),
-        ("RUSTLINK_LOG_RETENTION_DAYS", |c| &mut c.log_retention_days),
-        ("RUSTLINK_SOUNDCLOUD_CLIENT_ID_TTL_SECONDS", |c| &mut c.soundcloud_client_id_ttl_seconds),
-        ("RUSTLINK_WEBHOOK_STATE_LATENCY_SECONDS", |c| &mut c.webhook.state_latency_seconds),
-    ];
-    for (name, field) in numbers {
-        if let Some(value) = lookup(name) {
-            // A number that cannot be read is left alone rather than turning the
-            // whole variable into a startup failure; validation still catches a
-            // value that is out of range.
-            if let Ok(parsed) = value.trim().parse::<u32>() {
-                *field(config) = parsed;
-            }
+    // A number that cannot be read is left alone rather than turning the
+    // whole variable into a startup failure; validation still catches a
+    // value that is out of range.
+    for &(name, field) in NUMBERS {
+        if let Some(parsed) = lookup(name).and_then(|v| v.trim().parse::<u32>().ok()) {
+            *field(config) = parsed;
         }
     }
 }
@@ -123,10 +123,21 @@ pub fn apply_env_with(config: &mut Config, lookup: impl Fn(&str) -> Option<Strin
 /// so `no`, `off` or an empty value never switches a guard such as
 /// `RUSTLINK_PRIVATE_NETWORKS` on.
 fn switch(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+    let v = value.trim();
+    if v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("yes")
+        || v.eq_ignore_ascii_case("on")
+    {
+        Some(true)
+    } else if v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
+        || v.eq_ignore_ascii_case("off")
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -183,16 +194,33 @@ mod tests {
     #[test]
     fn spotify_variables_use_their_own_names() {
         let mut config = Config::default();
-        let pairs = [("SPOTIFY_CLIENT_ID", "id"), ("SPOTIFY_MARKET", "TW")];
+        let partial = [("SPOTIFY_CLIENT_ID", "id"), ("SPOTIFY_MARKET", "TW")];
+        apply_env_with(&mut config, |name| lookup(&partial, name));
+        assert_eq!(config.spotify_client_id, "id");
+        assert_eq!(config.spotify_market, "TW");
+        assert!(!config.spotify_enabled(), "client ID without secret is not enabled");
+
+        let pairs = [
+            ("SPOTIFY_CLIENT_ID", "legacy-id"),
+            ("RUSTLINK_SPOTIFY_CLIENT_ID", "id"),
+            ("SPOTIFY_CLIENT_SECRET", "secret"),
+            ("SPOTIFY_MARKET", "TW"),
+        ];
         apply_env_with(&mut config, |name| lookup(&pairs, name));
         assert_eq!(config.spotify_client_id, "id");
+        assert_eq!(config.spotify_client_secret, "secret");
         assert_eq!(config.spotify_market, "TW");
         assert!(config.spotify_enabled());
 
         // Blank container placeholders do not erase values from config.yaml.
-        let blanks = [("SPOTIFY_CLIENT_ID", ""), ("SPOTIFY_MARKET", "   ")];
+        let blanks = [
+            ("SPOTIFY_CLIENT_ID", ""),
+            ("SPOTIFY_CLIENT_SECRET", "   "),
+            ("SPOTIFY_MARKET", "   "),
+        ];
         apply_env_with(&mut config, |name| lookup(&blanks, name));
         assert_eq!(config.spotify_client_id, "id");
+        assert_eq!(config.spotify_client_secret, "secret");
         assert_eq!(config.spotify_market, "TW");
     }
 

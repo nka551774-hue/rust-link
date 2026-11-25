@@ -11,9 +11,10 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rustlink_audio::{AudioError, Frames};
+use rustlink_audio::{AudioError, FilterSet, Frames};
 use rustlink_protocol::{
-    decode_track, Object, Patch, Player as PlayerBody, PlayerUpdate, Track, VoiceState,
+    decode_track, decode_track_owned, Int64, Object, Patch, Player as PlayerBody, PlayerState,
+    PlayerUpdate, Track, VoiceState,
 };
 use rustlink_source::LoadResult;
 use rustlink_voice::{Closed, Connection, Factory};
@@ -80,8 +81,10 @@ struct State {
     running: bool,
     /// Whether the active `Frames` implementation accepts live DSP updates.
     live_filters: bool,
+    /// Validated DSP configuration matching `body.filters` and `body.volume`.
+    filter_set: FilterSet,
     /// Pending in-place volume/filter update for the active pump thread.
-    pending_filters: Option<rustlink_audio::FilterSet>,
+    pending_filters: Option<FilterSet>,
     /// Bumped whenever playback is stopped, so a thread that is still unwinding
     /// knows it is no longer the current one.
     generation: u64,
@@ -104,6 +107,7 @@ pub struct Player {
     deps: Arc<Deps>,
     emit: Emit,
     counters: Arc<Counters>,
+    load_timeout: Duration,
     state: Mutex<State>,
     /// Wakes the playback thread when the state it waits on changes.
     wake: Condvar,
@@ -122,12 +126,25 @@ impl Player {
         emit: Emit,
         counters: Arc<Counters>,
     ) -> Arc<Player> {
+        Self::with_load_timeout(user, guild, deps, emit, counters, Duration::from_secs(30))
+    }
+
+    /// Builds a player with an explicit query-resolution timeout.
+    pub fn with_load_timeout(
+        user: String,
+        guild: String,
+        deps: Arc<Deps>,
+        emit: Emit,
+        counters: Arc<Counters>,
+        load_timeout: Duration,
+    ) -> Arc<Player> {
         Arc::new(Player {
             user,
             guild: guild.clone(),
             deps,
             emit,
             counters,
+            load_timeout,
             state: Mutex::new(State {
                 body: PlayerBody::new(guild),
                 end_time: None,
@@ -135,6 +152,7 @@ impl Player {
                 closed: false,
                 running: false,
                 live_filters: false,
+                filter_set: FilterSet::default(),
                 pending_filters: None,
                 generation: 0,
                 connection: None,
@@ -158,6 +176,53 @@ impl Player {
         self.snapshot_locked(&state)
     }
 
+    /// Reads only the live `PlayerState` without cloning tracks, filters or voice credentials.
+    pub fn state_snapshot(&self) -> (&str, PlayerState) {
+        let state = self.state.lock().unwrap();
+        (&self.guild, Self::live_state(&state))
+    }
+
+    /// Reads the currently loaded track, if any, without cloning the rest of the player.
+    pub fn track(&self) -> Option<Track> {
+        let state = self.state.lock().unwrap();
+        let mut track = state.body.track.clone()?;
+        track.metadata.position = state.body.state.position;
+        Some(track)
+    }
+
+    /// Builds `(playing, state_entry)` for [`Server::player_state_report`] without
+    /// cloning track tokens, filter maps, user data, or voice credentials.
+    pub(crate) fn report_state(&self) -> (bool, serde_json::Value) {
+        let state = self.state.lock().unwrap();
+        let live = Self::live_state(&state);
+        let playing = state.body.track.is_some() && !state.body.paused && live.connected;
+        let (title, author, source, duration_ms) = match state.body.track.as_ref() {
+            Some(track) => (
+                track.metadata.title.as_str(),
+                track.metadata.author.as_str(),
+                track.metadata.source_name.as_str(),
+                track.metadata.length,
+            ),
+            None => ("", "", "", 0),
+        };
+        (
+            playing,
+            json!({
+                "guild_id": self.guild,
+                "title": title,
+                "author": author,
+                "source": source,
+                "duration_ms": duration_ms,
+                "position_ms": live.position,
+                "endpoint": state.body.voice.endpoint,
+                "volume": state.body.volume,
+                "paused": state.body.paused,
+                "connected": live.connected,
+                "ping_ms": live.ping,
+            }),
+        )
+    }
+
     /// Whether the player is playing, which is what the node's counters ask of
     /// every player it has.
     ///
@@ -171,21 +236,25 @@ impl Player {
             && state.connection.as_ref().is_some_and(|connection| connection.connected())
     }
 
+    fn live_state(state: &State) -> PlayerState {
+        let connected = state.connection.as_ref().is_some_and(|connection| connection.connected());
+        let ping = if connected {
+            state.connection.as_ref().map_or(-1, |connection| connection.ping())
+        } else {
+            -1
+        };
+        PlayerState { time: now_millis(), position: state.body.state.position, connected, ping }
+    }
+
     fn snapshot_locked(&self, state: &State) -> PlayerBody {
         let mut body = state.body.clone();
         if let Some(track) = body.track.as_mut() {
             track.metadata.position = body.state.position;
         }
-        body.state.time = now_millis();
-        body.state.connected =
-            state.connection.as_ref().map(|connection| connection.connected()).unwrap_or(false);
-        body.state.ping = if body.state.connected {
-            state.connection.as_ref().map(|connection| connection.ping()).unwrap_or(-1)
-        } else {
-            -1
-        };
+        body.state = Self::live_state(state);
         body
     }
+
     /// Applies a player update.
     ///
     /// The update is serialized against every other update for this player, so
@@ -197,27 +266,44 @@ impl Player {
         no_replace: bool,
     ) -> Result<PlayerBody, PlayerError> {
         let _serialized = self.updates.lock().await;
-        validate(&update)?;
-        let change = update.track_update();
-        let changes_track = !change.token.is_missing() || change.query.is_some();
-        let ignore = {
+        let prepared = prepare(update)?;
+        self.apply_locked(prepared, no_replace).await
+    }
+
+    /// Applies an already-validated [`PreparedUpdate`] without re-decoding the
+    /// track token or re-parsing filters.
+    pub(crate) async fn apply(
+        self: &Arc<Self>,
+        prepared: PreparedUpdate,
+        no_replace: bool,
+    ) -> Result<PlayerBody, PlayerError> {
+        let _serialized = self.updates.lock().await;
+        self.apply_locked(prepared, no_replace).await
+    }
+
+    async fn apply_locked(
+        self: &Arc<Self>,
+        mut prepared: PreparedUpdate,
+        no_replace: bool,
+    ) -> Result<PlayerBody, PlayerError> {
+        let changes_track = prepared.changes_track;
+        let skip_query = if changes_track && prepared.query.is_some() {
             let state = self.state.lock().unwrap();
             if state.closed {
                 return Err(PlayerError::Destroyed);
             }
             no_replace && state.body.track.is_some()
+        } else {
+            false
         };
-        let mut track: Option<Track> = None;
-        if changes_track && !ignore {
-            if let Some(identifier) = change.query.clone() {
-                track = Some(self.resolve(identifier).await?);
-            } else if let Some(encoded) = change.token.value() {
-                track = Some(
-                    decode_track(encoded)
-                        .map_err(|error| PlayerError::Invalid(error.to_string()))?,
-                );
+        let resolved_track = if changes_track && !skip_query {
+            match prepared.query.take() {
+                Some(identifier) => Some(self.resolve(identifier).await?),
+                None => None,
             }
-        }
+        } else {
+            None
+        };
         let mut connect = None;
         let mut to_close: Option<Arc<dyn Connection>> = None;
         let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
@@ -226,25 +312,29 @@ impl Player {
             if state.closed {
                 return Err(PlayerError::Destroyed);
             }
-            let ignore = no_replace && state.body.track.is_some();
+            let ignore = skip_query || (no_replace && state.body.track.is_some());
+            let mut track = if changes_track && !ignore {
+                resolved_track.or_else(|| prepared.decoded_track.take())
+            } else {
+                None
+            };
             let mut need_stop = false;
-            let next_volume = update.volume.map_or(state.body.volume, |v| v.get());
-            let next_filters = update.filters.as_ref().unwrap_or(&state.body.filters);
-            let settings_changed = update.volume.is_some_and(|v| v.get() != state.body.volume)
-                || update.filters.as_ref().is_some_and(|f| *f != state.body.filters);
+            let next_volume = prepared.volume.map_or(state.body.volume, Int64::get);
+            let next_filters = prepared.filters.as_ref().unwrap_or(&state.body.filters);
+            let settings_changed = prepared.volume.is_some_and(|v| v.get() != state.body.volume)
+                || prepared.filters.as_ref().is_some_and(|f| *f != state.body.filters);
             let mut live_filter_update = None;
             if settings_changed {
-                let old_set =
-                    rustlink_audio::parse_filters(&state.body.filters, state.body.volume).ok();
-                let new_set = rustlink_audio::parse_filters(next_filters, next_volume).ok();
-                if state.running
-                    && state.live_filters
-                    && old_set
-                        .as_ref()
-                        .zip(new_set.as_ref())
-                        .is_some_and(|(old, new)| old.effective_time() == new.effective_time())
-                {
-                    live_filter_update = new_set;
+                if let Ok(new_set) = rustlink_audio::parse_filters(next_filters, next_volume) {
+                    if state.running
+                        && state.live_filters
+                        && state.filter_set.effective_time() == new_set.effective_time()
+                    {
+                        live_filter_update = Some(new_set.clone());
+                    } else {
+                        need_stop = true;
+                    }
+                    state.filter_set = new_set;
                 } else {
                     need_stop = true;
                 }
@@ -257,63 +347,56 @@ impl Player {
                     events.push(("track.ended", json!({ "track": previous, "reason": reason })));
                 }
                 if let Some(next) = track.as_mut() {
-                    let mut initial = next.metadata.position.max(0);
-                    if next.metadata.length > 0 && initial > next.metadata.length {
-                        initial = next.metadata.length;
-                    }
-                    next.metadata.position = initial;
+                    next.metadata.position =
+                        clamp_position(next.metadata.position, next.metadata.length);
                 }
-                state.body.state.position = match &track {
-                    Some(next) => next.metadata.position,
-                    None => 0,
-                };
+                state.body.state.position = track.as_ref().map_or(0, |next| next.metadata.position);
                 state.body.track = track;
                 state.started = false;
                 state.end_time = None;
             }
-            if let Some(user_data) = &change.user_data {
+            if let Some(user_data) = prepared.user_data.take() {
                 if !ignore {
                     if let Some(current) = state.body.track.as_mut() {
-                        current.user_data = user_data.clone();
+                        current.user_data = user_data;
                     }
                 }
             }
-            if let Some(position) = update.position {
-                if let Some(current) = state.body.track.as_ref() {
+            if let Some(position) = prepared.position {
+                let body = &mut state.body;
+                if let Some(current) = body.track.as_mut() {
                     if current.metadata.is_seekable {
-                        let mut target = position.get();
-                        if current.metadata.length > 0 && target > current.metadata.length {
-                            target = current.metadata.length;
-                        }
-                        if target != state.body.state.position {
+                        let target = clamp_position(position.get(), current.metadata.length);
+                        if target != body.state.position {
                             need_stop = true;
                             live_filter_update = None;
                         }
-                        state.body.state.position = target;
+                        body.state.position = target;
+                        current.metadata.position = target;
                     }
                 }
             }
-            match &update.end_time {
+            match prepared.end_time {
                 Patch::Missing => {}
                 Patch::Null => state.end_time = None,
                 Patch::Value(end_time) => state.end_time = Some(end_time.get()),
             }
-            if let Some(volume) = update.volume {
+            if let Some(volume) = prepared.volume {
                 state.body.volume = volume.get();
             }
             if changes_track && !ignore {
                 // A new track starts unless the same request explicitly pauses it.
-                state.body.paused = update.paused.unwrap_or(false);
-            } else if let Some(paused) = update.paused {
+                state.body.paused = prepared.paused.unwrap_or(false);
+            } else if let Some(paused) = prepared.paused {
                 state.body.paused = paused;
             }
-            if let Some(filters) = &update.filters {
-                state.body.filters = filters.clone();
+            if let Some(filters) = prepared.filters {
+                state.body.filters = filters;
             }
-            if let Some(voice) = &update.voice {
+            if let Some(voice) = prepared.voice {
                 // The channel being left is the one the previous voice state
                 // named, which the update has not overwritten yet.
-                let left = state.body.voice.channel_id.clone();
+                let left = state.body.voice.channel_id.take();
                 state.body.voice = voice.clone();
                 need_stop = true;
                 live_filter_update = None;
@@ -326,14 +409,14 @@ impl Player {
                     events.push(("voice.disconnected", voice_fields(left.as_deref(), "replaced")));
                 }
                 state.voice_generation += 1;
-                connect = Some((state.voice_generation, voice.clone()));
+                connect = Some((state.voice_generation, voice));
             }
             if need_stop {
                 self.stop(&mut state);
             } else if let Some(set) = live_filter_update {
                 state.pending_filters = Some(set);
             }
-            self.start(&mut state);
+            self.start(&mut state, &mut events);
             self.wake.notify_all();
             self.snapshot_locked(&state)
         };
@@ -355,7 +438,7 @@ impl Player {
         let loader = self.deps.loader.clone();
         let trimmed = identifier.trim().to_owned();
         let work = tokio::task::spawn_blocking(move || loader.load_shared(&trimmed));
-        let result = tokio::time::timeout(Duration::from_secs(30), work)
+        let result = tokio::time::timeout(self.load_timeout, work)
             .await
             .map_err(|_| PlayerError::Invalid("the source did not answer in time".into()))?
             .map_err(|error| PlayerError::Invalid(error.to_string()))??;
@@ -402,6 +485,8 @@ impl Player {
             }
             return;
         }
+        state.connecting = None;
+        let mut extra_events = Vec::new();
         let pending_event = match result {
             Ok(connection) => {
                 // A connection that reports itself ready is the moment the bot
@@ -416,7 +501,7 @@ impl Player {
                     None
                 };
                 state.connection = Some(connection);
-                self.start(&mut state);
+                self.start(&mut state, &mut extra_events);
                 event
             }
             Err(error) => Some((
@@ -426,6 +511,9 @@ impl Player {
         };
         drop(state);
         if let Some((kind, payload)) = pending_event {
+            self.event(kind, payload);
+        }
+        for (kind, payload) in extra_events {
             self.event(kind, payload);
         }
     }
@@ -475,16 +563,20 @@ impl Player {
 
     /// Starts pacing frames, if there is a track, a live connection and no
     /// thread already doing it.
-    fn start(self: &Arc<Self>, state: &mut State) {
+    fn start(
+        self: &Arc<Self>,
+        state: &mut State,
+        events: &mut Vec<(&'static str, serde_json::Value)>,
+    ) {
+        if state.closed || state.running || state.body.track.is_none() {
+            return;
+        }
+        let Some(connection) = state.connection.as_ref().filter(|c| c.connected()).cloned() else {
+            return;
+        };
         let Some(track) = state.body.track.clone() else {
             return;
         };
-        let Some(connection) = state.connection.clone() else {
-            return;
-        };
-        if state.closed || state.running || !connection.connected() {
-            return;
-        }
         state.generation += 1;
         state.running = true;
         state.live_filters = false;
@@ -493,17 +585,39 @@ impl Player {
         let position = state.body.state.position;
         let volume = state.body.volume;
         let filters = state.body.filters.clone();
+        let tempo = state.filter_set.tempo();
         let player = Arc::clone(self);
-        let spawned = thread::Builder::new()
-            .name(format!("player-{}", self.guild))
-            .spawn(move || player.run(generation, track, position, volume, filters, connection));
-        if spawned.is_err() {
+        let spawned =
+            thread::Builder::new().name(format!("player-{}", self.guild)).spawn(move || {
+                player.run(generation, track, position, volume, filters, tempo, connection)
+            });
+        if let Err(error) = spawned {
             state.running = false;
+            if let Some(failed_track) = state.body.track.take() {
+                state.started = false;
+                let track_json =
+                    serde_json::to_value(&failed_track).unwrap_or(serde_json::Value::Null);
+                self.counters.errors.fetch_add(1, Ordering::Relaxed);
+                events.push((
+                    "track.failed",
+                    json!({
+                        "track": track_json.clone(),
+                        "exception": {
+                            "message": error.to_string(),
+                            "severity": "fault",
+                            "cause": "rustlink.audio",
+                        },
+                    }),
+                ));
+                events
+                    .push(("track.ended", json!({ "track": track_json, "reason": "load_failed" })));
+            }
         }
     }
 
     /// Paces frames out of the decoder until the track ends or the player is
     /// stopped.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         self: Arc<Self>,
         generation: u64,
@@ -511,6 +625,7 @@ impl Player {
         position: i64,
         volume: i64,
         filters: Object,
+        tempo: f64,
         connection: Arc<dyn Connection>,
     ) {
         let mut frames = match self.deps.engine.start(&track, position, volume, &filters) {
@@ -530,9 +645,9 @@ impl Player {
             }
         }
         let mut output = VoiceOutput { connection: &connection, speaking: false };
-        self.pump(generation, &mut frames, position, volume, &filters, &mut output);
+        self.pump(generation, &mut frames, position, tempo, &mut output);
         let state = self.state.lock().unwrap();
-        if state.generation == generation && output.speaking {
+        if state.generation == generation && output.speaking && output.connection.connected() {
             let _ = output.connection.speaking(false);
         }
     }
@@ -542,23 +657,27 @@ impl Player {
         generation: u64,
         frames: &mut Box<dyn Frames>,
         position: i64,
-        volume: i64,
-        filters: &Object,
+        tempo: f64,
         output: &mut VoiceOutput,
     ) {
-        let tempo =
-            rustlink_audio::parse_filters(filters, volume).map(|set| set.tempo()).unwrap_or(1.0);
         let mut position = position as f64;
         let mut next = Instant::now();
         // One packet buffer for the life of the pump: a player runs for hours,
         // and one frame is written here every twenty milliseconds.
-        let mut frame = Vec::new();
+        let mut frame = Vec::with_capacity(1500);
         loop {
             // Pause consumes neither source data nor playback time.
             let mut pending_update = None;
             {
                 let mut state = self.state.lock().unwrap();
                 if state.generation != generation || state.closed {
+                    return;
+                }
+                if !output.connection.connected() {
+                    state.running = false;
+                    state.live_filters = false;
+                    state.pending_filters = None;
+                    output.speaking = false;
                     return;
                 }
                 if let Some(end) = state.end_time {
@@ -606,6 +725,13 @@ impl Player {
                     if state.generation != generation || state.closed {
                         return;
                     }
+                    if !output.connection.connected() {
+                        state.running = false;
+                        state.live_filters = false;
+                        state.pending_filters = None;
+                        output.speaking = false;
+                        return;
+                    }
                     if state.end_time.is_some_and(|end| state.body.state.position >= end) {
                         drop(state);
                         self.finish(generation, None);
@@ -623,6 +749,14 @@ impl Player {
                     }
                     if !output.speaking {
                         if let Err(error) = output.connection.speaking(true) {
+                            if matches!(error, rustlink_voice::VoiceError::NotReady)
+                                || !output.connection.connected()
+                            {
+                                state.running = false;
+                                state.live_filters = false;
+                                state.pending_filters = None;
+                                return;
+                            }
                             drop(state);
                             self.finish(generation, Some(AudioError::Transport(error.to_string())));
                             return;
@@ -630,6 +764,15 @@ impl Player {
                         output.speaking = true;
                     }
                     if let Err(error) = output.connection.write(&frame) {
+                        if matches!(error, rustlink_voice::VoiceError::NotReady)
+                            || !output.connection.connected()
+                        {
+                            state.running = false;
+                            state.live_filters = false;
+                            state.pending_filters = None;
+                            output.speaking = false;
+                            return;
+                        }
                         drop(state);
                         self.finish(generation, Some(AudioError::Transport(error.to_string())));
                         return;
@@ -679,31 +822,30 @@ impl Player {
 
     /// Reports the end of a track, and stops the player from pacing more of it.
     fn finish(&self, generation: u64, error: Option<AudioError>) {
-        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::with_capacity(2);
         {
             let mut state = self.state.lock().unwrap();
             if state.generation != generation || state.closed || state.body.track.is_none() {
                 return;
             }
-            let mut reason = "finished";
             let track = state.body.track.take();
             state.running = false;
             state.live_filters = false;
             state.pending_filters = None;
             state.started = false;
             if let Some(error) = error {
-                reason = "load_failed";
+                let track_json = serde_json::to_value(&track).unwrap_or(serde_json::Value::Null);
                 self.counters.errors.fetch_add(1, Ordering::Relaxed);
                 if matches!(error, AudioError::Stuck) {
                     events.push((
                         "track.stalled",
-                        json!({ "track": track.clone(), "threshold_ms": STUCK_MILLIS }),
+                        json!({ "track": track_json.clone(), "threshold_ms": STUCK_MILLIS }),
                     ));
                 } else {
                     events.push((
                         "track.failed",
                         json!({
-                            "track": track.clone(),
+                            "track": track_json.clone(),
                             "exception": {
                                 "message": error.to_string(),
                                 "severity": "fault",
@@ -712,8 +854,11 @@ impl Player {
                         }),
                     ));
                 }
+                events
+                    .push(("track.ended", json!({ "track": track_json, "reason": "load_failed" })));
+            } else {
+                events.push(("track.ended", json!({ "track": track, "reason": "finished" })));
             }
-            events.push(("track.ended", json!({ "track": track, "reason": reason })));
         }
         for (kind, payload) in events {
             self.event(kind, payload);
@@ -781,36 +926,81 @@ fn voice_fields(channel: Option<&str>, reason: &str) -> serde_json::Value {
     }
     serde_json::Value::Object(fields)
 }
-/// Checks a request before any of it is applied, so a request that cannot be
-/// honoured leaves the player exactly as it was.
-pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
-    if let Some(volume) = update.volume {
+fn clamp_position(position: i64, length: i64) -> i64 {
+    let clamped = position.max(0);
+    if length > 0 {
+        clamped.min(length)
+    } else {
+        clamped
+    }
+}
+
+/// Validated, pre-decoded representation of a [`PlayerUpdate`] so route
+/// admission and player application never decode track tokens or parse filters
+/// more than once.
+pub(crate) struct PreparedUpdate {
+    changes_track: bool,
+    decoded_track: Option<Track>,
+    query: Option<String>,
+    user_data: Option<Object>,
+    position: Option<Int64>,
+    end_time: Patch<Int64>,
+    volume: Option<Int64>,
+    paused: Option<bool>,
+    pub(crate) filters: Option<Object>,
+    voice: Option<VoiceState>,
+}
+
+fn validate_scalar_fields(
+    volume: Option<Int64>,
+    position: Option<Int64>,
+    end_time: Patch<Int64>,
+    filters: Option<&Object>,
+    voice: Option<&VoiceState>,
+) -> Result<(), PlayerError> {
+    if let Some(volume) = volume {
         if !(0..=1000).contains(&volume.get()) {
             return Err(PlayerError::Invalid("volume must be 0..1000".into()));
         }
     }
-    if let Some(position) = update.position {
+    if let Some(position) = position {
         if position.get() < 0 {
             return Err(PlayerError::Invalid("position must be nonnegative".into()));
         }
     }
-    if let Patch::Value(end_time) = &update.end_time {
+    if let Patch::Value(end_time) = end_time {
         if end_time.get() <= 0 {
             return Err(PlayerError::Invalid("end_ms must be positive or null".into()));
         }
     }
-    if let Some(filters) = &update.filters {
+    if let Some(filters) = filters {
         rustlink_audio::parse_filters(filters, 100)
             .map_err(|error| PlayerError::Invalid(error.to_string()))?;
     }
-    if let Some(voice) = &update.voice {
+    if let Some(voice) = voice {
         rustlink_voice::validate(voice).map_err(|error| PlayerError::Invalid(error.to_string()))?;
     }
-    let change = update.track_update();
-    if !change.token.is_missing() && change.query.is_some() {
+    Ok(())
+}
+
+/// Validates and consumes a [`PlayerUpdate`], decoding any track token once.
+pub(crate) fn prepare(update: PlayerUpdate) -> Result<PreparedUpdate, PlayerError> {
+    validate_scalar_fields(
+        update.volume,
+        update.position,
+        update.end_time,
+        update.filters.as_ref(),
+        update.voice.as_ref(),
+    )?;
+    let (token, query, user_data) = match update.track {
+        Patch::Value(spec) => (spec.token, spec.query, spec.user_data),
+        Patch::Null => (Patch::Null, None, None),
+        Patch::Missing => (Patch::Missing, None, None),
+    };
+    if !token.is_missing() && query.is_some() {
         return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
     }
-    if let Some(identifier) = &change.query {
+    if let Some(identifier) = &query {
         if identifier.trim().is_empty() {
             return Err(PlayerError::Invalid("query must not be empty".into()));
         }
@@ -818,7 +1008,54 @@ pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
             return Err(PlayerError::Invalid("query must contain 1..8192 bytes".into()));
         }
     }
-    if let Some(encoded) = change.token.value() {
+    let changes_track = !token.is_missing() || query.is_some();
+    let decoded_track = match token {
+        Patch::Value(encoded) => Some(
+            decode_track_owned(encoded).map_err(|error| PlayerError::Invalid(error.to_string()))?,
+        ),
+        Patch::Null | Patch::Missing => None,
+    };
+    Ok(PreparedUpdate {
+        changes_track,
+        decoded_track,
+        query,
+        user_data,
+        position: update.position,
+        end_time: update.end_time,
+        volume: update.volume,
+        paused: update.paused,
+        filters: update.filters,
+        voice: update.voice,
+    })
+}
+
+/// Checks a request before any of it is applied, so a request that cannot be
+/// honoured leaves the player exactly as it was.
+pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
+    validate_scalar_fields(
+        update.volume,
+        update.position,
+        update.end_time,
+        update.filters.as_ref(),
+        update.voice.as_ref(),
+    )?;
+    let (token, query) = match &update.track {
+        Patch::Value(spec) => (&spec.token, spec.query.as_deref()),
+        Patch::Null => (&Patch::Null, None),
+        Patch::Missing => (&Patch::Missing, None),
+    };
+    if !token.is_missing() && query.is_some() {
+        return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
+    }
+    if let Some(identifier) = query {
+        if identifier.trim().is_empty() {
+            return Err(PlayerError::Invalid("query must not be empty".into()));
+        }
+        if identifier.len() > 8192 {
+            return Err(PlayerError::Invalid("query must contain 1..8192 bytes".into()));
+        }
+    }
+    if let Some(encoded) = token.value() {
         decode_track(encoded).map_err(|error| PlayerError::Invalid(error.to_string()))?;
     }
     Ok(())
@@ -1413,5 +1650,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "identifier must resolve to one track");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_disconnect_preserves_loaded_track_without_emitting_failure() {
+        let (player, events, connection) = player(1000);
+        player
+            .update(
+                update(json!({ "track": { "token": sample().token }, "voice": voice() })),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for(&events, "track.started");
+
+        connection.close();
+        assert!(!arrives(&events, "track.failed", Duration::from_millis(120)));
+        assert!(!arrives(&events, "track.ended", Duration::from_millis(120)));
+        assert_eq!(
+            player.snapshot().track.as_ref().map(|t| t.metadata.title.as_str()),
+            Some("A Song"),
+            "transient transport loss must keep the track parked for voice failover"
+        );
+        player.destroy();
     }
 }

@@ -6,6 +6,26 @@
 //! stream to a separate probe process: a live stream is then identified without
 //! waiting for any audio at all.
 
+#[inline]
+fn be_u24(bytes: &[u8]) -> usize {
+    u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]) as usize
+}
+
+#[inline]
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+#[inline]
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+#[inline]
+fn le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 /// How much of a stream is read before giving up on finding a header.
 pub const MAX_PROBE: usize = 8 << 20;
 
@@ -30,7 +50,7 @@ pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
         return false;
     }
     if head.get(4..8) == Some(b"ftyp") {
-        return find_box(head, b"moov").is_none();
+        return !has_complete_box(head, b"moov");
     }
     if head.starts_with(b"OggS") {
         return size <= MAX_PROBE as i64;
@@ -38,7 +58,7 @@ pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
     if head.starts_with(b"fLaC") {
         let mut at = 4usize;
         while let Some(header) = head.get(at..at + 4) {
-            let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+            let length = be_u24(&header[1..4]);
             let Some(next) = at.checked_add(4).and_then(|n| n.checked_add(length)) else {
                 return false;
             };
@@ -58,9 +78,7 @@ pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
         let mut at = 12usize;
         while at + 8 <= head.len() {
             let kind = &head[at..at + 4];
-            let length =
-                u32::from_le_bytes([head[at + 4], head[at + 5], head[at + 6], head[at + 7]])
-                    as usize;
+            let length = le_u32(&head[at + 4..at + 8]) as usize;
             if kind == b"fmt " {
                 saw_fmt = head.len() >= at + 24;
             } else if kind == b"data" {
@@ -134,7 +152,7 @@ pub fn probe(head: &[u8], size: i64) -> Probe {
         return probe_mp3(head, size);
     }
     if head.get(4..8) == Some(b"ftyp") {
-        return probe_mp4(head, size);
+        return probe_mp4(head);
     }
     if head[0] == 0xff && head[1] & 0xf6 == 0xf0 {
         return probe_adts(head, size);
@@ -157,27 +175,24 @@ pub fn probe(head: &[u8], size: i64) -> Probe {
 /// A box is a length, a four character type and its body. A length of one means
 /// the real length follows the type, which is how a box larger than four
 /// gigabytes is written.
-fn for_each_box<'a>(mut data: &'a [u8], mut visit: impl FnMut(&[u8; 4], &'a [u8])) {
-    while data.len() >= 8 {
-        let size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let mut kind = [0u8; 4];
-        kind.copy_from_slice(&data[4..8]);
+fn for_each_box<'a>(mut data: &'a [u8], mut visit: impl FnMut(&[u8; 4], &'a [u8], bool)) {
+    while let Some((header, rest)) = data.split_first_chunk::<8>() {
+        let size = be_u32(&header[..4]) as usize;
+        let kind: &[u8; 4] = header[4..8].try_into().unwrap();
         let (body_start, body_len) = match size {
-            0 => (8, data.len() - 8),
+            0 => (8, rest.len()),
             1 => {
-                if data.len() < 16 {
+                let Some((large, _)) = rest.split_first_chunk::<8>() else {
                     return;
-                }
-                let large = u64::from_be_bytes([
-                    data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-                ]);
-                if large < 16 {
-                    return;
-                }
+                };
+                let large = u64::from_be_bytes(*large);
                 let Ok(large) = usize::try_from(large) else {
                     return;
                 };
-                (16, large - 16)
+                let Some(body_len) = large.checked_sub(16) else {
+                    return;
+                };
+                (16, body_len)
             }
             2..=7 => return,
             size => (8, size - 8),
@@ -185,7 +200,7 @@ fn for_each_box<'a>(mut data: &'a [u8], mut visit: impl FnMut(&[u8; 4], &'a [u8]
         let available = data.len() - body_start;
         let truncated = body_len > available;
         let take = body_len.min(available);
-        visit(&kind, &data[body_start..body_start + take]);
+        visit(kind, &data[body_start..body_start + take], !truncated && size != 0);
         if truncated || body_start + take >= data.len() {
             return;
         }
@@ -196,7 +211,7 @@ fn for_each_box<'a>(mut data: &'a [u8], mut visit: impl FnMut(&[u8; 4], &'a [u8]
 /// Finds a box by type among a set of boxes.
 fn find_box<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     let mut found = None;
-    for_each_box(data, |kind, body| {
+    for_each_box(data, |kind, body, _| {
         if kind == want && found.is_none() {
             found = Some(body);
         }
@@ -204,66 +219,82 @@ fn find_box<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
     found
 }
 
-fn probe_mp4(head: &[u8], size: i64) -> Probe {
+fn has_complete_box(data: &[u8], want: &[u8; 4]) -> bool {
+    let mut complete = false;
+    for_each_box(data, |kind, _, is_complete| {
+        if kind == want && is_complete {
+            complete = true;
+        }
+    });
+    complete
+}
+
+fn probe_mp4(head: &[u8]) -> Probe {
     let mut out = Probe::default();
     // A stream that has not been indexed yet has no movie box in its head, which
     // is what a live broadcast looks like.
     let Some(moov) = find_box(head, b"moov") else {
         return out;
     };
-    out.audio = moov_has_audio(moov);
+    let (audio, audio_mdhd) = moov_audio_info(moov);
+    out.audio = audio;
     if let Some(mvhd) = find_box(moov, b"mvhd") {
         if let Some((timescale, duration)) = read_mvhd(mvhd) {
-            if timescale > 0 {
+            if timescale > 0 && duration > 0 {
+                out.duration_ms = milliseconds(duration as u128, timescale as u64);
+            }
+        }
+    }
+    if out.duration_ms == 0 {
+        if let Some((timescale, duration)) = audio_mdhd {
+            if timescale > 0 && duration > 0 {
                 out.duration_ms = milliseconds(duration as u128, timescale as u64);
             }
         }
     }
     read_mp4_tags(moov, &mut out);
-    if out.duration_ms == 0 && size > 0 && !out.audio {
-        out.duration_ms = 0;
-    }
     out
 }
 
-fn moov_has_audio(moov: &[u8]) -> bool {
+fn moov_audio_info(moov: &[u8]) -> (bool, Option<(u32, u64)>) {
     let mut audio = false;
-    for_each_box(moov, |kind, body| {
-        if kind != b"trak" {
+    let mut mdhd = None;
+    for_each_box(moov, |kind, body, _| {
+        if kind != b"trak" || audio {
             return;
         }
-        if let Some(handler) = find_box(body, b"mdia").and_then(|mdia| find_box(mdia, b"hdlr")) {
-            // The handler type sits after a version, some flags and a
-            // pre-defined field.
-            if handler.len() >= 12 && &handler[8..12] == b"soun" {
-                audio = true;
+        if let Some(mdia) = find_box(body, b"mdia") {
+            if let Some(handler) = find_box(mdia, b"hdlr") {
+                // The handler type sits after a version, some flags and a
+                // pre-defined field.
+                if handler.get(8..12) == Some(b"soun") {
+                    audio = true;
+                    mdhd = find_box(mdia, b"mdhd").and_then(read_mvhd);
+                }
             }
         }
     });
-    audio
+    (audio, mdhd)
 }
 
 /// Reads the timescale and duration out of a movie header.
 fn read_mvhd(mvhd: &[u8]) -> Option<(u32, u64)> {
-    let version = *mvhd.first()?;
-    if version == 1 {
-        // Version one widens the creation and modification times to 64 bits,
-        // which pushes the timescale to byte 20 and the duration to 24.
-        let timescale = u32::from_be_bytes(mvhd.get(20..24)?.try_into().ok()?);
-        let duration = u64::from_be_bytes(mvhd.get(24..32)?.try_into().ok()?);
-        (duration != u64::MAX).then_some((timescale, duration))
-    } else if version == 0 {
-        let timescale = u32::from_be_bytes(mvhd.get(12..16)?.try_into().ok()?);
-        let duration = u32::from_be_bytes(mvhd.get(16..20)?.try_into().ok()?) as u64;
-        (duration != u32::MAX as u64).then_some((timescale, duration))
-    } else {
-        None
+    match *mvhd.first()? {
+        1 => {
+            // Version one widens the creation and modification times to 64 bits,
+            // which pushes the timescale to byte 20 and the duration to 24.
+            let timescale = be_u32(mvhd.get(20..24)?);
+            let duration = u64::from_be_bytes(mvhd.get(24..32)?.try_into().ok()?);
+            (duration != u64::MAX).then_some((timescale, duration))
+        }
+        0 => {
+            let timescale = be_u32(mvhd.get(12..16)?);
+            let duration = u64::from(be_u32(mvhd.get(16..20)?));
+            (duration != u64::from(u32::MAX)).then_some((timescale, duration))
+        }
+        _ => None,
     }
 }
-
-/// The four character tags worth reading, and which field each one fills.
-const MP4_TAGS: [([u8; 4], &str); 3] =
-    [(*b"\xa9nam", "title"), (*b"\xa9ART", "artist"), (*b"covr", "artwork")];
 
 fn read_mp4_tags(moov: &[u8], out: &mut Probe) {
     let Some(ilst) = find_box(moov, b"udta")
@@ -281,49 +312,74 @@ fn read_mp4_tags(moov: &[u8], out: &mut Probe) {
     else {
         return;
     };
-    for_each_box(ilst, |kind, body| {
-        let Some((_, field)) = MP4_TAGS.iter().find(|(tag, _)| tag == kind) else {
-            return;
+    for_each_box(ilst, |kind, body, _| {
+        let is_title = match kind {
+            b"\xa9nam" => true,
+            b"\xa9ART" => false,
+            // Skip artwork (`covr`) and all unrelated atoms without scanning children.
+            _ => return,
         };
         let Some(data) = find_box(body, b"data") else {
             return;
         };
-        // A data box is a type, a locale, then the value itself.
         let Some(value) = data.get(8..) else {
             return;
         };
-        match *field {
-            "title" => out.title = decode_text(value),
-            "artist" => out.artist = decode_text(value),
-            // Artwork is a picture rather than text, and the node does not carry
-            // one out of a file it is about to stream.
-            _ => {}
+        let data_type = be_u32(&data[..4]);
+        let decoded = match data_type {
+            1 => decode_text(value),
+            2 => {
+                if value.starts_with(&[0xff, 0xfe]) || value.starts_with(&[0xfe, 0xff]) {
+                    decode_text(value)
+                } else {
+                    decode_utf16(value, false)
+                }
+            }
+            _ => return,
+        };
+        if is_title {
+            out.title = decoded;
+        } else {
+            out.artist = decoded;
         }
     });
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let pairs = bytes.as_chunks::<2>().0.iter().map(|pair| {
+        if little_endian {
+            u16::from_le_bytes(*pair)
+        } else {
+            u16::from_be_bytes(*pair)
+        }
+    });
+    let raw: String =
+        char::decode_utf16(pairs).map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
+    raw.trim_matches('\0').trim().to_owned()
 }
 
 /// Decodes a tag value that may be UTF-8 or UTF-16.
 fn decode_text(value: &[u8]) -> String {
     // A UTF-16 value starts with a byte order mark, which is what tells it apart
     // from UTF-8 that happens to hold zero bytes.
-    if value.len() >= 2 && value[0] == 0xff && value[1] == 0xfe {
-        let units: Vec<u16> =
-            value[2..].as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
-        return String::from_utf16_lossy(&units).trim().to_string();
+    if let Some(rest) = value.strip_prefix(&[0xff, 0xfe]) {
+        return decode_utf16(rest, true);
     }
-    if value.len() >= 2 && value[0] == 0xfe && value[1] == 0xff {
-        let units: Vec<u16> =
-            value[2..].as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes(*pair)).collect();
-        return String::from_utf16_lossy(&units).trim().to_string();
+    if let Some(rest) = value.strip_prefix(&[0xfe, 0xff]) {
+        return decode_utf16(rest, false);
     }
-    String::from_utf8_lossy(value).trim().to_string()
+    String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned()
 }
 
 fn probe_flac(head: &[u8]) -> Probe {
-    let mut out = Probe { audio: true, ..Probe::default() };
+    let mut out = Probe::default();
+    if head.len() < 42 || (head[4] & 0x7f) != 0 || be_u24(&head[5..8]) != 34 {
+        return out;
+    }
+    out.audio = true;
     let mut at = 4;
     while let Some(header) = head.get(at..at + 4) {
-        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        let length = be_u24(&header[1..4]);
         let Some(block) = head.get(at + 4..at + 4 + length) else {
             break;
         };
@@ -350,17 +406,11 @@ fn read_vorbis_comment(data: &[u8], out: &mut Probe) {
     if data.len() < 8 {
         return;
     }
-    let vendor = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let Some(after_vendor) = 4usize.checked_add(vendor) else {
+    let vendor = le_u32(&data[..4]) as usize;
+    let Some(count_end) = 4usize.checked_add(vendor).and_then(|n| n.checked_add(4)) else {
         return;
     };
-    let Some(count_end) = after_vendor.checked_add(4) else {
-        return;
-    };
-    let Some(count) = data
-        .get(after_vendor..count_end)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    else {
+    let Some(count) = data.get(count_end - 4..count_end).map(|b| le_u32(b) as usize) else {
         return;
     };
     let mut at = count_end;
@@ -368,9 +418,7 @@ fn read_vorbis_comment(data: &[u8], out: &mut Probe) {
         let Some(len_end) = at.checked_add(4) else {
             return;
         };
-        let Some(length) =
-            data.get(at..len_end).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-        else {
+        let Some(length) = data.get(at..len_end).map(|b| le_u32(b) as usize) else {
             return;
         };
         let Some(field_end) = len_end.checked_add(length) else {
@@ -380,49 +428,55 @@ fn read_vorbis_comment(data: &[u8], out: &mut Probe) {
             return;
         };
         at = field_end;
-        let field = String::from_utf8_lossy(field);
-        let Some((name, value)) = field.split_once('=') else {
-            continue;
-        };
-        match name.to_ascii_uppercase().as_str() {
-            "TITLE" => out.title = value.trim().to_string(),
-            "ARTIST" => out.artist = value.trim().to_string(),
-            _ => {}
+        // Match ASCII key prefixes before UTF-8 decoding so large embedded
+        // `METADATA_BLOCK_PICTURE` comments are skipped in O(1) without copying.
+        if field.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"TITLE=")) {
+            out.title = String::from_utf8_lossy(&field[6..]).trim().to_owned();
+        } else if field.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ARTIST=")) {
+            out.artist = String::from_utf8_lossy(&field[7..]).trim().to_owned();
         }
     }
 }
 
 fn probe_ogg(head: &[u8], size: i64) -> Probe {
     let mut out = Probe::default();
-    // The first page's payload names the codec and carries the rate.
-    let segments = head.get(26).copied().unwrap_or(0) as usize;
-    let payload = head.get(27 + segments..).unwrap_or_default();
+    if head.len() < 27 || head[4] != 0 {
+        return out;
+    }
+    let serial: [u8; 4] = head[14..18].try_into().unwrap();
+    let segments = head[26] as usize;
+    let Some(table) = head.get(27..27 + segments) else {
+        return out;
+    };
+    let page1_body: usize = table.iter().map(|&n| usize::from(n)).sum();
+    let page1_end = 27 + segments + page1_body;
+    let Some(payload) = head.get(27 + segments..page1_end) else {
+        return out;
+    };
     let mut rate = 0i64;
-    if payload.starts_with(b"OpusHead") {
+    if payload.starts_with(b"OpusHead") && payload.len() >= 19 {
         out.audio = true;
         // Opus is always decoded at 48 kHz.
         rate = 48_000;
-    } else if payload.starts_with(&[0x01, b'v', b'o', b'r', b'b', b'i', b's']) {
+    } else if payload.starts_with(&[0x01, b'v', b'o', b'r', b'b', b'i', b's'])
+        && payload.len() >= 16
+    {
         out.audio = true;
-        // The rate is a little endian integer after the version and the channel
-        // count.
-        if let Some(bytes) = payload.get(12..16) {
-            rate = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
-        }
+        rate = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as i64;
     } else if payload.starts_with(b"\x7fFLAC") {
         out.audio = true;
+    }
+    if out.audio {
+        read_ogg_tags(&head[page1_end..], &serial, &mut out);
     }
     // The length of an Ogg stream is only stated by the granule of its last
     // page, so a duration needs the tail. A stream with an unknown length is
     // reported as live rather than guessed at.
     if rate > 0 && size > 0 && head.len() as i64 == size {
-        if let Some(granule) = last_granule(head) {
+        if let Some(granule) = last_granule(head, &serial) {
             if granule > 0 {
                 let skip = if payload.starts_with(b"OpusHead") {
-                    payload
-                        .get(10..12)
-                        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as i64)
-                        .unwrap_or(0)
+                    u16::from_le_bytes([payload[10], payload[11]]) as i64
                 } else {
                     0
                 };
@@ -434,10 +488,31 @@ fn probe_ogg(head: &[u8], size: i64) -> Probe {
     out
 }
 
+fn read_ogg_tags(data: &[u8], serial: &[u8; 4], out: &mut Probe) {
+    if data.len() < 27 || &data[..4] != b"OggS" || data[4] != 0 || &data[14..18] != serial {
+        return;
+    }
+    let segments = data[26] as usize;
+    let Some(table) = data.get(27..27 + segments) else {
+        return;
+    };
+    let body_len: usize = table.iter().map(|&n| usize::from(n)).sum();
+    let end = (27 + segments + body_len).min(data.len());
+    let Some(body) = data.get(27 + segments..end) else {
+        return;
+    };
+    if let Some(tags) = body.strip_prefix(b"OpusTags") {
+        read_vorbis_comment(tags, out);
+    } else if let Some(tags) = body.strip_prefix(&[0x03, b'v', b'o', b'r', b'b', b'i', b's']) {
+        read_vorbis_comment(tags, out);
+    }
+}
+
 /// Reads an end-of-stream granule only when its complete page is present.
-fn last_granule(data: &[u8]) -> Option<i64> {
+fn last_granule(data: &[u8], serial: &[u8; 4]) -> Option<i64> {
     let mut at = 0usize;
-    let mut granule = None;
+    let mut last_positive = None;
+    let mut saw_eos = false;
     while at + 27 <= data.len() {
         if &data[at..at + 4] != b"OggS" {
             break;
@@ -451,40 +526,51 @@ fn last_granule(data: &[u8]) -> Option<i64> {
         if at + header + body > data.len() {
             break;
         }
-        let bytes = data.get(at + 6..at + 14)?;
-        granule = (data[at + 5] & 4 != 0).then(|| i64::from_le_bytes(bytes.try_into().unwrap()));
+        if &data[at + 14..at + 18] == serial {
+            let bytes = data.get(at + 6..at + 14)?;
+            let g = i64::from_le_bytes(bytes.try_into().unwrap());
+            if g > 0 {
+                last_positive = Some(g);
+            }
+            if data[at + 5] & 4 != 0 {
+                saw_eos = true;
+            }
+        }
         at += header + body;
     }
-    granule
+    saw_eos.then_some(last_positive).flatten()
 }
 
 fn probe_wav(head: &[u8], size: i64) -> Probe {
     let mut out = Probe::default();
+    let mut format_tag = 0u16;
     let mut rate = 0u32;
     let mut channels = 0u32;
     let mut bits = 0u32;
     let mut avg_bytes_per_sec = 0u32;
     let mut data_len = 0i64;
+    let mut saw_data = false;
     let mut streaming_data = false;
     let mut at = 12usize;
     while at + 8 <= head.len() {
         let kind = &head[at..at + 4];
-        let raw_len = u32::from_le_bytes([head[at + 4], head[at + 5], head[at + 6], head[at + 7]]);
+        let raw_len = le_u32(&head[at + 4..at + 8]);
         let length = raw_len as usize;
         let body_end = at.saturating_add(8).saturating_add(length).min(head.len());
         let body = head.get(at + 8..body_end).unwrap_or_default();
         match kind {
-            b"fmt " => {
-                out.audio = true;
-                if body.len() >= 16 {
-                    channels = u16::from_le_bytes([body[2], body[3]]) as u32;
-                    rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-                    avg_bytes_per_sec = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-                    bits = u16::from_le_bytes([body[14], body[15]]) as u32;
+            b"fmt " if body.len() >= 16 => {
+                format_tag = le_u16(&body[0..2]);
+                channels = u32::from(le_u16(&body[2..4]));
+                rate = le_u32(&body[4..8]);
+                avg_bytes_per_sec = le_u32(&body[8..12]);
+                bits = u32::from(le_u16(&body[14..16]));
+                if channels > 0 && rate > 0 {
+                    out.audio = true;
                 }
             }
             b"data" => {
-                out.audio = true;
+                saw_data = true;
                 if raw_len == u32::MAX {
                     streaming_data = true;
                 } else {
@@ -507,20 +593,31 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
         }
         at = next;
     }
-    let bytes_per_sec =
-        if rate > 0 && channels > 0 && bits > 0 && (channels * bits).is_multiple_of(8) {
-            u64::from(channels * bits / 8) * u64::from(rate)
-        } else {
-            u64::from(avg_bytes_per_sec)
-        };
+    let is_pcm_like = matches!(format_tag, 1 | 3 | 0xfffe);
+    let bytes_per_sec = if is_pcm_like
+        && rate > 0
+        && channels > 0
+        && bits > 0
+        && (channels * bits).is_multiple_of(8)
+    {
+        u64::from(channels * bits / 8) * u64::from(rate)
+    } else {
+        u64::from(avg_bytes_per_sec)
+    };
     let payload_bytes = if data_len > 0 {
         data_len
-    } else if streaming_data && size <= 0 {
+    } else if streaming_data {
+        if size > 0 {
+            size.saturating_sub(44)
+        } else {
+            0
+        }
+    } else if saw_data {
         0
     } else {
         size.saturating_sub(44)
     };
-    if bytes_per_sec > 0 && payload_bytes > 0 {
+    if out.audio && bytes_per_sec > 0 && payload_bytes > 0 {
         out.duration_ms = milliseconds(payload_bytes as u128, bytes_per_sec);
     }
     out
@@ -533,19 +630,18 @@ fn read_riff_info(body: &[u8], out: &mut Probe) {
     let mut at = 4usize;
     while at + 8 <= body.len() {
         let kind = &body[at..at + 4];
-        let length =
-            u32::from_le_bytes([body[at + 4], body[at + 5], body[at + 6], body[at + 7]]) as usize;
+        let length = le_u32(&body[at + 4..at + 8]) as usize;
         let value = body.get(at + 8..at + 8 + length).unwrap_or_default();
         match kind {
             b"INAM" => {
-                out.title = String::from_utf8_lossy(value).trim_matches('\0').trim().to_string()
+                out.title = String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned()
             }
             b"IART" => {
-                out.artist = String::from_utf8_lossy(value).trim_matches('\0').trim().to_string()
+                out.artist = String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned()
             }
             _ => {}
         }
-        at += 8 + length + (length & 1);
+        at = at.saturating_add(8).saturating_add(length).saturating_add(length & 1);
     }
 }
 
@@ -606,8 +702,57 @@ fn find_mpeg_sync(data: &[u8]) -> Option<&[u8]> {
     None
 }
 
+fn deunsync(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !data.windows(2).any(|w| w == [0xff, 0x00]) {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut idx = 0;
+    while idx < data.len() {
+        out.push(data[idx]);
+        if data[idx] == 0xff && data.get(idx + 1) == Some(&0x00) {
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Reads the frames of an ID3v2 tag that name the track.
-fn read_id3(data: &[u8], version: u8, flags: u8, out: &mut Probe) {
+fn read_id3(raw_data: &[u8], version: u8, flags: u8, out: &mut Probe) {
+    let whole_unsync = version <= 3 && (flags & 0x80 != 0);
+    let data_cow =
+        if whole_unsync { deunsync(raw_data) } else { std::borrow::Cow::Borrowed(raw_data) };
+    let data = data_cow.as_ref();
+
+    if version == 2 {
+        if flags & 0x40 != 0 {
+            return;
+        }
+        let mut at = 0usize;
+        while at + 6 <= data.len() {
+            let id = &data[at..at + 3];
+            if !id.iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()) {
+                return;
+            }
+            let length = be_u24(&data[at + 3..at + 6]);
+            let Some(body_end) = at.checked_add(6).and_then(|n| n.checked_add(length)) else {
+                return;
+            };
+            let Some(body) = data.get(at + 6..body_end) else {
+                return;
+            };
+            match id {
+                b"TT2" => out.title = decode_id3_text(body),
+                b"TP1" => out.artist = decode_id3_text(body),
+                _ => {}
+            }
+            at = body_end;
+        }
+        return;
+    }
+
     let mut at = 0usize;
     if flags & 0x40 != 0 {
         let Some(ext_hdr) = data.get(..4) else {
@@ -616,9 +761,7 @@ fn read_id3(data: &[u8], version: u8, flags: u8, out: &mut Probe) {
         let ext_len = if version == 4 {
             synchsafe(ext_hdr)
         } else {
-            4usize.saturating_add(u32::from_be_bytes([
-                ext_hdr[0], ext_hdr[1], ext_hdr[2], ext_hdr[3],
-            ]) as usize)
+            4usize.saturating_add(be_u32(ext_hdr) as usize)
         };
         if ext_len < 4 || ext_len > data.len() {
             return;
@@ -635,47 +778,89 @@ fn read_id3(data: &[u8], version: u8, flags: u8, out: &mut Probe) {
         let length = if version == 4 {
             synchsafe(&data[at + 4..at + 8])
         } else {
-            u32::from_be_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]) as usize
+            be_u32(&data[at + 4..at + 8]) as usize
         };
+        let fmt_flags = data[at + 9];
         let Some(body_end) = at.checked_add(10).and_then(|n| n.checked_add(length)) else {
             return;
         };
-        let Some(body) = data.get(at + 10..body_end) else {
+        let Some(mut body) = data.get(at + 10..body_end) else {
             return;
         };
-        // The frame body opens with the encoding of the text it carries.
-        let text = decode_id3_text(body);
-        match id {
-            b"TIT2" => out.title = text,
-            b"TPE1" => out.artist = text,
-            _ => {}
-        }
         at = body_end;
+        // Filter frame IDs before decoding text so multi-hundred-KiB `APIC`
+        // cover art frames are skipped in O(1) without allocating a String.
+        let is_title = match id {
+            b"TIT2" => true,
+            b"TPE1" => false,
+            _ => continue,
+        };
+        if version == 3 {
+            // Skip compressed (0x80) or encrypted (0x40) frames; strip group ID (0x20).
+            if fmt_flags & 0xc0 != 0 {
+                continue;
+            }
+            if fmt_flags & 0x20 != 0 {
+                let Some(rest) = body.get(1..) else { continue };
+                body = rest;
+            }
+        } else if version == 4 {
+            // Skip compressed (0x08) or encrypted (0x04) frames.
+            if fmt_flags & 0x0c != 0 {
+                continue;
+            }
+            if fmt_flags & 0x40 != 0 {
+                let Some(rest) = body.get(1..) else { continue };
+                body = rest;
+            }
+            if fmt_flags & 0x01 != 0 {
+                let Some(rest) = body.get(4..) else { continue };
+                body = rest;
+            }
+        }
+        let frame_cow = if version == 4 && ((flags & 0x80 != 0) || (fmt_flags & 0x02 != 0)) {
+            deunsync(body)
+        } else {
+            std::borrow::Cow::Borrowed(body)
+        };
+        let decoded = decode_id3_text(frame_cow.as_ref());
+        if is_title {
+            out.title = decoded;
+        } else {
+            out.artist = decoded;
+        }
     }
 }
 
 fn decode_id3_text(body: &[u8]) -> String {
-    let Some(encoding) = body.first() else {
+    let Some((&encoding, value)) = body.split_first() else {
         return String::new();
     };
-    let value = &body[1..];
-    match encoding {
+    let raw = match encoding {
         // UTF-16 with a byte order mark, little or big endian.
-        1 => decode_text(value).trim_matches('\0').trim().to_string(),
-        2 => {
-            let units: Vec<u16> =
-                value.as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes(*pair)).collect();
-            String::from_utf16_lossy(&units).trim_matches('\0').trim().to_string()
+        1 => decode_text(value),
+        // UTF-16BE without a byte order mark.
+        2 => decode_utf16(value, false),
+        // UTF-8.
+        3 => String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned(),
+        // ISO-8859-1 (Latin-1), trimmed before decoding bytes to chars.
+        _ => {
+            let trimmed = value.iter().position(|&b| b != 0 && !b.is_ascii_whitespace()).map_or(
+                &[][..],
+                |start| {
+                    let end = value
+                        .iter()
+                        .rposition(|&b| b != 0 && !b.is_ascii_whitespace())
+                        .map_or(start, |i| i + 1);
+                    &value[start..end]
+                },
+            );
+            trimmed.iter().map(|&byte| byte as char).collect()
         }
-        3 => String::from_utf8_lossy(value).trim_matches('\0').trim().to_string(),
-        // Latin-1, which is what a byte is.
-        _ => value
-            .iter()
-            .map(|byte| *byte as char)
-            .collect::<String>()
-            .trim_matches('\0')
-            .trim()
-            .to_string(),
+    };
+    match raw.find('\0') {
+        Some(pos) => raw[..pos].trim().to_owned(),
+        None => raw,
     }
 }
 
@@ -778,7 +963,10 @@ fn probe_adts(head: &[u8], size: i64) -> Probe {
     }
     let rate_index = ((head[2] >> 2) & 0xf) as usize;
     let rate = ADTS_RATES.get(rate_index).copied().unwrap_or(0);
-    if rate == 0 {
+    let min_hdr = if head[1] & 1 == 0 { 9 } else { 7 };
+    let frame_len =
+        (((head[3] as i64) & 0x3) << 11) | ((head[4] as i64) << 3) | ((head[5] as i64) >> 5);
+    if rate == 0 || frame_len < min_hdr {
         return out;
     }
     out.audio = true;
@@ -787,14 +975,9 @@ fn probe_adts(head: &[u8], size: i64) -> Probe {
     // the header implies.
     let channels = ((head[2] & 0x1) << 2) | (head[3] >> 6);
     if size > 0 && channels > 0 {
-        // 1024 samples a frame at the rate, and the frame length is stated in
-        // every header; the first one is a fair average.
-        let frame_len =
-            (((head[3] as i64) & 0x3) << 11) | ((head[4] as i64) << 3) | ((head[5] as i64) >> 5);
-        if frame_len > 0 {
-            let frames = size / frame_len;
-            out.duration_ms = milliseconds(frames as u128 * 1024, rate as u64);
-        }
+        let blocks = u128::from(head[6] & 0x03) + 1;
+        let frames = size / frame_len;
+        out.duration_ms = milliseconds(frames as u128 * blocks * 1024, rate as u64);
     }
     out
 }
@@ -913,7 +1096,7 @@ mod tests {
         page.push(1);
         page.push(255);
         page.resize(27 + 1 + 255, 0);
-        assert_eq!(last_granule(&page), Some(48_000));
+        assert_eq!(last_granule(&page, &[1, 2, 3, 4]), Some(48_000));
     }
 
     #[test]

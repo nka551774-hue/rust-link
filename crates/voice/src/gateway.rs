@@ -82,36 +82,11 @@ impl DiscordConnection {
         if !self.connected() {
             return Err(VoiceError::NotReady);
         }
-        let Command::Audio(packet) = command else {
-            // Speaking and Close take the reserved slots, so they only fail when
-            // the gateway task is gone.
-            return self
-                .commands
-                .try_send(command)
-                .map_err(|_| VoiceError::Gateway("voice command queue unavailable".into()));
-        };
-        // A gateway task that is held up (a heartbeat waiting on a stalled TCP
-        // write, say) must cost a few frames, not the track: the frame is
-        // dropped and the player carries on. A task that is really gone shows
-        // as a closed queue below, and a dead connection stops answering its
-        // heartbeat and is closed by the gateway itself.
-        if self.commands.capacity() <= CONTROL_RESERVE {
-            self.drop_frame(packet);
-            return Ok(());
-        }
-        match self.commands.try_send(Command::Audio(packet)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(Command::Audio(packet))) => {
-                self.drop_frame(packet);
-                Ok(())
-            }
-            Err(error) => {
-                if let Command::Audio(packet) = error.into_inner() {
-                    self.recycle(packet);
-                }
-                Err(VoiceError::Gateway("voice command queue unavailable".into()))
-            }
-        }
+        // Speaking and Close take the reserved slots, so they only fail when
+        // the gateway task is gone.
+        self.commands
+            .try_send(command)
+            .map_err(|_| VoiceError::Gateway("voice command queue unavailable".into()))
     }
 
     fn drop_frame(&self, packet: Vec<u8>) {
@@ -142,7 +117,27 @@ impl Connection for DiscordConnection {
         if !self.connected() {
             return Err(VoiceError::NotReady);
         }
-        self.command(Command::Audio(self.packet(payload)))
+        if self.commands.is_closed() {
+            return Err(VoiceError::Gateway("voice command queue unavailable".into()));
+        }
+        let packet = self.packet(payload);
+        if self.commands.capacity() <= CONTROL_RESERVE {
+            self.drop_frame(packet);
+            return Ok(());
+        }
+        match self.commands.try_send(Command::Audio(packet)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(Command::Audio(packet))) => {
+                self.drop_frame(packet);
+                Ok(())
+            }
+            Err(error) => {
+                if let Command::Audio(packet) = error.into_inner() {
+                    self.recycle(packet);
+                }
+                Err(VoiceError::Gateway("voice command queue unavailable".into()))
+            }
+        }
     }
     fn speaking(&self, on: bool) -> Result<(), VoiceError> {
         self.command(Command::Speaking(on))
@@ -180,7 +175,6 @@ struct Gateway {
     commands: mpsc::Receiver<Command>,
     probe: Option<Probe>,
     socket: Option<Arc<UdpSocket>>,
-    udp_buffer: Box<[u8; 2048]>,
     transport: Option<Transport>,
     ssrc: Option<u32>,
     mode: Option<Mode>,
@@ -251,7 +245,6 @@ async fn connect_url(
             commands: receiver,
             probe: None,
             socket: None,
-            udp_buffer: Box::new([0u8; 2048]),
             transport: None,
             ssrc: None,
             mode: None,
@@ -310,8 +303,13 @@ impl Gateway {
         on_close(closed);
     }
 
-    async fn send(&mut self, value: Value) -> Result<(), VoiceError> {
-        self.send_message(Message::Text(value.to_string().into())).await
+    async fn send(&mut self, value: &impl serde::Serialize) -> Result<(), VoiceError> {
+        let text = serde_json::to_string(value).map_err(gateway_error)?;
+        self.send_text(text).await
+    }
+
+    async fn send_text(&mut self, text: String) -> Result<(), VoiceError> {
+        self.send_message(Message::Text(text.into())).await
     }
 
     async fn send_message(&mut self, message: Message) -> Result<(), VoiceError> {
@@ -323,17 +321,19 @@ impl Gateway {
 
     async fn outbound(&mut self, messages: Vec<Outbound>) -> Result<(), VoiceError> {
         for message in messages {
-            match &message {
-                Outbound::Json(value) => log::debug!("voice gateway sent op {}", value["op"]),
-                Outbound::Binary(bytes) => log::debug!(
-                    "voice gateway sent binary op {} ({} bytes)",
-                    bytes.first().copied().unwrap_or_default(),
-                    bytes.len()
-                ),
-            }
             match message {
-                Outbound::Json(value) => self.send(value).await?,
-                Outbound::Binary(bytes) => self.send_message(Message::Binary(bytes.into())).await?,
+                Outbound::Json(value) => {
+                    log::debug!("voice gateway sent op {}", value["op"]);
+                    self.send(&value).await?;
+                }
+                Outbound::Binary(bytes) => {
+                    log::debug!(
+                        "voice gateway sent binary op {} ({} bytes)",
+                        bytes.first().copied().unwrap_or_default(),
+                        bytes.len()
+                    );
+                    self.send_message(Message::Binary(bytes.into())).await?;
+                }
             }
         }
         Ok(())
@@ -344,6 +344,7 @@ impl Gateway {
             return Err(local_close());
         }
         let deadline = self.next_heartbeat.unwrap_or_else(|| Instant::now() + HANDSHAKE_TIMEOUT);
+        let mut udp_discard = [0u8; 64];
         tokio::select! {
             biased;
             message = self.stream.next() => {
@@ -362,15 +363,19 @@ impl Gateway {
                         } else {
                             log::debug!("voice gateway received op {op} {}", value["d"]);
                         }
-                        self.json(op,&value["d"]).await?;
+                        self.json(op, &value["d"]).await?;
                     }
                     Message::Binary(bytes) => {
-                        if bytes.len() < 3 { return Err(VoiceError::Gateway("truncated binary gateway message".into())); }
-                        self.sequence = u16::from_be_bytes([bytes[0],bytes[1]]) as i64;
-                        log::debug!("voice gateway received binary op {} ({} bytes)", bytes[2], bytes.len());
-                        let outgoing = self.dave.handle_binary(bytes[2],&bytes[3..]).map_err(dave_error)?;
+                        let &[s0, s1, op, ref payload @ ..] = bytes.as_ref() else {
+                            return Err(VoiceError::Gateway("truncated binary gateway message".into()));
+                        };
+                        self.sequence = i64::from(u16::from_be_bytes([s0, s1]));
+                        log::debug!("voice gateway received binary op {op} ({} bytes)", bytes.len());
+                        let outgoing = self.dave.handle_binary(op, payload).map_err(dave_error)?;
                         self.outbound(outgoing).await?;
-                        if bytes[2] == 25 && !self.dave.ready() {
+                        if self.dave.ready() {
+                            self.alone_at = None;
+                        } else if op == 25 {
                             self.alone_at = Some(Instant::now() + ALONE_GRACE);
                         }
                     }
@@ -382,8 +387,8 @@ impl Gateway {
                             .map_err(gateway_error)?;
                     }
                     Message::Close(frame) => {
-                        let (code,reason) = frame.map(|f| (u16::from(f.code),f.reason.to_string())).unwrap_or((1000,String::new()));
-                        return Err(VoiceError::Closed {code,reason,by_remote:true});
+                        let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1000, String::new()));
+                        return Err(VoiceError::Closed { code, reason, by_remote: true });
                     }
                     _ => {},
                 }
@@ -391,8 +396,8 @@ impl Gateway {
             _ = tokio::time::sleep_until(deadline), if self.next_heartbeat.is_some() => {
                 if self.outstanding.is_some() { return Err(VoiceError::Gateway("voice heartbeat was not acknowledged".into())); }
                 let nonce = now_millis();
-                self.send(json!({"op":3,"d":{"t":nonce,"seq_ack":self.sequence}})).await?;
-                self.outstanding = Some((nonce,Instant::now()));
+                self.send_text(format!(r#"{{"op":3,"d":{{"t":{nonce},"seq_ack":{}}}}}"#, self.sequence)).await?;
+                self.outstanding = Some((nonce, Instant::now()));
                 self.next_heartbeat = Some(heartbeat_deadline(self.interval)?);
             }
             _ = tokio::time::sleep_until(self.alone_at.unwrap_or_else(Instant::now)), if self.alone_at.is_some() => {
@@ -407,9 +412,35 @@ impl Gateway {
                 log::debug!("voice IP discovery finished");
                 let mode = self.mode.ok_or_else(|| VoiceError::Gateway("no selected transport mode".into()))?;
                 let ssrc = self.ssrc.ok_or_else(|| VoiceError::Gateway("missing voice SSRC".into()))?;
-                self.transport = Some(Transport::new(discovered.socket.clone(),discovered.remote,ssrc));
+                self.transport = Some(Transport::new(discovered.socket.clone(), discovered.remote, ssrc));
                 self.socket = Some(discovered.socket);
-                self.send(json!({"op":1,"d":{"protocol":"udp","data":{"address":discovered.address,"port":discovered.port,"mode":mode.name()}}})).await?;
+                #[derive(serde::Serialize)]
+                struct SelectData<'a> {
+                    address: &'a str,
+                    port: u16,
+                    mode: &'a str,
+                }
+                #[derive(serde::Serialize)]
+                struct SelectProtocol<'a> {
+                    protocol: &'a str,
+                    data: SelectData<'a>,
+                }
+                #[derive(serde::Serialize)]
+                struct Op1<'a> {
+                    op: u8,
+                    d: SelectProtocol<'a>,
+                }
+                self.send(&Op1 {
+                    op: 1,
+                    d: SelectProtocol {
+                        protocol: "udp",
+                        data: SelectData {
+                            address: &discovered.address,
+                            port: discovered.port,
+                            mode: mode.name(),
+                        },
+                    },
+                }).await?;
             }
             command = self.commands.recv() => {
                 match command {
@@ -420,23 +451,33 @@ impl Gateway {
                         if !on && self.speaking {
                             // End the stream with five silence frames to stop Opus interpolation.
                             for _ in 0..5 {
-                                self.audio(self.shared.packet(&[0xf8,0xff,0xfe]))?;
+                                self.audio(self.shared.packet(&[0xf8, 0xff, 0xfe]))?;
                             }
                         }
-                        self.send(json!({"op":5,"d":{"speaking":u8::from(on),"delay":0,"ssrc":self.ssrc}})).await?;
+                        let text = match self.ssrc {
+                            Some(ssrc) => format!(
+                                r#"{{"op":5,"d":{{"speaking":{},"delay":0,"ssrc":{ssrc}}}}}"#,
+                                u8::from(on)
+                            ),
+                            None => format!(
+                                r#"{{"op":5,"d":{{"speaking":{},"delay":0,"ssrc":null}}}}"#,
+                                u8::from(on)
+                            ),
+                        };
+                        self.send_text(text).await?;
                         self.speaking = on;
                     }
                     Some(Command::Close) | None => return Err(local_close()),
                 }
             }
-            result = async { match &self.socket { Some(socket) => socket.recv(&mut *self.udp_buffer).await, None => pending().await } } => {
+            result = async { match &self.socket { Some(socket) => socket.recv(&mut udp_discard).await, None => pending().await } } => {
                 // Connected UDP reports ICMP unreachable (WSAECONNRESET on Windows) on recv; one
                 // lost datagram must not end the voice session.
                 if let Err(error) = result {
                     if !transport::transient_udp_error(&error) { return Err(error.into()); }
                 } else if let Some(socket) = &self.socket {
                     for _ in 0..15 {
-                        match socket.try_recv(&mut *self.udp_buffer) {
+                        match socket.try_recv(&mut udp_discard) {
                             Ok(_) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(error) if transport::transient_udp_error(&error) => {}
@@ -460,7 +501,7 @@ impl Gateway {
                 // Follow Hello's supplied cadence so the connection does not add control traffic
                 // ahead of the server-selected schedule.
                 self.next_heartbeat = Some(heartbeat_deadline(self.interval)?);
-                self.send(identify).await?;
+                self.send(&identify).await?;
             }
             2 => {
                 if self.identify.is_some() || self.ssrc.is_some() {
@@ -477,17 +518,14 @@ impl Gateway {
                 if port == 0 {
                     return Err(VoiceError::Gateway("invalid voice port".into()));
                 }
-                let offered: Vec<String> = data
+                let modes = data
                     .get("modes")
                     .and_then(Value::as_array)
-                    .ok_or_else(|| VoiceError::Gateway("missing transport modes".into()))?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect();
-                let mode = Mode::negotiate(&offered).ok_or_else(|| {
-                    VoiceError::Gateway("no supported RTP-size transport mode".into())
-                })?;
+                    .ok_or_else(|| VoiceError::Gateway("missing transport modes".into()))?;
+                let mode =
+                    Mode::negotiate(modes.iter().filter_map(Value::as_str)).ok_or_else(|| {
+                        VoiceError::Gateway("no supported RTP-size transport mode".into())
+                    })?;
                 self.ssrc = Some(ssrc);
                 self.mode = Some(mode);
                 self.probe = Some(Box::pin(discover(SocketAddr::new(ip, port), ssrc)));
@@ -532,7 +570,9 @@ impl Gateway {
             11 | 13 | 21 | 22 | 24 => {
                 let outgoing = self.dave.handle_json(opcode, data).map_err(dave_error)?;
                 self.outbound(outgoing).await?;
-                if opcode == 13 && !self.dave.ready() {
+                if self.dave.ready() {
+                    self.alone_at = None;
+                } else if opcode == 13 {
                     self.alone_at = Some(Instant::now() + ALONE_GRACE);
                 }
             }
@@ -549,7 +589,7 @@ async fn discover(remote: SocketAddr, ssrc: u32) -> Result<Discovered, VoiceErro
         // Connected UDP accepts discovery answers and subsequent traffic only from this peer.
         socket.connect(remote).await?;
         let request = transport::ip_discovery_request(ssrc);
-        let mut bytes = [0u8; 2048];
+        let mut bytes = [0u8; 75];
         loop {
             socket.send(&request).await?;
             let retry_at = Instant::now() + Duration::from_secs(1);

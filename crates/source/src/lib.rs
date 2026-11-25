@@ -63,12 +63,7 @@ impl SourceError {
     /// surfaces as 404 or 410; both are cured by resolving a fresh one, which is
     /// what the caller does when this says yes.
     pub fn retryable(&self) -> bool {
-        match self {
-            SourceError::Media { status } => {
-                matches!(*status, 403 | 404 | 410 | 429) || *status >= 500
-            }
-            _ => false,
-        }
+        matches!(self, Self::Media { status: 403 | 404 | 410 | 429 | 500.. })
     }
 }
 
@@ -81,12 +76,13 @@ const MAX_CACHED_RESULT: usize = 2 << 20;
 /// The largest number of bytes the cache may hold.
 const MAX_CACHE_BYTES: usize = 32 << 20;
 
+fn is_id_chars(text: &str) -> bool {
+    text.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// Whether an identifier is a bare YouTube video id.
 pub fn youtube_id(id: &str) -> bool {
-    id.len() == 11
-        && id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '-' || character == '_'
-        })
+    id.len() == 11 && is_id_chars(id)
 }
 
 /// Discord can wrap a literal link in angle brackets to suppress its preview.
@@ -104,18 +100,7 @@ fn identifier_text(identifier: &str) -> &str {
 }
 
 fn http_url(identifier: &str) -> Option<Url> {
-    let identifier = identifier_text(identifier);
-    // URL parsers may normalize embedded control characters or backslashes.
-    // Those are not a pasted literal link and must not change its authority.
-    if identifier.bytes().any(|byte| byte.is_ascii_whitespace() || byte == b'\\') {
-        return None;
-    }
-    let url = Url::parse(identifier).ok()?;
-    (matches!(url.scheme(), "http" | "https")
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none())
-    .then_some(url)
+    netguard::parse_http_url(identifier_text(identifier)).ok()
 }
 
 fn host_matches(host: &str, domain: &str) -> bool {
@@ -148,18 +133,16 @@ pub fn source_kind(id: &str) -> &'static str {
         return "";
     };
     let host = url.host_str().expect("http_url requires a host");
-    for (domain, name) in [
+    [
         ("youtube.com", "youtube"),
         ("youtu.be", "youtube"),
         ("soundcloud.com", "soundcloud"),
         ("open.spotify.com", "spotify"),
         ("deezer.com", "deezer"),
-    ] {
-        if host_matches(host, domain) {
-            return name;
-        }
-    }
-    "http"
+    ]
+    .into_iter()
+    .find_map(|(domain, name)| host_matches(host, domain).then_some(name))
+    .unwrap_or("http")
 }
 
 /// A counter that lets a bounded number of loads run at once.
@@ -210,8 +193,10 @@ struct Permit<'a> {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut free = self.gate.free.lock().unwrap_or_else(|error| error.into_inner());
-        *free += 1;
+        {
+            let mut free = self.gate.free.lock().unwrap_or_else(|error| error.into_inner());
+            *free += 1;
+        }
         self.gate.ready.notify_one();
     }
 }
@@ -323,7 +308,7 @@ impl Service {
             inflight.insert(identifier.to_owned(), Arc::clone(&flight));
             flight
         };
-        let leader = Leader { flight, key: identifier, inflight: &self.inflight };
+        let leader = Leader::new(flight, identifier, &self.inflight);
         let outcome = (|| {
             let _permit = self.gate.enter(deadline)?;
             let _scope = deadline::enter(deadline);
@@ -380,20 +365,21 @@ impl Service {
         }
         let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
         let catalog = innertube::Catalog { agent, config: &self.config };
-        if let Some(query) = identifier.strip_prefix("ytsearch:") {
+        if let Some((query, music)) = identifier
+            .strip_prefix("ytsearch:")
+            .map(|q| (q, false))
+            .or_else(|| identifier.strip_prefix("ytmsearch:").map(|q| (q, true)))
+        {
             let query = query.trim();
             if query.is_empty() {
                 return Ok(LoadResult::Empty);
             }
-            let tracks = catalog.search(query, self.config.search_results as usize)?;
-            return Ok(finish_search(tracks));
-        }
-        if let Some(query) = identifier.strip_prefix("ytmsearch:") {
-            let query = query.trim();
-            if query.is_empty() {
-                return Ok(LoadResult::Empty);
-            }
-            let tracks = catalog.music_search(query, self.config.search_results as usize)?;
+            let limit = self.config.search_results as usize;
+            let tracks = if music {
+                catalog.music_search(query, limit)?
+            } else {
+                catalog.search(query, limit)?
+            };
             return Ok(finish_search(tracks));
         }
         if youtube_id(identifier) {
@@ -424,7 +410,7 @@ impl Service {
     /// Loads a plain URL by reading what its own header says about it.
     fn load_http(&self, identifier: &str) -> Result<LoadResult, SourceError> {
         let (mut body, size) = self.fetch(identifier, &Default::default())?;
-        let mut head = Vec::new();
+        let mut head = Vec::with_capacity(probe::FIRST_PROBE);
         let mut chunk = vec![0u8; probe::FIRST_PROBE];
         // Only a file with a declared length can be read on for its index: a
         // live stream has none and never ends, so the first window is all it
@@ -439,16 +425,18 @@ impl Service {
         let mut next_probe = probe::FIRST_PROBE;
         let mut found = probe::Probe::default();
         while head.len() < probe::MAX_PROBE {
-            let read =
-                body.read(&mut chunk).map_err(|error| SourceError::Http(error.to_string()))?;
+            let cap = (probe::MAX_PROBE - head.len()).min(chunk.len());
+            let read = body
+                .read(&mut chunk[..cap])
+                .map_err(|error| SourceError::Http(error.to_string()))?;
             let ended = read == 0;
             head.extend_from_slice(&chunk[..read]);
-            if !ended && head.len() > probe::FIRST_PROBE && head.len() < next_probe {
+            if !ended && head.len() < next_probe {
                 continue;
             }
             found = probe::probe(&head, size);
             next_probe = head.len().saturating_mul(2);
-            if found.audio && (!found.title.is_empty() || found.duration_ms > 0) {
+            if found.audio && found.duration_ms > 0 && !found.title.is_empty() {
                 break;
             }
             if ended {
@@ -535,10 +523,7 @@ fn youtube_video_from_url(identifier: &str) -> Option<String> {
 /// Reads the playlist id out of a YouTube URL or a `youtube:playlist:` prefix.
 fn youtube_playlist_id(identifier: &str) -> Option<String> {
     let identifier = identifier_text(identifier);
-    let valid = |id: &str| {
-        !id.is_empty()
-            && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    };
+    let valid = |id: &str| !id.is_empty() && is_id_chars(id);
     if let Some(rest) = identifier.strip_prefix("youtube:playlist:") {
         let id = rest.trim();
         return valid(id).then(|| id.to_owned());
@@ -558,6 +543,16 @@ fn youtube_playlist_id(identifier: &str) -> Option<String> {
     valid(&id).then(|| id.into_owned())
 }
 impl Service {
+    fn with_budget<T>(
+        &self,
+        work: impl FnOnce() -> Result<T, SourceError>,
+    ) -> Result<T, SourceError> {
+        let deadline = Instant::now() + self.config.load_timeout();
+        let _permit = self.gate.enter(deadline)?;
+        let _scope = deadline::enter(deadline);
+        work()
+    }
+
     /// Opens the audio of a track that has already been loaded.
     ///
     /// A direct stream URL is never stored in a track encoding, because the ones
@@ -575,16 +570,22 @@ impl Service {
                 if source_kind(uri) != "http" {
                     return Err(SourceError::Url("track URI does not match its source".into()));
                 }
-                let deadline = Instant::now() + self.config.load_timeout();
-                let _permit = self.gate.enter(deadline)?;
-                let _scope = deadline::enter(deadline);
-                self.open_seekable(uri, &Default::default())
+                self.with_budget(|| {
+                    let range = MediaRange::for_url(uri);
+                    let body = MediaBody::open(self.agent.clone(), uri, Default::default(), range)?;
+                    Ok(Box::new(body) as Box<dyn Read + Send>)
+                })
             }
-            "spotify" | "deezer" => {
+            "spotify" | "deezer" => self.with_budget(|| {
                 // A catalogue supplies metadata only; the audio is mirrored from
                 // a YouTube search for the same name.
                 let name =
                     if track.metadata.source_name == "deezer" { "Deezer" } else { "Spotify" };
+                if track.metadata.title.trim().is_empty() {
+                    return Err(SourceError::Url(format!(
+                        "cannot match {name} track with an empty title"
+                    )));
+                }
                 let query = if matching::is_unknown_artist(&track.metadata.author) {
                     format!("ytsearch:{} audio", track.metadata.title)
                 } else {
@@ -600,19 +601,14 @@ impl Service {
                     ))
                 })?;
                 self.open(best)
-            }
+            }),
             "youtube" | "soundcloud" => {
-                if let Some(uri) = track.metadata.uri.as_deref() {
-                    if source_kind(uri) != track.metadata.source_name {
-                        return Err(SourceError::Url("track URI does not match its source".into()));
-                    }
-                } else if source_kind(&track.metadata.identifier) != track.metadata.source_name {
+                let declared =
+                    track.metadata.uri.as_deref().unwrap_or(track.metadata.identifier.as_str());
+                if source_kind(declared) != track.metadata.source_name {
                     return Err(SourceError::Url("track URI does not match its source".into()));
                 }
-                let deadline = Instant::now() + self.config.load_timeout();
-                let _permit = self.gate.enter(deadline)?;
-                let _scope = deadline::enter(deadline);
-                self.open_media(track)
+                self.with_budget(|| self.open_media(track))
             }
             _ => Err(SourceError::Url("unsupported track source".into())),
         }
@@ -639,16 +635,21 @@ impl Service {
                         &track.metadata.identifier,
                         |url, headers| {
                             let range = MediaRange::for_url(&url);
-                            let body = MediaBody::open(agent.clone(), &url, &headers, range)?;
+                            let body = MediaBody::open(agent.clone(), url, headers, range)?;
                             Ok(Box::new(body) as Box<dyn Read + Send>)
                         },
                     )
                 }
-                "youtube" => Err(SourceError::Disabled("youtube native source is disabled".into())),
-                _ => {
-                    let (url, headers) = self.resolve_media(track)?;
-                    self.open_seekable(&url, &headers)
+                "soundcloud" if self.config.soundcloud_native => {
+                    catalog::SoundCloud::with_state(&self.agent, &self.config, &self.catalog_state)
+                        .media_url(&track.metadata.identifier)
+                        .and_then(|(url, headers)| {
+                            let range = MediaRange::for_url(&url);
+                            let body = MediaBody::open(self.agent.clone(), url, headers, range)?;
+                            Ok(Box::new(body) as Box<dyn Read + Send>)
+                        })
                 }
+                source => Err(SourceError::Disabled(format!("{source} native source is disabled"))),
             };
             match opened {
                 Ok(body) => return Ok(body),
@@ -661,20 +662,6 @@ impl Service {
             }
         }
         Err(last.unwrap_or_else(|| SourceError::Http("the media URL could not be opened".into())))
-    }
-
-    /// Resolves a direct audio URL using the track's native provider.
-    fn resolve_media(
-        &self,
-        track: &Track,
-    ) -> Result<(String, std::collections::BTreeMap<String, String>), SourceError> {
-        match track.metadata.source_name.as_str() {
-            "soundcloud" if self.config.soundcloud_native => {
-                catalog::SoundCloud::with_state(&self.agent, &self.config, &self.catalog_state)
-                    .media_url(&track.metadata.identifier)
-            }
-            source => Err(SourceError::Disabled(format!("{source} native source is disabled"))),
-        }
     }
 
     /// Opens a playback body wrapped so that it can be read out of order.
@@ -692,7 +679,7 @@ impl Service {
         headers: &std::collections::BTreeMap<String, String>,
         range: MediaRange,
     ) -> Result<MediaBody, SourceError> {
-        MediaBody::open(self.agent.clone(), url, headers, range)
+        MediaBody::open(self.agent.clone(), url, headers.clone(), range)
     }
 
     /// Fetches a URL for reading, without asking for a range.

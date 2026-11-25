@@ -12,31 +12,31 @@ use crate::{
 
 const MAX_LIMIT: u32 = 100_000;
 
-pub fn validate(config: &Config) -> Result<(), ConfigError> {
-    let invalid = |message: String| Err(ConfigError::Invalid(message));
+fn invalid(message: impl Into<String>) -> Result<(), ConfigError> {
+    Err(ConfigError::Invalid(message.into()))
+}
 
+pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.password.is_empty() {
-        return invalid("set RUSTLINK_PASSWORD or password in config".into());
+        return invalid("set RUSTLINK_PASSWORD or password in config");
     }
     if config.password.trim() != config.password {
-        return invalid("password must not have leading or trailing whitespace".into());
+        return invalid("password must not have leading or trailing whitespace");
     }
     if !config.password.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
         return invalid(
-            "password must contain only printable ASCII characters (HTTP Authorization header limit)"
-                .into(),
+            "password must contain only printable ASCII characters (HTTP Authorization header limit)",
         );
     }
     if let Some(problem) = check_address(&config.address) {
         return invalid(problem);
     }
     if config.auto_download && config.tools_directory.trim().is_empty() {
-        return invalid("toolsDirectory is required while autoDownload is on".into());
+        return invalid("toolsDirectory is required while autoDownload is on");
     }
-    if !config.in_process_audio
-        && (config.ffmpeg.trim().is_empty() || config.ffmpeg.trim().eq_ignore_ascii_case("none"))
-    {
-        return invalid("ffmpeg is required when inProcessAudio is false".into());
+    let ffmpeg = config.ffmpeg.trim();
+    if !config.in_process_audio && (ffmpeg.is_empty() || ffmpeg.eq_ignore_ascii_case("none")) {
+        return invalid("ffmpeg is required when inProcessAudio is false");
     }
     for name in config.filters.keys() {
         if !FILTER_NAMES.contains(&name.as_str()) {
@@ -46,81 +46,69 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
             ));
         }
     }
-    if !one_of(&config.lyrics_source, &LYRICS_SOURCES) {
-        return invalid(format!("lyricsSource must be one of {}", LYRICS_SOURCES.join(", ")));
+    for (name, value, allowed) in [
+        ("lyricsSource", config.lyrics_source.as_str(), LYRICS_SOURCES.as_slice()),
+        ("logLevel", config.log_level.as_str(), LOG_LEVELS.as_slice()),
+        ("logFormat", config.log_format.as_str(), LOG_FORMATS.as_slice()),
+        ("logColor", config.log_color.as_str(), LOG_COLORS.as_slice()),
+    ] {
+        if !one_of(value, allowed) {
+            return invalid(format!("{name} must be one of {}", allowed.join(", ")));
+        }
     }
-    if !one_of(&config.log_level, &LOG_LEVELS) {
-        return invalid(format!("logLevel must be one of {}", LOG_LEVELS.join(", ")));
-    }
-    if !one_of(&config.log_format, &LOG_FORMATS) {
-        return invalid(format!("logFormat must be one of {}", LOG_FORMATS.join(", ")));
-    }
-    if !one_of(&config.log_color, &LOG_COLORS) {
-        return invalid(format!("logColor must be one of {}", LOG_COLORS.join(", ")));
-    }
-    if config.webhook.enable && config.webhook.url.trim().is_empty() {
-        return invalid("webhook.url is required while webhook is enabled".into());
+    let webhook_url = config.webhook.url.trim();
+    if config.webhook.enable && webhook_url.is_empty() {
+        return invalid("webhook.url is required while webhook is enabled");
     }
     if config.webhook.state_latency_seconds > MAX_LIMIT {
-        return invalid("webhook.stateLatencySeconds must be between 0 and 100000".into());
+        return invalid("webhook.stateLatencySeconds must be between 0 and 100000");
     }
     // Zero is meaningful here: it keeps every daily file rather than a window of
     // them, which is what a node whose logs are rotated elsewhere asks for.
     if config.log_retention_days > MAX_LIMIT {
-        return invalid("logRetentionDays must be between 0 and 100000".into());
+        return invalid("logRetentionDays must be between 0 and 100000");
     }
-    if let Some(problem) = check_webhook_url(config.webhook.url.trim()) {
+    if let Some(problem) = check_webhook_url(webhook_url) {
         return invalid(problem);
     }
     if let Some(problem) = check_proxy_url(config.youtube_proxy.trim()) {
         return invalid(problem);
     }
     if config.youtube_native {
-        if config.youtube_endpoint.trim().is_empty()
-            || config.youtube_music_endpoint.trim().is_empty()
-        {
+        let yt_api = config.youtube_endpoint.trim();
+        let yt_music = config.youtube_music_endpoint.trim();
+        if yt_api.is_empty() || yt_music.is_empty() {
             return invalid(
-                "youtubeEndpoint and youtubeMusicEndpoint are required while youtubeNative is on"
-                    .into(),
+                "youtubeEndpoint and youtubeMusicEndpoint are required while youtubeNative is on",
             );
         }
-        if let Some(problem) =
-            check_http_endpoint("youtubeEndpoint", config.youtube_endpoint.trim())
-        {
+        if let Some(problem) = check_http_endpoint("youtubeEndpoint", yt_api) {
             return invalid(problem);
         }
-        if let Some(problem) =
-            check_http_endpoint("youtubeMusicEndpoint", config.youtube_music_endpoint.trim())
-        {
+        if let Some(problem) = check_http_endpoint("youtubeMusicEndpoint", yt_music) {
             return invalid(problem);
         }
     }
     if config.soundcloud_native {
-        if config.soundcloud_api_endpoint.trim().is_empty()
-            || config.soundcloud_web_endpoint.trim().is_empty()
-        {
+        let sc_api = config.soundcloud_api_endpoint.trim();
+        let sc_web = config.soundcloud_web_endpoint.trim();
+        if sc_api.is_empty() || sc_web.is_empty() {
             return invalid(
-                "soundcloudApiEndpoint and soundcloudWebEndpoint are required while soundcloudNative is on"
-                    .into(),
+                "soundcloudApiEndpoint and soundcloudWebEndpoint are required while soundcloudNative is on",
             );
         }
-        if let Some(problem) =
-            check_http_endpoint("soundcloudApiEndpoint", config.soundcloud_api_endpoint.trim())
-        {
+        if let Some(problem) = check_http_endpoint("soundcloudApiEndpoint", sc_api) {
             return invalid(problem);
         }
-        if let Some(problem) =
-            check_http_endpoint("soundcloudWebEndpoint", config.soundcloud_web_endpoint.trim())
-        {
+        if let Some(problem) = check_http_endpoint("soundcloudWebEndpoint", sc_web) {
             return invalid(problem);
         }
     }
-    if config.deezer_api_endpoint.trim().is_empty() {
-        return invalid("deezerApiEndpoint is required".into());
+    let deezer_api = config.deezer_api_endpoint.trim();
+    if deezer_api.is_empty() {
+        return invalid("deezerApiEndpoint is required");
     }
-    if let Some(problem) =
-        check_http_endpoint("deezerApiEndpoint", config.deezer_api_endpoint.trim())
-    {
+    if let Some(problem) = check_http_endpoint("deezerApiEndpoint", deezer_api) {
         return invalid(problem);
     }
 
@@ -144,31 +132,33 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
         }
     }
     if !(16_000..=256_000).contains(&config.opus_bitrate) {
-        return invalid("opusBitrate must be 16000..256000".into());
+        return invalid("opusBitrate must be 16000..256000");
     }
     if config.opus_complexity > 10 {
-        return invalid("opusComplexity must be 0..10".into());
+        return invalid("opusComplexity must be 0..10");
     }
-    if config.spotify_client_id.trim().is_empty() != config.spotify_client_secret.trim().is_empty()
-    {
-        return invalid("Spotify client ID and secret must both be set".into());
+    let has_spotify_id = !config.spotify_client_id.trim().is_empty();
+    let has_spotify_secret = !config.spotify_client_secret.trim().is_empty();
+    if has_spotify_id != has_spotify_secret {
+        return invalid("Spotify client ID and secret must both be set");
     }
-    if !config.spotify_refresh_token.trim().is_empty() && config.spotify_client_id.trim().is_empty()
-    {
-        return invalid(
-            "Spotify refresh token requires the application client ID and secret".into(),
-        );
+    if !config.spotify_refresh_token.trim().is_empty() && !has_spotify_id {
+        return invalid("Spotify refresh token requires the application client ID and secret");
     }
-    if !config.spotify_client_id.trim().is_empty() {
+    if has_spotify_id {
         let market = config.spotify_market.trim();
         if market.is_empty() {
-            return invalid("spotifyMarket is required when Spotify credentials are set".into());
+            return invalid("spotifyMarket is required when Spotify credentials are set");
         }
         if market.len() != 2 || !market.bytes().all(|b| b.is_ascii_alphabetic()) {
-            return invalid(
-                "spotifyMarket must be a two-letter ISO country code such as US or TW".into(),
-            );
+            return invalid("spotifyMarket must be a two-letter ISO country code such as US or TW");
         }
+    }
+    if !config.youtube_client_version.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return invalid("youtubeClientVersion must contain only printable ASCII characters");
+    }
+    if !config.youtube_visitor_data.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return invalid("youtubeVisitorData must contain only printable ASCII characters");
     }
     Ok(())
 }
@@ -211,11 +201,8 @@ fn check_address(address: &str) -> Option<String> {
 
 fn strip_scheme_ascii_case<'a>(url: &'a str, schemes: &[&str]) -> Option<&'a str> {
     schemes.iter().find_map(|scheme| {
-        if url.len() >= scheme.len() && url[..scheme.len()].eq_ignore_ascii_case(scheme) {
-            Some(&url[scheme.len()..])
-        } else {
-            None
-        }
+        let (prefix, rest) = url.split_at_checked(scheme.len())?;
+        prefix.eq_ignore_ascii_case(scheme).then_some(rest)
     })
 }
 
@@ -234,7 +221,7 @@ fn valid_authority_host_port(host_port: &str) -> bool {
         }
         return match tail.strip_prefix(':') {
             None => tail.is_empty(),
-            Some(port) => !port.is_empty() && port.parse::<u16>().is_ok(),
+            Some(port) => !port.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0),
         };
     }
     match host_port.split_once(':') {
@@ -243,56 +230,49 @@ fn valid_authority_host_port(host_port: &str) -> bool {
             !host.is_empty()
                 && !port.is_empty()
                 && !port.contains(':')
-                && port.parse::<u16>().is_ok()
+                && port.parse::<u16>().is_ok_and(|p| p > 0)
         }
     }
 }
 
-fn check_http_endpoint(name: &str, url: &str) -> Option<String> {
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Some(format!("{name} must be an http or https URL"));
+fn has_valid_url_authority(url: &str, schemes: &[&str]) -> bool {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
+        return false;
     }
-    let Some(rest) = strip_scheme_ascii_case(url, &["https://", "http://"]) else {
-        return Some(format!("{name} must be an http or https URL"));
+    let Some(rest) = strip_scheme_ascii_case(url, schemes) else {
+        return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit('@').next().unwrap_or("");
-    if !valid_authority_host_port(host_port) {
-        return Some(format!("{name} must be an http or https URL"));
-    }
-    None
+    valid_authority_host_port(host_port)
+}
+
+fn check_http_endpoint(name: &str, url: &str) -> Option<String> {
+    let valid =
+        has_valid_url_authority(url, &["https://", "http://"]) && !url.contains(['@', '?', '#']);
+    (!valid).then(|| {
+        format!("{name} must be an http or https base URL without credentials, query, or fragment")
+    })
 }
 
 fn check_webhook_url(url: &str) -> Option<String> {
     if url.is_empty() {
         return None;
     }
-    check_http_endpoint("webhook.url", url)
+    let valid = has_valid_url_authority(url, &["https://", "http://"]) && !url.contains(['@', '#']);
+    (!valid).then(|| "webhook.url must be an http or https URL without credentials".into())
 }
 
 fn check_proxy_url(url: &str) -> Option<String> {
-    const SCHEMES: [&str; 4] = ["http://", "socks4://", "socks5://", "socks5h://"];
-    let problem = || {
-        Some(
-            "youtubeProxy must be an http://, socks4://, socks5:// or socks5h:// URL with a host"
-                .into(),
-        )
-    };
-    if url.is_empty() {
+    const SCHEMES: [&str; 6] =
+        ["http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://"];
+    if url.is_empty() || (has_valid_url_authority(url, &SCHEMES) && !url.contains(['?', '#'])) {
         return None;
     }
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return problem();
-    }
-    let Some(rest) = strip_scheme_ascii_case(url, &SCHEMES) else {
-        return problem();
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit('@').next().unwrap_or("");
-    if !valid_authority_host_port(host_port) {
-        return problem();
-    }
-    None
+    Some(
+        "youtubeProxy must be an http://, https://, socks4://, socks4a://, socks5:// or socks5h:// URL with a host"
+            .into(),
+    )
 }
 
 fn one_of(value: &str, allowed: &[&str]) -> bool {
@@ -331,7 +311,9 @@ mod tests {
             let config = Config { youtube_proxy: good.into(), ..valid() };
             validate(&config).unwrap_or_else(|error| panic!("{good}: {error:?}"));
         }
-        for bad in ["127.0.0.1:40000", "ftp://proxy.example", "socks5://", "http://user@:8080"] {
+        for bad in
+            ["127.0.0.1:40000", "ftp://proxy.example", "socks5://", "http://user@:8080", "測試測試"]
+        {
             let config = Config { youtube_proxy: bad.into(), ..valid() };
             assert!(validate(&config).is_err(), "{bad} was accepted");
         }

@@ -19,6 +19,7 @@ mod config;
 mod state;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,8 +28,8 @@ use rustlink_client::{
     Client, LoadResult, Object, Patch, PlayerUpdate, Session, Track, TrackUpdate, VoiceState,
 };
 use rustlink_discord_bot::{
-    BotEvent, DiscordRest, Gateway, Interaction, VoiceStatePairer, VoiceStateUpdate, GUILDS,
-    GUILD_VOICE_STATES,
+    truncate_chars, BotEvent, DiscordRest, Gateway, Interaction, VoiceStatePairer,
+    VoiceStateUpdate, GUILDS, GUILD_VOICE_STATES,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -61,13 +62,7 @@ async fn run() -> Result<(), Failure> {
 
     let rest = Arc::new(DiscordRest::new(config.token.clone())?);
     let mut gateway = Gateway::connect(config.token.clone(), GUILDS | GUILD_VOICE_STATES).await?;
-    let ready = loop {
-        if let BotEvent::Ready(ready) =
-            gateway.next_event().await?.ok_or("the Discord gateway closed before READY")?
-        {
-            break ready;
-        }
-    };
+    let ready = gateway.next_ready().await?;
     if ready.application_id.is_empty() {
         return Err("READY carried no application ID".into());
     }
@@ -88,6 +83,7 @@ async fn run() -> Result<(), Failure> {
         pairer: VoiceStatePairer::new(&ready.user_id)?,
         application_id: ready.application_id,
         user_id: ready.user_id,
+        commands: Arc::new(commands()),
         config,
         rustlink,
         session,
@@ -151,9 +147,10 @@ struct Bot {
     pairer: VoiceStatePairer,
     application_id: String,
     user_id: String,
+    commands: Arc<Value>,
     guilds: HashMap<String, Guild>,
-    /// `(guild, user)` to the voice channel the member is in.
-    channels: HashMap<(String, String), String>,
+    /// `guild` -> (`user` -> voice channel the member is in).
+    channels: HashMap<String, HashMap<String, String>>,
     /// Guilds whose voice state Rustlink currently holds.
     voiced: HashSet<String>,
     /// Guilds the bot has been asked to join, and should play in once it lands.
@@ -163,13 +160,16 @@ struct Bot {
 }
 
 impl Bot {
+    fn member_channel(&self, guild: &str, user: &str) -> Option<&str> {
+        self.channels
+            .get(guild)
+            .and_then(|guild_channels| guild_channels.get(user))
+            .map(String::as_str)
+    }
+
     async fn on_gateway(&mut self, event: BotEvent) -> Result<(), Failure> {
         if let Some(voice) = self.pairer.observe(&event)? {
-            let guild = match &event {
-                BotEvent::VoiceStateUpdate(update) => update.guild_id.clone().unwrap_or_default(),
-                BotEvent::VoiceServerUpdate(update) => update.guild_id.clone(),
-                _ => String::new(),
-            };
+            let guild = event.guild_id().unwrap_or_default().to_owned();
             self.voice_ready(&guild, voice).await;
         }
         match event {
@@ -178,7 +178,7 @@ impl Bot {
             }
             BotEvent::Other { name, data } if name == "GUILD_DELETE" => {
                 if let Some(guild) = data["id"].as_str() {
-                    self.channels.retain(|(g, _), _| g != guild);
+                    self.channels.remove(guild);
                     let _ = self.pairer.clear(guild);
                     self.forget(guild).await;
                 }
@@ -195,25 +195,26 @@ impl Bot {
         if self.config.serves(&guild) {
             let rest = Arc::clone(&self.rest);
             let app_id = self.application_id.clone();
+            let cmds = Arc::clone(&self.commands);
             let guild_for_cmds = guild.clone();
             tokio::spawn(async move {
-                if let Err(error) =
-                    rest.set_guild_commands(&app_id, &guild_for_cmds, &commands()).await
-                {
+                if let Err(error) = rest.set_guild_commands(&app_id, &guild_for_cmds, &cmds).await {
                     eprintln!("could not register the commands in guild {guild_for_cmds}: {error}");
                 }
             });
         }
-        self.channels.retain(|(g, _), _| g != &guild);
+        let active_voice = self.voiced.contains(&guild) || self.joining.contains(&guild);
+        let guild_channels = self.channels.entry(guild.clone()).or_default();
+        guild_channels.clear();
         let mut stale = false;
         for state in data["voice_states"].as_array().into_iter().flatten() {
             if let (Some(user), Some(channel)) =
                 (state["user_id"].as_str(), state["channel_id"].as_str())
             {
-                if user == self.user_id {
+                if user == self.user_id && !active_voice {
                     stale = true;
                 } else {
-                    self.channels.insert((guild.clone(), user.into()), channel.into());
+                    guild_channels.insert(user.into(), channel.into());
                 }
             }
         }
@@ -225,13 +226,14 @@ impl Bot {
 
     async fn voice_state(&mut self, update: VoiceStateUpdate) {
         let Some(guild) = update.guild_id else { return };
-        let key = (guild.clone(), update.user_id.clone());
         match update.channel_id {
             Some(channel) => {
-                self.channels.insert(key, channel);
+                self.channels.entry(guild).or_default().insert(update.user_id, channel);
             }
             None => {
-                self.channels.remove(&key);
+                if let Some(guild_channels) = self.channels.get_mut(&guild) {
+                    guild_channels.remove(&update.user_id);
+                }
                 if update.user_id == self.user_id {
                     // Left, or removed by someone: what was queued has no channel to play in.
                     self.forget(&guild).await;
@@ -243,15 +245,18 @@ impl Bot {
     /// Rustlink gets the voice details, and the queue starts when the bot was
     /// waiting to join.
     async fn voice_ready(&mut self, guild: &str, voice: VoiceState) {
-        if let Err(error) = self.session.set_voice(guild, voice).await {
+        let volume = self.guilds.get(guild).map_or(self.config.volume, |state| state.volume);
+        let update = PlayerUpdate {
+            voice: Some(voice),
+            volume: (volume != 100).then_some(rustlink_protocol::Int64(volume)),
+            ..Default::default()
+        };
+        if let Err(error) = self.session.update_player(guild, &update, false).await {
             eprintln!("Rustlink refused the voice state for guild {guild}: {error}");
+            self.joining.remove(guild);
             return;
         }
         self.voiced.insert(guild.to_string());
-        let volume = self.guilds.get(guild).map_or(self.config.volume, |state| state.volume);
-        if volume != 100 {
-            let _ = self.session.set_volume(guild, volume).await;
-        }
         if self.joining.remove(guild) && !self.guilds.get(guild).is_some_and(Guild::playing) {
             self.start_next(guild).await;
         }
@@ -284,6 +289,11 @@ impl Bot {
                 Err(error) => {
                     eprintln!("could not start {:?}: {error}", track.metadata.title);
                     state.finish();
+                    if !state.record(false) {
+                        state.clear();
+                        self.idle_since.insert(guild.to_string(), Instant::now());
+                        return;
+                    }
                 }
             }
         }
@@ -337,40 +347,39 @@ impl Bot {
         }
         let text = self.run(&request).await;
         // Discord caps a message at 2000 characters.
-        let text: String = text.chars().take(1900).collect();
+        let bounded = truncate_chars(&text, 1900);
         if let Err(error) =
-            self.rest.edit_interaction_response(&self.application_id, &request.token, &text).await
+            self.rest.edit_interaction_response(&self.application_id, &request.token, bounded).await
         {
             eprintln!("could not answer /{}: {error}", request.command);
         }
     }
 
     async fn run(&mut self, request: &Interaction) -> String {
-        let Some(guild) = request.guild_id.clone() else {
+        let Some(guild) = request.guild_id.as_deref() else {
             return "請在伺服器裡使用這個指令。".into();
         };
         match request.command.as_str() {
-            "queue" => return self.queue_text(&guild),
-            "nowplaying" => return self.now_playing(&guild).await,
+            "queue" => return self.queue_text(guild),
+            "nowplaying" => return self.now_playing(guild).await,
             "play" | "skip" | "pause" | "resume" | "stop" | "volume" => {}
             _ => return "不認得這個指令。".into(),
         }
-        let Some(channel) = self.channels.get(&(guild.clone(), request.user_id.clone())).cloned()
-        else {
+        let Some(channel) = self.member_channel(guild, &request.user_id).map(str::to_owned) else {
             return "請先加入一個語音頻道。".into();
         };
         if request.command == "play" {
-            return self.play(&guild, &channel, request.option("query").unwrap_or_default()).await;
+            return self.play(guild, &channel, request.option("query").unwrap_or_default()).await;
         }
-        if self.channels.get(&(guild.clone(), self.user_id.clone())) != Some(&channel) {
+        if self.member_channel(guild, &self.user_id) != Some(channel.as_str()) {
             return "請先加入機器人所在的語音頻道。".into();
         }
         match request.command.as_str() {
-            "skip" => self.skip(&guild).await,
-            "pause" => self.pause(&guild, true).await,
-            "resume" => self.pause(&guild, false).await,
-            "stop" => self.stop(&guild).await,
-            _ => self.volume(&guild, request.option("level").unwrap_or_default()).await,
+            "skip" => self.skip(guild).await,
+            "pause" => self.pause(guild, true).await,
+            "resume" => self.pause(guild, false).await,
+            "stop" => self.stop(guild).await,
+            _ => self.volume(guild, request.option("level").unwrap_or_default()).await,
         }
     }
 
@@ -379,7 +388,7 @@ impl Bot {
         if query.is_empty() {
             return "請提供連結或關鍵字。".into();
         }
-        let bot_channel = self.channels.get(&(guild.to_string(), self.user_id.clone())).cloned();
+        let bot_channel = self.member_channel(guild, &self.user_id).map(str::to_owned);
         let busy = self.guilds.get(guild).is_some_and(Guild::busy);
         if busy && bot_channel.as_deref().is_some_and(|current| current != channel) {
             return "機器人正在別的語音頻道播放。".into();
@@ -487,20 +496,25 @@ impl Bot {
         let Some(state) = self.guilds.get(guild).filter(|state| state.busy()) else {
             return "佇列是空的。".into();
         };
-        let mut lines = Vec::new();
+        let mut out = String::with_capacity(256);
         if let Some(track) = state.current() {
-            lines.push(format!("🎵 正在播放：{}", describe(track)));
+            out.push_str("🎵 正在播放：");
+            write_describe(&mut out, track);
         }
         if state.waiting() > 0 {
-            lines.push(format!("📜 接下來（共 {} 首）：", state.waiting()));
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let _ = write!(out, "📜 接下來（共 {} 首）：", state.waiting());
             for (number, track) in state.upcoming(QUEUE_PAGE).enumerate() {
-                lines.push(format!("{}. {}", number + 1, describe(track)));
+                let _ = write!(out, "\n{}. ", number + 1);
+                write_describe(&mut out, track);
             }
             if state.waiting() > QUEUE_PAGE {
-                lines.push(format!("…還有 {} 首", state.waiting() - QUEUE_PAGE));
+                let _ = write!(out, "\n…還有 {} 首", state.waiting() - QUEUE_PAGE);
             }
         }
-        lines.join("\n")
+        out
     }
 
     async fn now_playing(&self, guild: &str) -> String {
@@ -512,9 +526,13 @@ impl Bot {
             Err(_) => "?".into(),
         };
         let length = format_length(track.metadata.length, track.metadata.is_stream);
-        let mut text = format!("🎵 {}\n⏱️ {position} / {length}", describe(track));
+        let mut text = String::with_capacity(128);
+        text.push_str("🎵 ");
+        write_describe(&mut text, track);
+        let _ = write!(text, "\n⏱️ {position} / {length}");
         if let Some(link) = &track.metadata.uri {
-            text.push_str(&format!("\n{link}"));
+            text.push('\n');
+            text.push_str(link);
         }
         text
     }
@@ -576,15 +594,21 @@ fn describe_added(
         (_, true) => format!("➕ 已加入 {added} 首到佇列"),
     };
     if added < total {
-        text.push_str(&format!("（佇列已滿，略過 {} 首）", total - added));
+        let _ = write!(text, "（佇列已滿，略過 {} 首）", total - added);
     }
     text
 }
 
-/// `title — author (3:45)`
-fn describe(track: &Track) -> String {
+/// Writes `title — author（3:45）` directly into `out`.
+fn write_describe(out: &mut String, track: &Track) {
     let info = &track.metadata;
-    format!("{} — {}（{}）", info.title, info.author, format_length(info.length, info.is_stream))
+    let _ = write!(
+        out,
+        "{} — {}（{}）",
+        info.title,
+        info.author,
+        format_length(info.length, info.is_stream)
+    );
 }
 
 /// The slash commands registered in each guild.

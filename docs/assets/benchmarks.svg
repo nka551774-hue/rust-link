@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 490" width="1120" height="490" role="img" aria-label="Rustlink Measured Release Benchmarks and Zero-Allocation Hot Paths">
+  <defs>
+    <linearGradient id="bgBench" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#131922"/>
+    </linearGradient>
+    <linearGradient id="barTeal" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#39c5bb"/>
+      <stop offset="100%" stop-color="#2ea097"/>
+    </linearGradient>
+    <linearGradient id="barCrimson" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#d93a49"/>
+      <stop offset="100%" stop-color="#f85149"/>
+    </linearGradient>
+    <linearGradient id="barLegacy" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#30363d"/>
+      <stop offset="100%" stop-color="#484f58"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1120" height="490" rx="14" fill="url(#bgBench)" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="32" y="38" font-family="ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#e6edf3">
+    <tspan fill="#39c5bb">EMPIRICAL RELEASE BENCHMARKS</tspan>
+    <tspan fill="#8b949e" font-weight="500" font-size="13.5">  ·  Counting-Allocator Verified  ·  rustc --release (x86_64)</tspan>
+  </text>
+  <line x1="32" y1="54" x2="1088" y2="54" stroke="#21262d" stroke-width="1"/>
+
+  <!-- Top KPI Cards (4 cards) -->
+  <rect x="32" y="72" width="252" height="84" rx="9" fill="#161b22" stroke="#39c5bb" stroke-opacity="0.55" stroke-width="1.2"/>
+  <text x="48" y="96" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#39c5bb">PLAYLIST CACHE HIT (100 TRACKS)</text>
+  <text x="48" y="126" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="23" font-weight="700" fill="#e6edf3">43.3 ns <tspan font-size="12.5" fill="#39c5bb">4,944× faster</tspan></text>
+  <text x="48" y="144" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">Arc&lt;LoadResult&gt; vs 214.1 µs JSON parse</text>
+
+  <rect x="300" y="72" width="252" height="84" rx="9" fill="#161b22" stroke="#39c5bb" stroke-opacity="0.55" stroke-width="1.2"/>
+  <text x="316" y="96" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#39c5bb">OGG OPUS PACKET DEMUX</text>
+  <text x="316" y="126" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="23" font-weight="700" fill="#e6edf3">19.9 ns <tspan font-size="12.5" fill="#39c5bb">3.56× faster</tspan></text>
+  <text x="316" y="144" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">200,004 -&gt; 5 total heap allocs</text>
+
+  <rect x="568" y="72" width="252" height="84" rx="9" fill="#161b22" stroke="#d93a49" stroke-opacity="0.65" stroke-width="1.2"/>
+  <text x="584" y="96" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#d93a49">DAVE v1 + RTP DOUBLE SEAL</text>
+  <text x="584" y="126" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="23" font-weight="700" fill="#e6edf3">494.0 ns <tspan font-size="12.5" fill="#d93a49">0 allocs/op</tspan></text>
+  <text x="584" y="144" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">226.4 ns MLS + 267.6 ns AES-256-GCM</text>
+
+  <rect x="836" y="72" width="252" height="84" rx="9" fill="#161b22" stroke="#39c5bb" stroke-opacity="0.55" stroke-width="1.2"/>
+  <text x="852" y="96" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#39c5bb">FULL 8-STAGE SIMD DSP CHAIN</text>
+  <text x="852" y="126" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="23" font-weight="700" fill="#e6edf3">42.3 µs <tspan font-size="12.5" fill="#39c5bb">473× real-time</tspan></text>
+  <text x="852" y="144" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">0 heap allocs across 5,000 frames</text>
+
+  <!-- Left Panel: Before vs After Optimization Bars -->
+  <rect x="32" y="174" width="516" height="238" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.2"/>
+  <text x="50" y="200" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">HOT-PATH LATENCY &amp; ALLOCATION REDUCTION</text>
+
+  <!-- Row 1: DAVE encrypt_in_place -->
+  <text x="50" y="228" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#c9d1d9">DAVE v1 Frame Seal (AES-128-GCM + ULEB128)</text>
+  <rect x="50" y="235" width="320" height="12" rx="3" fill="url(#barLegacy)"/>
+  <text x="378" y="245" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#8b949e">375.6 ns · 2 allocs</text>
+  <rect x="50" y="251" width="193" height="12" rx="3" fill="url(#barCrimson)"/>
+  <text x="251" y="261" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#f85149">226.4 ns · 0 allocs (-40%)</text>
+
+  <!-- Row 2: RTP AES-256-GCM -->
+  <text x="50" y="287" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#c9d1d9">Discord RTP Transport (aead_aes256_gcm_rtpsize)</text>
+  <rect x="50" y="294" width="356" height="12" rx="3" fill="url(#barLegacy)"/>
+  <text x="414" y="304" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#8b949e">418.4 ns</text>
+  <rect x="50" y="310" width="228" height="12" rx="3" fill="url(#barCrimson)"/>
+  <text x="286" y="320" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#f85149">267.6 ns · 0 allocs (-36%)</text>
+
+  <!-- Row 3: Ogg 200k Packets -->
+  <text x="50" y="346" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#c9d1d9">Ogg Opus Demux (200,000 Frames Span-Coalesced)</text>
+  <rect x="50" y="353" width="310" height="12" rx="3" fill="url(#barLegacy)"/>
+  <text x="368" y="363" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#8b949e">14.17 ms · 200k allocs</text>
+  <rect x="50" y="369" width="87" height="12" rx="3" fill="url(#barTeal)"/>
+  <text x="145" y="379" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#39c5bb">3.99 ms · 5 allocs (3.56×)</text>
+
+  <text x="50" y="401" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#6e7681">Gray = v0.4.0 baseline  ·  Colored = Current zero-alloc hot path</text>
+
+  <!-- Right Panel: 20,000 µs Frame Deadline Budget -->
+  <rect x="568" y="174" width="520" height="238" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.2"/>
+  <text x="586" y="200" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">20,000 µs (20 ms) FRAME BUDGET UTILIZATION</text>
+
+  <text x="586" y="226" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#c9d1d9">Per-player CPU cost for one 20 ms 48 kHz stereo frame:</text>
+
+  <!-- Breakdown Table inside Right Panel -->
+  <rect x="586" y="240" width="484" height="28" rx="5" fill="#0d1117"/>
+  <text x="598" y="258" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#39c5bb">Sinc 44.1-&gt;48 kHz Resample (SLP 4-way)</text>
+  <text x="1056" y="258" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">6.12 µs  (0.03%)</text>
+
+  <rect x="586" y="274" width="484" height="28" rx="5" fill="#0d1117"/>
+  <text x="598" y="292" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#39c5bb">8-Stage Active DSP (SSE2 SIMD + Phasor)</text>
+  <text x="1056" y="292" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">42.27 µs  (0.21%)</text>
+
+  <rect x="586" y="308" width="484" height="28" rx="5" fill="#0d1117"/>
+  <text x="598" y="326" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#39c5bb">WAV Decode + libopus Encode (Complexity 10)</text>
+  <text x="1056" y="326" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">196.90 µs  (0.98%)</text>
+
+  <rect x="586" y="342" width="484" height="28" rx="5" fill="#0d1117"/>
+  <text x="598" y="360" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#d93a49">DAVE v1 MLS E2EE + AES-256-GCM RTP Seal</text>
+  <text x="1056" y="360" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">0.49 µs  (0.002%)</text>
+
+  <!-- Total Budget Bar -->
+  <rect x="586" y="382" width="484" height="14" rx="7" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <rect x="586" y="382" width="14" height="14" rx="7" fill="url(#barTeal)"/>
+  <text x="608" y="393" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#8b949e">Total active pipeline = ~245.8 µs / 20,000 µs  -&gt;  98.77% frame headroom remaining</text>
+
+  <!-- Footer Summary -->
+  <rect x="32" y="428" width="1056" height="44" rx="8" fill="#161b22" stroke="#21262d" stroke-width="1"/>
+  <text x="52" y="455" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" fill="#c9d1d9">
+    <tspan fill="#39c5bb" font-weight="700">RELEASE BINARY:</tspan> 9.68 MiB single executable  ·
+    <tspan fill="#39c5bb" font-weight="700">STEADY-STATE ALLOCS:</tspan> 0 on DSP / Resampler / DAVE / RTP  ·
+    <tspan fill="#d93a49" font-weight="700">GC PAUSES:</tspan> None (Compile-time RAII)
+  </text>
+</svg>

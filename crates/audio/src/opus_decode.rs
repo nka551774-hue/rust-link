@@ -6,7 +6,7 @@
 
 use std::ffi::c_int;
 #[cfg(feature = "native-opus")]
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 /// Opus packets may contain up to 120 ms, even though Discord output uses 20 ms.
 #[cfg(feature = "native-opus")]
@@ -44,18 +44,30 @@ extern "C" {
     ) -> c_int;
 }
 
-/// Returns the number of 48 kHz frames described by `packet`'s TOC byte(s).
+/// Validates `packet`'s length and TOC sample count `(len, frames)`.
 #[cfg(feature = "native-opus")]
-pub fn packet_samples(packet: &[u8]) -> Option<usize> {
-    let length = c_int::try_from(packet.len()).ok()?;
+#[inline]
+fn packet_frame_count(packet: &[u8]) -> Result<(c_int, c_int), DecodeError> {
+    let length = c_int::try_from(packet.len()).map_err(|_| DecodeError::Decode(-1))?;
     if length == 0 {
-        return None;
+        return Err(DecodeError::Decode(-1));
     }
     let frames = unsafe { opus_packet_get_nb_samples(packet.as_ptr(), length, 48_000) };
-    (1..=MAX_PACKET_FRAMES).contains(&frames).then_some(frames as usize)
+    if !(1..=MAX_PACKET_FRAMES).contains(&frames) {
+        return Err(DecodeError::Decode(frames.min(-1)));
+    }
+    Ok((length, frames))
+}
+
+/// Returns the number of 48 kHz frames described by `packet`'s TOC byte(s).
+#[cfg(feature = "native-opus")]
+#[inline]
+pub fn packet_samples(packet: &[u8]) -> Option<usize> {
+    packet_frame_count(packet).ok().map(|(_, frames)| frames as usize)
 }
 
 #[cfg(not(feature = "native-opus"))]
+#[inline]
 pub fn packet_samples(_packet: &[u8]) -> Option<usize> {
     None
 }
@@ -71,7 +83,7 @@ pub enum DecodeError {
 /// A stereo 48 kHz Opus decoder.
 #[cfg(feature = "native-opus")]
 pub struct Decoder {
-    state: *mut OpusDecoder,
+    state: NonNull<OpusDecoder>,
 }
 
 #[cfg(not(feature = "native-opus"))]
@@ -84,31 +96,40 @@ unsafe impl Send for Decoder {}
 impl Decoder {
     pub fn new() -> Result<Self, DecodeError> {
         let mut error: c_int = OPUS_OK;
-        let state = unsafe { opus_decoder_create(48_000, 2, &mut error) };
-        if state.is_null() || error != OPUS_OK {
+        let raw = unsafe { opus_decoder_create(48_000, 2, &mut error) };
+        let Some(state) = NonNull::new(raw).filter(|_| error == OPUS_OK) else {
+            if !raw.is_null() {
+                unsafe { opus_decoder_destroy(raw) };
+            }
             return Err(DecodeError::Create(error));
-        }
+        };
         Ok(Decoder { state })
     }
 
     /// Decodes one packet into interleaved stereo 16-bit samples.
     pub fn decode(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, DecodeError> {
-        let length = c_int::try_from(packet.len()).map_err(|_| DecodeError::Decode(-1))?;
-        if length == 0 {
-            return Err(DecodeError::Decode(-1));
-        }
-        let expected = unsafe { opus_packet_get_nb_samples(packet.as_ptr(), length, 48_000) };
-        if !(1..=MAX_PACKET_FRAMES).contains(&expected) {
-            return Err(DecodeError::Decode(expected.min(-1)));
-        }
-        out.resize(expected as usize * 2, 0);
+        let (length, expected) = packet_frame_count(packet)?;
+        let cap = expected as usize * 2;
+        out.clear();
+        out.reserve(cap);
+        // SAFETY: `out.reserve(cap)` guarantees at least `expected * 2` writable `i16` slots,
+        // and `opus_decode` initializes `0..frames * 2` (`0 <= frames <= expected`) without reading `pcm`.
         let frames = unsafe {
-            opus_decode(self.state, packet.as_ptr(), length, out.as_mut_ptr(), expected, 0)
+            opus_decode(
+                self.state.as_ptr(),
+                packet.as_ptr(),
+                length,
+                out.spare_capacity_mut().as_mut_ptr().cast::<i16>(),
+                expected,
+                0,
+            )
         };
-        if frames < 0 {
-            return Err(DecodeError::Decode(frames));
+        if frames < 0 || frames > expected {
+            return Err(DecodeError::Decode(frames.min(-1)));
         }
-        out.truncate(frames as usize * 2);
+        unsafe {
+            out.set_len(frames as usize * 2);
+        }
         Ok(frames as usize)
     }
 
@@ -119,22 +140,28 @@ impl Decoder {
         packet: &[u8],
         out: &mut Vec<f32>,
     ) -> Result<usize, DecodeError> {
-        let length = c_int::try_from(packet.len()).map_err(|_| DecodeError::Decode(-1))?;
-        if length == 0 {
-            return Err(DecodeError::Decode(-1));
-        }
-        let expected = unsafe { opus_packet_get_nb_samples(packet.as_ptr(), length, 48_000) };
-        if !(1..=MAX_PACKET_FRAMES).contains(&expected) {
-            return Err(DecodeError::Decode(expected.min(-1)));
-        }
-        out.resize(expected as usize * 2, 0.0);
+        let (length, expected) = packet_frame_count(packet)?;
+        let cap = expected as usize * 2;
+        out.clear();
+        out.reserve(cap);
+        // SAFETY: `out.reserve(cap)` guarantees at least `expected * 2` writable `f32` slots,
+        // and `opus_decode_float` initializes `0..frames * 2` (`0 <= frames <= expected`) without reading `pcm`.
         let frames = unsafe {
-            opus_decode_float(self.state, packet.as_ptr(), length, out.as_mut_ptr(), expected, 0)
+            opus_decode_float(
+                self.state.as_ptr(),
+                packet.as_ptr(),
+                length,
+                out.spare_capacity_mut().as_mut_ptr().cast::<f32>(),
+                expected,
+                0,
+            )
         };
-        if frames < 0 {
-            return Err(DecodeError::Decode(frames));
+        if frames < 0 || frames > expected {
+            return Err(DecodeError::Decode(frames.min(-1)));
         }
-        out.truncate(frames as usize * 2);
+        unsafe {
+            out.set_len(frames as usize * 2);
+        }
         Ok(frames as usize)
     }
 
@@ -150,8 +177,9 @@ impl Decoder {
             .filter(|f| (1..=MAX_PACKET_FRAMES).contains(f))
             .ok_or(DecodeError::Decode(-1))?;
         out.resize(frames * 2, 0.0);
-        let produced =
-            unsafe { opus_decode_float(self.state, ptr::null(), 0, out.as_mut_ptr(), expected, 0) };
+        let produced = unsafe {
+            opus_decode_float(self.state.as_ptr(), ptr::null(), 0, out.as_mut_ptr(), expected, 0)
+        };
         if produced < 0 {
             out.fill(0.0);
             return Ok(frames);
@@ -191,10 +219,7 @@ impl Decoder {
 #[cfg(feature = "native-opus")]
 impl Drop for Decoder {
     fn drop(&mut self) {
-        if !self.state.is_null() {
-            unsafe { opus_decoder_destroy(self.state) };
-            self.state = ptr::null_mut();
-        }
+        unsafe { opus_decoder_destroy(self.state.as_ptr()) };
     }
 }
 

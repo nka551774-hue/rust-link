@@ -5,9 +5,7 @@
 //! argument is a Rustlink source query (the resolver itself is native Rust).
 
 use rustlink_client::{Client, LoadResult};
-use rustlink_discord_bot::{
-    BotEvent, DiscordRest, Gateway, VoiceStatePairer, GUILDS, GUILD_VOICE_STATES,
-};
+use rustlink_discord_bot::{DiscordRest, Gateway, VoiceStatePairer, GUILDS, GUILD_VOICE_STATES};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,13 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let rest = DiscordRest::new(token.clone())?;
     let mut gateway = Gateway::connect(token, GUILDS | GUILD_VOICE_STATES).await?;
-    let ready = loop {
-        if let BotEvent::Ready(ready) =
-            gateway.next_event().await?.ok_or("gateway closed before READY")?
-        {
-            break ready;
-        }
-    };
+    let ready = gateway.next_ready().await?;
     println!("Discord bot READY as {}", ready.user_id);
 
     let session = rustlink.create_session(&ready.user_id, 60).await?;

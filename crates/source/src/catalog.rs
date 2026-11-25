@@ -5,12 +5,14 @@
 //! YouTube search for the same name. SoundCloud serves its own audio, and is
 //! resolved natively when the configuration asks for it.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
 use rustlink_protocol::{encode_track_owned, LoadResult, Playlist, Track, TrackInfo};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -94,10 +96,17 @@ impl CredentialCache {
     }
 }
 
-/// Reads a JSON answer from a catalogue.
-fn get_json(agent: &ureq::Agent, url: &str, bearer: Option<&str>) -> Result<Value, SourceError> {
+fn read_checked_body(
+    agent: &ureq::Agent,
+    url: &str,
+    bearer: Option<&str>,
+    accept_json: bool,
+) -> Result<ureq::Body, SourceError> {
     netguard::validate_url(url)?;
-    let mut request = agent.get(url).header("Accept", "application/json");
+    let mut request = agent.get(url);
+    if accept_json {
+        request = request.header("Accept", "application/json");
+    }
     if let Some(token) = bearer {
         request = request.header("Authorization", &format!("Bearer {token}"));
     }
@@ -112,8 +121,16 @@ fn get_json(agent: &ureq::Agent, url: &str, bearer: Option<&str>) -> Result<Valu
     if !(200..300).contains(&status) {
         return Err(SourceError::Media { status });
     }
-    let raw = response
-        .into_body()
+    Ok(response.into_body())
+}
+
+/// Reads and deserializes a JSON answer from a catalogue directly from bytes.
+fn get_json<T: DeserializeOwned>(
+    agent: &ureq::Agent,
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<T, SourceError> {
+    let raw = read_checked_body(agent, url, bearer, true)?
         .with_config()
         .limit(MAX_BODY)
         .read_to_vec()
@@ -125,34 +142,39 @@ fn get_json(agent: &ureq::Agent, url: &str, bearer: Option<&str>) -> Result<Valu
 
 /// Reads a text answer, which is how a client id is scraped out of a page.
 fn get_text(agent: &ureq::Agent, url: &str) -> Result<String, SourceError> {
-    netguard::validate_url(url)?;
-    let response = agent
-        .get(url)
-        .config()
-        .timeout_global(Some(deadline::timeout(Duration::from_secs(20))?))
-        .http_status_as_error(false)
-        .build()
-        .call()
-        .map_err(|error| SourceError::Http(format!("{url} could not be reached: {error}")))?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(SourceError::Media { status });
-    }
-    response
-        .into_body()
+    read_checked_body(agent, url, None, false)?
         .with_config()
         .limit(MAX_BODY)
         .read_to_string()
         .map_err(|error| SourceError::Http(error.to_string()))
 }
 
-/// Splits an identifier of the form `prefix:kind:id` into its parts.
-fn parts_after(id: &str, prefix: &str) -> Vec<String> {
-    id.trim_start_matches(prefix)
-        .split(':')
-        .map(|part| part.trim().to_string())
-        .filter(|part| !part.is_empty())
-        .collect()
+/// Resolves a relative API path or pagination URL while ensuring it stays on
+/// `base_endpoint`'s origin and path prefix without URL fragments.
+fn scoped_api_url(
+    base_endpoint: &str,
+    path: &str,
+    provider: &str,
+) -> Result<url::Url, SourceError> {
+    if path.starts_with("//") {
+        return Err(SourceError::Url(format!("invalid {provider} pagination URL")));
+    }
+    let base_str = base_endpoint.trim_end_matches('/');
+    let base = url::Url::parse(base_str).map_err(|error| SourceError::Url(error.to_string()))?;
+    let full = if path.starts_with('/') {
+        Cow::Owned(format!("{base_str}{path}"))
+    } else {
+        Cow::Borrowed(path)
+    };
+    let parsed = crate::http_url(&full)
+        .ok_or_else(|| SourceError::Url(format!("invalid {provider} pagination URL")))?;
+    let base_prefix = base.path().trim_end_matches('/');
+    let outside_prefix = !base_prefix.is_empty()
+        && parsed.path().strip_prefix(base_prefix).is_none_or(|rest| !rest.starts_with('/'));
+    if parsed.origin() != base.origin() || outside_prefix || parsed.fragment().is_some() {
+        return Err(SourceError::Url(format!("{provider} pagination left the catalogue API")));
+    }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +224,8 @@ struct SpotifyImage {
 struct SpotifyTrack {
     id: String,
     name: String,
+    #[serde(rename = "type")]
+    kind: String,
     duration_ms: i64,
     artists: Vec<SpotifyArtist>,
     album: Option<SpotifyAlbum>,
@@ -221,18 +245,39 @@ struct SpotifyExternalIds {
     isrc: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpotifyPage<T> {
+    #[serde(default)]
+    items: Vec<T>,
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    total: u64,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct SpotifyPage {
-    items: Vec<Value>,
-    next: Option<String>,
-    total: u64,
+struct SpotifyPlaylistItem {
+    track: Option<SpotifyTrack>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SpotifySearchResponse {
+    tracks: Option<SpotifyPage<SpotifyTrack>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SpotifyNamed {
+    name: String,
 }
 
 impl Spotify<'_> {
     /// Whether the node has the credentials to ask at all.
     pub fn enabled(&self) -> bool {
-        !self.config.spotify_client_id.is_empty() && !self.config.spotify_client_secret.is_empty()
+        !self.config.spotify_client_id.trim().is_empty()
+            && !self.config.spotify_client_secret.trim().is_empty()
     }
 
     /// Fetches an access token, reusing the one already held.
@@ -249,17 +294,17 @@ impl Spotify<'_> {
         self.token.get_or_refresh(|| self.fetch_token())
     }
 
-    fn token_form(&self) -> Vec<(&'static str, String)> {
-        let mut form = if self.config.spotify_refresh_token.is_empty() {
-            vec![("grant_type", "client_credentials".to_string())]
+    fn token_form(&self) -> Vec<(&'static str, &str)> {
+        let mut form = Vec::with_capacity(4);
+        let refresh = self.config.spotify_refresh_token.trim();
+        if refresh.is_empty() {
+            form.push(("grant_type", "client_credentials"));
         } else {
-            vec![
-                ("grant_type", "refresh_token".to_string()),
-                ("refresh_token", self.config.spotify_refresh_token.clone()),
-            ]
-        };
-        form.push(("client_id", self.config.spotify_client_id.clone()));
-        form.push(("client_secret", self.config.spotify_client_secret.clone()));
+            form.push(("grant_type", "refresh_token"));
+            form.push(("refresh_token", refresh));
+        }
+        form.push(("client_id", self.config.spotify_client_id.trim()));
+        form.push(("client_secret", self.config.spotify_client_secret.trim()));
         form
     }
 
@@ -284,46 +329,33 @@ impl Spotify<'_> {
             .limit(MAX_BODY)
             .read_to_vec()
             .map_err(|error| SourceError::Http(error.to_string()))?;
-        let value: Value = serde_json::from_slice(&raw).map_err(|error| {
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: Option<String>,
+            expires_in: Option<u64>,
+        }
+        let value: TokenResponse = serde_json::from_slice(&raw).map_err(|error| {
             SourceError::Http(format!("spotify sent an unreadable answer: {error}"))
         })?;
         let token = value
-            .get("access_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| SourceError::Http("spotify sent no token".into()))?
-            .to_string();
-        let expires = value.get("expires_in").and_then(Value::as_u64).unwrap_or(3600).min(86_400);
+            .access_token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| SourceError::Http("spotify sent no token".into()))?;
+        let expires = value.expires_in.unwrap_or(3600).min(86_400);
         let ttl = Duration::from_secs(expires.saturating_sub(30.min(expires / 10)));
         Ok((token, ttl))
     }
 
-    fn api(&self, path: &str) -> Result<Value, SourceError> {
+    fn api<T: DeserializeOwned>(&self, path: &str) -> Result<T, SourceError> {
         // Pagination is supplied by the remote response. Never forward our
         // bearer token to an unrelated host or outside the catalogue API.
-        if path.starts_with("//") {
-            return Err(SourceError::Url("invalid Spotify pagination URL".into()));
-        }
-        let url = if path.starts_with('/') {
-            format!("{}{path}", self.api_endpoint)
-        } else {
-            path.to_string()
-        };
-        let base = url::Url::parse(self.api_endpoint)
-            .map_err(|error| SourceError::Url(error.to_string()))?;
-        let parsed = crate::http_url(&url)
-            .ok_or_else(|| SourceError::Url("invalid Spotify pagination URL".into()))?;
-        if parsed.origin() != base.origin()
-            || !parsed.path().starts_with(&format!("{}/", base.path().trim_end_matches('/')))
-            || parsed.fragment().is_some()
-        {
-            return Err(SourceError::Url("Spotify pagination left the catalogue API".into()));
-        }
+        let parsed = scoped_api_url(self.api_endpoint, path, "Spotify")?;
         let token = self.token()?;
-        match get_json(self.agent, &url, Some(&token)) {
+        match get_json(self.agent, parsed.as_str(), Some(&token)) {
             Err(SourceError::Media { status: 401 }) => {
                 self.token.invalidate_if(&token);
                 let fresh = self.token()?;
-                get_json(self.agent, &url, Some(&fresh))
+                get_json(self.agent, parsed.as_str(), Some(&fresh))
             }
             other => other,
         }
@@ -342,17 +374,10 @@ impl Spotify<'_> {
                 encode_query(self.config.spotify_market.trim()),
                 encode_query(query)
             );
-            let answer = self.api(&path)?;
+            let answer: SpotifySearchResponse = self.api(&path)?;
             let tracks: Vec<Track> = answer
-                .pointer("/tracks/items")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| SpotifyTrack::deserialize(item).ok())
-                        .filter_map(|track| self.track(&track))
-                        .collect()
-                })
+                .tracks
+                .map(|page| page.items.into_iter().filter_map(|t| self.track(t)).collect())
                 .unwrap_or_default();
             if tracks.is_empty() {
                 return Ok(LoadResult::Empty);
@@ -360,43 +385,41 @@ impl Spotify<'_> {
             return Ok(LoadResult::Search(tracks));
         }
         let (kind, key) = self.parse(id)?;
-        match kind.as_str() {
+        match kind {
             "track" => {
-                let track: SpotifyTrack =
-                    serde_json::from_value(self.api(&format!("/tracks/{key}"))?)
-                        .map_err(|error| SourceError::Http(error.to_string()))?;
-                let track = self.track(&track).ok_or_else(|| {
+                let entry: SpotifyTrack = self.api(&format!("/tracks/{key}"))?;
+                let track = self.track(entry).ok_or_else(|| {
                     SourceError::Http("spotify described a track that cannot be played".into())
                 })?;
                 Ok(LoadResult::Track(Box::new(track)))
             }
             "album" => {
-                let album = self.api(&format!("/albums/{key}"))?;
-                let name =
-                    album.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-                let tracks = self.page(&format!("/albums/{key}/tracks"))?;
+                let album: SpotifyNamed = self.api(&format!("/albums/{key}"))?;
+                let tracks = self.page::<SpotifyTrack>(&format!("/albums/{key}/tracks"), Some)?;
                 if tracks.is_empty() {
                     return Ok(LoadResult::Empty);
                 }
-                Ok(LoadResult::Playlist(Box::new(Playlist::new(name, -1, tracks))))
+                Ok(LoadResult::Playlist(Box::new(Playlist::new(album.name, -1, tracks))))
             }
             "playlist" => {
                 // A Spotify editorial playlist cannot be read without a user's
                 // token, and the failure a client gets otherwise is a confusing
                 // one, so it is named here.
-                if key.starts_with("37i9dQZ") && self.config.spotify_refresh_token.is_empty() {
+                if key.starts_with("37i9dQZ") && self.config.spotify_refresh_token.trim().is_empty()
+                {
                     return Err(SourceError::Disabled(
                         "spotify editorial playlists need spotifyRefreshToken".into(),
                     ));
                 }
-                let playlist = self.api(&format!("/playlists/{key}"))?;
-                let name =
-                    playlist.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-                let tracks = self.page(&format!("/playlists/{key}/tracks"))?;
+                let playlist: SpotifyNamed = self.api(&format!("/playlists/{key}"))?;
+                let tracks = self
+                    .page::<SpotifyPlaylistItem>(&format!("/playlists/{key}/tracks"), |item| {
+                        item.track
+                    })?;
                 if tracks.is_empty() {
                     return Ok(LoadResult::Empty);
                 }
-                Ok(LoadResult::Playlist(Box::new(Playlist::new(name, -1, tracks))))
+                Ok(LoadResult::Playlist(Box::new(Playlist::new(playlist.name, -1, tracks))))
             }
             other => {
                 Err(SourceError::Url(format!("spotify {other} is not a kind this node loads")))
@@ -406,20 +429,19 @@ impl Spotify<'_> {
 
     /// Reads a paged collection, following the next link until the node has
     /// enough tracks.
-    fn page(&self, path: &str) -> Result<Vec<Track>, SourceError> {
+    fn page<T: DeserializeOwned + Default>(
+        &self,
+        path: &str,
+        mut extract: impl FnMut(T) -> Option<SpotifyTrack>,
+    ) -> Result<Vec<Track>, SourceError> {
         let mut tracks = Vec::new();
         let mut next = Some(path.to_string());
         let mut pages = 0;
         while let Some(path) = next.take() {
-            let answer = self.api(&path)?;
-            let page: SpotifyPage = serde_json::from_value(answer)
-                .map_err(|error| SourceError::Http(error.to_string()))?;
-            for item in &page.items {
-                // A playlist entry wraps its track, and a local file has no id
-                // to play.
-                let value = item.get("track").unwrap_or(item);
-                if let Ok(track) = SpotifyTrack::deserialize(value) {
-                    if let Some(track) = self.track(&track) {
+            let page: SpotifyPage<T> = self.api(&path)?;
+            for item in page.items {
+                if let Some(entry) = extract(item) {
+                    if let Some(track) = self.track(entry) {
                         tracks.push(track);
                     }
                 }
@@ -437,17 +459,23 @@ impl Spotify<'_> {
     }
 
     /// Splits an identifier or an open.spotify.com URL into its kind and key.
-    fn parse(&self, id: &str) -> Result<(String, String), SourceError> {
+    fn parse(&self, id: &str) -> Result<(&'static str, String), SourceError> {
         let id = crate::identifier_text(id);
-        let valid = |kind: &str, key: &str| {
-            matches!(kind, "track" | "album" | "playlist")
-                && key.len() == 22
-                && key.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        let match_kind = |kind: &str, key: &str| -> Option<&'static str> {
+            if key.len() != 22 || !key.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                return None;
+            }
+            match kind {
+                "track" => Some("track"),
+                "album" => Some("album"),
+                "playlist" => Some("playlist"),
+                _ => None,
+            }
         };
         if let Some(rest) = id.strip_prefix("spotify:") {
             if let Some((kind, key)) = rest.split_once(':') {
-                if valid(kind, key) {
-                    return Ok((kind.to_string(), key.to_string()));
+                if let Some(static_kind) = match_kind(kind, key) {
+                    return Ok((static_kind, key.to_string()));
                 }
             }
         }
@@ -462,41 +490,49 @@ impl Spotify<'_> {
                     kind = parts.next().unwrap_or_default();
                 }
                 let key = parts.next().unwrap_or_default();
-                if parts.next().is_none() && valid(kind, key) {
-                    return Ok((kind.to_string(), key.to_string()));
+                if parts.next().is_none() {
+                    if let Some(static_kind) = match_kind(kind, key) {
+                        return Ok((static_kind, key.to_string()));
+                    }
                 }
             }
         }
         Err(SourceError::Url(format!("{id} is not a Spotify track, album or playlist")))
     }
 
-    /// Turns a catalogue entry into a track.
-    fn track(&self, entry: &SpotifyTrack) -> Option<Track> {
-        if entry.is_local || entry.id.is_empty() {
+    /// Turns a catalogue entry into a track, moving strings out without cloning.
+    fn track(&self, entry: SpotifyTrack) -> Option<Track> {
+        if entry.is_local
+            || entry.id.is_empty()
+            || (!entry.kind.is_empty() && entry.kind != "track")
+        {
             return None;
         }
-        let author = entry
-            .artists
-            .iter()
-            .map(|artist| artist.name.as_str())
-            .filter(|name| !name.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut author = String::new();
+        for artist in entry.artists {
+            if !artist.name.is_empty() {
+                if author.is_empty() {
+                    author = artist.name;
+                } else {
+                    author.push_str(", ");
+                    author.push_str(&artist.name);
+                }
+            }
+        }
         let artwork = entry
             .album
-            .as_ref()
-            .and_then(|album| album.images.iter().max_by_key(|image| image.width))
-            .map(|image| image.url.clone())
+            .and_then(|album| album.images.into_iter().max_by_key(|image| image.width))
+            .map(|image| image.url)
             .filter(|url| !url.is_empty());
-        let isrc =
-            entry.external_ids.as_ref().map(|ids| ids.isrc.clone()).filter(|isrc| !isrc.is_empty());
+        let isrc = entry.external_ids.map(|ids| ids.isrc).filter(|isrc| !isrc.is_empty());
+        let uri = Some(format!("https://open.spotify.com/track/{}", entry.id));
         let info = TrackInfo {
-            identifier: entry.id.clone(),
-            title: entry.name.clone(),
+            identifier: entry.id,
+            title: entry.name,
             author: if author.is_empty() { "Unknown artist".into() } else { author },
-            length: entry.duration_ms,
+            length: entry.duration_ms.max(0),
             is_seekable: true,
-            uri: Some(format!("https://open.spotify.com/track/{}", entry.id)),
+            uri,
             artwork_url: artwork,
             isrc,
             source_name: "spotify".into(),
@@ -542,11 +578,26 @@ struct DeezerAlbum {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeezerList {
-    data: Vec<Value>,
+    data: Vec<DeezerTrack>,
+    next: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DeezerResponse<T> {
+    error: Option<serde::de::IgnoredAny>,
+    #[serde(flatten)]
+    payload: T,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DeezerNamed {
+    title: String,
 }
 
 impl Deezer<'_> {
-    fn api(&self, path: &str) -> Result<Value, SourceError> {
+    fn api<T: DeserializeOwned>(&self, path: &str) -> Result<T, SourceError> {
         let url = format!("{}{path}", self.config.deezer_api_endpoint.trim_end_matches('/'));
         get_json(self.agent, &url, None)
     }
@@ -559,9 +610,9 @@ impl Deezer<'_> {
                 return Ok(LoadResult::Empty);
             }
             let limit = self.config.search_results.min(25);
-            let answer =
+            let list: DeezerList =
                 self.api(&format!("/search/track?limit={limit}&q={}", encode_query(query)))?;
-            let tracks = self.list_tracks(answer)?;
+            let tracks = self.tracks_from_list(list);
             if tracks.is_empty() {
                 return Ok(LoadResult::Empty);
             }
@@ -572,57 +623,45 @@ impl Deezer<'_> {
             if isrc.is_empty() {
                 return Ok(LoadResult::Empty);
             }
-            let answer = self.api(&format!("/track/isrc:{}", encode_query(isrc)))?;
-            if answer.get("error").is_some() {
+            let answer: DeezerResponse<DeezerTrack> =
+                self.api(&format!("/track/isrc:{}", encode_query(isrc)))?;
+            if answer.error.is_some() {
                 return Ok(LoadResult::Empty);
             }
-            let entry: DeezerTrack = serde_json::from_value(answer)
-                .map_err(|error| SourceError::Http(error.to_string()))?;
-            let track = self.track(&entry).ok_or_else(|| {
+            let track = self.track(answer.payload).ok_or_else(|| {
                 SourceError::Http("deezer described a track that cannot be played".into())
             })?;
             return Ok(LoadResult::Track(Box::new(track)));
         }
         let (kind, key) = self.parse(id)?;
-        match kind.as_str() {
+        match kind {
             "track" => {
-                let answer = self.api(&format!("/track/{key}"))?;
-                if answer.get("error").is_some() {
+                let answer: DeezerResponse<DeezerTrack> = self.api(&format!("/track/{key}"))?;
+                if answer.error.is_some() {
                     return Ok(LoadResult::Empty);
                 }
-                let entry: DeezerTrack = serde_json::from_value(answer)
-                    .map_err(|error| SourceError::Http(error.to_string()))?;
-                let track = self.track(&entry).ok_or_else(|| {
+                let track = self.track(answer.payload).ok_or_else(|| {
                     SourceError::Http("deezer described a track that cannot be played".into())
                 })?;
                 Ok(LoadResult::Track(Box::new(track)))
             }
             "album" | "playlist" => {
-                let answer = self.api(&format!("/{kind}/{key}"))?;
-                if answer.get("error").is_some() {
+                let answer: DeezerResponse<DeezerNamed> = self.api(&format!("/{kind}/{key}"))?;
+                if answer.error.is_some() {
                     return Ok(LoadResult::Empty);
                 }
-                let name =
-                    answer.get("title").and_then(Value::as_str).unwrap_or_default().to_string();
                 let tracks = self.paged(&format!("/{kind}/{key}/tracks"))?;
                 if tracks.is_empty() {
                     return Ok(LoadResult::Empty);
                 }
-                Ok(LoadResult::Playlist(Box::new(Playlist::new(name, -1, tracks))))
+                Ok(LoadResult::Playlist(Box::new(Playlist::new(answer.payload.title, -1, tracks))))
             }
             other => Err(SourceError::Url(format!("deezer {other} is not a kind this node loads"))),
         }
     }
 
-    fn list_tracks(&self, answer: Value) -> Result<Vec<Track>, SourceError> {
-        let list: DeezerList =
-            serde_json::from_value(answer).map_err(|error| SourceError::Http(error.to_string()))?;
-        Ok(list
-            .data
-            .iter()
-            .filter_map(|item| DeezerTrack::deserialize(item).ok())
-            .filter_map(|entry| self.track(&entry))
-            .collect())
+    fn tracks_from_list(&self, list: DeezerList) -> Vec<Track> {
+        list.data.into_iter().filter_map(|entry| self.track(entry)).collect()
     }
 
     /// Reads a collection, following the next page the payload names.
@@ -630,30 +669,12 @@ impl Deezer<'_> {
         let mut tracks = Vec::new();
         let mut next = Some(path.to_string());
         let mut pages = 0;
-        let base_str = self.config.deezer_api_endpoint.trim_end_matches('/');
-        let base =
-            url::Url::parse(base_str).map_err(|error| SourceError::Url(error.to_string()))?;
-        let base_prefix = base.path().trim_end_matches('/');
         while let Some(raw_next) = next.take() {
             // The next link comes from the response; never follow it off the API.
-            if raw_next.starts_with("//") {
-                return Err(SourceError::Url("Deezer pagination left the catalogue API".into()));
-            }
-            let full =
-                if raw_next.starts_with('/') { format!("{base_str}{raw_next}") } else { raw_next };
-            let parsed = crate::http_url(&full).ok_or_else(|| {
-                SourceError::Url("Deezer pagination left the catalogue API".into())
-            })?;
-            if parsed.origin() != base.origin()
-                || (!base_prefix.is_empty()
-                    && !parsed.path().starts_with(&format!("{base_prefix}/")))
-                || parsed.fragment().is_some()
-            {
-                return Err(SourceError::Url("Deezer pagination left the catalogue API".into()));
-            }
-            let answer = get_json(self.agent, parsed.as_str(), None)?;
-            next = answer.get("next").and_then(Value::as_str).map(str::to_string);
-            tracks.extend(self.list_tracks(answer)?);
+            let parsed = scoped_api_url(&self.config.deezer_api_endpoint, &raw_next, "Deezer")?;
+            let mut list: DeezerList = get_json(self.agent, parsed.as_str(), None)?;
+            next = list.next.take();
+            tracks.extend(self.tracks_from_list(list));
             pages += 1;
             if tracks.len() >= self.config.max_playlist_tracks as usize || pages >= MAX_PAGES {
                 break;
@@ -663,67 +684,69 @@ impl Deezer<'_> {
         Ok(tracks)
     }
 
-    fn parse(&self, id: &str) -> Result<(String, String), SourceError> {
+    fn parse(&self, id: &str) -> Result<(&'static str, String), SourceError> {
         let id = crate::identifier_text(id);
-        // The key is spliced into an API path, so only Deezer's numeric ids pass.
-        let valid = |kind: &str, key: &str| {
-            matches!(kind, "track" | "album" | "playlist")
-                && !key.is_empty()
-                && key.bytes().all(|byte| byte.is_ascii_digit())
+        let match_kind = |kind: &str, key: &str| -> Option<&'static str> {
+            if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            match kind {
+                "track" => Some("track"),
+                "album" => Some("album"),
+                "playlist" => Some("playlist"),
+                _ => None,
+            }
         };
         if let Some(rest) = id.strip_prefix("deezer:") {
-            let parts = parts_after(rest, "");
-            if parts.len() >= 2 && valid(&parts[0], &parts[1]) {
-                return Ok((parts[0].clone(), parts[1].clone()));
+            let mut parts = rest.split(':').map(str::trim).filter(|part| !part.is_empty());
+            if let (Some(kind), Some(key), None) = (parts.next(), parts.next(), parts.next()) {
+                if let Some(static_kind) = match_kind(kind, key) {
+                    return Ok((static_kind, key.to_string()));
+                }
             }
         }
         if let Some(url) = crate::http_url(id) {
             if url.host_str().is_some_and(|host| crate::host_matches(host, "deezer.com")) {
                 // Share links carry any locale first, such as /fr/ or /us/.
-                let parts: Vec<&str> =
-                    url.path_segments().into_iter().flatten().filter(|p| !p.is_empty()).collect();
-                let parts = match parts.as_slice() {
-                    [kind, key] | [_, kind, key] => Some((*kind, *key)),
+                let mut parts = url.path_segments().into_iter().flatten().filter(|p| !p.is_empty());
+                let pair = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                    (Some(kind), Some(key), None, None)
+                    | (Some(_), Some(kind), Some(key), None) => Some((kind, key)),
                     _ => None,
                 };
-                if let Some((kind, key)) = parts.filter(|(kind, key)| valid(kind, key)) {
-                    return Ok((kind.to_string(), key.to_string()));
+                if let Some((kind, key)) = pair {
+                    if let Some(static_kind) = match_kind(kind, key) {
+                        return Ok((static_kind, key.to_string()));
+                    }
                 }
             }
         }
         Err(SourceError::Url(format!("{id} is not a Deezer track, album or playlist")))
     }
 
-    fn track(&self, entry: &DeezerTrack) -> Option<Track> {
+    fn track(&self, entry: DeezerTrack) -> Option<Track> {
         if entry.id == 0 || entry.title.is_empty() {
             return None;
         }
         let id = entry.id.to_string();
         let artwork = entry
             .album
-            .as_ref()
-            .map(|album| {
-                if !album.cover_xl.is_empty() {
-                    album.cover_xl.clone()
-                } else {
-                    album.cover_big.clone()
-                }
-            })
+            .map(|album| if !album.cover_xl.is_empty() { album.cover_xl } else { album.cover_big })
             .filter(|url| !url.is_empty());
+        let uri = Some(format!("https://www.deezer.com/track/{id}"));
         let info = TrackInfo {
-            identifier: id.clone(),
-            title: entry.title.clone(),
+            identifier: id,
+            title: entry.title,
             author: entry
                 .artist
-                .as_ref()
-                .map(|artist| artist.name.clone())
+                .map(|artist| artist.name)
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "Unknown artist".into()),
-            length: entry.duration.saturating_mul(1000),
+            length: entry.duration.max(0).saturating_mul(1000),
             is_seekable: true,
-            uri: Some(format!("https://www.deezer.com/track/{id}")),
+            uri,
             artwork_url: artwork,
-            isrc: (!entry.isrc.is_empty()).then(|| entry.isrc.clone()),
+            isrc: (!entry.isrc.is_empty()).then_some(entry.isrc),
             source_name: "deezer".into(),
             ..Default::default()
         };
@@ -787,14 +810,21 @@ impl SoundCloud<'_> {
         self.client_id.get_or_refresh(|| {
             let base = self.config.soundcloud_web_endpoint.trim_end_matches('/');
             let page = get_text(self.agent, base)?;
-            let id = scrape_client_id(&page).ok_or_else(|| {
-                SourceError::Http("soundcloud no longer publishes a client id".into())
-            })?;
-            Ok((id, self.config.soundcloud_client_id_ttl()))
+            if let Some(id) = scrape_client_id(&page) {
+                return Ok((id, self.config.soundcloud_client_id_ttl()));
+            }
+            for script_url in scrape_script_urls(&page, base) {
+                if let Ok(script) = get_text(self.agent, &script_url) {
+                    if let Some(id) = scrape_client_id(&script) {
+                        return Ok((id, self.config.soundcloud_client_id_ttl()));
+                    }
+                }
+            }
+            Err(SourceError::Http("soundcloud no longer publishes a client id".into()))
         })
     }
 
-    fn api(&self, path: &str) -> Result<Value, SourceError> {
+    fn api<T: DeserializeOwned>(&self, path: &str) -> Result<T, SourceError> {
         let client = self.client_id()?;
         let base = self.config.soundcloud_api_endpoint.trim_end_matches('/');
         let separator = if path.contains('?') { '&' } else { '?' };
@@ -820,12 +850,10 @@ impl SoundCloud<'_> {
                 return Ok(LoadResult::Empty);
             }
             let limit = self.config.search_results.min(20);
-            let answer =
+            let list: SoundCloudList =
                 self.api(&format!("/search/tracks?q={}&limit={limit}", encode_query(query)))?;
-            let list: SoundCloudList = serde_json::from_value(answer)
-                .map_err(|error| SourceError::Http(error.to_string()))?;
             let tracks: Vec<Track> =
-                list.collection.iter().filter_map(|entry| self.track(entry)).collect();
+                list.collection.into_iter().filter_map(|entry| self.track(entry)).collect();
             if tracks.is_empty() {
                 return Ok(LoadResult::Empty);
             }
@@ -835,30 +863,59 @@ impl SoundCloud<'_> {
         if key.is_empty() {
             return Err(SourceError::Url(format!("{id} is not a SoundCloud track or playlist")));
         }
-        let answer = self.api(&format!("/resolve?url={}", encode_query(&key)))?;
+        let answer: Value = self.api(&format!("/resolve?url={}", encode_query(&key)))?;
         let kind = answer.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
         if kind == "track" {
             let entry: SoundCloudTrack = serde_json::from_value(answer)
                 .map_err(|error| SourceError::Http(error.to_string()))?;
-            let track = self.track(&entry).ok_or_else(|| {
+            let track = self.track(entry).ok_or_else(|| {
                 SourceError::Http("soundcloud described a track that cannot be played".into())
             })?;
             return Ok(LoadResult::Track(Box::new(track)));
         }
         if kind == "playlist" {
             let name = answer.get("title").and_then(Value::as_str).unwrap_or_default().to_string();
-            let tracks: Vec<Track> = answer
+            let raw_entries: Vec<SoundCloudTrack> = answer
                 .get("tracks")
                 .and_then(Value::as_array)
                 .map(|entries| {
                     entries
                         .iter()
-                        .filter_map(|entry| SoundCloudTrack::deserialize(entry).ok())
-                        .filter_map(|entry| self.track(&entry))
                         .take(self.config.max_playlist_tracks as usize)
+                        .filter_map(|entry| SoundCloudTrack::deserialize(entry).ok())
                         .collect()
                 })
                 .unwrap_or_default();
+            let stub_ids: Vec<u64> = raw_entries
+                .iter()
+                .filter(|entry| entry.id != 0 && entry.title.is_empty())
+                .map(|entry| entry.id)
+                .collect();
+            let mut hydrated = std::collections::HashMap::new();
+            for chunk in stub_ids.chunks(50) {
+                let mut ids = String::new();
+                for (idx, stub_id) in chunk.iter().enumerate() {
+                    if idx > 0 {
+                        ids.push(',');
+                    }
+                    use std::fmt::Write as _;
+                    let _ = write!(ids, "{stub_id}");
+                }
+                if let Ok(fetched) = self.api::<Vec<SoundCloudTrack>>(&format!("/tracks?ids={ids}"))
+                {
+                    for item in fetched {
+                        hydrated.insert(item.id, item);
+                    }
+                }
+            }
+            let tracks: Vec<Track> = raw_entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let full =
+                        if entry.title.is_empty() { hydrated.remove(&entry.id)? } else { entry };
+                    self.track(full)
+                })
+                .collect();
             if tracks.is_empty() {
                 return Ok(LoadResult::Empty);
             }
@@ -873,7 +930,7 @@ impl SoundCloud<'_> {
         if key.is_empty() && (id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit())) {
             return Err(SourceError::Url("invalid SoundCloud track identifier".into()));
         }
-        let answer = if key.is_empty() {
+        let answer: Value = if key.is_empty() {
             self.api(&format!("/tracks/{id}"))?
         } else {
             self.api(&format!("/resolve?url={}", encode_query(&key)))?
@@ -885,7 +942,7 @@ impl SoundCloud<'_> {
         // A full track/resolve response already carries transcodings. Fetch a
         // second time only when resolve returned an abbreviated track object.
         let track = if !key.is_empty() && answer.pointer("/media/transcodings").is_none() {
-            self.api(&format!("/tracks/{track_id}"))?
+            self.api::<Value>(&format!("/tracks/{track_id}"))?
         } else {
             answer
         };
@@ -910,42 +967,63 @@ impl SoundCloud<'_> {
         // The transcoding endpoint is a complete URL, not a path to append to
         // the catalogue origin. It passes the same network guard as all media.
         netguard::validate_url(url)?;
-        let separator = if url.contains('?') { '&' } else { '?' };
-        let client = self.client_id()?;
-        let resolved = get_json(
-            self.agent,
-            &format!("{url}{separator}client_id={}", encode_query(&client)),
-            None,
-        )?;
-        let direct = resolved
-            .get("url")
+        let auth_param = track
+            .get("track_authorization")
             .and_then(Value::as_str)
+            .filter(|t| !t.is_empty() && !url.contains("track_authorization="));
+        let separator = if url.contains('?') { '&' } else { '?' };
+        #[derive(Deserialize)]
+        struct StreamUrl {
+            url: Option<String>,
+        }
+        let build_stream_req = |cid: &str| match auth_param {
+            Some(auth) => format!(
+                "{url}{separator}client_id={}&track_authorization={}",
+                encode_query(cid),
+                encode_query(auth)
+            ),
+            None => format!("{url}{separator}client_id={}", encode_query(cid)),
+        };
+        let client = self.client_id()?;
+        let resolved: StreamUrl = match get_json(self.agent, &build_stream_req(&client), None) {
+            Err(SourceError::Media { status: 401 | 403 })
+                if self.config.soundcloud_client_id.trim().is_empty() =>
+            {
+                self.client_id.invalidate_if(&client);
+                let fresh = self.client_id()?;
+                get_json(self.agent, &build_stream_req(&fresh), None)?
+            }
+            other => other?,
+        };
+        let direct = resolved
+            .url
+            .filter(|url| !url.is_empty())
             .ok_or_else(|| SourceError::Http("soundcloud resolved to no stream".into()))?;
-        Ok((direct.to_string(), BTreeMap::new()))
+        Ok((direct, BTreeMap::new()))
     }
 
-    fn track(&self, entry: &SoundCloudTrack) -> Option<Track> {
+    fn track(&self, entry: SoundCloudTrack) -> Option<Track> {
         if entry.id == 0 || entry.title.is_empty() || !entry.streamable {
             return None;
         }
         let id = entry.id.to_string();
+        let uri = Some(if entry.permalink_url.is_empty() {
+            format!("https://soundcloud.com/tracks/{id}")
+        } else {
+            entry.permalink_url
+        });
         let info = TrackInfo {
-            identifier: id.clone(),
-            title: entry.title.clone(),
+            identifier: id,
+            title: entry.title,
             author: entry
                 .user
-                .as_ref()
-                .map(|user| user.username.clone())
+                .map(|user| user.username)
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "Unknown artist".into()),
-            length: entry.duration,
+            length: entry.duration.max(0),
             is_seekable: true,
-            uri: Some(if entry.permalink_url.is_empty() {
-                format!("https://soundcloud.com/tracks/{id}")
-            } else {
-                entry.permalink_url.clone()
-            }),
-            artwork_url: entry.artwork_url.clone(),
+            uri,
+            artwork_url: entry.artwork_url,
             source_name: "soundcloud".into(),
             ..Default::default()
         };
@@ -956,8 +1034,11 @@ impl SoundCloud<'_> {
 /// Turns a SoundCloud identifier or URL into the page URL the API resolves.
 fn soundcloud_key(id: &str) -> String {
     let trimmed = crate::identifier_text(id);
-    if let Some(url) = crate::http_url(trimmed) {
+    if let Some(mut url) = crate::http_url(trimmed) {
         if url.host_str().is_some_and(|host| crate::host_matches(host, "soundcloud.com")) {
+            if url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("m.soundcloud.com")) {
+                let _ = url.set_host(Some("soundcloud.com"));
+            }
             return url.into();
         }
         return String::new();
@@ -974,24 +1055,55 @@ fn soundcloud_key(id: &str) -> String {
     String::new()
 }
 
+fn scrape_script_urls(page: &str, base: &str) -> Vec<String> {
+    let base_origin = url::Url::parse(base).ok();
+    let mut urls = Vec::new();
+    for part in page.rsplit("<script") {
+        let Some(tag_end) = part.find('>') else { continue };
+        let tag = &part[..tag_end];
+        let Some(src_at) = tag.find("src=\"") else { continue };
+        let rest = &tag[src_at + 5..];
+        let Some(end_quote) = rest.find('"') else { continue };
+        let candidate = &rest[..end_quote];
+        if !candidate.ends_with(".js") {
+            continue;
+        }
+        let resolved = if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            url::Url::parse(candidate).ok()
+        } else {
+            base_origin.as_ref().and_then(|b| b.join(candidate).ok())
+        };
+        let Some(parsed) = resolved else { continue };
+        let allowed = parsed.host_str().is_some_and(|host| {
+            crate::host_matches(host, "sndcdn.com")
+                || crate::host_matches(host, "soundcloud.com")
+                || base_origin
+                    .as_ref()
+                    .is_some_and(|b| b.host_str() == Some(host) && b.port() == parsed.port())
+        });
+        if allowed && netguard::validate_url(parsed.as_str()).is_ok() {
+            urls.push(String::from(parsed));
+            if urls.len() >= 5 {
+                break;
+            }
+        }
+    }
+    urls
+}
+
 /// Finds `client_id:"..."` in a page of JavaScript.
 ///
 /// The id is 32 alphanumeric characters and the page states it in more than one
 /// place, so the first value that looks like one is used.
 fn scrape_client_id(page: &str) -> Option<String> {
     for marker in ["client_id:\"", "client_id=\"", "client_id\":\""] {
-        let mut at = 0usize;
-        while let Some(found) = page[at..].find(marker) {
-            let start = at + found + marker.len();
-            let rest = &page[start..];
-            let end = rest
-                .find(|character: char| !character.is_ascii_alphanumeric())
-                .unwrap_or(rest.len());
-            let candidate = &rest[..end];
-            if candidate.len() == 32 && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Some(candidate.to_string());
+        for rest in page.split(marker).skip(1) {
+            let bytes = rest.as_bytes();
+            if bytes.get(..32).is_some_and(|id| id.iter().all(u8::is_ascii_alphanumeric))
+                && !bytes.get(32).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return Some(rest[..32].to_owned());
             }
-            at = start;
         }
     }
     None
@@ -999,14 +1111,19 @@ fn scrape_client_id(page: &str) -> Option<String> {
 
 /// Percent-encodes a query value the way a form submission does.
 fn encode_query(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
+                out.push(byte as char);
             }
             b' ' => out.push('+'),
-            other => out.push_str(&format!("%{other:02X}")),
+            other => {
+                out.push('%');
+                out.push(HEX[(other >> 4) as usize] as char);
+                out.push(HEX[(other & 0x0f) as usize] as char);
+            }
         }
     }
     out
@@ -1095,15 +1212,15 @@ mod tests {
         };
         let spotify = Spotify::new(&agent, &config);
         let form = spotify.token_form();
-        assert!(form.contains(&("client_id", "id".into())));
-        assert!(form.contains(&("client_secret", "secret".into())));
-        assert!(form.contains(&("refresh_token", "refresh".into())));
+        assert!(form.contains(&("client_id", "id")));
+        assert!(form.contains(&("client_secret", "secret")));
+        assert!(form.contains(&("refresh_token", "refresh")));
         let entry: SpotifyTrack = serde_json::from_value(serde_json::json!({
             "id":"track", "name":"name", "duration_ms":12345, "is_local":false,
             "external_ids":{"isrc":"CODE"}
         }))
         .unwrap();
-        let track = spotify.track(&entry).unwrap();
+        let track = spotify.track(entry).unwrap();
         assert_eq!(track.metadata.length, 12345);
         assert_eq!(track.metadata.isrc.as_deref(), Some("CODE"));
     }
@@ -1162,7 +1279,7 @@ mod tests {
         let config = config();
         let spotify = Spotify::new(&agent, &config);
         let (kind, key) = spotify.parse("spotify:track:4cOdK2wGLETKBW3PvgPWqT").unwrap();
-        assert_eq!((kind.as_str(), key.as_str()), ("track", "4cOdK2wGLETKBW3PvgPWqT"));
+        assert_eq!((kind, key.as_str()), ("track", "4cOdK2wGLETKBW3PvgPWqT"));
     }
 
     #[test]
@@ -1172,7 +1289,7 @@ mod tests {
         let spotify = Spotify::new(&agent, &config);
         let (kind, key) =
             spotify.parse("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT?si=abc").unwrap();
-        assert_eq!((kind.as_str(), key.as_str()), ("track", "4cOdK2wGLETKBW3PvgPWqT"));
+        assert_eq!((kind, key.as_str()), ("track", "4cOdK2wGLETKBW3PvgPWqT"));
     }
 
     #[test]
@@ -1182,7 +1299,7 @@ mod tests {
         let spotify = Spotify::new(&agent, &config);
         let (kind, key) =
             spotify.parse("https://open.spotify.com/intl-ja/album/1ATL5GLyefJaxhQzSPVrLX").unwrap();
-        assert_eq!((kind.as_str(), key.as_str()), ("album", "1ATL5GLyefJaxhQzSPVrLX"));
+        assert_eq!((kind, key.as_str()), ("album", "1ATL5GLyefJaxhQzSPVrLX"));
     }
 
     #[test]
@@ -1200,7 +1317,7 @@ mod tests {
             assert_eq!(crate::source_kind(link), "spotify", "{link}");
             assert_eq!(
                 spotify.parse(link).unwrap(),
-                ("track".into(), "4cOdK2wGLETKBW3PvgPWqT".into()),
+                ("track", "4cOdK2wGLETKBW3PvgPWqT".into()),
                 "{link}"
             );
         }
@@ -1288,12 +1405,12 @@ mod tests {
             .token
             .get_or_refresh(|| Ok(("test-token".into(), Duration::from_secs(60))))
             .unwrap();
-        assert!(matches!(spotify.page("/tracks"), Err(SourceError::Url(_))));
+        assert!(matches!(spotify.page::<SpotifyTrack>("/tracks", Some), Err(SourceError::Url(_))));
         server.join().unwrap();
         for path in
             ["https://api.spotify.com/v1/tracks", "/../outside", "//outside", "/tracks#fragment"]
         {
-            assert!(matches!(spotify.api(path), Err(SourceError::Url(_))), "{path}");
+            assert!(matches!(spotify.api::<Value>(path), Err(SourceError::Url(_))), "{path}");
         }
     }
 
@@ -1302,7 +1419,7 @@ mod tests {
         let agent = netguard::agent(false);
         let deezer = Deezer { agent: &agent, config: &config() };
         let (kind, key) = deezer.parse("deezer:track:3135556").unwrap();
-        assert_eq!((kind.as_str(), key.as_str()), ("track", "3135556"));
+        assert_eq!((kind, key.as_str()), ("track", "3135556"));
     }
 
     #[test]
@@ -1316,7 +1433,7 @@ mod tests {
             "http://deezer.com/us/track/3135556/",
         ] {
             assert_eq!(crate::source_kind(link), "deezer", "{link}");
-            assert_eq!(deezer.parse(link).unwrap(), ("track".into(), "3135556".into()), "{link}");
+            assert_eq!(deezer.parse(link).unwrap(), ("track", "3135556".into()), "{link}");
         }
         for bad in [
             "deezer:track:1/../../user/me",
@@ -1358,6 +1475,7 @@ mod tests {
         let entry = SpotifyTrack {
             id: "abc".into(),
             name: "A Song".into(),
+            kind: "track".into(),
             duration_ms: 200_000,
             artists: vec![SpotifyArtist { name: "Someone".into() }],
             album: Some(SpotifyAlbum {
@@ -1369,7 +1487,7 @@ mod tests {
             external_ids: Some(SpotifyExternalIds { isrc: "ISRC123".into() }),
             is_local: false,
         };
-        let track = spotify.track(&entry).unwrap();
+        let track = spotify.track(entry).unwrap();
         assert_eq!(track.metadata.title, "A Song");
         assert_eq!(track.metadata.author, "Someone");
         assert_eq!(track.metadata.isrc.as_deref(), Some("ISRC123"));
@@ -1388,7 +1506,7 @@ mod tests {
             is_local: true,
             ..Default::default()
         };
-        assert!(spotify.track(&entry).is_none());
+        assert!(spotify.track(entry).is_none());
     }
 
     #[test]
@@ -1403,7 +1521,7 @@ mod tests {
             artist: Some(DeezerArtist { name: "Someone".into() }),
             album: Some(DeezerAlbum { cover_xl: "large".into(), cover_big: String::new() }),
         };
-        let track = deezer.track(&entry).unwrap();
+        let track = deezer.track(entry).unwrap();
         assert_eq!(track.metadata.title, "A Song");
         assert_eq!(track.metadata.length, 200_000);
         assert_eq!(track.metadata.artwork_url.as_deref(), Some("large"));
@@ -1423,7 +1541,7 @@ mod tests {
             streamable: true,
             artwork_url: None,
         };
-        let track = soundcloud.track(&entry).unwrap();
+        let track = soundcloud.track(entry).unwrap();
         assert_eq!(track.metadata.title, "A Song");
         assert_eq!(track.metadata.source_name, "soundcloud");
         assert_eq!(track.metadata.uri.as_deref(), Some("https://soundcloud.com/someone/a-song"));
@@ -1440,7 +1558,7 @@ mod tests {
             streamable: false,
             ..Default::default()
         };
-        assert!(soundcloud.track(&entry).is_none());
+        assert!(soundcloud.track(entry).is_none());
     }
 
     #[test]

@@ -70,10 +70,6 @@ impl MediaSource for Unseekable {
 pub struct Decoder {
     inner: Inner,
     rate: u32,
-    scratch: Vec<f32>,
-    /// The interleaving buffer of the symphonia path, kept between packets so
-    /// that a steady stream does not allocate one per packet.
-    samples: SampleBuffer<f32>,
 }
 
 enum Inner {
@@ -83,9 +79,29 @@ enum Inner {
         track_id: u32,
         spec: SignalSpec,
         mixer: Downmix,
+        /// Interleaving buffer kept between packets so steady streams never reallocate.
+        samples: SampleBuffer<f32>,
     },
     OggOpus(Box<OggDecoder>),
     ContainerOpus(Box<ContainerOpusDecoder>),
+}
+
+#[inline]
+fn finite_or_zero(s: f32) -> f32 {
+    if s.is_finite() {
+        s
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn extend_scaled_finite(samples: &[f32], gain: f32, out: &mut Vec<f32>) {
+    if gain == 1.0 {
+        out.extend(samples.iter().copied().map(finite_or_zero));
+    } else {
+        out.extend(samples.iter().map(|&s| finite_or_zero(s * gain)));
+    }
 }
 
 struct ContainerOpusDecoder {
@@ -94,6 +110,60 @@ struct ContainerOpusDecoder {
     track_id: u32,
     skip: u32,
     gain: f32,
+    scratch: Vec<f32>,
+}
+
+fn parse_container_opus_params(
+    params: &symphonia::core::codecs::CodecParameters,
+) -> Result<(u32, f32), AudioError> {
+    let channels = params.channels.map(|c| c.count()).unwrap_or(2);
+    if !(1..=2).contains(&channels) {
+        return Err(AudioError::Decode("unsupported Opus channel count".into()));
+    }
+    let mut skip = params.delay.unwrap_or(0);
+    let mut output_gain = 0i16;
+    if let Some(extra) = params.extra_data.as_deref() {
+        if let Some(rest) = extra.strip_prefix(b"OpusHead") {
+            let &[version, ch, s0, s1, _, _, _, _, g0, g1, family, ..] = rest else {
+                return Err(AudioError::Decode("unsupported OpusHead in container".into()));
+            };
+            if !(1..=2).contains(&ch) || family != 0 {
+                return Err(AudioError::Decode("unsupported OpusHead in container".into()));
+            }
+            match version {
+                // Symphonia's `isomp4` reader prepends `b"OpusHead"` onto the raw
+                // big-endian ISO-BMFF `dOps` (`OpusSpecificBox`, Version = 0) payload.
+                0 => {
+                    if skip == 0 {
+                        skip = u32::from(u16::from_be_bytes([s0, s1]));
+                    }
+                    output_gain = i16::from_be_bytes([g0, g1]);
+                }
+                // RFC 7845 `OpusHead` (Matroska/WebM CodecPrivate): little-endian, version 1..=15.
+                1..=15 => {
+                    if skip == 0 {
+                        skip = u32::from(u16::from_le_bytes([s0, s1]));
+                    }
+                    output_gain = i16::from_le_bytes([g0, g1]);
+                }
+                _ => {
+                    return Err(AudioError::Decode("unsupported OpusHead in container".into()));
+                }
+            }
+        } else if let &[0, ch, s0, s1, _, _, _, _, g0, g1, family, ..] = extra {
+            // ISO-MP4 `dOps` OpusSpecificBox payload: version=0, OutputChannelCount,
+            // PreSkip (BE u16), InputSampleRate (BE u32), OutputGain (BE i16), MappingFamily.
+            if !(1..=2).contains(&ch) || family != 0 {
+                return Err(AudioError::Decode("unsupported dOps channel mapping".into()));
+            }
+            if skip == 0 {
+                skip = u32::from(u16::from_be_bytes([s0, s1]));
+            }
+            output_gain = i16::from_be_bytes([g0, g1]);
+        }
+    }
+    let gain = 10.0f32.powf(output_gain as f32 / (20.0 * 256.0));
+    Ok((skip, gain))
 }
 
 impl ContainerOpusDecoder {
@@ -102,50 +172,18 @@ impl ContainerOpusDecoder {
         track_id: u32,
         params: &symphonia::core::codecs::CodecParameters,
     ) -> Result<Self, AudioError> {
-        let channels = params.channels.map(|c| c.count()).unwrap_or(2);
-        if !(1..=2).contains(&channels) {
-            return Err(AudioError::Decode("unsupported Opus channel count".into()));
-        }
-        let mut skip = params.delay.unwrap_or(0);
-        let mut output_gain = 0i16;
-        if let Some(extra) = params.extra_data.as_deref() {
-            if extra.starts_with(b"OpusHead") {
-                if extra.len() < 19
-                    || extra[8] > 15
-                    || !(1..=2).contains(&extra[9])
-                    || extra[18] != 0
-                {
-                    return Err(AudioError::Decode("unsupported OpusHead in container".into()));
-                }
-                let head_skip = u16::from_le_bytes([extra[10], extra[11]]) as u32;
-                if skip == 0 {
-                    skip = head_skip;
-                }
-                output_gain = i16::from_le_bytes([extra[16], extra[17]]);
-            } else if extra.len() >= 11 && extra[0] == 0 {
-                // ISO-MP4 `dOps` OpusSpecificBox payload: version=0, OutputChannelCount,
-                // PreSkip (BE u16), InputSampleRate (BE u32), OutputGain (BE i16), MappingFamily.
-                if !(1..=2).contains(&extra[1]) || extra[10] != 0 {
-                    return Err(AudioError::Decode("unsupported dOps channel mapping".into()));
-                }
-                let box_skip = u16::from_be_bytes([extra[2], extra[3]]) as u32;
-                if skip == 0 {
-                    skip = box_skip;
-                }
-                output_gain = i16::from_be_bytes([extra[8], extra[9]]);
-            }
-        }
-        let gain = 10.0f32.powf(output_gain as f32 / (20.0 * 256.0));
+        let (skip, gain) = parse_container_opus_params(params)?;
         Ok(Self {
             format,
             decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
             track_id,
             skip,
             gain,
+            scratch: Vec::new(),
         })
     }
 
-    fn decode(&mut self, scratch: &mut Vec<f32>, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+    fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(packet) => packet,
@@ -162,11 +200,11 @@ impl ContainerOpusDecoder {
             let Some(expected) = opus_decode::packet_samples(buf) else {
                 continue;
             };
-            let frames = match self.decoder.decode_float(buf, scratch) {
+            let frames = match self.decoder.decode_float(buf, &mut self.scratch) {
                 Ok(frames) => frames,
                 Err(_) => self
                     .decoder
-                    .conceal_float(expected, scratch)
+                    .conceal_float(expected, &mut self.scratch)
                     .map_err(|e| AudioError::Decode(e.to_string()))?,
             };
             let pkt_trim_start = packet.trim_start() as usize;
@@ -177,26 +215,17 @@ impl ContainerOpusDecoder {
             if end == start {
                 continue;
             }
-            out.reserve((end - start) * 2);
-            let gain = self.gain;
-            out.extend(scratch[start * 2..end * 2].iter().map(|s| {
-                let v = *s * gain;
-                if v.is_finite() {
-                    v
-                } else {
-                    0.0
-                }
-            }));
+            extend_scaled_finite(&self.scratch[start * 2..end * 2], self.gain, out);
             return Ok(true);
         }
     }
 }
 
 struct OggPacket {
-    offset: usize,
-    length: usize,
-    frames: usize,
-    keep: usize,
+    offset: u32,
+    length: u32,
+    frames: u16,
+    keep: u16,
 }
 
 /// Stage compressed packets for one page so RFC 7845 end trimming can cut
@@ -209,10 +238,10 @@ struct OggDecoder {
     skip: u32,
     gain: f32,
     page: Vec<u8>,
-    packet: Vec<u8>,
     packets: VecDeque<OggPacket>,
     previous_granule: Option<u64>,
     ended: bool,
+    scratch: Vec<f32>,
 }
 
 impl OggDecoder {
@@ -223,10 +252,10 @@ impl OggDecoder {
             skip: 0,
             gain: 1.0,
             page: Vec::new(),
-            packet: Vec::new(),
             packets: VecDeque::new(),
             previous_granule: None,
             ended: false,
+            scratch: Vec::new(),
         };
         // Validate the initial granule and establish cropping before playback
         // starts, while the caller can still select its FFmpeg fallback.
@@ -244,23 +273,24 @@ impl OggDecoder {
         self.packets.clear();
         let mut total = 0u64;
         loop {
-            if !self.reader.next_packet_into(&mut self.packet)? {
+            let offset = self.page.len();
+            if !self.reader.append_next_packet(&mut self.page)? {
                 return if self.packets.is_empty() {
                     Ok(false)
                 } else {
                     Err(AudioError::Decode("missing ogg page granule".into()))
                 };
             }
-            let frames = opus_decode::packet_samples(&self.packet)
+            let raw_packet = &self.page[offset..];
+            let frames = opus_decode::packet_samples(raw_packet)
                 .ok_or_else(|| AudioError::Decode("invalid opus packet duration".into()))?;
             total += frames as u64;
             self.packets.push_back(OggPacket {
-                offset: self.page.len(),
-                length: self.packet.len(),
-                frames,
-                keep: frames,
+                offset: offset as u32,
+                length: raw_packet.len() as u32,
+                frames: frames as u16,
+                keep: frames as u16,
             });
-            self.page.extend_from_slice(&self.packet);
             let Some((granule, end_of_stream)) = self.reader.packet_page_end() else {
                 // The reader must delimit every page with completed packets;
                 // this guard also keeps accidental metadata loss bounded.
@@ -305,8 +335,9 @@ impl OggDecoder {
             };
             let mut remaining = keep as usize;
             for packet in &mut self.packets {
-                packet.keep = remaining.min(packet.frames);
-                remaining -= packet.keep;
+                let keep_frames = remaining.min(usize::from(packet.frames));
+                packet.keep = keep_frames as u16;
+                remaining -= keep_frames;
             }
             self.previous_granule = Some(granule);
             self.ended = end_of_stream;
@@ -314,38 +345,40 @@ impl OggDecoder {
         }
     }
 
-    fn decode(&mut self, scratch: &mut Vec<f32>, out: &mut Vec<f32>) -> Result<bool, AudioError> {
-        if self.packets.is_empty() && !self.read_page()? {
-            return Ok(false);
-        }
-        let packet = self.packets.pop_front().expect("a nonempty audio page was loaded");
-        let drop = (self.skip as usize).min(packet.frames);
-        self.skip -= drop as u32;
-        let frames = match self
-            .decoder
-            .decode_float(&self.page[packet.offset..packet.offset + packet.length], scratch)
-        {
-            Ok(frames) => frames,
-            // The TOC gave a valid duration: conceal the damaged packet so it
-            // still occupies its exact duration on the page's clock.
-            Err(_) => self
-                .decoder
-                .conceal_float(packet.frames, scratch)
-                .map_err(|e| AudioError::Decode(e.to_string()))?,
-        };
-        let end = packet.keep.min(frames);
-        let start = drop.min(end);
-        out.reserve((end - start) * 2);
-        let gain = self.gain;
-        out.extend(scratch[start * 2..end * 2].iter().map(|sample| {
-            let v = *sample * gain;
-            if v.is_finite() {
-                v
-            } else {
-                0.0
+    fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+        loop {
+            if self.packets.is_empty() && !self.read_page()? {
+                return Ok(false);
             }
-        }));
-        Ok(true)
+            let packet = self.packets.pop_front().expect("a nonempty audio page was loaded");
+            if self.ended && packet.keep == 0 {
+                continue;
+            }
+            let pkt_frames = usize::from(packet.frames);
+            let drop = (self.skip as usize).min(pkt_frames);
+            self.skip -= drop as u32;
+            let start_byte = packet.offset as usize;
+            let end_byte = start_byte + packet.length as usize;
+            let frames = match self
+                .decoder
+                .decode_float(&self.page[start_byte..end_byte], &mut self.scratch)
+            {
+                Ok(frames) => frames,
+                // The TOC gave a valid duration: conceal the damaged packet so it
+                // still occupies its exact duration on the page's clock.
+                Err(_) => self
+                    .decoder
+                    .conceal_float(pkt_frames, &mut self.scratch)
+                    .map_err(|e| AudioError::Decode(e.to_string()))?,
+            };
+            let end = usize::from(packet.keep).min(frames);
+            let start = drop.min(end);
+            if start == end {
+                continue;
+            }
+            extend_scaled_finite(&self.scratch[start * 2..end * 2], self.gain, out);
+            return Ok(true);
+        }
     }
 }
 
@@ -361,8 +394,6 @@ impl Decoder {
             return Ok(Decoder {
                 inner: Inner::OggOpus(Box::new(OggDecoder::new(body)?)),
                 rate: 48_000,
-                scratch: Vec::new(),
-                samples: SampleBuffer::new(0, SignalSpec::new(48_000, Channels::FRONT_LEFT)),
             });
         }
 
@@ -388,12 +419,7 @@ impl Decoder {
         if track.codec_params.codec == CODEC_TYPE_OPUS {
             let params = track.codec_params.clone();
             let opus = ContainerOpusDecoder::from_track(format, track_id, &params)?;
-            return Ok(Decoder {
-                inner: Inner::ContainerOpus(Box::new(opus)),
-                rate: 48_000,
-                scratch: Vec::new(),
-                samples: SampleBuffer::new(0, SignalSpec::new(48_000, Channels::FRONT_LEFT)),
-            });
+            return Ok(Decoder { inner: Inner::ContainerOpus(Box::new(opus)), rate: 48_000 });
         }
         let rate = track.codec_params.sample_rate.unwrap_or(48_000);
         if rate == 0 {
@@ -408,21 +434,22 @@ impl Decoder {
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
             .map_err(|e| AudioError::Decode(e.to_string()))?;
+        let spec = SignalSpec::new(rate, channels);
         Ok(Decoder {
             inner: Inner::Symphonia {
                 format,
                 decoder,
                 track_id,
-                spec: SignalSpec::new(rate, channels),
+                spec,
                 mixer: Downmix::new(channels),
+                samples: SampleBuffer::new(0, spec),
             },
             rate,
-            scratch: Vec::new(),
-            samples: SampleBuffer::new(0, SignalSpec::new(rate, channels)),
         })
     }
 
     /// The source sample rate, before any resampling.
+    #[inline]
     pub fn rate(&self) -> u32 {
         self.rate
     }
@@ -443,9 +470,9 @@ impl Decoder {
 
     fn decode_next(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         match &mut self.inner {
-            Inner::OggOpus(decoder) => decoder.decode(&mut self.scratch, out),
-            Inner::ContainerOpus(decoder) => decoder.decode(&mut self.scratch, out),
-            Inner::Symphonia { format, decoder, track_id, spec, mixer } => loop {
+            Inner::OggOpus(decoder) => decoder.decode(out),
+            Inner::ContainerOpus(decoder) => decoder.decode(out),
+            Inner::Symphonia { format, decoder, track_id, spec, mixer, samples } => loop {
                 let packet = match format.next_packet() {
                     Ok(packet) => packet,
                     Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -480,17 +507,17 @@ impl Decoder {
                 }
                 let channels_changed = decoded_spec.channels != spec.channels;
                 let needed = audio.frames() * decoded_spec.channels.count();
-                if channels_changed || self.samples.capacity() < needed {
+                if channels_changed || samples.capacity() < needed {
                     // Room for twice the packet means a stream of even packets
                     // reallocates once rather than on every step up.
-                    self.samples = SampleBuffer::new((audio.frames() * 2) as u64, decoded_spec);
+                    *samples = SampleBuffer::new((audio.frames() * 2) as u64, decoded_spec);
                 }
                 if channels_changed {
                     *spec = decoded_spec;
                     *mixer = Downmix::new(spec.channels);
                 }
-                self.samples.copy_interleaved_ref(audio);
-                mixer.process(self.samples.samples(), out);
+                samples.copy_interleaved_ref(audio);
+                mixer.process(samples.samples(), out);
                 return Ok(true);
             },
         }
@@ -501,122 +528,101 @@ impl Decoder {
 /// position label. Multichannel content uses conventional centre/surround
 /// weights, normalised per output to keep full-scale input from clipping.
 /// This is not a bit-identical FFmpeg rematrix.
-struct Downmix {
-    count: usize,
-    stereo_layout: bool,
-    fallback_mix: bool,
-    left: Vec<(usize, f32)>,
-    right: Vec<(usize, f32)>,
-    left_gain: f32,
-    right_gain: f32,
+enum Downmix {
+    Empty,
+    Mono,
+    Stereo,
+    FallbackMono { count: usize, inv_count: f32 },
+    Matrix { count: usize, weights: Vec<[f32; 2]>, inv_left: f32, inv_right: f32 },
 }
 
 impl Downmix {
     /// Build coefficients once per channel layout, instead of allocating and
-    /// normalising two vectors for every decoded packet.
+    /// normalising vectors for every decoded packet.
     fn new(channels: Channels) -> Self {
         let count = channels.count();
-        let stereo_layout = channels == (Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        if !stereo_layout {
-            for (index, channel) in channels.iter().enumerate() {
-                if channel == Channels::TOP_CENTRE
-                    || channel == Channels::TOP_REAR_CENTRE
-                    || channel == Channels::REAR_CENTRE
-                {
-                    // Split rear/overhead centre contributions at half level.
-                    left.push((index, 0.5));
-                    right.push((index, 0.5));
-                } else if channel == Channels::FRONT_CENTRE
-                    || channel == Channels::TOP_FRONT_CENTRE
-                    || channel == Channels::FRONT_CENTRE_HIGH
-                {
-                    left.push((index, 0.707));
-                    right.push((index, 0.707));
-                } else if channel == Channels::FRONT_LEFT
-                    || channel == Channels::FRONT_LEFT_CENTRE
-                    || channel == Channels::TOP_FRONT_LEFT
-                    || channel == Channels::FRONT_LEFT_WIDE
-                    || channel == Channels::FRONT_LEFT_HIGH
-                {
-                    left.push((index, 1.0));
-                } else if channel == Channels::FRONT_RIGHT
-                    || channel == Channels::FRONT_RIGHT_CENTRE
-                    || channel == Channels::TOP_FRONT_RIGHT
-                    || channel == Channels::FRONT_RIGHT_WIDE
-                    || channel == Channels::FRONT_RIGHT_HIGH
-                {
-                    right.push((index, 1.0));
-                } else if channel == Channels::REAR_LEFT
-                    || channel == Channels::SIDE_LEFT
-                    || channel == Channels::TOP_REAR_LEFT
-                    || channel == Channels::REAR_LEFT_CENTRE
-                {
-                    left.push((index, 0.707));
-                } else if channel == Channels::REAR_RIGHT
-                    || channel == Channels::SIDE_RIGHT
-                    || channel == Channels::TOP_REAR_RIGHT
-                    || channel == Channels::REAR_RIGHT_CENTRE
-                {
-                    right.push((index, 0.707));
-                }
-            }
+        match count {
+            0 => return Self::Empty,
+            1 => return Self::Mono,
+            2 if channels == (Channels::FRONT_LEFT | Channels::FRONT_RIGHT) => return Self::Stereo,
+            _ => {}
         }
-        let left_gain = left.iter().map(|(_, weight)| weight).sum::<f32>().max(1.0);
-        let right_gain = right.iter().map(|(_, weight)| weight).sum::<f32>().max(1.0);
-        let fallback_mix = !stereo_layout && left.is_empty() && right.is_empty();
-        Self { count, stereo_layout, fallback_mix, left, right, left_gain, right_gain }
+        let mut weights = Vec::with_capacity(count);
+        let mut left_sum = 0.0f32;
+        let mut right_sum = 0.0f32;
+        for channel in channels.iter() {
+            let [lw, rw] = match channel {
+                Channels::TOP_CENTRE | Channels::TOP_REAR_CENTRE | Channels::REAR_CENTRE => {
+                    [0.5, 0.5]
+                }
+                Channels::FRONT_CENTRE
+                | Channels::TOP_FRONT_CENTRE
+                | Channels::FRONT_CENTRE_HIGH => [0.707, 0.707],
+                Channels::FRONT_LEFT
+                | Channels::FRONT_LEFT_CENTRE
+                | Channels::TOP_FRONT_LEFT
+                | Channels::FRONT_LEFT_WIDE
+                | Channels::FRONT_LEFT_HIGH => [1.0, 0.0],
+                Channels::FRONT_RIGHT
+                | Channels::FRONT_RIGHT_CENTRE
+                | Channels::TOP_FRONT_RIGHT
+                | Channels::FRONT_RIGHT_WIDE
+                | Channels::FRONT_RIGHT_HIGH => [0.0, 1.0],
+                Channels::REAR_LEFT
+                | Channels::SIDE_LEFT
+                | Channels::TOP_REAR_LEFT
+                | Channels::REAR_LEFT_CENTRE => [0.707, 0.0],
+                Channels::REAR_RIGHT
+                | Channels::SIDE_RIGHT
+                | Channels::TOP_REAR_RIGHT
+                | Channels::REAR_RIGHT_CENTRE => [0.0, 0.707],
+                _ => [0.0, 0.0],
+            };
+            weights.push([lw, rw]);
+            left_sum += lw;
+            right_sum += rw;
+        }
+        if left_sum == 0.0 && right_sum == 0.0 {
+            return Self::FallbackMono { count, inv_count: 1.0 / count as f32 };
+        }
+        Self::Matrix {
+            count,
+            weights,
+            inv_left: 1.0 / left_sum.max(1.0),
+            inv_right: 1.0 / right_sum.max(1.0),
+        }
     }
 
     fn process(&self, samples: &[f32], out: &mut Vec<f32>) {
-        if self.count == 0 {
-            return;
-        }
-        let frames = samples.len() / self.count;
-        out.reserve(frames * 2);
-        match self.count {
-            1 => {
-                // A lone channel is mono content, not a positioned surround bed.
-                for sample in samples {
-                    let s = if sample.is_finite() { *sample } else { 0.0 };
-                    out.push(s);
-                    out.push(s);
-                }
+        match self {
+            Self::Empty => {}
+            Self::Mono => {
+                out.extend(samples.iter().flat_map(|&sample| {
+                    let s = finite_or_zero(sample);
+                    [s, s]
+                }));
             }
-            2 if self.stereo_layout => {
-                out.extend(
-                    samples[..frames * 2].iter().map(|s| if s.is_finite() { *s } else { 0.0 }),
-                );
+            Self::Stereo => {
+                let len = (samples.len() / 2) * 2;
+                out.extend(samples[..len].iter().copied().map(finite_or_zero));
             }
-            _ if self.fallback_mix => {
-                for frame in samples.chunks_exact(self.count) {
-                    let mono =
-                        frame.iter().map(|s| if s.is_finite() { *s } else { 0.0 }).sum::<f32>()
-                            / self.count as f32;
-                    out.push(mono);
-                    out.push(mono);
-                }
+            Self::FallbackMono { count, inv_count } => {
+                out.extend(samples.chunks_exact(*count).flat_map(|frame| {
+                    let mono = frame.iter().copied().map(finite_or_zero).sum::<f32>() * inv_count;
+                    [mono, mono]
+                }));
             }
-            _ => {
-                for frame in samples.chunks_exact(self.count) {
+            Self::Matrix { count, weights, inv_left, inv_right } => {
+                out.extend(samples.chunks_exact(*count).flat_map(|frame| {
                     let mut l = 0.0f32;
                     let mut r = 0.0f32;
-                    for (index, weight) in &self.left {
-                        let s = frame[*index];
-                        if s.is_finite() {
-                            l += s * weight;
-                        }
+                    for (&sample, &[lw, rw]) in frame.iter().zip(weights) {
+                        let s = finite_or_zero(sample);
+                        l += s * lw;
+                        r += s * rw;
                     }
-                    for (index, weight) in &self.right {
-                        let s = frame[*index];
-                        if s.is_finite() {
-                            r += s * weight;
-                        }
-                    }
-                    out.push(l / self.left_gain);
-                    out.push(r / self.right_gain);
-                }
+                    [l * inv_left, r * inv_right]
+                }));
             }
         }
     }
@@ -749,5 +755,30 @@ mod tests {
         for sample in out {
             assert!(sample <= 1.0, "{sample} exceeds full scale");
         }
+    }
+
+    #[test]
+    fn symphonia_isomp4_dops_big_endian_vs_rfc7845_little_endian() {
+        use symphonia::core::codecs::CodecParameters;
+
+        // Symphonia 0.5.5 `isomp4` prepends `b"OpusHead"` onto raw big-endian ISO-BMFF `dOps`
+        // (`Version = 0`, PreSkip = 0x0138 = 312, OutputGain = 0x0100 = +1 dB in Q7.8).
+        let mut mp4_extra = b"OpusHead".to_vec();
+        mp4_extra.extend_from_slice(&[0, 2, 0x01, 0x38, 0x00, 0x00, 0xbb, 0x80, 0x01, 0x00, 0]);
+        let mut mp4_params = CodecParameters::new();
+        mp4_params.with_extra_data(mp4_extra.into_boxed_slice());
+        let (skip_be, gain_be) = parse_container_opus_params(&mp4_params).unwrap();
+        assert_eq!(skip_be, 312);
+        let expected_gain = 10.0f32.powf(256.0 / (20.0 * 256.0));
+        assert!((gain_be - expected_gain).abs() < 1e-6, "gain_be={gain_be}");
+
+        // RFC 7845 `OpusHead` (`Version = 1`, little-endian PreSkip = 0x0138, OutputGain = 0x0100).
+        let mut webm_extra = b"OpusHead".to_vec();
+        webm_extra.extend_from_slice(&[1, 2, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x00, 0x01, 0]);
+        let mut webm_params = CodecParameters::new();
+        webm_params.with_extra_data(webm_extra.into_boxed_slice());
+        let (skip_le, gain_le) = parse_container_opus_params(&webm_params).unwrap();
+        assert_eq!(skip_le, 312);
+        assert!((gain_le - expected_gain).abs() < 1e-6, "gain_le={gain_le}");
     }
 }

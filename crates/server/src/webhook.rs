@@ -11,6 +11,9 @@
 //! an event that still cannot be delivered, or that finds the queue full, is
 //! dropped with a warning and counted.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -80,9 +83,19 @@ impl Client {
         thread::Builder::new()
             .name("webhook".into())
             .spawn(move || {
+                let mut payload = Vec::with_capacity(1024);
                 while let Ok(event) = inbox.recv() {
+                    payload.clear();
+                    let ok = if discord {
+                        serde_json::to_writer(&mut payload, &discord_payload(&event)).is_ok()
+                    } else {
+                        serde_json::to_writer(&mut payload, &event).is_ok()
+                    };
+                    if !ok {
+                        continue;
+                    }
                     if let Err((attempts, error)) =
-                        deliver(|| post(&agent, &worker, discord, &event), thread::sleep)
+                        deliver(|| post(&agent, &worker, &payload), thread::sleep)
                     {
                         let count = worker_dropped.fetch_add(1, Ordering::Relaxed) + 1;
                         if count == 1 || count.is_multiple_of(100) {
@@ -194,14 +207,6 @@ fn scrub_value(value: &mut Value) {
             for key in ["token", "uri", "artwork_url", "identifier", "extra", "user_data"] {
                 object.remove(key);
             }
-            // Source/media failures can include the URL they were trying to
-            // open in an exception message. Keep the diagnostic text, but
-            // replace URL tokens that carry a query, fragment, or userinfo.
-            for key in ["message", "cause", "cause_stack_trace"] {
-                if let Some(Value::String(text)) = object.get_mut(key) {
-                    *text = redact_urls(text);
-                }
-            }
             for child in object.values_mut() {
                 scrub_value(child);
             }
@@ -211,59 +216,74 @@ fn scrub_value(value: &mut Value) {
                 scrub_value(child);
             }
         }
+        // Source/media/voice failures can include the URL they were trying to
+        // open in diagnostic text (`message`, `cause`, `reason`, etc.). Keep
+        // the diagnostic text, but replace URL tokens carrying credentials.
+        Value::String(text) => redact_urls_in_place(text),
         _ => {}
     }
 }
 
-/// Redacts credential-bearing HTTP(S) URLs embedded in diagnostic text while
-/// retaining the surrounding error message. A whole URL token is replaced when
-/// it has a query, fragment, or userinfo; plain host/path URLs are left useful
-/// for troubleshooting.
-fn redact_urls(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
+/// Redacts credential-bearing URLs embedded in diagnostic text while retaining
+/// surrounding punctuation and error text. Allocates nothing when `text` has no
+/// credentialed URL tokens.
+fn redact_urls_in_place(text: &mut String) {
+    let mut output: Option<String> = None;
     let mut cursor = 0;
-    let mut changed = false;
     while let Some(relative) = find_http_scheme(&text[cursor..]) {
         let start = cursor + relative;
-        output.push_str(&text[cursor..start]);
         let end = text[start..]
-            .find(|character: char| character.is_whitespace())
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>' | '<' | ',')
+            })
             .map_or(text.len(), |offset| start + offset);
         let candidate = &text[start..end];
         if candidate.contains(['?', '#', '@']) {
-            output.push_str("<redacted-url>");
-            changed = true;
-        } else {
-            output.push_str(candidate);
+            let buf = output.get_or_insert_with(|| {
+                let mut s = String::with_capacity(text.len());
+                s.push_str(&text[..cursor]);
+                s
+            });
+            buf.push_str(&text[cursor..start]);
+            buf.push_str("<redacted-url>");
+        } else if let Some(buf) = output.as_mut() {
+            buf.push_str(&text[cursor..end]);
         }
         cursor = end;
     }
-    output.push_str(&text[cursor..]);
-    if changed {
-        output
-    } else {
-        text.to_owned()
+    if let Some(mut buf) = output {
+        buf.push_str(&text[cursor..]);
+        *text = buf;
     }
 }
 
 fn find_http_scheme(text: &str) -> Option<usize> {
-    const SCHEMES: [&[u8]; 7] =
-        [b"http://", b"https://", b"ws://", b"wss://", b"socks4://", b"socks5://", b"socks5h://"];
-    text.char_indices().find_map(|(index, _)| {
-        let tail = text.get(index..)?.as_bytes();
-        SCHEMES
-            .iter()
-            .any(|scheme| {
-                tail.get(..scheme.len()).is_some_and(|bytes| bytes.eq_ignore_ascii_case(scheme))
-            })
-            .then_some(index)
-    })
+    const SCHEMES: [&[u8]; 8] =
+        [b"socks5h", b"socks5", b"socks4a", b"socks4", b"https", b"http", b"wss", b"ws"];
+    let bytes = text.as_bytes();
+    let mut offset = 0usize;
+    while let Some(rel) = bytes[offset..].windows(3).position(|w| w == b"://") {
+        let colon = offset + rel;
+        for scheme in SCHEMES {
+            if let Some(start) = colon.checked_sub(scheme.len()) {
+                let at_boundary = start == 0
+                    || !matches!(
+                        bytes[start - 1],
+                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.'
+                    );
+                if at_boundary && bytes[start..colon].eq_ignore_ascii_case(scheme) {
+                    return Some(start);
+                }
+            }
+        }
+        offset = colon + 3;
+    }
+    None
 }
 
-/// Delivers one scrubbed event. A Discord endpoint gets an embed built from it;
-/// every other endpoint gets the scrubbed event as JSON.
-fn post(agent: &ureq::Agent, url: &str, discord: bool, event: &Value) -> Result<(), Failure> {
-    let body = if discord { discord_payload(event) } else { event.clone() };
+/// Delivers one pre-serialized JSON payload, draining bounded response bytes so
+/// `ureq` can return TLS sockets to its keep-alive pool.
+fn post(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), Failure> {
     let response = agent
         .post(url)
         .header("Accept-Encoding", "identity")
@@ -273,7 +293,7 @@ fn post(agent: &ureq::Agent, url: &str, discord: bool, event: &Value) -> Result<
         .timeout_global(Some(SEND_TIMEOUT))
         .http_status_as_error(false)
         .build()
-        .send_json(&body)
+        .send(body)
         .map_err(|error| {
             let detail = error.to_string().replace(url, "<redacted webhook URL>");
             Failure {
@@ -283,16 +303,32 @@ fn post(agent: &ureq::Agent, url: &str, discord: bool, event: &Value) -> Result<
             }
         })?;
     let status = response.status().as_u16();
+    let header_retry = if status == 429 {
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.trim().parse::<f64>().ok())
+    } else {
+        None
+    };
+    let mut response_bytes = Vec::new();
+    let _ = std::io::Read::take(response.into_body().into_reader(), 4096)
+        .read_to_end(&mut response_bytes);
     if (200..300).contains(&status) {
         return Ok(());
     }
     // A rate limit and a server fault may pass; any other refusal (a deleted
     // webhook, a bad payload) will be refused again, so it is not retried.
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|text| text.trim().parse::<f64>().ok())
+    let body_retry = if status == 429 {
+        serde_json::from_slice::<Value>(&response_bytes)
+            .ok()
+            .and_then(|json| json.get("retry_after").and_then(Value::as_f64))
+    } else {
+        None
+    };
+    let retry_after = body_retry
+        .or(header_retry)
         .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
         .map(|seconds| Duration::from_secs_f64(seconds.min(MAX_RETRY_WAIT.as_secs_f64())));
     Err(Failure {
@@ -308,11 +344,17 @@ fn is_discord(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host == "discord.com" || host == "discordapp.com" || host.ends_with(".discord.com") {
-        return true;
-    }
-    url.path().contains("/api/webhooks/")
+    let host = url.host_str().unwrap_or_default();
+    let has_suffix = |suffix: &[u8]| {
+        host.as_bytes()
+            .get(host.len().wrapping_sub(suffix.len())..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+    };
+    let discord_host = host.eq_ignore_ascii_case("discord.com")
+        || host.eq_ignore_ascii_case("discordapp.com")
+        || has_suffix(b".discord.com")
+        || has_suffix(b".discordapp.com");
+    discord_host || url.path().contains("/api/webhooks/")
 }
 
 /// Embed colours, chosen so a track that started reads calm and a failure that
@@ -428,10 +470,12 @@ fn player_state_payload(report: &Value) -> Value {
 fn bounded_payload(mut embed: Map<String, Value>) -> Value {
     let mut remaining = MAX_EMBED_TEXT;
     for (key, limit) in [("title", 256), ("description", 4096)] {
-        if let Some(text) = embed.get(key).and_then(Value::as_str) {
-            let text = truncate(text, limit.min(remaining));
-            remaining -= discord_len(&text);
-            embed.insert(key.into(), json!(text));
+        if let Some(Value::String(slot)) = embed.get_mut(key) {
+            let cut = truncate(slot, limit.min(remaining));
+            remaining -= discord_len(&cut);
+            if let Cow::Owned(shortened) = cut {
+                *slot = shortened;
+            }
         }
     }
     remaining = remaining.saturating_sub(
@@ -441,18 +485,29 @@ fn bounded_payload(mut embed: Map<String, Value>) -> Value {
         let mut bounded = Vec::new();
         for mut field in fields.into_iter().take(MAX_EMBED_FIELDS) {
             let name = truncate(field["name"].as_str().unwrap_or(""), 256);
+            if name.is_empty() {
+                continue;
+            }
             let name_length = discord_len(&name);
             if remaining <= name_length {
                 break;
             }
+            let name_owned = match name {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(shortened) => Some(shortened),
+            };
             let value =
                 truncate(field["value"].as_str().unwrap_or(""), 1024.min(remaining - name_length));
-            if name.is_empty() || value.is_empty() {
+            if value.is_empty() {
                 continue;
             }
             remaining -= name_length + discord_len(&value);
-            field["name"] = json!(name);
-            field["value"] = json!(value);
+            if let Cow::Owned(shortened) = value {
+                field["value"] = Value::String(shortened);
+            }
+            if let Some(shortened) = name_owned {
+                field["name"] = Value::String(shortened);
+            }
             bounded.push(field);
         }
         if !bounded.is_empty() {
@@ -488,8 +543,10 @@ fn player_state_fields(states: &[Value]) -> Vec<Value> {
 /// Heads a player field with the guild it serves and what it is playing, which
 /// is what an operator scans a channel for.
 fn player_state_name(state: &Value) -> String {
-    let mut name = embed_value(state.get("guild_id").unwrap_or(&Value::Null));
+    let guild = embed_value(state.get("guild_id").unwrap_or(&Value::Null));
     let title = embed_value(state.get("title").unwrap_or(&Value::Null));
+    let mut name = String::with_capacity(guild.len() + title.len() + 3);
+    name.push_str(&guild);
     if !title.is_empty() {
         name.push_str(" · ");
         name.push_str(&title);
@@ -504,45 +561,60 @@ fn player_state_name(state: &Value) -> String {
 /// is and how it reaches the voice channel. Who owns the player is deliberately
 /// absent, because the report is readable by anyone the endpoint is shared with.
 fn player_state_value(state: &Value) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(48);
+    let sep = |out: &mut String| {
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+    };
     if embed_value(state.get("title").unwrap_or(&Value::Null)).is_empty() {
-        parts.push("idle".into());
+        out.push_str("idle");
     } else {
-        let mut elapsed = String::new();
+        let mut has_elapsed = false;
         if let Some(position) = number(state.get("position_ms").unwrap_or(&Value::Null)) {
-            elapsed = format_duration(position as i64);
+            write_duration(&mut out, position as i64);
+            has_elapsed = true;
         }
         if let Some(length) = number(state.get("duration_ms").unwrap_or(&Value::Null)) {
             if length > 0.0 {
-                elapsed.push('/');
-                elapsed.push_str(&format_duration(length as i64));
+                out.push('/');
+                write_duration(&mut out, length as i64);
+                has_elapsed = true;
             }
         }
-        if !elapsed.is_empty() {
-            parts.push(elapsed);
-        }
+        let _ = has_elapsed;
         match state.get("paused").and_then(Value::as_bool) {
-            Some(true) => parts.push("paused".into()),
-            Some(false) => parts.push("playing".into()),
+            Some(true) => {
+                sep(&mut out);
+                out.push_str("paused");
+            }
+            Some(false) => {
+                sep(&mut out);
+                out.push_str("playing");
+            }
             None => {}
         }
     }
     let volume = embed_value(state.get("volume").unwrap_or(&Value::Null));
     if !volume.is_empty() {
-        parts.push(format!("vol {volume}"));
+        sep(&mut out);
+        out.push_str("vol ");
+        out.push_str(&volume);
     }
     if state.get("connected").and_then(Value::as_bool) == Some(false) {
-        parts.push("disconnected".into());
+        sep(&mut out);
+        out.push_str("disconnected");
     }
     if let Some(ping) = number(state.get("ping_ms").unwrap_or(&Value::Null)) {
         if ping >= 0.0 {
-            parts.push(format!("ping {}", ping as i64));
+            sep(&mut out);
+            let _ = write!(out, "ping {}", ping as i64);
         }
     }
-    if parts.is_empty() {
+    if out.is_empty() {
         return "—".into();
     }
-    parts.join(" · ")
+    out
 }
 
 /// Renders a count with its noun, keeping the singular when the count is one so
@@ -560,17 +632,17 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 /// Turns a Rustlink event name into the heading a Discord embed shows.
-fn event_title(kind: &str) -> String {
+fn event_title(kind: &str) -> &str {
     match kind {
-        "track.started" => "Track Started".into(),
-        "track.ended" => "Track Ended".into(),
-        "track.failed" => "Track Exception".into(),
-        "track.stalled" => "Track Stuck".into(),
-        "voice.closed" => "Voice WebSocket Closed".into(),
-        "voice.connected" => "Bot Joined Voice".into(),
-        "voice.disconnected" => "Bot Left Voice".into(),
-        "" => "Rustlink Event".into(),
-        other => other.to_string(),
+        "track.started" => "Track Started",
+        "track.ended" => "Track Ended",
+        "track.failed" => "Track Exception",
+        "track.stalled" => "Track Stuck",
+        "voice.closed" => "Voice WebSocket Closed",
+        "voice.connected" => "Bot Joined Voice",
+        "voice.disconnected" => "Bot Left Voice",
+        "" => "Rustlink Event",
+        other => other,
     }
 }
 
@@ -586,16 +658,17 @@ fn event_color(kind: &str) -> u32 {
 
 /// Renders a value decoded from JSON as the string an embed field needs, and
 /// returns the empty string for anything an embed cannot show.
-fn embed_value(value: &Value) -> String {
+fn embed_value(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.trim().to_string(),
-        Value::Bool(flag) => flag.to_string(),
+        Value::Null => Cow::Borrowed(""),
+        Value::String(text) => Cow::Borrowed(text.trim()),
+        Value::Bool(true) => Cow::Borrowed("true"),
+        Value::Bool(false) => Cow::Borrowed("false"),
         Value::Number(number) => match number.as_i64() {
-            Some(integer) => integer.to_string(),
-            None => number.to_string(),
+            Some(integer) => Cow::Owned(integer.to_string()),
+            None => Cow::Owned(number.to_string()),
         },
-        other => other.to_string().trim().to_string(),
+        other => Cow::Owned(other.to_string().trim().to_owned()),
     }
 }
 
@@ -603,44 +676,57 @@ fn embed_value(value: &Value) -> String {
 /// keeps astral characters such as emoji inside the documented field budgets
 /// without ever cutting a Rust `char` or UTF-8 sequence in half.
 fn discord_len(text: &str) -> usize {
-    text.encode_utf16().count()
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    }
 }
 
 /// Keeps a value inside a Discord text budget and reserves one unit for an
 /// ellipsis when truncation is necessary.
-fn truncate(text: &str, limit: usize) -> String {
+fn truncate(text: &str, limit: usize) -> Cow<'_, str> {
     if discord_len(text) <= limit {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if limit == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     let content_limit = limit - 1;
     let mut used = 0;
-    let mut out = String::new();
-    for character in text.chars() {
+    let mut end_byte = 0;
+    for (idx, character) in text.char_indices() {
         let width = character.len_utf16();
         if used + width > content_limit {
             break;
         }
-        out.push(character);
         used += width;
+        end_byte = idx + character.len_utf8();
     }
+    let mut out = String::with_capacity(end_byte + '…'.len_utf8());
+    out.push_str(&text[..end_byte]);
     out.push('…');
-    out
+    Cow::Owned(out)
 }
 
-/// Renders a track length as m:ss or h:mm:ss.
-fn format_duration(millis: i64) -> String {
+fn write_duration(out: &mut String, millis: i64) {
     let millis = millis.max(0);
     let total = millis / 1000 + i64::from(millis % 1000 >= 500);
     let hours = total / 3600;
     let minutes = (total % 3600) / 60;
     let seconds = total % 60;
     if hours > 0 {
-        return format!("{hours}:{minutes:02}:{seconds:02}");
+        let _ = write!(out, "{hours}:{minutes:02}:{seconds:02}");
+    } else {
+        let _ = write!(out, "{minutes}:{seconds:02}");
     }
-    format!("{minutes}:{seconds:02}")
+}
+
+/// Renders a track length as m:ss or h:mm:ss.
+fn format_duration(millis: i64) -> String {
+    let mut out = String::with_capacity(10);
+    write_duration(&mut out, millis);
+    out
 }
 
 /// The timestamp an embed carries, in the form Discord parses.
@@ -685,7 +771,7 @@ mod tests {
         // An invalid authority fails before any network request is attempted.
         let agent = rustlink_source::netguard::agent(false);
         let target = "http://bad host/api/webhooks/123/private-webhook-token?key=private-key";
-        let error = post(&agent, target, false, &json!({ "type": "test" })).unwrap_err().message;
+        let error = post(&agent, target, br#"{"type":"test"}"#).unwrap_err().message;
         assert!(error.contains("could not be reached"));
         assert!(!error.contains("private-webhook-token"));
         assert!(!error.contains("private-key"));
@@ -926,7 +1012,8 @@ mod tests {
 
     #[test]
     fn emoji_are_bounded_by_utf16_units_without_splitting_utf8() {
-        let cut = truncate(&"😀".repeat(300), 256);
+        let emoji = "😀".repeat(300);
+        let cut = truncate(&emoji, 256);
         assert!(discord_len(&cut) <= 256);
         assert!(cut.ends_with('…'));
         assert!(cut[..cut.len() - '…'.len_utf8()].chars().all(|character| character == '😀'));

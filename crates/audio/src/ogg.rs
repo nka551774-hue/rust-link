@@ -24,6 +24,8 @@ pub struct OggOpusReader<R: Read> {
     inner: R,
     buffer: Vec<u8>,
     consumed: usize,
+    filled: usize,
+    serial: Option<u32>,
     page: Option<PageState>,
     packets: u64,
     pre_skip: u32,
@@ -41,6 +43,8 @@ impl<R: Read> OggOpusReader<R> {
             inner,
             buffer: Vec::new(),
             consumed: 0,
+            filled: 0,
+            serial: None,
             page: None,
             packets: 0,
             pre_skip: 0,
@@ -66,19 +70,29 @@ impl<R: Read> OggOpusReader<R> {
     /// Reuses the caller's packet storage across headers, pages and packets.
     /// The buffer is cleared before every packet and at EOF.
     pub fn next_packet_into(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
+        packet.clear();
+        self.append_next_packet(packet)
+    }
+
+    /// Appends the next audio packet onto `packet` without clearing prior bytes,
+    /// allowing a page decoder to stage a full page in one contiguous buffer.
+    pub(crate) fn append_next_packet(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
+        let base = packet.len();
         loop {
             if self.packets == 1 {
                 self.skip_opus_tags()?;
                 self.packets = 2;
                 continue;
             }
-            if !self.next_raw_packet_into(packet)? {
+            packet.truncate(base);
+            if !self.append_raw_packet(packet)? {
                 return Ok(false);
             }
             self.packets += 1;
             match self.packets {
                 1 => {
-                    let (pre_skip, output_gain) = read_head(packet)?;
+                    let (pre_skip, output_gain) = read_head(&packet[base..])?;
+                    packet.truncate(base);
                     self.pre_skip = pre_skip;
                     self.drop_samples = pre_skip;
                     self.output_gain = output_gain;
@@ -91,109 +105,99 @@ impl<R: Read> OggOpusReader<R> {
     fn skip_opus_tags(&mut self) -> io::Result<()> {
         let mut magic = [0u8; 8];
         let mut magic_len = 0usize;
-        let mut total = 0usize;
-        self.packet_end_granule = None;
-        self.packet_page_end = None;
-        loop {
-            if self.page.is_none() {
-                if !self.have_page()? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "missing OpusTags".chars().as_str(),
-                    ));
-                }
-                self.page = Some(self.read_page_header()?);
-            }
-            let page = self.page.as_mut().expect("a page was just read");
-            while page.next_segment < page.count {
-                let size = self.buffer[page.table + page.next_segment] as usize;
-                page.next_segment += 1;
-                let end = page.offset + size;
-                if end > self.buffer.len() {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
-                }
-                total = total.saturating_add(size);
-                if total > MAX_TAGS_PACKET {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "OpusTags packet too large",
-                    ));
-                }
+        let found = self.read_laced_packet(
+            MAX_TAGS_PACKET,
+            "OpusTags packet too large",
+            false,
+            true,
+            |span| {
                 if magic_len < 8 {
-                    let take = (8 - magic_len).min(size);
-                    magic[magic_len..magic_len + take]
-                        .copy_from_slice(&self.buffer[page.offset..page.offset + take]);
+                    let take = (8 - magic_len).min(span.len());
+                    magic[magic_len..magic_len + take].copy_from_slice(&span[..take]);
                     magic_len += take;
                 }
-                page.offset = end;
-                if size < 255 {
-                    self.consumed = page.offset;
-                    if page.end_of_stream && page.next_segment == page.last_complete {
-                        self.ended = true;
-                    }
-                    if page.next_segment >= page.count {
-                        self.page = None;
-                    }
-                    if magic_len < 8 || &magic != b"OpusTags" {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing OpusTags"));
-                    }
-                    return Ok(());
-                }
-            }
-            self.consumed = page.offset;
-            self.page = None;
+            },
+        )?;
+        if !found || magic_len < 8 || &magic != b"OpusTags" {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "missing OpusTags"));
         }
+        Ok(())
     }
 
-    fn next_raw_packet_into(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
-        packet.clear();
+    fn append_raw_packet(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
+        self.read_laced_packet(MAX_PACKET, "ogg packet too large", true, false, |span| {
+            packet.extend_from_slice(span);
+        })
+    }
+
+    /// Reads one complete laced packet across page boundaries, passing each
+    /// page's contiguous payload span to `on_span`.
+    #[inline(always)]
+    fn read_laced_packet(
+        &mut self,
+        limit: usize,
+        too_large_msg: &'static str,
+        record_granule: bool,
+        require_packet: bool,
+        mut on_span: impl FnMut(&[u8]),
+    ) -> io::Result<bool> {
+        let mut total = 0usize;
+        let mut started = false;
         self.packet_end_granule = None;
         self.packet_page_end = None;
         loop {
             if self.page.is_none() {
                 if !self.have_page()? {
-                    if packet.is_empty() {
+                    if !started && !require_packet {
                         return Ok(false);
                     }
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated ogg packet",
-                    ));
+                    let msg =
+                        if require_packet { "missing OpusTags" } else { "truncated ogg packet" };
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, msg));
                 }
                 self.page = Some(self.read_page_header()?);
             }
             let page = self.page.as_mut().expect("a page was just read");
-            while page.next_segment < page.count {
-                let size = self.buffer[page.table + page.next_segment] as usize;
-                page.next_segment += 1;
-                let end = page.offset + size;
-                if end > self.buffer.len() {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
-                }
-                if packet.len() + size > MAX_PACKET {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ogg packet too large"));
-                }
-                packet.extend_from_slice(&self.buffer[page.offset..end]);
-                page.offset = end;
-                if size < 255 {
-                    self.consumed = page.offset;
-                    // A page may finish one packet and start another. Its
-                    // granule belongs to the last completed packet, even when
-                    // that packet is not the page's final lacing segment.
-                    if page.next_segment == page.last_complete {
+            let segs = &self.buffer[page.table + page.next_segment..page.table + page.count];
+            let done_at = segs.iter().position(|&s| s < 255);
+            let consumed_segs = done_at.map_or(segs.len(), |i| i + 1);
+            let chunk_len: usize = segs[..consumed_segs].iter().map(|&s| usize::from(s)).sum();
+            let start = page.offset;
+            let end = start + chunk_len;
+            if end > self.filled {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
+            }
+            total = total.saturating_add(chunk_len);
+            if total > limit {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, too_large_msg));
+            }
+            on_span(&self.buffer[start..end]);
+            page.next_segment += consumed_segs;
+            page.offset = end;
+            if done_at.is_some() {
+                self.consumed = end;
+                // A page may finish one packet and start another. Its granule
+                // belongs to the last completed packet, even when that packet
+                // is not the page's final lacing segment.
+                if page.next_segment == page.last_complete {
+                    if record_granule {
                         self.packet_page_end = Some((page.granule, page.end_of_stream));
                         self.packet_end_granule = page.end_of_stream.then_some(page.granule);
-                        if page.end_of_stream {
-                            self.ended = true;
-                        }
                     }
-                    if page.next_segment >= page.count {
-                        self.page = None;
+                    if page.end_of_stream {
+                        self.ended = true;
                     }
-                    return Ok(true);
                 }
+                if page.next_segment >= page.count {
+                    self.page = None;
+                }
+                return Ok(true);
             }
-            self.consumed = page.offset;
+            if page.end_of_stream {
+                self.ended = true;
+            }
+            started |= consumed_segs > 0;
+            self.consumed = end;
             self.page = None;
         }
     }
@@ -205,25 +209,22 @@ impl<R: Read> OggOpusReader<R> {
         }
         loop {
             self.compact();
-            let available = self.buffer.len() - self.consumed;
-            if available >= 4 && &self.buffer[self.consumed..self.consumed + 4] != b"OggS" {
+            let unconsumed = &self.buffer[self.consumed..self.filled];
+            let available = unconsumed.len();
+            if available >= 4 && &unconsumed[..4] != b"OggS" {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ogg page"));
             }
-            if available >= 5 && self.buffer[self.consumed + 4] != 0 {
+            if available >= 5 && unconsumed[4] != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "unsupported ogg page version",
                 ));
             }
             if available >= PAGE_HEADER {
-                let segments = self.buffer[self.consumed + 26] as usize;
+                let segments = usize::from(unconsumed[26]);
                 let total = PAGE_HEADER + segments;
-                if available >= total {
-                    let payload: usize = self.buffer
-                        [self.consumed + PAGE_HEADER..self.consumed + total]
-                        .iter()
-                        .map(|n| *n as usize)
-                        .sum();
+                if let Some(table) = unconsumed.get(PAGE_HEADER..total) {
+                    let payload: usize = table.iter().map(|&n| usize::from(n)).sum();
                     if available >= total + payload {
                         return Ok(true);
                     }
@@ -240,20 +241,32 @@ impl<R: Read> OggOpusReader<R> {
         }
     }
 
-    fn read_page_header(&self) -> io::Result<PageState> {
-        if self.buffer.len() - self.consumed < PAGE_HEADER {
+    fn read_page_header(&mut self) -> io::Result<PageState> {
+        let Some(unconsumed) = self.buffer.get(self.consumed..self.filled) else {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
+        };
+        if unconsumed.len() < PAGE_HEADER {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
         }
-        let count = self.buffer[self.consumed + 26] as usize;
+        let serial = u32::from_le_bytes(unconsumed[14..18].try_into().unwrap());
+        if let Some(expected) = self.serial {
+            if serial != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "multiplexed ogg stream requires ffmpeg",
+                ));
+            }
+        } else {
+            self.serial = Some(serial);
+        }
+        let count = usize::from(unconsumed[26]);
         let table = self.consumed + PAGE_HEADER;
         // No compaction takes place while a page is open, so the table can be
         // read from the input buffer without copying it into another array.
-        let granule = u64::from_le_bytes(
-            self.buffer[self.consumed + 6..self.consumed + 14].try_into().unwrap(),
-        );
-        let end_of_stream = self.buffer[self.consumed + 5] & 4 != 0;
-        let segments = &self.buffer[table..table + count];
-        let last_complete = segments.iter().rposition(|size| *size < 255).map_or(0, |i| i + 1);
+        let granule = u64::from_le_bytes(unconsumed[6..14].try_into().unwrap());
+        let end_of_stream = unconsumed[5] & 4 != 0;
+        let segments = &unconsumed[PAGE_HEADER..PAGE_HEADER + count];
+        let last_complete = segments.iter().rposition(|&size| size < 255).map_or(0, |i| i + 1);
         if end_of_stream && segments.last() == Some(&255) {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -274,26 +287,20 @@ impl<R: Read> OggOpusReader<R> {
     fn compact(&mut self) {
         // FFmpeg commonly writes small pages. Moving the unread tail at each
         // page made parsing proportional to page count times read chunk size.
-        if self.consumed > 0 && (self.consumed == self.buffer.len() || self.consumed >= READ_CHUNK)
-        {
-            self.buffer.drain(..self.consumed);
+        if self.consumed > 0 && (self.consumed == self.filled || self.consumed >= READ_CHUNK) {
+            self.buffer.copy_within(self.consumed..self.filled, 0);
+            self.filled -= self.consumed;
             self.consumed = 0;
         }
     }
 
     fn fill(&mut self) -> io::Result<bool> {
-        let start = self.buffer.len();
-        self.buffer.resize(start + READ_CHUNK, 0);
-        match self.inner.read(&mut self.buffer[start..]) {
-            Ok(read) => {
-                self.buffer.truncate(start + read);
-                Ok(read > 0)
-            }
-            Err(error) => {
-                self.buffer.truncate(start);
-                Err(error)
-            }
+        if self.buffer.len() - self.filled < READ_CHUNK {
+            self.buffer.resize(self.filled + READ_CHUNK, 0);
         }
+        let read = self.inner.read(&mut self.buffer[self.filled..self.filled + READ_CHUNK])?;
+        self.filled += read;
+        Ok(read > 0)
     }
 
     pub fn take_drop_samples(&mut self) -> u32 {

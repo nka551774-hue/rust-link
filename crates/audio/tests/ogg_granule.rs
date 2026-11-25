@@ -1,4 +1,5 @@
 //! RFC 7845 page granules, including cropping and trimming across packets.
+#![cfg(feature = "native-opus")]
 
 use std::io::Cursor;
 

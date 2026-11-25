@@ -61,10 +61,13 @@ impl Color {
     /// Reads the configuration value. The configuration is checked when it is
     /// loaded, so anything unexpected is treated as auto.
     pub fn parse(value: &str) -> Color {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "always" => Color::Always,
-            "never" => Color::Never,
-            _ => Color::Auto,
+        let v = value.trim();
+        if v.eq_ignore_ascii_case("always") {
+            Color::Always
+        } else if v.eq_ignore_ascii_case("never") {
+            Color::Never
+        } else {
+            Color::Auto
         }
     }
 
@@ -93,9 +96,10 @@ impl Format {
     /// Reads the configuration value, defaulting to text the way the
     /// configuration validator does.
     pub fn parse(value: &str) -> Format {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "json" => Format::Json,
-            _ => Format::Text,
+        if value.trim().eq_ignore_ascii_case("json") {
+            Format::Json
+        } else {
+            Format::Text
         }
     }
 }
@@ -152,7 +156,7 @@ pub fn fatal(message: &str, error: &str) -> ! {
 /// A node given CLI flags, `RUSTLINK_NO_PAUSE`, a non-terminal stdin, a Unix
 /// shell, or an existing parent console session exits immediately without blocking.
 fn hold_console() {
-    if std::env::args().len() > 1
+    if std::env::args_os().nth(1).is_some()
         || std::env::var_os("RUSTLINK_NO_PAUSE").is_some()
         || !std::io::stdin().is_terminal()
         || !owns_ephemeral_console()
@@ -207,7 +211,11 @@ impl Logger {
         let _ = out.flush();
         drop(out);
         if let Some(files) = &self.files {
-            files.lock().unwrap().write(self.format, label, message, at);
+            let file_line = match self.format {
+                Format::Json => console,
+                Format::Text => text_line(label, message, at),
+            };
+            files.lock().unwrap().write_line(&file_line, at.date_naive());
         }
     }
 }
@@ -222,17 +230,26 @@ impl Log for Logger {
             return;
         }
         let (label, color) = style(record.level());
-        self.write(label, color, &record.args().to_string());
+        if let Some(literal) = record.args().as_str() {
+            self.write(label, color, literal);
+        } else {
+            self.write(label, color, &record.args().to_string());
+        }
     }
 
-    fn flush(&self) {}
+    fn flush(&self) {
+        let _ = std::io::stdout().flush();
+        if let Some(files) = &self.files {
+            let _ = files.lock().unwrap().handle.flush();
+        }
+    }
 }
 /// The daily file the log is mirrored into. Records are never coloured, even
 /// when the console is: an escape sequence in a file is noise for every tool
 /// that reads one.
 struct Files {
     directory: PathBuf,
-    day: String,
+    date: NaiveDate,
     handle: File,
     /// How many days of files are kept.
     retention: u32,
@@ -242,46 +259,41 @@ impl Files {
     fn open(directory: &str, retention: u32) -> Result<Files, String> {
         std::fs::create_dir_all(directory)
             .map_err(|error| format!("log directory {directory}: {error}"))?;
-        let day = Local::now().format("%Y-%m-%d").to_string();
-        let handle = open_day(Path::new(directory), &day)?;
-        let files = Files { directory: PathBuf::from(directory), day, handle, retention };
-        files.prune();
+        let date = Local::now().date_naive();
+        let handle = open_day(Path::new(directory), date)?;
+        let files = Files { directory: PathBuf::from(directory), date, handle, retention };
+        files.prune(date);
         Ok(files)
     }
 
     /// The file currently being written to.
     fn path(&self) -> String {
-        self.directory.join(format!("{FILE_PREFIX}{}.log", self.day)).display().to_string()
+        self.directory.join(format!("{FILE_PREFIX}{}.log", self.date)).display().to_string()
     }
 
     /// Appends one record, reopening the file when the date changes so a node
     /// that stays up for weeks does not grow one file forever.
-    fn write(&mut self, format: Format, label: &str, message: &str, at: DateTime<Local>) {
-        let day = at.format("%Y-%m-%d").to_string();
-        if day > self.day {
+    fn write_line(&mut self, line: &str, date: NaiveDate) {
+        if date > self.date {
             // Keeping the previous file when the new day cannot be opened is
             // the lesser loss: a misnamed log beats no log.
-            if let Ok(handle) = open_day(&self.directory, &day) {
+            if let Ok(handle) = open_day(&self.directory, date) {
                 self.handle = handle;
-                self.day = day;
-                self.prune();
+                self.date = date;
+                self.prune(date);
             }
         }
-        let line = match format {
-            Format::Json => json_line(label, message, at),
-            Format::Text => text_line(label, message, at),
-        };
         let _ = self.handle.write_all(line.as_bytes());
     }
 
     /// Removes the files that have aged out of the retention window.
-    fn prune(&self) {
-        prune(&self.directory, self.retention);
+    fn prune(&self, today: NaiveDate) {
+        prune(&self.directory, self.retention, today);
     }
 }
 
-fn open_day(directory: &Path, day: &str) -> Result<File, String> {
-    let path = directory.join(format!("{FILE_PREFIX}{day}.log"));
+fn open_day(directory: &Path, date: NaiveDate) -> Result<File, String> {
+    let path = directory.join(format!("{FILE_PREFIX}{date}.log"));
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -298,13 +310,11 @@ fn open_day(directory: &Path, day: &str) -> Result<File, String> {
 /// files keeps them. Zero keeps every file. A deletion that fails is passed
 /// over: a log file that could not be removed is not worth stopping a node for,
 /// and the next start tries again.
-fn prune(directory: &Path, retention: u32) {
+fn prune(directory: &Path, retention: u32, today: NaiveDate) {
     if retention == 0 {
         return;
     }
-    let Some(cutoff) =
-        Local::now().date_naive().checked_sub_days(Days::new(u64::from(retention - 1)))
-    else {
+    let Some(cutoff) = today.checked_sub_days(Days::new(u64::from(retention - 1))) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(directory) else {
@@ -337,36 +347,40 @@ fn console_line(
     at: DateTime<Local>,
     colored: bool,
 ) -> String {
-    let clean: std::borrow::Cow<'_, str> = if message.chars().any(|c| c < ' ' || c == '\x7f') {
-        std::borrow::Cow::Owned(
-            message.chars().map(|c| if c < ' ' || c == '\x7f' { ' ' } else { c }).collect(),
-        )
-    } else {
-        std::borrow::Cow::Borrowed(message)
-    };
-    let time = at.format(CONSOLE_TIME).to_string();
+    let clean: std::borrow::Cow<'_, str> =
+        if message.bytes().any(|b| b < b' ' || b == 0x7f || b == 0xc2)
+            && message.chars().any(char::is_control)
+        {
+            std::borrow::Cow::Owned(
+                message.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(message)
+        };
+    let time = at.format(CONSOLE_TIME);
     if !colored {
         return format!("{time} {label:<5} {clean}\n");
     }
-    let padded = format!("{label:<5}");
     format!(
-        "{dim}{time}{reset} {color}{padded}{reset} {bold}{clean}{reset}\n",
+        "{dim}{time}{reset} {color}{label:<5}{reset} {bold}{clean}{reset}\n",
         dim = paint::DIM,
         reset = paint::RESET,
-        color = color,
         bold = paint::BOLD,
-        padded = padded,
     )
 }
 
 /// One JSON record containing time, level and message.
 fn json_line(label: &str, message: &str, at: DateTime<Local>) -> String {
-    let body = serde_json::json!({
-        "time": at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        "level": label,
-        "msg": message,
-    });
-    format!("{body}\n")
+    let time = at.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut out = Vec::with_capacity(36 + time.len() + label.len() + message.len());
+    out.extend_from_slice(b"{\"time\":\"");
+    out.extend_from_slice(time.as_bytes());
+    out.extend_from_slice(b"\",\"level\":\"");
+    out.extend_from_slice(label.as_bytes());
+    out.extend_from_slice(b"\",\"msg\":");
+    let _ = serde_json::to_writer(&mut out, message);
+    out.extend_from_slice(b"}\n");
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// One text record with quoted values for the log file.
@@ -381,25 +395,21 @@ fn text_line(label: &str, message: &str, at: DateTime<Local>) -> String {
 
 /// Quotes a value that would otherwise be ambiguous. Printable non-ASCII text
 /// is kept as it is, which matters for a title written in CJK.
-fn quote_if_needed(value: &str) -> String {
+fn quote_if_needed(value: &str) -> std::borrow::Cow<'_, str> {
     if value.is_empty() {
-        return "\"\"".to_string();
+        return std::borrow::Cow::Borrowed("\"\"");
     }
-    if value.chars().any(|character| {
-        character < ' '
-            || character == '\x7f'
-            || character == ' '
-            || character == '"'
-            || character == '='
-    }) {
-        return format!("{value:?}");
+    if value.bytes().any(|b| b <= b' ' || b == 0x7f || b == b'"' || b == b'=')
+        || (value.bytes().any(|b| b == 0xc2) && value.chars().any(char::is_control))
+    {
+        return std::borrow::Cow::Owned(format!("{value:?}"));
     }
-    value.to_string()
+    std::borrow::Cow::Borrowed(value)
 }
 
 /// The label and colour of a level. The label is padded where it is written, so
 /// every line starts its message in the same column.
-fn style(level: Level) -> (&'static str, &'static str) {
+const fn style(level: Level) -> (&'static str, &'static str) {
     match level {
         Level::Trace | Level::Debug => ("DEBUG", paint::CYAN),
         Level::Info => ("INFO", paint::GREEN),
@@ -418,52 +428,37 @@ const SPLIT: usize = 4;
 /// Draws the wordmark and the version line, which a person reads at startup. A
 /// node that writes JSON logs leaves it out so the stream stays parseable.
 pub fn banner(color: bool, version: &str, api_version: &str) -> String {
-    let mut out = String::new();
+    use std::fmt::Write;
+    let mut out = String::with_capacity(if color { 1600 } else { 700 });
     for row in 0..6 {
         for (index, letter) in WORDMARK.chars().enumerate() {
             let glyph = block(letter)[row];
             if !color {
                 out.push_str(glyph);
-            } else if index < SPLIT {
-                out.push_str(paint::TEAL);
-                out.push_str(glyph);
-                out.push_str(paint::RESET);
             } else {
-                out.push_str(paint::CRIMSON);
+                out.push_str(if index < SPLIT { paint::TEAL } else { paint::CRIMSON });
                 out.push_str(glyph);
                 out.push_str(paint::RESET);
             }
         }
         out.push('\n');
     }
-    let subtitle = format!("v{version}  -  Rustlink API {api_version}");
     if color {
-        out.push_str(&format!("\n  {}{subtitle}{}\n\n", paint::DIM, paint::RESET));
+        let _ = write!(
+            out,
+            "\n  {}v{version}  -  Rustlink API {api_version}{}\n\n",
+            paint::DIM,
+            paint::RESET
+        );
     } else {
-        out.push_str(&format!("\n  {subtitle}\n\n"));
+        let _ = write!(out, "\n  v{version}  -  Rustlink API {api_version}\n\n");
     }
     out
 }
 
 /// The wordmark in the ANSI Shadow face: six rows per letter, ten columns wide.
-fn block(letter: char) -> [&'static str; 6] {
+const fn block(letter: char) -> [&'static str; 6] {
     match letter {
-        'G' => [
-            " \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d} ",
-            "\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}",
-            " \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d} ",
-        ],
-        'O' => [
-            " \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}",
-            " \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d} ",
-        ],
         'R' => [
             "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
             "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
@@ -503,14 +498,6 @@ fn block(letter: char) -> [&'static str; 6] {
             "\u{2588}\u{2588}\u{2551}     ",
             "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}",
             "\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}",
-        ],
-        'A' => [
-            " \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d}",
         ],
         'I' => [
             "\u{2588}\u{2588}\u{2557}",
@@ -654,7 +641,7 @@ mod tests {
     #[test]
     fn a_file_older_than_the_window_goes_and_the_others_stay() {
         let (directory, stale, today, foreign) = prepared_directory("prune");
-        prune(&directory, 14);
+        prune(&directory, 14, Local::now().date_naive());
         assert!(!stale.exists(), "a file from 2020 is outside a fourteen day window");
         assert!(today.exists(), "today's file is inside it");
         assert!(foreign.exists(), "a file this node did not write is left alone");
@@ -668,7 +655,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let odd = directory.join("rustlink-not-a-date.log");
         std::fs::write(&odd, b"a line\n").unwrap();
-        prune(&directory, 1);
+        prune(&directory, 1, Local::now().date_naive());
         assert!(odd.exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -676,7 +663,7 @@ mod tests {
     #[test]
     fn zero_retention_keeps_every_file() {
         let (directory, stale, _, _) = prepared_directory("keep");
-        prune(&directory, 0);
+        prune(&directory, 0, Local::now().date_naive());
         assert!(stale.exists(), "zero days means every file is kept");
         let _ = std::fs::remove_dir_all(&directory);
     }

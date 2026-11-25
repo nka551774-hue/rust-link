@@ -280,7 +280,7 @@ write_config() {
             } >"$DIRECTORY/config.yaml"
         fi
     )
-    chown "$SERVICE_USER:$SERVICE_GROUP" "$DIRECTORY/config.yaml"
+    chown "root:$SERVICE_GROUP" "$DIRECTORY/config.yaml"
     chmod 0640 "$DIRECTORY/config.yaml"
 }
 

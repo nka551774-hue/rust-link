@@ -65,10 +65,15 @@ impl Body {
 
 impl Read for Body {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.position < self.head.len() {
-            let count = (self.head.len() - self.position).min(buf.len());
-            buf[..count].copy_from_slice(&self.head[self.position..self.position + count]);
+        let buffered = self.head();
+        if !buffered.is_empty() {
+            let count = buffered.len().min(buf.len());
+            buf[..count].copy_from_slice(&buffered[..count]);
             self.position += count;
+            if self.position == self.head.len() {
+                self.head = Vec::new();
+                self.position = 0;
+            }
             return Ok(count);
         }
         self.inner.read(buf)
@@ -129,44 +134,28 @@ pub fn detect(head: &[u8]) -> Container {
     if head.len() < 4 {
         return Container::Unknown;
     }
-    if head.starts_with(b"OggS") {
-        // The first page's payload starts after the header and its segment
-        // table, and the codec names itself there.
-        let segments = head.get(26).copied().unwrap_or(0) as usize;
-        let payload = 27 + segments;
-        return match head.get(payload..) {
-            Some(rest) if rest.starts_with(b"OpusHead") => Container::OggOpus,
-            Some([0x01, b'v', b'o', b'r', b'b', b'i', b's', ..]) => Container::OggVorbis,
-            Some(rest) if rest.starts_with(b"\x7fFLAC") => Container::OggFlac,
-            _ => Container::Unknown,
-        };
-    }
-    if head.starts_with(b"fLaC") {
-        return Container::Flac;
-    }
-    if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WAVE") {
-        return Container::Wav;
-    }
-    if head.starts_with(b"ID3") {
-        return Container::Mp3;
-    }
-    if head[0] == 0xff {
-        match head[1] & 0xf0 {
-            // ADTS starts with a sync word and no layer.
-            0xf0 if head[1] & 0x06 == 0x00 => return Container::Adts,
-            _ => {}
+    match head {
+        [b'O', b'g', b'g', b'S', ..] => {
+            // The first page's payload starts after the header and its segment
+            // table, and the codec names itself there.
+            let payload = 27 + usize::from(head.get(26).copied().unwrap_or(0));
+            match head.get(payload..) {
+                Some([b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', ..]) => Container::OggOpus,
+                Some([0x01, b'v', b'o', b'r', b'b', b'i', b's', ..]) => Container::OggVorbis,
+                Some([0x7f, b'F', b'L', b'A', b'C', ..]) => Container::OggFlac,
+                _ => Container::Unknown,
+            }
         }
-        if head[1] & 0xe0 == 0xe0 && head[1] & 0x06 != 0 {
-            return Container::Mp3;
-        }
+        [b'f', b'L', b'a', b'C', ..] => Container::Flac,
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'A', b'V', b'E', ..] => Container::Wav,
+        [b'I', b'D', b'3', ..] => Container::Mp3,
+        // ADTS starts with a sync word and no layer.
+        [0xff, b1, ..] if b1 & 0xf6 == 0xf0 => Container::Adts,
+        [0xff, b1, ..] if b1 & 0xe0 == 0xe0 && b1 & 0x06 != 0 => Container::Mp3,
+        [_, _, _, _, b'f', b't', b'y', b'p', ..] => Container::Mp4,
+        [0x1a, 0x45, 0xdf, 0xa3, ..] => Container::Webm,
+        _ => Container::Unknown,
     }
-    if head.len() >= 8 && &head[4..8] == b"ftyp" {
-        return Container::Mp4;
-    }
-    if head.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
-        return Container::Webm;
-    }
-    Container::Unknown
 }
 
 /// The engine, which knows how to play a track and not where it came from.
@@ -186,7 +175,7 @@ impl Engine {
     pub fn start(
         &self,
         track: &Track,
-        body: Body,
+        mut body: Body,
         position_ms: i64,
         volume: i64,
         filters: &Object,
@@ -200,7 +189,6 @@ impl Engine {
         {
             return self.start_ffmpeg(body, position_ms, &set);
         }
-        let mut body = body;
         // An Ogg page header with 255 lacing segments takes 282 bytes before
         // `OpusHead` or `\x01vorbis` starts; 512 bytes always covers it.
         body.peek(512)?;

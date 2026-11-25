@@ -19,14 +19,23 @@ pub type Object = Map<String, Value>;
 pub struct Int64(pub i64);
 
 impl Int64 {
-    pub fn get(self) -> i64 {
+    #[inline]
+    pub const fn get(self) -> i64 {
         self.0
     }
 }
 
 impl From<i64> for Int64 {
+    #[inline]
     fn from(value: i64) -> Self {
         Self(value)
+    }
+}
+
+impl From<Int64> for i64 {
+    #[inline]
+    fn from(value: Int64) -> Self {
+        value.0
     }
 }
 
@@ -35,7 +44,7 @@ impl From<i64> for Int64 {
 /// The protocol leans on that difference: an absent `end_ms` leaves the current
 /// limit alone while `"end_ms": null` clears it, and the same holds for the
 /// track token in a player update.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Patch<T> {
     /// The client did not mention the field.
     #[default]
@@ -47,19 +56,23 @@ pub enum Patch<T> {
 }
 
 impl<T> Patch<T> {
-    pub fn is_missing(&self) -> bool {
+    #[inline]
+    pub const fn is_missing(&self) -> bool {
         matches!(self, Patch::Missing)
     }
-    pub fn is_null(&self) -> bool {
+    #[inline]
+    pub const fn is_null(&self) -> bool {
         matches!(self, Patch::Null)
     }
-    pub fn is_present(&self) -> bool {
+    #[inline]
+    pub const fn is_present(&self) -> bool {
         !self.is_missing()
     }
-    pub fn value(&self) -> Option<&T> {
+    #[inline]
+    pub const fn value(&self) -> Option<&T> {
         match self {
             Patch::Value(v) => Some(v),
-            _ => None,
+            Patch::Missing | Patch::Null => None,
         }
     }
 }
@@ -205,7 +218,8 @@ pub enum LoadResult {
 }
 
 impl LoadResult {
-    pub fn load_type(&self) -> &'static str {
+    #[inline]
+    pub const fn load_type(&self) -> &'static str {
         match self {
             LoadResult::Track(_) => "track",
             LoadResult::Playlist(_) => "playlist",
@@ -220,6 +234,7 @@ impl LoadResult {
         LoadResult::Error(Box::new(Exception::common(err.to_string())))
     }
 
+    #[inline]
     pub fn track(self) -> Option<Track> {
         match self {
             LoadResult::Track(t) => Some(*t),
@@ -248,16 +263,21 @@ impl<'de> Deserialize<'de> for LoadResult {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = RawLoadResult::deserialize(d)?;
         let data = raw.data.unwrap_or(Value::Null);
-        let convert = |e: serde_json::Error| de::Error::custom(e.to_string());
         Ok(match raw.load_type.as_str() {
-            "track" => LoadResult::Track(Box::new(serde_json::from_value(data).map_err(convert)?)),
-            "playlist" => {
-                LoadResult::Playlist(Box::new(serde_json::from_value(data).map_err(convert)?))
+            "track" => LoadResult::Track(Box::new(
+                serde_json::from_value(data).map_err(de::Error::custom)?,
+            )),
+            "playlist" => LoadResult::Playlist(Box::new(
+                serde_json::from_value(data).map_err(de::Error::custom)?,
+            )),
+            "search" => {
+                LoadResult::Search(serde_json::from_value(data).map_err(de::Error::custom)?)
             }
-            "search" => LoadResult::Search(serde_json::from_value(data).map_err(convert)?),
             "empty" => LoadResult::Empty,
-            "error" => LoadResult::Error(Box::new(serde_json::from_value(data).map_err(convert)?)),
-            other => return Err(de::Error::custom(format!("unknown load type {other}"))),
+            "error" => LoadResult::Error(Box::new(
+                serde_json::from_value(data).map_err(de::Error::custom)?,
+            )),
+            other => return Err(de::Error::custom(format_args!("unknown load type {other}"))),
         })
     }
 }

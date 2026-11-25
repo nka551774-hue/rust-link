@@ -5,8 +5,9 @@ use rustlink_client::{Client, LoadResult, VoiceState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTLINK_URL");
     let client = Client::new(
-        &std::env::var("RUSTLINK_URL").unwrap_or_else(|_| "http://127.0.0.1:2333".into()),
+        url.as_deref().unwrap_or("http://127.0.0.1:2333"),
         std::env::var("RUSTLINK_PASSWORD")?,
     )?;
     let bot = std::env::var("DISCORD_BOT_ID")?;
@@ -37,7 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 LoadResult::Playlist(playlist) => {
                     playlist.tracks.into_iter().next().ok_or("empty playlist")?
                 }
-                _ => return Err("no playable track".into()),
+                LoadResult::Empty => return Err("no playable track".into()),
+                LoadResult::Error(err) => {
+                    return Err(format!("resolve failed: {}", err.message).into())
+                }
             };
             session.play(&guild, &track.token).await?;
             tokio::select! {

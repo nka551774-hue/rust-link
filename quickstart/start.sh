@@ -128,7 +128,12 @@ for _ in $(seq 300); do
         tail -n 15 "$NODE_LOG" >&2
         fail "the node stopped; is port $PORT already in use?"
     fi
-    if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/version" >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+    elif (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
         ready=1
         break
     fi

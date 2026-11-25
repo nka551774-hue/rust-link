@@ -12,7 +12,7 @@ pub use lrclib::{LRCLIB, LRCLIB_BASE};
 pub use ytmusic::{YTMusic, YTMUSIC_ENDPOINT};
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
@@ -116,14 +116,14 @@ pub struct Manager {
 
 #[derive(Default)]
 struct Cache {
-    entries: HashMap<String, Entry>,
-    order: VecDeque<String>,
+    entries: HashMap<Arc<str>, Entry>,
+    order: VecDeque<Arc<str>>,
     /// The sum of every entry's weight.
     bytes: usize,
 }
 
 struct Entry {
-    lyrics: Option<Lyrics>,
+    lyrics: Option<Arc<Lyrics>>,
     at: Instant,
     /// What this entry counts against [`CACHE_BYTES`], key included.
     weight: usize,
@@ -146,7 +146,7 @@ fn value_weight(value: &serde_json::Value) -> usize {
 
 /// What an answer costs the cache: its text, its lines and the key it is kept
 /// under, with a little for the structure around them.
-fn weight(key: &str, lyrics: &Option<Lyrics>) -> usize {
+fn weight(key: &str, lyrics: Option<&Lyrics>) -> usize {
     let Some(lyrics) = lyrics else { return key.len() + 64 };
     let lines: usize = lyrics
         .lines
@@ -236,6 +236,12 @@ impl Manager {
     /// because the next one may still answer; only when none of them do is the
     /// last failure raised.
     pub fn fetch(&self, track: &Track) -> Result<Lyrics, LyricsError> {
+        let shared = self.fetch_shared(track)?;
+        Ok(Arc::unwrap_or_clone(shared))
+    }
+
+    /// Returns shared cached lyrics without deep-cloning the lines vector on hits.
+    pub fn fetch_shared(&self, track: &Track) -> Result<Arc<Lyrics>, LyricsError> {
         if !self.enabled() {
             return Err(LyricsError::NotFound);
         }
@@ -247,8 +253,9 @@ impl Manager {
         for provider in &self.providers {
             match provider.fetch(track) {
                 Ok(found) => {
-                    self.remember(&key, Some(found.clone()));
-                    return Ok(found);
+                    let shared = Arc::new(found);
+                    self.remember(&key, Some(Arc::clone(&shared)));
+                    return Ok(shared);
                 }
                 Err(LyricsError::NotFound) => {}
                 Err(error) => last = Some(error),
@@ -266,14 +273,14 @@ impl Manager {
         Err(LyricsError::NotFound)
     }
 
-    fn cached(&self, key: &str) -> Option<Option<Lyrics>> {
+    fn cached(&self, key: &str) -> Option<Option<Arc<Lyrics>>> {
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         let entry = cache.entries.get(key)?;
         if entry.at.elapsed() > self.ttl {
             if let Some(expired) = cache.entries.remove(key) {
-                cache.bytes -= expired.weight;
+                cache.bytes = cache.bytes.saturating_sub(expired.weight);
             }
-            cache.order.retain(|held| held != key);
+            cache.order.retain(|held| held.as_ref() != key);
             return None;
         }
         Some(entry.lyrics.clone())
@@ -284,32 +291,43 @@ impl Manager {
     ///
     /// Entries leave in the order they arrived, which is enough to keep the map
     /// bounded.
-    fn remember(&self, key: &str, lyrics: Option<Lyrics>) {
-        let weight = weight(key, &lyrics);
+    fn remember(&self, key: &str, lyrics: Option<Arc<Lyrics>>) {
+        let weight = weight(key, lyrics.as_deref());
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         // An answer this large is not worth what it would push out.
         if weight > MAX_ENTRY_BYTES {
             if let Some(stale) = cache.entries.remove(key) {
-                cache.bytes -= stale.weight;
-                cache.order.retain(|held| held != key);
+                cache.bytes = cache.bytes.saturating_sub(stale.weight);
+                cache.order.retain(|held| held.as_ref() != key);
             }
             return;
         }
-        if let Some(previous) = cache.entries.remove(key) {
-            cache.bytes -= previous.weight;
+        let shared_key = if let Some((existing_key, previous)) = cache.entries.remove_entry(key) {
+            cache.bytes = cache.bytes.saturating_sub(previous.weight);
+            cache.order.retain(|held| held.as_ref() != key);
+            cache.order.push_back(Arc::clone(&existing_key));
+            existing_key
         } else {
-            cache.order.push_back(key.to_string());
-        }
+            let fresh: Arc<str> = Arc::from(key);
+            cache.order.push_back(Arc::clone(&fresh));
+            fresh
+        };
         // Oldest first, until both the count and the bytes are within bounds.
         while cache.order.len() > self.limit || cache.bytes + weight > CACHE_BYTES {
-            let Some(oldest) = cache.order.iter().position(|held| held != key) else { break };
-            let Some(oldest) = cache.order.remove(oldest) else { break };
+            let Some(oldest) = cache.order.pop_front() else { break };
+            if oldest.as_ref() == key {
+                cache.order.push_back(oldest);
+                if cache.order.len() <= 1 {
+                    break;
+                }
+                continue;
+            }
             if let Some(evicted) = cache.entries.remove(&oldest) {
-                cache.bytes -= evicted.weight;
+                cache.bytes = cache.bytes.saturating_sub(evicted.weight);
             }
         }
         cache.bytes += weight;
-        cache.entries.insert(key.to_string(), Entry { lyrics, at: Instant::now(), weight });
+        cache.entries.insert(shared_key, Entry { lyrics, at: Instant::now(), weight });
     }
 }
 
@@ -318,7 +336,6 @@ mod tests {
     use super::*;
     use rustlink_protocol::TrackInfo;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     fn track(source: &str, identifier: &str) -> Track {
         Track::new(

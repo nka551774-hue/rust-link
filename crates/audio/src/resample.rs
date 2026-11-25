@@ -44,7 +44,7 @@ pub struct SincResampler {
     half: usize,
     /// The weights of the frame being produced, kept between frames so that
     /// producing one does not allocate.
-    scratch: Vec<f64>,
+    scratch: Vec<f32>,
     /// Which row of the weight table the next output frame reads.
     phase: usize,
     /// Exact integer read frame used alongside `phases`, eliminating cumulative
@@ -128,13 +128,22 @@ impl SincResampler {
     /// Returns how many frames were produced, which is zero when the caller has
     /// not pushed enough input yet.
     pub fn produce(&mut self, limit: usize, out: &mut Vec<f32>) -> usize {
-        let limit = if self.finished { limit.min(self.remaining()) } else { limit };
+        if limit == 0 {
+            return 0;
+        }
+        let capped = if self.finished { limit.min(self.remaining()) } else { limit };
+        if capped == 0 {
+            return 0;
+        }
         let produced = if self.ratio == 1.0 {
-            self.produce_unity(limit, out)
+            self.produce_unity(capped, out)
         } else {
-            self.produce_filtered(limit, out)
+            self.produce_filtered(capped, out)
         };
         self.output_frames += produced as u64;
+        if self.finished && produced < capped {
+            self.output_frames = self.output_frames.saturating_add(self.remaining() as u64);
+        }
         self.compact();
         produced
     }
@@ -163,38 +172,34 @@ impl SincResampler {
 
     /// The general case: a windowed sinc interpolation at the read position.
     fn produce_filtered(&mut self, limit: usize, out: &mut Vec<f32>) -> usize {
-        let frames = self.buffer.len() / CHANNELS;
+        let buf_frames = self.buffer.as_chunks::<CHANNELS>().0;
+        let frames = buf_frames.len();
         let width = 2 * self.half;
         let mut produced = 0;
+        out.reserve(self.available().min(limit) * CHANNELS);
         if let Some(phases) = &self.phases {
-            out.reserve(limit.min(frames) * CHANNELS);
+            let mut centre = self.centre_frame;
+            let mut phase = self.phase;
             while produced < limit {
-                let centre = self.centre_frame;
                 let start = centre + 1 - self.half;
                 let end = centre + self.half + 1;
                 if end > frames {
                     break;
                 }
-                let base = self.phase * width;
+                let base = phase * width;
                 let row = &phases.weights[base..base + width];
-                let mut left = 0.0f64;
-                let mut right = 0.0f64;
-                let window_samples = &self.buffer[start * CHANNELS..end * CHANNELS];
-                for (pair, &tap_weight) in window_samples.as_chunks::<CHANNELS>().0.iter().zip(row)
-                {
-                    left += pair[0] as f64 * tap_weight;
-                    right += pair[1] as f64 * tap_weight;
-                }
-                out.push(left as f32);
-                out.push(right as f32);
-                self.centre_frame += phases.steps[self.phase];
-                self.phase += 1;
-                if self.phase == phases.period {
-                    self.phase = 0;
+                let sample = convolve(&buf_frames[start..end], row);
+                out.extend_from_slice(&sample);
+                centre += phases.steps[phase];
+                phase += 1;
+                if phase == phases.period {
+                    phase = 0;
                 }
                 produced += 1;
             }
-            self.position = self.centre_frame as f64 + phases.fractions[self.phase];
+            self.centre_frame = centre;
+            self.phase = phase;
+            self.position = centre as f64 + phases.fractions[phase];
             return produced;
         }
 
@@ -211,22 +216,18 @@ impl SincResampler {
                 break;
             }
             let fraction = self.position.fract();
-            let mut weight = 0.0f64;
-            for (tap_index, w) in weights.iter_mut().enumerate() {
-                *w = tap(fraction, tap_offset(tap_index, self.half), cutoff);
-                weight += *w;
+            let mut sum = 0.0f64;
+            for (tap_index, slot) in weights.iter_mut().enumerate() {
+                let w = tap(fraction, tap_offset(tap_index, self.half), cutoff);
+                sum += w;
+                *slot = w as f32;
             }
-            let inv_weight = if weight.abs() > 1e-9 { 1.0 / weight } else { 0.0 };
-            let mut sums = [0.0f64; CHANNELS];
-            let window_samples = &self.buffer[start * CHANNELS..end * CHANNELS];
-            for (pair, &tap_weight) in
-                window_samples.as_chunks::<CHANNELS>().0.iter().zip(weights.iter())
-            {
-                sums[0] += pair[0] as f64 * tap_weight;
-                sums[1] += pair[1] as f64 * tap_weight;
+            let inv = if sum.abs() > 1e-9 { (1.0 / sum) as f32 } else { 0.0 };
+            for w in &mut weights {
+                *w *= inv;
             }
-            out.push((sums[0] * inv_weight) as f32);
-            out.push((sums[1] * inv_weight) as f32);
+            let sample = convolve(&buf_frames[start..end], &weights);
+            out.extend_from_slice(&sample);
             self.position += self.ratio;
             produced += 1;
         }
@@ -257,6 +258,45 @@ impl SincResampler {
     }
 }
 
+/// Four-way independent accumulator FIR dot product so LLVM SLP-vectorizes and
+/// unrolls the 16-tap stereo window without needing unsafe or `-ffast-math`.
+#[inline(always)]
+fn convolve(frames: &[[f32; CHANNELS]], weights: &[f32]) -> [f32; CHANNELS] {
+    if let (Ok(frames), Ok(weights)) =
+        (<&[[f32; CHANNELS]; TAPS]>::try_from(frames), <&[f32; TAPS]>::try_from(weights))
+    {
+        let mut acc = [[0.0f32; CHANNELS]; 4];
+        for i in 0..TAPS / 4 {
+            for k in 0..4 {
+                let w = weights[i * 4 + k];
+                let [l, r] = frames[i * 4 + k];
+                acc[k][0] += l * w;
+                acc[k][1] += r * w;
+            }
+        }
+        return [
+            (acc[0][0] + acc[1][0]) + (acc[2][0] + acc[3][0]),
+            (acc[0][1] + acc[1][1]) + (acc[2][1] + acc[3][1]),
+        ];
+    }
+    let mut acc = [[0.0f32; CHANNELS]; 4];
+    let (frame_chunks, frame_rem) = frames.as_chunks::<4>();
+    let (weight_chunks, weight_rem) = weights.as_chunks::<4>();
+    for (fc, wc) in frame_chunks.iter().zip(weight_chunks) {
+        for k in 0..4 {
+            acc[k][0] += fc[k][0] * wc[k];
+            acc[k][1] += fc[k][1] * wc[k];
+        }
+    }
+    let mut left = (acc[0][0] + acc[1][0]) + (acc[2][0] + acc[3][0]);
+    let mut right = (acc[0][1] + acc[1][1]) + (acc[2][1] + acc[3][1]);
+    for (&[l, r], &w) in frame_rem.iter().zip(weight_rem) {
+        left += l * w;
+        right += r * w;
+    }
+    [left, right]
+}
+
 /// The filter weights of every fractional read position a ratio repeats.
 #[derive(Debug, Clone)]
 struct Phases {
@@ -267,7 +307,7 @@ struct Phases {
     /// Exact integer input-frame step to take after producing each phase.
     steps: Vec<usize>,
     /// `period` sets of `2 * half` pre-normalised weights.
-    weights: Vec<f64>,
+    weights: Vec<f32>,
 }
 
 impl Phases {
@@ -285,6 +325,7 @@ impl Phases {
         let mut fractions = Vec::with_capacity(period);
         let mut steps = Vec::with_capacity(period);
         let mut weights = Vec::with_capacity(period * width);
+        let mut row_f64 = vec![0.0f64; width];
         for phase in 0..period {
             let num = phase * turns;
             let q_curr = num / period;
@@ -293,17 +334,14 @@ impl Phases {
             steps.push(q_next - q_curr);
             let fraction = rem as f64 / period as f64;
             fractions.push(fraction);
-            let row_start = weights.len();
             let mut sum = 0.0f64;
-            for tap_index in 0..width {
+            for (tap_index, slot) in row_f64.iter_mut().enumerate() {
                 let w = tap(fraction, tap_offset(tap_index, half), cutoff);
-                weights.push(w);
+                *slot = w;
                 sum += w;
             }
             let inv = if sum.abs() > 1e-9 { 1.0 / sum } else { 0.0 };
-            for w in &mut weights[row_start..row_start + width] {
-                *w *= inv;
-            }
+            weights.extend(row_f64.iter().map(|&w| (w * inv) as f32));
         }
         Some(Phases { period, fractions, steps, weights })
     }
@@ -362,9 +400,6 @@ fn tap(fraction: f64, offset: i64, cutoff: f64) -> f64 {
 /// does at any useful ratio.
 #[derive(Debug, Clone)]
 pub struct TimeStretcher {
-    frame: usize,
-    hop: usize,
-    search: usize,
     input: Vec<f32>,
     /// At high tempos the analysis hop can pass the buffered input. Keep the
     /// remainder as a skip for the next push instead of draining past the end.
@@ -373,14 +408,13 @@ pub struct TimeStretcher {
     /// blend with. The stretcher owns them so that a caller cannot drain the
     /// tail out from under it.
     output: Vec<f32>,
-    /// The tail of the last frame written, which the next frame aligns to.
-    tail: [f32; TAIL],
+    /// Mono-summed tail of the last frame written, which the next frame aligns to.
+    tail: [f32; HOP],
     /// The summed channels of the frames the alignment search reads, kept
     /// between frames so that the search does not allocate one of its own.
-    sums: Vec<f64>,
-    /// The cross-fade of each frame of the overlap, which is the same curve on
-    /// every frame and so is worked out once.
-    fades: [f64; HOP],
+    sums: Vec<f32>,
+    /// The cross-fade of each frame of the overlap, worked out once.
+    fades: [f32; HOP],
     primed: bool,
     total_input_frames: u64,
     total_output_frames: u64,
@@ -391,8 +425,9 @@ pub struct TimeStretcher {
 pub const STRETCH_FRAME: usize = 1024;
 /// The hop the output advances by, which is half a frame.
 const HOP: usize = STRETCH_FRAME / 2;
-/// The overlap between one frame and the next, which is also the hop the output
-/// advances by, counted in samples.
+/// Half-width of the WSOLA alignment search window, in frames.
+const SEARCH: usize = STRETCH_FRAME / 4;
+/// The overlap between one frame and the next, counted in stereo samples.
 const TAIL: usize = HOP * CHANNELS;
 
 impl Default for TimeStretcher {
@@ -401,24 +436,37 @@ impl Default for TimeStretcher {
     }
 }
 
+/// Eight-lane independent accumulator dot product over `HOP = 512` frames so
+/// LLVM SLP-vectorizes WSOLA cross-correlation into packed SIMD instructions.
+#[inline(always)]
+fn dot_hop(window: &[f32; HOP], tail: &[f32; HOP]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    for (w, t) in window.as_chunks::<8>().0.iter().zip(tail.as_chunks::<8>().0) {
+        for i in 0..8 {
+            acc[i] += w[i] * t[i];
+        }
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+}
+
+#[inline(always)]
+fn energy_hop(window: &[f32; HOP]) -> f32 {
+    dot_hop(window, window)
+}
+
 impl TimeStretcher {
     pub fn new() -> Self {
-        let frame = STRETCH_FRAME;
-        let hop = HOP;
-        let search = frame / 4;
-        let mut fades = [0.0f64; HOP];
+        let mut fades = [0.0f32; HOP];
         for (offset, fade) in fades.iter_mut().enumerate() {
-            *fade = 0.5 - 0.5 * (std::f64::consts::PI * (offset as f64 + 0.5) / hop as f64).cos();
+            *fade = (0.5 - 0.5 * (std::f64::consts::PI * (offset as f64 + 0.5) / HOP as f64).cos())
+                as f32;
         }
         TimeStretcher {
-            frame,
-            hop,
-            search,
             input: Vec::new(),
             skip: 0,
             output: Vec::new(),
-            tail: [0.0; TAIL],
-            sums: vec![0.0; search * 2 + hop],
+            tail: [0.0; HOP],
+            sums: vec![0.0; SEARCH * 2 + HOP],
             fades,
             primed: false,
             total_input_frames: 0,
@@ -442,38 +490,43 @@ impl TimeStretcher {
         let factor = factor.clamp(0.05, 5.0);
         // A faster factor consumes more input per output frame, which is what
         // makes the output shorter.
-        let analysis = (self.hop as f64 * factor).round().max(1.0) as usize;
+        let analysis = (HOP as f64 * factor).round().max(1.0) as usize;
         let frames = self.input.len() / CHANNELS;
         let mut read = 0usize;
         // The frame is taken from the read position plus an alignment offset,
         // and the offset reaches as far as twice the search window, so the
         // whole frame and the whole window have to be buffered before a frame
         // can be placed.
-        while read + self.frame + self.search * 2 <= frames {
+        while read + STRETCH_FRAME + SEARCH * 2 <= frames {
             let offset = if self.primed { self.best_offset(read) } else { 0 };
             let start = (read + offset) * CHANNELS;
-            let segment = &self.input[start..start + self.frame * CHANNELS];
+            let segment = &self.input[start..start + STRETCH_FRAME * CHANNELS];
             if self.primed {
                 // The frame overlaps what was just written by one hop, so that
                 // much of the output is cross-faded in place rather than
                 // appended: the output advances by the hop, not by the frame.
                 let base = self.output.len() - TAIL;
-                // The fade belongs to the frame, not to the sample, and the
-                // curve is the same every time, so it is read from the table.
-                for (frame, fade) in self.fades.iter().enumerate() {
-                    for channel in 0..CHANNELS {
-                        let i = frame * CHANNELS + channel;
-                        self.output[base + i] = (self.output[base + i] as f64 * (1.0 - *fade)
-                            + segment[i] as f64 * *fade)
-                            as f32;
-                    }
+                let tail_out = &mut self.output[base..];
+                for ((out_frame, seg_frame), &fade) in tail_out
+                    .as_chunks_mut::<CHANNELS>()
+                    .0
+                    .iter_mut()
+                    .zip(segment[..TAIL].as_chunks::<CHANNELS>().0)
+                    .zip(&self.fades)
+                {
+                    out_frame[0] += (seg_frame[0] - out_frame[0]) * fade;
+                    out_frame[1] += (seg_frame[1] - out_frame[1]) * fade;
                 }
                 self.output.extend_from_slice(&segment[TAIL..]);
             } else {
                 self.output.extend_from_slice(segment);
                 self.primed = true;
             }
-            self.tail.copy_from_slice(&segment[(self.frame - self.hop) * CHANNELS..]);
+            let tail_frames = segment[(STRETCH_FRAME - HOP) * CHANNELS..].as_chunks::<CHANNELS>().0;
+            for (dst, &[l, r]) in self.tail.iter_mut().zip(tail_frames) {
+                let sum = l + r;
+                *dst = if sum.is_finite() { sum } else { 0.0 };
+            }
             read += analysis;
         }
         if read > 0 {
@@ -515,7 +568,7 @@ impl TimeStretcher {
         let remaining_target = target_total.saturating_sub(self.total_output_frames) as usize;
         if !self.input.is_empty() || !self.primed {
             self.skip = 0;
-            let pad_samples = (self.frame + self.search * 2) * CHANNELS;
+            let pad_samples = (STRETCH_FRAME + SEARCH * 2) * CHANNELS;
             self.input.resize(self.input.len() + pad_samples, 0.0);
             self.produce(factor);
         }
@@ -532,42 +585,34 @@ impl TimeStretcher {
     /// Finds the offset within the search window where the next frame lines up
     /// best with the tail already written, judged on the summed channels.
     fn best_offset(&mut self, read: usize) -> usize {
-        let mut best = self.search;
-        let mut best_score = f64::MIN;
-        // The tail is the same for every candidate, so its summed channels are
-        // worked out once instead of once per offset.
-        let mut tail = [0.0f64; HOP];
-        for (i, sum) in tail.iter_mut().enumerate() {
-            for channel in 0..CHANNELS {
-                *sum += self.tail[i * CHANNELS + channel] as f64;
-            }
-        }
-        let frames = self.input.len() / CHANNELS;
-        let last = frames.saturating_sub(read).min(self.sums.len());
-        if last < self.hop {
+        let mut best = SEARCH;
+        let mut best_score = f32::MIN;
+        let input_frames = self.input.as_chunks::<CHANNELS>().0;
+        let last = input_frames.len().saturating_sub(read).min(self.sums.len());
+        if last < HOP {
             return best;
         }
-        for (i, sum) in self.sums[..last].iter_mut().enumerate() {
-            *sum = 0.0;
-            for channel in 0..CHANNELS {
-                *sum += self.input[(read + i) * CHANNELS + channel] as f64;
-            }
+        for (sum, &[l, r]) in self.sums[..last].iter_mut().zip(&input_frames[read..read + last]) {
+            let s = l + r;
+            *sum = if s.is_finite() { s } else { 0.0 };
         }
-        let max_offset = (self.search * 2).min(last - self.hop);
-        let mut energy: f64 = self.sums[..self.hop].iter().map(|a| a * a).sum();
+        let max_offset = (SEARCH * 2).min(last - HOP);
+        let mut energy = 0.0f32;
         for offset in 0..=max_offset {
-            if offset > 0 {
-                if offset % 64 == 0 {
-                    energy = self.sums[offset..offset + self.hop].iter().map(|a| a * a).sum();
-                } else {
-                    let prev = self.sums[offset - 1];
-                    let next = self.sums[offset + self.hop - 1];
-                    energy = (energy + next * next - prev * prev).max(0.0);
+            let window: &[f32; HOP] = self.sums[offset..offset + HOP].try_into().unwrap();
+            if offset % 64 == 0 {
+                energy = energy_hop(window);
+            } else {
+                let prev = self.sums[offset - 1];
+                let next = self.sums[offset + HOP - 1];
+                energy = (energy + next * next - prev * prev).max(0.0);
+                if !energy.is_finite() {
+                    energy = energy_hop(window);
                 }
             }
-            let mut dot = 0.0f64;
-            for (a, tail_sum) in self.sums[offset..offset + self.hop].iter().zip(tail.iter()) {
-                dot += *a * *tail_sum;
+            let dot = dot_hop(window, &self.tail);
+            if dot <= 0.0 && best_score >= 0.0 {
+                continue;
             }
             // Normalising by the energy keeps a loud passage from always
             // winning over a quiet one that fits better.

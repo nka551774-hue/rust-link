@@ -4,7 +4,10 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use rustlink_audio::{ogg::OggOpusReader, Body, Engine, Preference};
+use rustlink_audio::{ogg::OggOpusReader, parse_filters, DspChain, SincResampler};
+#[cfg(feature = "native-opus")]
+use rustlink_audio::{Body, Engine, Preference};
+#[cfg(feature = "native-opus")]
 use rustlink_protocol::{Track, TrackInfo};
 
 #[allow(dead_code)]
@@ -58,6 +61,7 @@ fn ogg_fixture() -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "native-opus")]
 fn wav_fixture() -> Vec<u8> {
     let frames = 480_000u32;
     let data_len = frames * 4;
@@ -165,26 +169,86 @@ fn main() {
         }
         assert_eq!(count, 200_000);
     });
-    let wav = wav_fixture();
-    measure("wav_48khz_stereo_opus_128k_complexity10", 501, || {
-        let engine = Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 10 };
-        let track = Track::new("bench".into(), TrackInfo::default());
-        let mut frames = engine
-            .start(
-                &track,
-                Body::new(Box::new(std::io::Cursor::new(wav.clone()))),
-                0,
-                100,
-                &Default::default(),
-                Preference::Auto,
-            )
-            .unwrap();
-        let mut packet = Vec::new();
-        let mut count = 0;
-        while frames.next_frame(&mut packet).unwrap() {
-            black_box(&packet);
-            count += 1;
+    let filter_json: rustlink_protocol::Object = serde_json::from_value(serde_json::json!({
+        "volume": 0.9,
+        "equalizer": [
+            {"band": 0, "gain": 0.2},
+            {"band": 2, "gain": 0.15},
+            {"band": 7, "gain": -0.1},
+            {"band": 12, "gain": 0.12}
+        ],
+        "karaoke": {"level": 0.5, "monoLevel": 0.5, "filterBand": 220.0, "filterWidth": 100.0},
+        "tremolo": {"frequency": 4.0, "depth": 0.5},
+        "vibrato": {"frequency": 5.0, "depth": 0.4},
+        "rotation": {"rotationHz": 0.25},
+        "distortion": {
+            "sinOffset": 0.0,
+            "sinScale": 1.0,
+            "cosOffset": 0.0,
+            "cosScale": 0.2,
+            "tanOffset": 0.0,
+            "tanScale": 0.25,
+            "offset": 0.0,
+            "scale": 0.8
+        },
+        "lowPass": {"smoothing": 12.0}
+    }))
+    .unwrap();
+    let parsed_filters = parse_filters(&filter_json, 95).unwrap();
+    let mut chain = DspChain::new(&parsed_filters);
+    let mut pcm_frame = vec![0.25f32; 960 * 2];
+    for (idx, sample) in pcm_frame.iter_mut().enumerate() {
+        *sample = ((idx as f32 * 0.05).sin()) * 0.4;
+    }
+    measure("dsp_full_8stage_chain_frames", 5_000, || {
+        for _ in 0..5_000 {
+            let buf = black_box(pcm_frame.as_mut_slice());
+            chain.process_pre(buf);
+            chain.process_post(buf);
+            black_box(&*buf);
         }
-        assert_eq!(count, 501); // Includes the encoder's delayed final samples.
     });
+
+    let mut resampler = SincResampler::new(44_100.0 / 48_000.0);
+    let src_chunk = pcm_frame.clone();
+    let mut resampled = Vec::with_capacity(2048 * 2);
+    // Warm up internal buffer capacity so steady-state heap allocations are measured cleanly.
+    resampler.push(&src_chunk);
+    resampler.produce(1024, &mut resampled);
+    resampled.clear();
+    measure("sinc_resampler_44k1_to_48k_frames", 5_000, || {
+        for _ in 0..5_000 {
+            resampler.push(black_box(&src_chunk));
+            resampled.clear();
+            let produced = resampler.produce(2048, &mut resampled);
+            black_box((produced, resampled.as_slice()));
+        }
+    });
+
+    #[cfg(feature = "native-opus")]
+    {
+        let wav = wav_fixture();
+        measure("wav_48khz_stereo_opus_128k_complexity10", 501, || {
+            let engine =
+                Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 10 };
+            let track = Track::new("bench".into(), TrackInfo::default());
+            let mut frames = engine
+                .start(
+                    &track,
+                    Body::new(Box::new(std::io::Cursor::new(wav.clone()))),
+                    0,
+                    100,
+                    &Default::default(),
+                    Preference::Auto,
+                )
+                .unwrap();
+            let mut packet = Vec::new();
+            let mut count = 0;
+            while frames.next_frame(&mut packet).unwrap() {
+                black_box(&packet);
+                count += 1;
+            }
+            assert_eq!(count, 501); // Includes the encoder's delayed final samples.
+        });
+    }
 }

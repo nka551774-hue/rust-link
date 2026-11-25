@@ -34,10 +34,16 @@ impl Mode {
         }
     }
 
-    pub fn negotiate(offered: &[String]) -> Option<Self> {
-        [Self::AeadAes256GcmRtpSize, Self::AeadXChaCha20Poly1305RtpSize]
-            .into_iter()
-            .find(|m| offered.iter().any(|s| Self::parse(s) == Some(*m)))
+    pub fn negotiate(offered: impl IntoIterator<Item = impl AsRef<str>>) -> Option<Self> {
+        let mut has_chacha = false;
+        for item in offered {
+            match Self::parse(item.as_ref()) {
+                Some(Self::AeadAes256GcmRtpSize) => return Some(Self::AeadAes256GcmRtpSize),
+                Some(Self::AeadXChaCha20Poly1305RtpSize) => has_chacha = true,
+                None => {}
+            }
+        }
+        has_chacha.then_some(Self::AeadXChaCha20Poly1305RtpSize)
     }
 }
 
@@ -109,8 +115,8 @@ impl PacketCipher {
     }
 }
 
-pub fn ip_discovery_request(ssrc: u32) -> Vec<u8> {
-    let mut bytes = vec![0; 74];
+pub fn ip_discovery_request(ssrc: u32) -> [u8; 74] {
+    let mut bytes = [0u8; 74];
     bytes[..2].copy_from_slice(&1u16.to_be_bytes());
     bytes[2..4].copy_from_slice(&70u16.to_be_bytes());
     bytes[4..8].copy_from_slice(&ssrc.to_be_bytes());
@@ -286,13 +292,10 @@ mod tests {
 
     #[test]
     fn negotiation_requires_supported_authenticated_modes() {
-        assert_eq!(Mode::negotiate(&["plain".into()]), None);
+        assert_eq!(Mode::negotiate(["plain"]), None);
+        assert_eq!(Mode::negotiate(["aead_aes256_gcm_rtpsize"]), Some(Mode::AeadAes256GcmRtpSize));
         assert_eq!(
-            Mode::negotiate(&["aead_aes256_gcm_rtpsize".into()]),
-            Some(Mode::AeadAes256GcmRtpSize)
-        );
-        assert_eq!(
-            Mode::negotiate(&["aead_xchacha20_poly1305_rtpsize".into()]),
+            Mode::negotiate(["aead_xchacha20_poly1305_rtpsize"]),
             Some(Mode::AeadXChaCha20Poly1305RtpSize)
         );
         assert_eq!(Mode::parse("aead_xchacha20poly1305_rtpsize"), None);

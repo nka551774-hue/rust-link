@@ -92,10 +92,9 @@ impl Provider for YTMusic {
         let Some(video_id) = video_id(track) else {
             return Err(LyricsError::NotFound);
         };
-        let page = self.page(&video_id)?;
-        if page.is_empty() {
+        let Some(page) = self.page(video_id)? else {
             return Err(LyricsError::NotFound);
-        }
+        };
         // A shape that failed is not a reason to stop: the other one is a
         // separate request and may still answer. Only when neither has anything
         // is the failure raised, and the first one is the one worth reporting.
@@ -130,11 +129,11 @@ impl Provider for YTMusic {
 }
 
 impl YTMusic {
-    /// Returns the lyrics page a track has, or an empty string when it has none.
+    /// Returns the lyrics page a track has, or `None` when it has none.
     ///
-    /// The words are not in this answer, so an empty result is the catalogue
+    /// The words are not in this answer, so a missing browse id is the catalogue
     /// saying the track has no lyrics rather than a failure.
-    fn page(&self, video_id: &str) -> Result<String, LyricsError> {
+    fn page(&self, video_id: &str) -> Result<Option<String>, LyricsError> {
         let answer: Value = self.call(&WEB, "next", json!({ "videoId": video_id }))?;
         let tabs = answer
             .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
@@ -145,12 +144,14 @@ impl YTMusic {
                 .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
                 .and_then(Value::as_str);
             if page_type == Some(LYRICS_PAGE) {
-                let browse_id =
-                    endpoint.get("browseId").and_then(Value::as_str).unwrap_or_default();
-                return Ok(browse_id.to_string());
+                return Ok(endpoint
+                    .get("browseId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned));
             }
         }
-        Ok(String::new())
+        Ok(None)
     }
 
     /// Posts one browse request for the lyrics page.
@@ -227,14 +228,28 @@ fn client_context(client: &Client, version: &str) -> Value {
 
 /// The id a track can be asked about, or `None` when the track is not one the
 /// catalogue knows.
-fn video_id(track: &Track) -> Option<String> {
+fn video_id(track: &Track) -> Option<&str> {
     if track.metadata.source_name != "youtube" {
         return None;
     }
     let id = track.metadata.identifier.trim();
     let valid =
-        id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    valid.then(|| id.to_string())
+        id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    valid.then_some(id)
+}
+
+fn trim_owned(mut text: String) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() == text.len() {
+        return text;
+    }
+    let leading = text.len() - text.trim_start().len();
+    let len = trimmed.len();
+    if leading > 0 {
+        text.drain(..leading);
+    }
+    text.truncate(len);
+    text
 }
 
 /// Builds the payload from the mobile answer.
@@ -262,16 +277,18 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
                     || millis(line.pointer("/cueRange/endTimeMilliseconds")) > 0
             }));
     if !timed {
-        let words: Vec<&str> = lines
-            .iter()
-            .map(|line| line.get("lyricLine").and_then(Value::as_str).unwrap_or_default())
-            .collect();
-        let joined = words.join("\n");
-        let joined = joined.trim();
+        let mut joined = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                joined.push('\n');
+            }
+            joined.push_str(line.get("lyricLine").and_then(Value::as_str).unwrap_or_default());
+        }
+        let joined = trim_owned(joined);
         if joined.is_empty() {
             return None;
         }
-        out.text = Some(joined.to_string());
+        out.text = Some(joined);
         return Some(out);
     }
     let mut timed_lines = Vec::with_capacity(lines.len());
@@ -298,9 +315,9 @@ fn from_web(track: &Track, answer: &Value) -> Option<Lyrics> {
     let contents = answer.pointer("/contents/sectionListRenderer/contents")?.as_array()?;
     let shelf = contents.iter().find_map(|item| item.get("musicDescriptionShelfRenderer"))?;
     let runs = shelf.pointer("/description/runs").and_then(Value::as_array)?;
-    let text: String =
-        runs.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect();
-    let text = text.trim();
+    let text = trim_owned(
+        runs.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect::<String>(),
+    );
     if text.is_empty() {
         return None;
     }
@@ -311,7 +328,7 @@ fn from_web(track: &Track, answer: &Value) -> Option<Lyrics> {
         .filter_map(|run| run.get("text").and_then(Value::as_str))
         .collect();
     let mut out = base(track, &source);
-    out.text = Some(text.to_string());
+    out.text = Some(text);
     Some(out)
 }
 
@@ -368,7 +385,7 @@ mod tests {
 
     #[test]
     fn only_a_youtube_video_id_is_worth_asking_about() {
-        assert_eq!(video_id(&track("youtube", "dQw4w9WgXcQ")).as_deref(), Some("dQw4w9WgXcQ"));
+        assert_eq!(video_id(&track("youtube", "dQw4w9WgXcQ")), Some("dQw4w9WgXcQ"));
         assert!(video_id(&track("youtube", "too short")).is_none());
         assert!(video_id(&track("soundcloud", "dQw4w9WgXcQ")).is_none());
     }

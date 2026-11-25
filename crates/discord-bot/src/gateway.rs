@@ -124,6 +124,22 @@ pub enum BotEvent {
     Other { name: String, data: Value },
 }
 
+impl BotEvent {
+    /// Returns the guild ID associated with this event, if any.
+    pub fn guild_id(&self) -> Option<&str> {
+        match self {
+            Self::VoiceStateUpdate(update) => update.guild_id.as_deref(),
+            Self::VoiceServerUpdate(update) => Some(update.guild_id.as_str()),
+            Self::MessageCreate(message) => message.guild_id.as_deref(),
+            Self::Interaction(interaction) => interaction.guild_id.as_deref(),
+            Self::Other { data, .. } => {
+                data.get("guild_id").or_else(|| data.get("id")).and_then(Value::as_str)
+            }
+            Self::Ready(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GatewayResponse {
     url: String,
@@ -140,22 +156,34 @@ pub struct Gateway {
     heartbeat_interval: Duration,
     next_heartbeat: Instant,
     heartbeat_acknowledged: bool,
+    needs_flush: bool,
     /// The code Discord closed the connection with, once it has.
     close_code: Option<u16>,
     sequence: Option<u64>,
     invalid_session_resumable: bool,
 }
 
+fn apply_initial_heartbeat_jitter(gateway: &mut Gateway) {
+    let jitter_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let factor = 0.25 + (f64::from(jitter_nanos % 7_500) / 10_000.0);
+    gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval.mul_f64(factor);
+}
+
 impl Gateway {
     /// Fetch Discord's gateway URL, receive HELLO, and send IDENTIFY.
     pub async fn connect(token: impl Into<String>, intents: u64) -> Result<Self, BotError> {
-        let token = validate_gateway_token(&token.into())?;
-        let mut auth =
-            reqwest::header::HeaderValue::from_str(&format!("Bot {token}")).map_err(|_| {
-                BotError::Invalid("bot token contains invalid header characters".into())
-            })?;
+        let raw_token = Zeroizing::new(token.into());
+        let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
+        let auth_text = Zeroizing::new(format!("Bot {}", token.as_str()));
+        let mut auth = reqwest::header::HeaderValue::from_str(&auth_text).map_err(|_| {
+            BotError::Invalid("bot token contains invalid header characters".into())
+        })?;
         auth.set_sensitive(true);
         let http = reqwest::Client::builder()
+            .tcp_nodelay(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
@@ -167,7 +195,13 @@ impl Gateway {
             .send()
             .await?;
         let status = response.status();
-        let body = read_response_body(response, status).await?;
+        let body = crate::read_limited_body(
+            response,
+            status,
+            MAX_HTTP_RESPONSE_BYTES,
+            "Discord gateway response exceeded the configured limit",
+        )
+        .await?;
         if !status.is_success() {
             return Err(BotError::HttpStatus {
                 status: status.as_u16(),
@@ -177,14 +211,8 @@ impl Gateway {
             });
         }
         let info: GatewayResponse = serde_json::from_slice(&body)?;
-        let mut gateway = Self::connect_url(info.url, Zeroizing::new(token), intents).await?;
-        // Per Discord Gateway v10, jitter the first heartbeat on production connections.
-        let jitter_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let factor = 0.25 + (f64::from(jitter_nanos % 7_500) / 10_000.0);
-        gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval.mul_f64(factor);
+        let mut gateway = Self::connect_url(info.url, token, intents).await?;
+        apply_initial_heartbeat_jitter(&mut gateway);
         Ok(gateway)
     }
 
@@ -196,9 +224,11 @@ impl Gateway {
         sequence: u64,
         intents: u64,
     ) -> Result<Self, BotError> {
-        let token = Zeroizing::new(validate_gateway_token(&token.into())?);
+        let raw_token = Zeroizing::new(token.into());
+        let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
         let session_id = crate::validate_text(session_id.as_ref(), "session ID")?;
         let mut gateway = Self::open_hello(resume_gateway_url.as_ref(), token, intents).await?;
+        apply_initial_heartbeat_jitter(&mut gateway);
         gateway.sequence = Some(sequence);
         gateway
             .send(json!({
@@ -234,7 +264,7 @@ impl Gateway {
             .max_frame_size(Some(MAX_GATEWAY_MESSAGE));
         let (mut socket, _) = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            tokio_tungstenite::connect_async_with_config(&url, Some(config), false),
+            tokio_tungstenite::connect_async_with_config(&url, Some(config), true),
         )
         .await
         .map_err(|_| BotError::Protocol("gateway HELLO timed out".into()))??;
@@ -259,6 +289,7 @@ impl Gateway {
             heartbeat_interval: interval,
             next_heartbeat: Instant::now() + interval,
             heartbeat_acknowledged: true,
+            needs_flush: false,
             close_code: None,
             sequence: None,
             invalid_session_resumable: false,
@@ -285,19 +316,24 @@ impl Gateway {
     }
 
     async fn send_heartbeat(&mut self) -> Result<(), BotError> {
-        self.send(json!({"op": 1, "d": self.sequence})).await?;
+        let text = match self.sequence {
+            Some(seq) => format!(r#"{{"op":1,"d":{seq}}}"#),
+            None => r#"{"op":1,"d":null}"#.to_owned(),
+        };
+        self.send_text(text).await?;
         self.heartbeat_acknowledged = false;
         self.next_heartbeat = Instant::now() + self.heartbeat_interval;
         Ok(())
     }
 
     async fn send(&mut self, payload: Value) -> Result<(), BotError> {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            self.socket.send(Message::Text(payload.to_string().into())),
-        )
-        .await
-        .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
+        self.send_text(payload.to_string()).await
+    }
+
+    async fn send_text(&mut self, text: String) -> Result<(), BotError> {
+        tokio::time::timeout(Duration::from_secs(10), self.socket.send(Message::Text(text.into())))
+            .await
+            .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
         Ok(())
     }
 
@@ -333,9 +369,32 @@ impl Gateway {
         .await
     }
 
+    /// Polls events until Discord sends `READY`.
+    pub async fn next_ready(&mut self) -> Result<Ready, BotError> {
+        loop {
+            match self.next_event().await? {
+                Some(BotEvent::Ready(ready)) => return Ok(ready),
+                Some(_) => {}
+                None => {
+                    let detail = match self.close_code {
+                        Some(code) => format!("gateway closed before READY (code {code})"),
+                        None => "gateway closed before READY".into(),
+                    };
+                    return Err(BotError::Protocol(detail));
+                }
+            }
+        }
+    }
+
     /// Polls one dispatch and services heartbeats while waiting.
     pub async fn next_event(&mut self) -> Result<Option<BotEvent>, BotError> {
         loop {
+            if self.needs_flush {
+                tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
+                    .await
+                    .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
+                self.needs_flush = false;
+            }
             tokio::select! {
                 // What has already arrived is read before the heartbeat timer is
                 // looked at. A caller that was busy for a moment leaves both the
@@ -352,7 +411,7 @@ impl Gateway {
                                 self.sequence = Some(sequence);
                             }
                             match payload.get("op").and_then(Value::as_u64) {
-                                Some(0) => return dispatch(&payload),
+                                Some(0) => return dispatch(payload),
                                 Some(1) => self.send_heartbeat().await?,
                                 Some(7) => return Err(BotError::Reconnect),
                                 Some(9) => {
@@ -367,9 +426,7 @@ impl Gateway {
                             }
                         }
                         Message::Ping(_) => {
-                            tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
-                                .await
-                                .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
+                            self.needs_flush = true;
                         }
                         Message::Close(frame) => {
                             self.close_code = frame.map(|frame| u16::from(frame.code));
@@ -414,10 +471,14 @@ fn gateway_url(base: &str) -> Result<String, BotError> {
     if scheme != "wss" && scheme != "ws" {
         return Err(BotError::Invalid("Discord gateway URL must use ws or wss".into()));
     }
-    let host_lower = host.to_ascii_lowercase();
-    let discord_host = host_lower == "gateway.discord.gg"
-        || (host_lower.ends_with(".discord.gg") && host_lower.len() > ".discord.gg".len());
-    let loopback = matches!(host_lower.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    let discord_host = host.eq_ignore_ascii_case("gateway.discord.gg")
+        || (host.len() > ".discord.gg".len()
+            && host
+                .as_bytes()
+                .get(host.len().wrapping_sub(".discord.gg".len())..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(b".discord.gg")));
+    let loopback =
+        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1" | "[::1]");
     if scheme == "wss" && !discord_host {
         return Err(BotError::Invalid("remote Discord gateway URL has an untrusted host".into()));
     }
@@ -448,29 +509,6 @@ fn validate_gateway_token(token: &str) -> Result<String, BotError> {
     Ok(token.to_owned())
 }
 
-async fn read_response_body(
-    mut response: reqwest::Response,
-    status: reqwest::StatusCode,
-) -> Result<Vec<u8>, BotError> {
-    if response.content_length().is_some_and(|length| length > MAX_HTTP_RESPONSE_BYTES as u64) {
-        return Err(BotError::HttpStatus {
-            status: status.as_u16(),
-            message: "Discord gateway response exceeded the configured limit".into(),
-        });
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
-            return Err(BotError::HttpStatus {
-                status: status.as_u16(),
-                message: "Discord gateway response exceeded the configured limit".into(),
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 fn text_json(message: Message) -> Result<Value, BotError> {
     match message {
         Message::Text(text) => Ok(serde_json::from_str(&text)?),
@@ -479,10 +517,18 @@ fn text_json(message: Message) -> Result<Value, BotError> {
     }
 }
 
-fn dispatch(payload: &Value) -> Result<Option<BotEvent>, BotError> {
-    let name = payload.get("t").and_then(Value::as_str).unwrap_or_default();
-    let data = payload.get("d").cloned().unwrap_or(Value::Null);
-    let event = match name {
+fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
+    let Value::Object(mut map) = payload else {
+        return Ok(None);
+    };
+    let Some(Value::String(name)) = map.remove("t") else {
+        return Ok(None);
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let data = map.remove("d").unwrap_or(Value::Null);
+    let event = match name.as_str() {
         "READY" => {
             let ready: RawReady = serde_json::from_value(data)?;
             Some(BotEvent::Ready(Ready {
@@ -550,8 +596,7 @@ fn dispatch(payload: &Value) -> Result<Option<BotEvent>, BotError> {
                 options,
             }))
         }
-        _ if name.is_empty() => None,
-        _ => Some(BotEvent::Other { name: name.into(), data }),
+        _ => Some(BotEvent::Other { name, data }),
     };
     Ok(event)
 }
@@ -643,7 +688,7 @@ mod tests {
 
     #[test]
     fn voice_server_dispatch_is_decoded_without_exposing_gateway_token() {
-        let event = dispatch(&json!({
+        let event = dispatch(json!({
             "op": 0,
             "t": "VOICE_SERVER_UPDATE",
             "d": {"guild_id": "123", "token": "voice-secret", "endpoint": "voice.discord.media:443"}
@@ -667,7 +712,7 @@ mod tests {
         let ready = json!({"op": 0, "t": "READY", "d": {
             "user": {"id": "100"}, "application": {"id": "900"}, "session_id": "s"
         }});
-        let Some(BotEvent::Ready(ready)) = dispatch(&ready).unwrap() else { panic!() };
+        let Some(BotEvent::Ready(ready)) = dispatch(ready).unwrap() else { panic!() };
         assert_eq!(ready.application_id, "900");
 
         let interaction = json!({"op": 0, "t": "INTERACTION_CREATE", "d": {
@@ -678,7 +723,7 @@ mod tests {
                 {"name": "volume", "type": 4, "value": 50}
             ]}
         }});
-        let Some(BotEvent::Interaction(interaction)) = dispatch(&interaction).unwrap() else {
+        let Some(BotEvent::Interaction(interaction)) = dispatch(interaction).unwrap() else {
             panic!()
         };
         assert_eq!(interaction.user_id, "400");
@@ -689,12 +734,12 @@ mod tests {
 
         // A button click (type 3) is not a slash command.
         let button = json!({"op": 0, "t": "INTERACTION_CREATE", "d": {"type": 3}});
-        assert!(matches!(dispatch(&button).unwrap(), Some(BotEvent::Other { .. })));
+        assert!(matches!(dispatch(button).unwrap(), Some(BotEvent::Other { .. })));
     }
 
     #[test]
     fn malformed_dispatch_is_rejected() {
-        let result = dispatch(&json!({"op": 0, "t": "READY", "d": {}}));
+        let result = dispatch(json!({"op": 0, "t": "READY", "d": {}}));
         assert!(result.is_err());
     }
 

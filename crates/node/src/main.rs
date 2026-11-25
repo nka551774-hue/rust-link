@@ -39,26 +39,28 @@ struct Arguments {
 }
 
 impl Arguments {
-    fn parse(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
+    fn parse(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
         let mut parsed = Arguments { config: None, version: false, check: false, help: false };
-        let mut arguments = arguments;
         while let Some(argument) = arguments.next() {
             let (name, inline) = match argument.split_once('=') {
-                Some((name, value)) => (name.to_string(), Some(value.to_string())),
-                None => (argument, None),
+                Some((name, value)) => (name, Some(value)),
+                None => (argument.as_str(), None),
             };
-            match name.as_str() {
+            match name {
                 "--config" | "-c" => {
-                    let value = match inline {
-                        Some(value) => value,
-                        None => arguments
-                            .next()
-                            .ok_or_else(|| "--config needs a configuration file".to_string())?,
+                    let path = match inline {
+                        Some(v) if !v.is_empty() && !v.starts_with('-') => PathBuf::from(v),
+                        Some(_) => return Err("--config needs a configuration file".into()),
+                        None => {
+                            let v =
+                                arguments.next().ok_or("--config needs a configuration file")?;
+                            if v.is_empty() || v.starts_with('-') {
+                                return Err("--config needs a configuration file".into());
+                            }
+                            PathBuf::from(v)
+                        }
                     };
-                    if value.is_empty() || value.starts_with('-') {
-                        return Err("--config needs a configuration file".into());
-                    }
-                    parsed.config = Some(PathBuf::from(value));
+                    parsed.config = Some(path);
                 }
                 "--version" | "-V" if inline.is_none() => parsed.version = true,
                 "--check" if inline.is_none() => parsed.check = true,
@@ -164,7 +166,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("configuration is not valid: {error}"))?;
         log::info!(
             "configuration valid config={} sources={} logLevel={} logFormat={} logColor={} logDirectory={}",
-            path.map(|path| path.display().to_string()).unwrap_or_else(|| "defaults".into()),
+            path.as_deref().unwrap_or_else(|| Path::new("defaults")).display(),
             source_summary(&config),
             config.log_level,
             config.log_format,
@@ -177,7 +179,7 @@ fn run() -> Result<(), String> {
     log_startup(&config, path.as_deref());
     let sources = Arc::new(rustlink_source::Service::new(config.clone()));
     let engine = rustlink_audio::Engine {
-        ffmpeg: Some(config.ffmpeg.clone()).filter(|program| !program.trim().is_empty()),
+        ffmpeg: (!config.ffmpeg.trim().is_empty()).then(|| config.ffmpeg.clone()),
         in_process: config.in_process_audio,
         bitrate: config.opus_bitrate as i32,
         complexity: config.opus_complexity as i32,
@@ -199,6 +201,9 @@ fn run() -> Result<(), String> {
         &config.webhook,
         config.allow_private_networks,
     );
+    if config.webhook.enable && webhook.is_none() {
+        log::warn!("webhook is enabled in config, but worker could not be started");
+    }
     let deps = Dependencies {
         loader: Arc::clone(&sources) as Arc<dyn Loader>,
         engine: playback,
@@ -213,13 +218,14 @@ fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| format!("runtime: {error}"))?;
+    let address = config.address.clone();
     let result = runtime.block_on(async {
-        let server = Server::new(config.clone(), deps).map_err(|error| error.to_string())?;
+        let server = Server::new(config, deps).map_err(|error| error.to_string())?;
         server
             .clone()
-            .listen(&config.address, interrupt())
+            .listen(&address, interrupt())
             .await
-            .map_err(|error| format!("could not listen on {}: {error}", config.address))?;
+            .map_err(|error| format!("could not listen on {address}: {error}"))?;
         // Sessions and players end before the process does, so a client that is
         // watching sees the tracks stop rather than the socket vanish.
         server.close();
@@ -273,7 +279,7 @@ struct Starter {
 /// Whether a password was handed to the node through the environment, which is
 /// how a container is configured and why one never needs a file.
 fn password_from_environment() -> bool {
-    std::env::var("RUSTLINK_PASSWORD").map(|value| !value.trim().is_empty()).unwrap_or(false)
+    std::env::var("RUSTLINK_PASSWORD").is_ok_and(|value| !value.trim().is_empty())
 }
 
 /// Writes the configuration a first start runs with.
@@ -302,9 +308,8 @@ fn write_starter() -> Option<Starter> {
         Ok(()) => {
             // The node is normally double-clicked, so the message names the file
             // in full rather than relative to a directory nobody can see.
-            let shown = std::env::current_dir()
-                .map(|directory| directory.join(&path))
-                .unwrap_or_else(|_| path.clone());
+            let shown =
+                std::env::current_dir().map(|directory| directory.join(&path)).unwrap_or(path);
             Some(Starter { path: shown, password })
         }
         Err(error) => {
@@ -325,11 +330,7 @@ fn write_starter() -> Option<Starter> {
 fn random_password() -> Option<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).ok()?;
-    let mut password = String::with_capacity(32);
-    for byte in bytes {
-        password.push_str(&format!("{byte:02x}"));
-    }
-    Some(password)
+    Some(tools::hex_encode(&bytes))
 }
 
 /// Reports a helper the configuration has switched off. Naming none is how a
@@ -363,10 +364,10 @@ fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
     vec![
         format!("version={}", rustlink_server::VERSION),
         format!("apiVersion={}", rustlink_server::APIVERSION),
-        format!(
-            "config={}",
-            path.map(|path| path.display().to_string()).unwrap_or_else(|| "defaults".into())
-        ),
+        match path {
+            Some(path) => format!("config={}", path.display()),
+            None => "config=defaults".into(),
+        },
         format!("sources={}", source_summary(config)),
         format!("inProcessAudio={}", config.in_process_audio),
         format!(
@@ -391,7 +392,7 @@ fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
 
 /// Which source paths are active, for the startup summary.
 fn source_summary(config: &Config) -> String {
-    let mut active = Vec::new();
+    let mut active = Vec::with_capacity(6);
     if config.youtube_native {
         active.push("youtube(native)");
     }
@@ -412,11 +413,15 @@ fn source_summary(config: &Config) -> String {
 /// Reads the configured level. The configuration is validated when it is
 /// loaded, so anything unexpected falls back to info.
 fn level(name: &str) -> LevelFilter {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "debug" => LevelFilter::Debug,
-        "warn" => LevelFilter::Warn,
-        "error" => LevelFilter::Error,
-        _ => LevelFilter::Info,
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("debug") {
+        LevelFilter::Debug
+    } else if name.eq_ignore_ascii_case("warn") {
+        LevelFilter::Warn
+    } else if name.eq_ignore_ascii_case("error") {
+        LevelFilter::Error
+    } else {
+        LevelFilter::Info
     }
 }
 

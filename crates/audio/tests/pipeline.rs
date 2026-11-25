@@ -1,4 +1,5 @@
 //! End-to-end checks of the in-process pipeline, over real bytes.
+#![cfg(feature = "native-opus")]
 
 use rustlink_audio::{Body, Engine, Preference};
 use rustlink_protocol::{Track, TrackInfo};

@@ -160,7 +160,8 @@ const SECRET_FIELDS: [&str; 7] = [
     "spotifyRefreshToken",
 ];
 
-fn redacted(value: &str) -> &'static str {
+#[inline]
+const fn redacted(value: &str) -> &'static str {
     if value.is_empty() {
         ""
     } else {
@@ -260,25 +261,30 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load_timeout(&self) -> Duration {
+    #[inline]
+    pub const fn load_timeout(&self) -> Duration {
         Duration::from_secs(self.load_timeout_seconds as u64)
     }
 
-    pub fn soundcloud_client_id_ttl(&self) -> Duration {
+    #[inline]
+    pub const fn soundcloud_client_id_ttl(&self) -> Duration {
         Duration::from_secs(self.soundcloud_client_id_ttl_seconds as u64)
     }
 
+    #[inline]
     pub fn lyrics_enabled(&self) -> bool {
         !self.lyrics_source.trim().eq_ignore_ascii_case("none")
     }
 
+    #[inline]
     pub fn spotify_enabled(&self) -> bool {
-        !self.spotify_client_id.is_empty()
+        !self.spotify_client_id.trim().is_empty() && !self.spotify_client_secret.trim().is_empty()
     }
 
     /// Whether the operator left a filter available to clients. A name that is
     /// absent from the map is enabled, which is what the reference
     /// implementation does.
+    #[inline]
     pub fn filter_enabled(&self, name: &str) -> bool {
         self.filters.get(name).copied().unwrap_or(true)
     }
@@ -293,7 +299,11 @@ pub fn discover(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = explicit {
         return Some(path.to_path_buf());
     }
-    CANDIDATES.iter().map(PathBuf::from).find(|candidate| candidate.is_file())
+    CANDIDATES
+        .into_iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+        .map(Path::to_path_buf)
 }
 
 /// The file a node writes for itself when it is started without one, which is
@@ -308,40 +318,48 @@ pub const STARTER_FILE: &str = "config.yaml";
 /// and it is generated rather than fixed because a node that ships with a
 /// password ships with a hole in it.
 pub fn starter(password: &str) -> String {
-    let mut escaped = String::with_capacity(password.len());
+    const PREFIX: &str = "# Written by Rustlink because no configuration file was found. Every\n\
+        # setting has a default, so this only states what a fresh node needs,\n\
+        # and the environment overrides it.\n\
+        address: 0.0.0.0:2333\n\
+        password: \"";
+    const SUFFIX: &str = "\"\n\
+        logLevel: info\n\
+        logDirectory: logs\n\
+        # Fetch FFmpeg on first start for media formats the built-in\n\
+        # decoders do not support. Source resolution runs in Rust.\n\
+        autoDownload: true\n";
+    let mut out = String::with_capacity(PREFIX.len() + SUFFIX.len() + password.len());
+    out.push_str(PREFIX);
     for ch in password.chars() {
         match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            _ => escaped.push(ch),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            _ => out.push(ch),
         }
     }
-    format!(
-        "# Written by Rustlink because no configuration file was found. Every\n\
-         # setting has a default, so this only states what a fresh node needs,\n\
-         # and the environment overrides it.\n\
-         address: 0.0.0.0:2333\n\
-         password: \"{escaped}\"\n\
-         logLevel: info\n\
-         logDirectory: logs\n\
-         # Fetch FFmpeg on first start for media formats the built-in\n\
-         # decoders do not support. Source resolution runs in Rust.\n\
-         autoDownload: true\n"
-    )
+    out.push_str(SUFFIX);
+    out
 }
 
 /// Loads the configuration: defaults, then the file, then the environment.
 pub fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
-    let mut config = Config::default();
-    if let Some(path) = discover(explicit) {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
-        config = parse_configuration(&text)
-            .map_err(|source| ConfigError::Parse { path: path.display().to_string(), source })?;
-    }
+    let mut config = match discover(explicit) {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
+            parse_configuration(&text)
+                .map_err(|source| ConfigError::Parse { path: path.display().to_string(), source })?
+        }
+        None => Config::default(),
+    };
     apply_env(&mut config);
     validate(&config)?;
     Ok(config)

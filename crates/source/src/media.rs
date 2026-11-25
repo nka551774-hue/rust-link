@@ -89,30 +89,31 @@ fn send_once(
         })
         .unwrap_or(USER_AGENT);
     let mut builder = agent.get(url).header("User-Agent", user_agent);
-    for (name, value) in headers {
-        // A header carrying a line break would let a source inject a second
-        // request, so the pair is dropped rather than escaped.
-        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
-            continue;
+    // What a provider supplied (a cookie, an authorization) was meant for
+    // the host it named, not for wherever a redirect leads.
+    if provider_headers {
+        for (name, value) in headers {
+            // A header carrying a line break would let a source inject a second
+            // request, so the pair is dropped rather than escaped.
+            if name.contains(['\r', '\n'])
+                || value.contains(['\r', '\n'])
+                || name.eq_ignore_ascii_case("User-Agent")
+                || ureq::http::HeaderName::try_from(name.as_str()).is_err()
+                || ureq::http::HeaderValue::try_from(value.as_str()).is_err()
+            {
+                continue;
+            }
+            // Playback owns the requested offset. Provider headers must not pin a
+            // resumed request to an earlier range, regardless of header casing.
+            if offset.is_some()
+                && (name.eq_ignore_ascii_case("Range")
+                    || name.eq_ignore_ascii_case("Accept-Encoding")
+                    || name.eq_ignore_ascii_case("If-Range"))
+            {
+                continue;
+            }
+            builder = builder.header(name, value);
         }
-        if name.eq_ignore_ascii_case("User-Agent") {
-            continue;
-        }
-        // What a provider supplied (a cookie, an authorization) was meant for
-        // the host it named, not for wherever a redirect leads.
-        if !provider_headers {
-            continue;
-        }
-        // Playback owns the requested offset. Provider headers must not pin a
-        // resumed request to an earlier range, regardless of header casing.
-        if offset.is_some()
-            && (name.eq_ignore_ascii_case("Range")
-                || name.eq_ignore_ascii_case("Accept-Encoding")
-                || name.eq_ignore_ascii_case("If-Range"))
-        {
-            continue;
-        }
-        builder = builder.header(name, value);
     }
     if let Some(offset) = offset {
         if offset < 0 {
@@ -143,10 +144,20 @@ fn send_once(
     } else {
         config.timeout_global(Some(budget))
     };
-    config
-        .build()
-        .call()
-        .map_err(|error| SourceError::Http(format!("{url} {UNREACHABLE}: {error}")))
+    config.build().call().map_err(|error| {
+        let retryable = matches!(
+            error,
+            ureq::Error::Io(_)
+                | ureq::Error::Timeout(_)
+                | ureq::Error::ConnectionFailed
+                | ureq::Error::Protocol(_)
+        );
+        if retryable {
+            SourceError::Http(format!("{url} {UNREACHABLE}: {error}"))
+        } else {
+            SourceError::Http(format!("{url} failed: {error}"))
+        }
+    })
 }
 
 /// How many redirects one request follows before giving up.
@@ -172,10 +183,10 @@ fn request_media(
     url: &str,
     headers: &std::collections::BTreeMap<String, String>,
     offset: Option<i64>,
-    range: MediaRange,
+    mut range: MediaRange,
     validator: Option<&str>,
 ) -> Result<Response, SourceError> {
-    let mut current = url.to_string();
+    let mut current = std::borrow::Cow::Borrowed(url);
     let mut provider_headers = true;
     let mut hops = 0;
     // Podcasts, file hosts and short links answer with a redirect to the real
@@ -213,7 +224,10 @@ fn request_media(
         {
             provider_headers = false;
         }
-        current = next.to_string();
+        if MediaRange::for_url(next.as_str()) == MediaRange::Chunked {
+            range = MediaRange::Chunked;
+        }
+        current = std::borrow::Cow::Owned(String::from(next));
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -230,38 +244,62 @@ fn request_media(
     }
     let header = |name: &str| response.headers().get(name).and_then(|value| value.to_str().ok());
     if offset.is_some()
-        && header("Content-Encoding").is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+        && response.headers().get_all("Content-Encoding").iter().any(|value| {
+            value
+                .to_str()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .any(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+                })
+                .unwrap_or(true)
+        })
     {
         return Err(SourceError::Http("media range response used content encoding".into()));
     }
     if let Some(validator) = validator {
-        if header("ETag").is_some_and(|value| value != validator) {
+        if header("ETag") != Some(validator) {
             return Err(SourceError::Http("media representation changed while resuming".into()));
         }
     }
     // Weak tags and unqualified modification dates cannot prove byte-for-byte
     // equality. Only use a strong entity tag for conditional continuation.
     let next_validator = header("ETag")
-        .filter(|value| value.len() >= 2 && value.starts_with('"') && value.ends_with('"'))
+        .filter(|value| {
+            value
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .is_some_and(|inner| !inner.contains('"'))
+        })
         .map(str::to_owned);
-    let mut size = response
-        .headers()
-        .get("Content-Length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(-1);
+    let mut size = {
+        let mut cl_iter = response.headers().get_all("Content-Length").iter();
+        match (cl_iter.next(), cl_iter.next()) {
+            (None, None) => -1,
+            (Some(raw), None) => {
+                raw.to_str().ok().and_then(|v| parse_digits_i64(v.trim())).ok_or_else(|| {
+                    SourceError::Http("media server returned an invalid Content-Length".into())
+                })?
+            }
+            _ => {
+                return Err(SourceError::Http(
+                    "media server returned multiple Content-Length headers".into(),
+                ))
+            }
+        }
+    };
     // A partial response describes the slice it returned, so the whole length
     // only comes from the range it states.
     let mut slice_length = None;
     if partial {
-        let content_range = response
-            .headers()
-            .get("Content-Range")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_content_range)
-            .ok_or_else(|| {
-                SourceError::Http("media server returned an invalid Content-Range".into())
-            })?;
+        let mut cr_iter = response.headers().get_all("Content-Range").iter();
+        let raw_cr = match (cr_iter.next(), cr_iter.next()) {
+            (Some(first), None) => first.to_str().ok(),
+            _ => None,
+        };
+        let content_range = raw_cr.and_then(parse_content_range).ok_or_else(|| {
+            SourceError::Http("media server returned an invalid Content-Range".into())
+        })?;
         if content_range.0 != offset.unwrap_or(0) {
             return Err(SourceError::Http(
                 "media server returned the wrong resume byte offset".into(),
@@ -329,6 +367,13 @@ const RESUME_ATTEMPTS: usize = 3;
 /// Backoff for a stalled stream; normal chunk boundaries continue immediately.
 const RESUME_DELAY: Duration = Duration::from_millis(250);
 
+fn parse_digits_i64(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
 /// Validate a satisfied byte range and return its starting offset and total.
 /// A range whose total is unknown must not use its slice length as file size.
 fn parse_content_range(value: &str) -> Option<(i64, i64, Option<i64>)> {
@@ -338,14 +383,14 @@ fn parse_content_range(value: &str) -> Option<(i64, i64, Option<i64>)> {
     }
     let (range, total) = range.split_once('/')?;
     let (start, end) = range.split_once('-')?;
-    let (start, end): (i64, i64) = (start.parse().ok()?, end.parse().ok()?);
+    let (start, end) = (parse_digits_i64(start)?, parse_digits_i64(end)?);
     if start < 0 || end < start || end.checked_sub(start)?.checked_add(1).is_none() {
         return None;
     }
     let total = if total == "*" {
         None
     } else {
-        let total: i64 = total.parse().ok()?;
+        let total = parse_digits_i64(total)?;
         if total <= end {
             return None;
         }
@@ -376,15 +421,16 @@ pub struct MediaBody {
 impl MediaBody {
     pub(super) fn open(
         agent: ureq::Agent,
-        url: &str,
-        headers: &std::collections::BTreeMap<String, String>,
+        url: impl Into<String>,
+        headers: std::collections::BTreeMap<String, String>,
         range: MediaRange,
     ) -> Result<Self, SourceError> {
-        let response = request_media(&agent, url, headers, Some(0), range, None)?;
+        let url = url.into();
+        let response = request_media(&agent, &url, &headers, Some(0), range, None)?;
         Ok(Self {
             agent,
-            url: url.to_owned(),
-            headers: headers.clone(),
+            url,
+            headers,
             range,
             reader: Some(response.body),
             offset: 0,

@@ -51,9 +51,7 @@ impl Cache {
         ttl: Duration,
         limit: usize,
     ) {
-        if let Some(&index) = self.entries.get(key) {
-            self.remove(index);
-        }
+        let reused_key = self.entries.remove(key).map(|index| self.take_slot(index).key);
         if limit == 0 || ttl.is_zero() || bytes > MAX_CACHED_RESULT {
             return;
         }
@@ -67,7 +65,7 @@ impl Cache {
             self.slots.push(None);
             self.slots.len() - 1
         });
-        let key: Arc<str> = Arc::from(key);
+        let key: Arc<str> = reused_key.unwrap_or_else(|| Arc::from(key));
         self.entries.insert(Arc::clone(&key), index);
         self.slots[index] = Some(Entry {
             key,
@@ -108,12 +106,17 @@ impl Cache {
         self.last = Some(index);
     }
 
-    fn remove(&mut self, index: usize) {
+    fn take_slot(&mut self, index: usize) -> Entry {
         self.detach(index);
         let entry = self.slots[index].take().expect("indexed entry");
-        self.entries.remove(&entry.key);
         self.bytes -= entry.bytes;
         self.vacant.push(index);
+        entry
+    }
+
+    fn remove(&mut self, index: usize) {
+        let entry = self.take_slot(index);
+        self.entries.remove(&entry.key);
     }
 }
 
@@ -143,40 +146,39 @@ pub(super) fn result_size(result: &LoadResult) -> Option<usize> {
 
 fn track_heap(track: &Track) -> usize {
     let metadata = &track.metadata;
-    track.token.capacity()
-        + metadata.identifier.capacity()
-        + metadata.title.capacity()
-        + metadata.author.capacity()
-        + metadata.source_name.capacity()
-        + metadata.uri.as_ref().map_or(0, String::capacity)
-        + metadata.artwork_url.as_ref().map_or(0, String::capacity)
-        + metadata.isrc.as_ref().map_or(0, String::capacity)
-        + object_heap(&track.extra)
-        + object_heap(&track.user_data)
+    track
+        .token
+        .capacity()
+        .saturating_add(metadata.identifier.capacity())
+        .saturating_add(metadata.title.capacity())
+        .saturating_add(metadata.author.capacity())
+        .saturating_add(metadata.source_name.capacity())
+        .saturating_add(metadata.uri.as_ref().map_or(0, String::capacity))
+        .saturating_add(metadata.artwork_url.as_ref().map_or(0, String::capacity))
+        .saturating_add(metadata.isrc.as_ref().map_or(0, String::capacity))
+        .saturating_add(object_heap(&track.extra))
+        .saturating_add(object_heap(&track.user_data))
 }
 
 fn object_heap(object: &rustlink_protocol::Object) -> usize {
     // A conservative per-entry allowance covers BTreeMap node occupancy and
     // pointers as well as the inline key/value. No JSON object is cached free.
-    object
-        .iter()
-        .map(|(key, value)| {
-            key.capacity()
-                + size_of::<String>()
-                + size_of::<serde_json::Value>()
-                + size_of::<[usize; 8]>()
-                + value_heap(value)
-        })
-        .sum()
+    const NODE_OVERHEAD: usize =
+        size_of::<String>() + size_of::<serde_json::Value>() + size_of::<[usize; 8]>();
+    object.iter().fold(0usize, |acc, (key, value)| {
+        acc.saturating_add(key.capacity())
+            .saturating_add(NODE_OVERHEAD)
+            .saturating_add(value_heap(value))
+    })
 }
 
 fn value_heap(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(text) => text.capacity(),
-        serde_json::Value::Array(items) => {
-            items.capacity() * size_of::<serde_json::Value>()
-                + items.iter().map(value_heap).sum::<usize>()
-        }
+        serde_json::Value::Array(items) => items
+            .capacity()
+            .saturating_mul(size_of::<serde_json::Value>())
+            .saturating_add(items.iter().map(value_heap).fold(0usize, usize::saturating_add)),
         serde_json::Value::Object(object) => object_heap(object),
         _ => 0,
     }

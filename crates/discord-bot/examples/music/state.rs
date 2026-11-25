@@ -107,32 +107,8 @@ impl Guild {
 /// Turns what a person typed into something Rustlink can resolve. A link, a
 /// video ID or a source prefix is passed through; plain words become a YouTube
 /// search, because Rustlink answers `empty` to text it cannot route.
-pub fn normalize_query(text: &str) -> String {
-    let text = text.trim();
-    const PREFIXES: [&str; 10] = [
-        "ytsearch:",
-        "ytmsearch:",
-        "scsearch:",
-        "spsearch:",
-        "dzsearch:",
-        "dzisrc:",
-        "spotify:",
-        "deezer:",
-        "soundcloud:",
-        "youtube:playlist:",
-    ];
-    let is_video_id = text.len() == 11
-        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if text.is_empty()
-        || text.contains("://")
-        || text.starts_with("<http")
-        || is_video_id
-        || PREFIXES.iter().any(|prefix| text.starts_with(prefix))
-    {
-        text.to_string()
-    } else {
-        format!("ytsearch:{text}")
-    }
+pub fn normalize_query(text: &str) -> std::borrow::Cow<'_, str> {
+    rustlink_discord_bot::normalize_query(text)
 }
 
 /// `3:45` or `1:02:03`; a stream and an unknown length are named instead.

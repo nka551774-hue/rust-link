@@ -68,7 +68,8 @@ impl Resolver {
 
     /// Removes the archives fetched during this run.
     pub fn close(&self) {
-        if let Some(directory) = self.temp.lock().unwrap().take() {
+        let directory = self.temp.lock().unwrap().take();
+        if let Some(directory) = directory {
             let _ = fs::remove_dir_all(directory);
         }
     }
@@ -89,13 +90,19 @@ impl Resolver {
                 format!("{name} is configured as {configured:?} but cannot be run")
             });
         }
-        let cached = Path::new(&self.directory).join(executable_name(name));
+        let cached = Path::new(&self.directory).join(executable_name(configured));
         if cached.is_file() {
+            if !is_runnable(&cached) {
+                let _ = make_executable(&cached);
+            }
             return Ok(absolute(&cached));
         }
-        if !self.download {
+        let default_exe = executable_name(name);
+        let is_default =
+            configured.eq_ignore_ascii_case(name) || configured.eq_ignore_ascii_case(&default_exe);
+        if !self.download || !is_default {
             return Err(format!(
-                "{name} was not found in {} and autoDownload is off; put a copy there or turn autoDownload on",
+                "{configured} was not found in {} and autoDownload is off; put a copy there or turn autoDownload on",
                 self.directory
             ));
         }
@@ -147,7 +154,7 @@ impl Resolver {
         }
         let mut nonce = [0u8; 8];
         let _ = getrandom::fill(&mut nonce);
-        let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let suffix = hex_encode(&nonce);
         let directory =
             std::env::temp_dir().join(format!("rustlink-tools-{}-{suffix}", std::process::id()));
         #[cfg(unix)]
@@ -167,6 +174,17 @@ impl Resolver {
         *temp = Some(directory.clone());
         Ok(directory)
     }
+}
+
+/// Encodes bytes as lowercase hexadecimal in a single allocation.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Streams one URL into the download directory and checks what arrived.
@@ -208,12 +226,14 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
             format!("{}.sha256", landed.split(['?', '#']).next().unwrap_or(&landed))
         }
     };
-    if let Err(error) = verify(&agent, &sums_url, &source.asset, &file) {
+    if let Err(error) = verify(agent, &sums_url, &source.asset, &file) {
         let _ = fs::remove_file(&file);
         return Err(error);
     }
     Ok(file)
 }
+
+const MAX_ARCHIVE_BYTES: u64 = 512 << 20;
 
 /// Copies a download into a file, reporting where it is every so often.
 fn copy(
@@ -222,6 +242,14 @@ fn copy(
     tool: &str,
     total: Option<u64>,
 ) -> Result<u64, String> {
+    if let Some(total) = total {
+        if total > MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "refusing {tool} download of {} MiB (exceeds 512 MiB safety cap)",
+                total >> 20
+            ));
+        }
+    }
     let mut buffer = vec![0u8; 64 << 10];
     let mut written = 0u64;
     let mut next = Instant::now() + PROGRESS;
@@ -230,32 +258,105 @@ fn copy(
         if read == 0 {
             return Ok(written);
         }
-        out.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
         written += read as u64;
-        if total.is_some() && Instant::now() >= next {
-            next = Instant::now() + PROGRESS;
-            log::info!(
-                "media helper download in progress tool={tool} receivedMiB={} totalMiB={}",
-                written >> 20,
-                total.unwrap_or(0) >> 20
-            );
+        if written > MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "{tool} download exceeded 512 MiB safety cap at {} MiB",
+                written >> 20
+            ));
+        }
+        out.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+        let now = Instant::now();
+        if now >= next {
+            next = now + PROGRESS;
+            match total {
+                Some(total) => log::info!(
+                    "media helper download in progress tool={tool} receivedMiB={} totalMiB={}",
+                    written >> 20,
+                    total >> 20
+                ),
+                None => log::info!(
+                    "media helper download in progress tool={tool} receivedMiB={}",
+                    written >> 20
+                ),
+            }
         }
     }
 }
 
-/// A client suited to a large file: the response deadline is generous because a
-/// helper is hundreds of megabytes on a slow link.
-fn agent() -> ureq::Agent {
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
+#[derive(Debug)]
+struct ToolIdleConnector;
+
+impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<In>
+    for ToolIdleConnector
+{
+    type Out = ToolIdleTransport<In>;
+
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(ToolIdleTransport))
+    }
+}
+
+#[derive(Debug)]
+struct ToolIdleTransport<In>(In);
+
+impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
+    for ToolIdleTransport<In>
+{
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.0.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        mut timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        timeout.after = timeout.after.min(Duration::from_secs(60).into());
+        self.0.transmit_output(amount, timeout)
+    }
+
+    fn await_input(
+        &mut self,
+        mut timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<bool, ureq::Error> {
+        timeout.after = timeout.after.min(Duration::from_secs(60).into());
+        self.0.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.0.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.0.is_tls()
+    }
+}
+
+/// A client suited to a large file: socket operations time out after 60 seconds
+/// of inactivity, while an active download on a slow link is allowed to finish.
+fn agent() -> &'static ureq::Agent {
+    use ureq::unversioned::transport::Connector as _;
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        let config = ureq::Agent::config_builder()
             .accept_encoding("identity")
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_global(None)
             .timeout_recv_response(Some(Duration::from_secs(60)))
-            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .timeout_recv_body(None)
             .http_status_as_error(false)
-            .build(),
-    )
+            .build();
+        ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default().chain(ToolIdleConnector),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        )
+    })
 }
 /// Checks a download against a `<sha256>  <file>` listing.
 fn verify(agent: &ureq::Agent, sums_url: &str, asset: &str, file: &Path) -> Result<(), String> {
@@ -286,36 +387,26 @@ fn verify(agent: &ureq::Agent, sums_url: &str, asset: &str, file: &Path) -> Resu
 /// Finds the hash a listing gives for one file. Accepts both `<sha256>  <file>`
 /// and GNU `sha256sum -b` `<sha256> *<file>`.
 fn lookup_sum(list: &str, asset: &str) -> Option<String> {
-    for line in list.lines() {
+    list.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
-        if let (Some(hash), Some(raw_name), None) = (fields.next(), fields.next(), fields.next()) {
-            let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
-            if name == asset && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Some(hash.to_string());
-            }
-        }
-    }
-    None
+        let (Some(hash), Some(raw_name), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return None;
+        };
+        let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
+        let name = name.strip_prefix("./").unwrap_or(name);
+        (name == asset && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_owned())
+    })
 }
 
 /// The SHA-256 of a file, as lowercase hexadecimal.
 fn file_sum(file: &Path) -> Result<String, String> {
-    let mut handle =
-        fs::File::open(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let handle = fs::File::open(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let mut reader = std::io::BufReader::with_capacity(64 << 10, handle);
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 64 << 10];
-    loop {
-        let read = handle.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let mut out = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    Ok(out)
+    std::io::copy(&mut reader, &mut hasher).map_err(|error| error.to_string())?;
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 /// Copies one member of a zip archive onto the target.
@@ -329,14 +420,17 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
         if entry.is_dir() || entry.is_symlink() {
             continue;
         }
-        let name = Path::new(entry.name())
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name != member {
-            continue;
+        let matched = entry
+            .enclosed_name()
+            .and_then(|path| path.file_name().map(|f| f == std::ffi::OsStr::new(member)))
+            .unwrap_or(false);
+        if matched {
+            if entry.size() > MAX_ARCHIVE_BYTES {
+                return Err(format!("{member} exceeds 512 MiB uncompressed safety cap"));
+            }
+            let mut bounded = (&mut entry).take(MAX_ARCHIVE_BYTES + 1);
+            return copy_into(&mut bounded, target);
         }
-        return copy_into(&mut entry, target);
     }
     Err(format!("{member} is not part of {}", archive.display()))
 }
@@ -345,32 +439,37 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
 /// atomic rename, so `target` is never half-written or non-executable.
 fn copy_into(source: &mut impl Read, target: &Path) -> Result<(), String> {
     let temp = PathBuf::from(format!("{}.part-{}", target.display(), std::process::id()));
-    let mut out =
-        fs::File::create(&temp).map_err(|error| format!("{}: {error}", temp.display()))?;
-    if let Err(error) = std::io::copy(source, &mut out) {
-        drop(out);
-        let _ = fs::remove_file(&temp);
-        return Err(format!("{}: {error}", target.display()));
-    }
-    if let Err(error) = out.sync_all() {
-        drop(out);
-        let _ = fs::remove_file(&temp);
-        return Err(format!("{}: {error}", target.display()));
-    }
-    drop(out);
-    if let Err(error) = make_executable(&temp) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-    fs::rename(&temp, target).map_err(|error| {
-        let _ = fs::remove_file(&temp);
-        format!("{}: {error}", target.display())
-    })
+    let write_result = fs::File::create(&temp)
+        .map_err(|error| format!("{}: {error}", target.display()))
+        .and_then(|mut out| {
+            let written = std::io::copy(source, &mut out)
+                .map_err(|e| format!("{}: {e}", target.display()))?;
+            if written > MAX_ARCHIVE_BYTES {
+                return Err(format!(
+                    "{} exceeded 512 MiB uncompressed safety cap",
+                    target.display()
+                ));
+            }
+            out.sync_all().map_err(|e| format!("{}: {e}", target.display()))
+        });
+    write_result
+        .and_then(|()| make_executable(&temp))
+        .and_then(|()| {
+            fs::rename(&temp, target).map_err(|error| format!("{}: {error}", target.display()))
+        })
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&temp);
+        })
 }
 
 /// The file name a helper is installed under.
 fn executable_name(name: &str) -> String {
-    if cfg!(windows) {
+    if cfg!(windows)
+        && !name
+            .as_bytes()
+            .get(name.len().wrapping_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(b".exe"))
+    {
         format!("{name}.exe")
     } else {
         name.to_string()
@@ -406,13 +505,16 @@ fn absolute(path: &Path) -> String {
 
 /// Validates an explicit helper path configured by the operator.
 fn look_up(program: &str) -> Option<String> {
-    for candidate in executable_names(program) {
-        let path = Path::new(&candidate);
-        if path.is_file() && is_runnable(path) {
-            return Some(absolute(path));
+    let check = |path: &Path| (path.is_file() && is_runnable(path)).then(|| absolute(path));
+    if cfg!(windows)
+        && !Path::new(program).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        let with_exe = PathBuf::from(format!("{program}.exe"));
+        if let Some(found) = check(&with_exe) {
+            return Some(found);
         }
     }
-    None
+    check(Path::new(program))
 }
 
 #[cfg(unix)]
@@ -424,16 +526,6 @@ fn is_runnable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_runnable(_path: &Path) -> bool {
     true
-}
-
-/// The file names a program may have on this platform. Windows resolves a bare
-/// name through `PATHEXT`, and every entry there starts with `.exe` in practice.
-fn executable_names(program: &str) -> Vec<String> {
-    if cfg!(windows) && !program.to_ascii_lowercase().ends_with(".exe") {
-        vec![format!("{program}.exe"), program.to_string()]
-    } else {
-        vec![program.to_string()]
-    }
 }
 
 /// Where a helper comes from on this platform.

@@ -149,28 +149,41 @@ impl Session {
 
     /// Sends one event to the client, and to the webhook if one is configured.
     pub fn emit(&self, mut event: Object) {
-        event.insert("session_id".into(), json!(self.id));
-        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
-        log::debug!(target: "rustlink::event", "event dispatched {kind} session={} guild={}", self.id, event.get("guild_id").and_then(Value::as_str).unwrap_or(""));
-        let value = Value::Object(event);
-        if let Some(server) = self.server.upgrade() {
-            server.publish(&value);
-        }
-        if self.state.lock().unwrap().closed {
+        let (closing, closed) = {
+            let state = self.state.lock().unwrap();
+            (state.closing, state.closed)
+        };
+        if closed {
             return;
         }
-        if self.events.try_send(value).is_err() && !self.overflowed.swap(true, Ordering::SeqCst) {
+        event.insert("session_id".into(), json!(self.id));
+        log::debug!(
+            target: "rustlink::event",
+            "event dispatched {} session={} guild={}",
+            event.get("type").and_then(Value::as_str).unwrap_or(""),
+            self.id,
+            event.get("guild_id").and_then(Value::as_str).unwrap_or("")
+        );
+        let value = Value::Object(event);
+        let server = self.server.upgrade();
+        if let Some(server) = &server {
+            server.publish(&value);
+        }
+        if self.events.try_send(value).is_err()
+            && !closing
+            && !self.overflowed.swap(true, Ordering::SeqCst)
+        {
             log::warn!(
                 "event buffer overflow; closing session because the client is not reading session={} buffer={}",
                 self.id,
                 self.buffer
             );
-            if let Some(server) = self.server.upgrade() {
+            if let Some(owner) = server {
                 let id = self.id.clone();
                 // The node is moved into the task rather than borrowed from, so
                 // the task can outlive this call without holding the session.
-                let owner = Arc::clone(&server);
-                server.spawn(async move { owner.remove_session(&id) });
+                let spawner = Arc::clone(&owner);
+                spawner.spawn(async move { owner.remove_session(&id) });
             }
         }
     }
@@ -178,6 +191,30 @@ impl Session {
     /// What every player on the session reports.
     pub fn snapshots(&self) -> Vec<PlayerBody> {
         self.players().iter().map(|player| player.snapshot()).collect()
+    }
+
+    /// Number of players owned by the session without cloning the map values.
+    pub fn player_count(&self) -> usize {
+        self.state.lock().unwrap().players.len()
+    }
+
+    /// Number of actively playing players owned by the session without allocating a `Vec`.
+    pub fn playing_player_count(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.players.values().filter(|player| player.playing()).count()
+    }
+
+    /// Appends sanitized webhook player reports and returns how many are actively playing.
+    pub(crate) fn collect_reports(&self, out: &mut Vec<Value>) -> usize {
+        let mut playing = 0;
+        for player in self.players() {
+            let (is_playing, entry) = player.report_state();
+            if is_playing {
+                playing += 1;
+            }
+            out.push(entry);
+        }
+        playing
     }
 
     /// The players the session owns.
@@ -264,6 +301,16 @@ impl Session {
         self.state.lock().unwrap().timeout
     }
 
+    pub(crate) fn configure(&self, resuming: Option<bool>, timeout: Option<u32>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(resuming) = resuming {
+            state.resuming = resuming;
+        }
+        if let Some(timeout) = timeout {
+            state.timeout = timeout;
+        }
+    }
+
     /// The settings a `PATCH` on the session changes, and the answer it gets.
     pub fn update(&self, resuming: Option<bool>, timeout: Option<u32>) -> Value {
         let mut state = self.state.lock().unwrap();
@@ -308,16 +355,47 @@ impl Session {
     /// Whether the session has been away for longer than it was told to wait.
     pub fn expired(&self) -> bool {
         let state = self.state.lock().unwrap();
+        Self::expired_locked(&state)
+    }
+
+    fn expired_locked(state: &State) -> bool {
+        !state.connected
+            && (!state.resuming
+                || state
+                    .disconnected
+                    .is_none_or(|at| at.elapsed().as_secs() >= u64::from(state.timeout)))
+    }
+
+    /// Single-lock check whether the session is open and has not expired.
+    pub(crate) fn is_usable(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.closing && !state.closed && !Self::expired_locked(&state)
+    }
+
+    /// Atomically claims the session's single WebSocket event stream, returning
+    /// `Ok(Some(had_connected))` on success, `Ok(None)` if closed/expired, or `Err(())`
+    /// if another subscriber is already attached.
+    pub(crate) fn claim_subscriber(&self) -> Result<Option<bool>, ()> {
+        let mut state = self.state.lock().unwrap();
+        if state.closing || state.closed || Self::expired_locked(&state) {
+            return Ok(None);
+        }
         if state.connected {
-            return false;
+            return Err(());
         }
-        if !state.resuming {
-            return true;
-        }
-        match state.disconnected {
-            Some(at) => at.elapsed().as_secs() >= state.timeout as u64,
-            None => true,
-        }
+        let had_connected = state.has_connected;
+        state.connected = true;
+        state.has_connected = true;
+        state.disconnected = None;
+        Ok(Some(had_connected))
+    }
+
+    /// Atomically marks the WebSocket stream disconnected and returns `(closed, players, resuming, timeout)`.
+    pub(crate) fn detach_info(&self) -> (bool, usize, bool, u32) {
+        let mut state = self.state.lock().unwrap();
+        state.connected = false;
+        state.disconnected = Some(Instant::now());
+        (state.closing || state.closed, state.players.len(), state.resuming, state.timeout)
     }
 
     /// Tears the session down, ending every track it owns.
@@ -330,9 +408,10 @@ impl Session {
             state.closing = true;
             std::mem::take(&mut state.players)
         };
+        let server = self.server.upgrade();
         for (_, player) in players {
             player.destroy();
-            if let Some(server) = self.server.upgrade() {
+            if let Some(server) = &server {
                 server.player_destroyed();
             }
         }

@@ -2,6 +2,8 @@
 //! Tokens carry metadata, not credentials or cached media URLs. Sources still
 //! validate and resolve that metadata before opening a stream.
 
+use std::cell::RefCell;
+
 use crate::types::{Track, TrackInfo};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -9,6 +11,26 @@ use base64::Engine;
 pub const MAX_ENCODED_TRACK: usize = 256 << 10;
 pub const VERSION: u8 = 1;
 const PREFIX: &str = "rlt1.";
+const MAX_JSON_BYTES: usize = (MAX_ENCODED_TRACK - PREFIX.len()) * 3 / 4;
+const MAX_SCRATCH_CAP: usize = 64 << 10;
+
+thread_local! {
+    static CODEC_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    CODEC_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.clear();
+            let result = f(&mut buf);
+            if buf.capacity() > MAX_SCRATCH_CAP {
+                *buf = Vec::new();
+            }
+            result
+        }
+        Err(_) => f(&mut Vec::new()),
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CodecError {
@@ -20,6 +42,7 @@ pub enum CodecError {
     UnsupportedVersion,
 }
 
+#[inline]
 fn validate(info: &TrackInfo) -> Result<(), CodecError> {
     if info.identifier.trim().is_empty()
         || info.source_name.trim().is_empty()
@@ -33,14 +56,16 @@ fn validate(info: &TrackInfo) -> Result<(), CodecError> {
 
 fn encode_token(info: &TrackInfo) -> Result<String, CodecError> {
     validate(info)?;
-    let json = serde_json::to_vec(info).map_err(|_| CodecError::Invalid)?;
-    if json.len() > (MAX_ENCODED_TRACK - PREFIX.len()) / 4 * 3 {
-        return Err(CodecError::TextTooLong);
-    }
-    let mut token = String::with_capacity(PREFIX.len() + json.len().div_ceil(3) * 4);
-    token.push_str(PREFIX);
-    URL_SAFE_NO_PAD.encode_string(&json, &mut token);
-    Ok(token)
+    with_scratch(|json| {
+        serde_json::to_writer(&mut *json, info).map_err(|_| CodecError::Invalid)?;
+        if json.len() > MAX_JSON_BYTES {
+            return Err(CodecError::TextTooLong);
+        }
+        let mut token = String::with_capacity(PREFIX.len() + (json.len() * 4).div_ceil(3));
+        token.push_str(PREFIX);
+        URL_SAFE_NO_PAD.encode_string(json.as_slice(), &mut token);
+        Ok(token)
+    })
 }
 
 pub fn encode_track(info: &TrackInfo) -> Result<Track, CodecError> {
@@ -53,18 +78,33 @@ pub fn encode_track_owned(info: TrackInfo) -> Result<Track, CodecError> {
     Ok(Track::new(token, info))
 }
 
-pub fn decode_track(token: &str) -> Result<Track, CodecError> {
+fn decode_info(token: &str) -> Result<TrackInfo, CodecError> {
     if token.len() > MAX_ENCODED_TRACK {
         return Err(CodecError::TextTooLong);
     }
-    if token.bytes().any(|b| b.is_ascii_whitespace()) {
-        return Err(CodecError::Invalid);
-    }
-    let payload = token.strip_prefix(PREFIX).ok_or(CodecError::UnsupportedVersion)?;
-    let json = URL_SAFE_NO_PAD.decode(payload).map_err(|_| CodecError::Invalid)?;
-    let info: TrackInfo = serde_json::from_slice(&json).map_err(|_| CodecError::Invalid)?;
-    validate(&info)?;
+    let Some(payload) = token.strip_prefix(PREFIX) else {
+        return if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace()) {
+            Err(CodecError::Invalid)
+        } else {
+            Err(CodecError::UnsupportedVersion)
+        };
+    };
+    with_scratch(|json| {
+        URL_SAFE_NO_PAD.decode_vec(payload, json).map_err(|_| CodecError::Invalid)?;
+        let info: TrackInfo = serde_json::from_slice(json).map_err(|_| CodecError::Invalid)?;
+        validate(&info)?;
+        Ok(info)
+    })
+}
+
+pub fn decode_track(token: &str) -> Result<Track, CodecError> {
+    let info = decode_info(token)?;
     Ok(Track::new(token.to_owned(), info))
+}
+
+pub fn decode_track_owned(token: String) -> Result<Track, CodecError> {
+    let info = decode_info(&token)?;
+    Ok(Track::new(token, info))
 }
 
 #[cfg(test)]

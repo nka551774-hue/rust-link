@@ -6,7 +6,7 @@
 //! able to reach, so every connection is checked twice: once when the URL is
 //! accepted, and once for every address the name resolves to.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, Transport};
@@ -14,11 +14,8 @@ use ureq::{Agent, Error};
 
 use crate::{deadline, SourceError};
 
-/// Checks the shape of a URL before anything is asked of it.
-///
-/// Credentials are refused because they are a way to hide the real destination
-/// from a log, and because nothing the node streams needs them.
-pub fn validate_url(raw: &str) -> Result<(), SourceError> {
+/// Parses and validates an HTTP(S) URL without credentials, control bytes or backslashes.
+pub(crate) fn parse_http_url(raw: &str) -> Result<url::Url, SourceError> {
     if raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\') {
         return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
     }
@@ -32,7 +29,15 @@ pub fn validate_url(raw: &str) -> Result<(), SourceError> {
     {
         return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
     }
-    Ok(())
+    Ok(url)
+}
+
+/// Checks the shape of a URL before anything is asked of it.
+///
+/// Credentials are refused because they are a way to hide the real destination
+/// from a log, and because nothing the node streams needs them.
+pub fn validate_url(raw: &str) -> Result<(), SourceError> {
+    parse_http_url(raw).map(|_| ())
 }
 
 /// Whether an address is one the node is willing to connect to.
@@ -48,7 +53,6 @@ pub fn is_public(address: IpAddr) -> bool {
 }
 
 fn is_public_v4(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
     if address.is_private()
         || address.is_loopback()
         || address.is_link_local()
@@ -58,54 +62,30 @@ fn is_public_v4(address: Ipv4Addr) -> bool {
     {
         return false;
     }
-    // This-network, multicast and the reserved top of the space are not
-    // public unicast destinations, even when the individual address is not
-    // classified as unspecified or broadcast by std.
-    if octets[0] == 0 || octets[0] >= 224 {
-        return false;
-    }
-    // Carrier grade NAT, benchmarking and the retired 6to4 relay prefix.
-    if octets[0] == 100 && (64..128).contains(&octets[1]) {
-        return false;
-    }
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return false;
-    }
-    if octets[0] == 192 && octets[1] == 88 && octets[2] == 99 {
-        return false;
-    }
-    // 192.0.0.0/24 and the documentation range sit inside blocks that are
-    // otherwise routable, so they are checked by hand.
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return false;
-    }
-    true
+    // Reject this-network (0/8), multicast/reserved (224+/3), CGNAT (100.64/10),
+    // benchmarking (198.18/15), retired 6to4 relay (192.88.99/24), and 192.0.0/24.
+    !matches!(
+        address.octets(),
+        [0 | 224.., ..]
+            | [100, 64..=127, ..]
+            | [198, 18 | 19, ..]
+            | [192, 88, 99, _]
+            | [192, 0, 0, _]
+    )
 }
 
 fn is_public_v6(address: Ipv6Addr) -> bool {
     if let Some(mapped) = address.to_ipv4_mapped() {
         return is_public_v4(mapped);
     }
-    let segments = address.segments();
-    // Public IPv6 unicast is allocated from 2000::/3. This also excludes
-    // multicast, site/link/unique-local, translation and discard-only space.
-    if segments[0] & 0xe000 != 0x2000 {
-        return false;
-    }
-    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
-        return false;
-    }
-    // IETF protocol assignments (including Teredo) occupy 2001::/23,
-    // not all of 2001::/16: ordinary networks such as 2001:4860::/32
-    // must remain usable. Refuse 6to4, whose embedded IPv4 is unchecked.
-    if segments[0] == 0x2002 || (segments[0] == 0x2001 && segments[1] < 0x0200) {
-        return false;
-    }
-    // The newer documentation prefix is 3fff::/20 (RFC 9637).
-    if segments[0] == 0x3fff && segments[1] & 0xf000 == 0 {
-        return false;
-    }
-    true
+    let s = address.segments();
+    // Public IPv6 unicast is 2000::/3, excluding documentation (2001:db8::/32,
+    // 3fff::/20), 6to4 (2002::/16), and IETF protocol assignments (2001::/23).
+    (s[0] & 0xe000 == 0x2000)
+        && !matches!(
+            (s[0], s[1]),
+            (0x2001, 0x0db8) | (0x2002, _) | (0x2001, ..0x0200) | (0x3fff, ..0x1000)
+        )
 }
 
 /// A resolver that refuses to hand back an address the node will not connect
@@ -117,10 +97,9 @@ fn is_public_v6(address: Ipv6Addr) -> bool {
 #[derive(Debug)]
 struct GuardedResolver {
     allow_private: bool,
-    /// The operator's own proxy `(host, port)`, which is exempt because it
-    /// usually listens on this machine. Stored without userinfo so authenticated
-    /// local proxies match the host URI ureq resolves.
-    proxy: Option<(String, Option<u16>)>,
+    /// Exact proxy URI resolved by `ureq`'s proxy connectors, exempt because an
+    /// operator's proxy commonly listens on loopback.
+    proxy: Option<ureq::http::Uri>,
 }
 
 impl Resolver for GuardedResolver {
@@ -132,10 +111,7 @@ impl Resolver for GuardedResolver {
     ) -> Result<ResolvedSocketAddrs, Error> {
         let addresses =
             DefaultResolver::default().resolve(uri, config, bounded_timeout(timeout)?)?;
-        let is_proxy = self.proxy.as_ref().is_some_and(|(proxy_host, proxy_port)| {
-            uri.host().is_some_and(|host| host.eq_ignore_ascii_case(proxy_host))
-                && (*proxy_port == uri.port_u16() || proxy_port.is_none())
-        });
+        let is_proxy = self.proxy.as_ref() == Some(uri);
         if self.allow_private || is_proxy {
             return Ok(addresses);
         }
@@ -149,6 +125,37 @@ impl Resolver for GuardedResolver {
             return Err(Error::HostNotFound);
         }
         Ok(allowed)
+    }
+}
+
+/// Blocks literal private/loopback target IPs even when a proxy (`http://`,
+/// `https://`, `socks4a://`, `socks5h://`) defers target resolution to the proxy.
+#[derive(Debug)]
+struct TargetGuardConnector {
+    allow_private: bool,
+}
+
+impl Connector<()> for TargetGuardConnector {
+    type Out = ();
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<Self::Out>, Error> {
+        if !self.allow_private && details.config.proxy().is_some() {
+            if let Some(host) = details.uri.host() {
+                let ip = match url::Host::parse(host) {
+                    Ok(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
+                    Ok(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
+                    _ => None,
+                };
+                if ip.is_some_and(|addr| !is_public(addr)) {
+                    return Err(Error::HostNotFound);
+                }
+            }
+        }
+        Ok(chained)
     }
 }
 
@@ -223,10 +230,7 @@ pub fn proxied_agent(allow_private: bool, proxy: &str) -> Result<Agent, SourceEr
 }
 
 fn build(allow_private: bool, proxy: Option<ureq::Proxy>) -> Agent {
-    let exempt = proxy.as_ref().and_then(|proxy| {
-        let uri = proxy.uri();
-        Some((uri.host()?.to_ascii_lowercase(), uri.port_u16()))
-    });
+    let exempt = proxy.as_ref().map(|p| p.uri().clone());
     let config = Agent::config_builder()
         .accept_encoding("identity")
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
@@ -236,7 +240,9 @@ fn build(allow_private: bool, proxy: Option<ureq::Proxy>) -> Agent {
         .build();
     Agent::with_parts(
         config,
-        ureq::unversioned::transport::DefaultConnector::default().chain(IdleConnector),
+        TargetGuardConnector { allow_private }
+            .chain(ureq::unversioned::transport::DefaultConnector::default())
+            .chain(IdleConnector),
         GuardedResolver { allow_private, proxy: exempt },
     )
 }
@@ -247,19 +253,15 @@ pub fn resolve_all_public(host: &str, port: u16, allow_private: bool) -> Result<
     if allow_private {
         return Ok(());
     }
-    let addresses: Vec<SocketAddr> = (host, port)
+    let mut addresses = (host, port)
         .to_socket_addrs()
         .map_err(|error| SourceError::Url(format!("{host} could not be resolved: {error}")))?
-        .collect();
-    if addresses.is_empty() {
+        .peekable();
+    if addresses.peek().is_none() {
         return Err(SourceError::Url(format!("{host} has no addresses")));
     }
-    for address in addresses {
-        if !is_public(address.ip()) {
-            return Err(SourceError::Url(
-                "private or special-use network address is disabled".into(),
-            ));
-        }
+    if addresses.any(|address| !is_public(address.ip())) {
+        return Err(SourceError::Url("private or special-use network address is disabled".into()));
     }
     Ok(())
 }
