@@ -29,7 +29,7 @@
 ---
 
 <a id="why-rust"></a>
-## ⚡ 為何選擇純 Rust？極致系統工程優勢
+## 為何選擇純 Rust？極致系統工程優勢
 
 即時音訊節點必須每 **20.000 ms（50 Hz）** 準時送出一個加密 Opus 音框。傳統基於 JVM 或 V8 的音訊節點在高併發播放與大型歌單解析時，容易因垃圾回收（Stop-The-World GC）或頻繁堆積配置導致音框延遲與爆音；Rustlink 透過編譯期靜態保證與底層硬體親和設計徹底消除這些瓶頸：
 
@@ -45,7 +45,7 @@
 ---
 
 <a id="architecture"></a>
-## 🏗️ 系統架構與 50 Hz 即時媒體管線
+## 系統架構與 50 Hz 即時媒體管線
 
 <p align="center">
   <img src="docs/assets/architecture.svg" alt="Rustlink 11-Crate Pure-Rust Architecture" width="100%" />
@@ -58,7 +58,7 @@
 ---
 
 <a id="benchmarks"></a>
-## 📊 實測效能基準
+## 實測效能基準
 
 以下數據皆由內建全域計數分配器（`CountAlloc`）於 `rustc --release` 下實機量測，同時驗證**中位數延遲**與**真實堆積配置次數**：
 
@@ -80,7 +80,7 @@
 ---
 
 <a id="comparison"></a>
-## ⚔️ Rustlink 與其他音訊節點方案深度對比
+## Rustlink 與其他音訊節點方案深度對比
 
 在 Discord 音訊生態系中，常見方案包含基於 JVM 的 **Lavalink**、基於 Node.js V8 的 **NodeLink**、基於 Go 執行環境的音訊節點／客戶端生態（如 **GoLink** 搭配 Go 語音服務），以及傳統機器人直接呼叫 **`yt-dlp` + `FFmpeg` 子程序**。下表從執行環境本質、記憶體模型、20 ms 音框抖動來源與加密邊界進行客觀對比：
 
@@ -104,7 +104,7 @@
 
 ---
 
-## ✨ 核心功能一覽
+## 核心功能一覽
 
 - **控制平面與 SDK**：`/api/v1` REST API、常數時間 Bearer 驗證、每工作階段專屬 WebSocket 事件流、斷線自動續傳（Session Resume），以及非同步強型別客戶端 `rustlink-client`。
 - **次世代 Discord 語音與 E2EE**：完整支援 Discord Voice Gateway v8、UDP IP 探索、**DAVE v1（OpenMLS）端對端加密**、`aead_aes256_gcm_rtpsize` 與 `aead_xchacha20_poly1305_rtpsize` 傳輸加密。
@@ -119,7 +119,7 @@
 ---
 
 <a id="quickstart"></a>
-## 🚀 快速開始
+## 快速開始
 
 需要 **Rust 1.88+** 與系統 `libopus`。專案內建跨平台啟動腳本，會自動檢查並安裝缺少的建置依賴（Linux 支援 `apt`、`dnf`、`pacman`、`apk`；Windows 自動配置 MSYS2 UCRT64 與 GNU 工具鏈）：
 
@@ -143,7 +143,7 @@ target/release/rustlink --config config.yaml
 ---
 
 <a id="examples"></a>
-## 🎵 在 Discord 用 `/play` 播 YouTube
+## 在 Discord 用 `/play` 播 YouTube
 
 `crates/discord-bot/examples/slash.rs` 是一個精簡完整的純 Rust 斜線指令機器人：自動註冊 `/play url:<連結或關鍵字>`、配對語音狀態並指揮節點播放。啟動節點後執行：
 
@@ -160,7 +160,7 @@ cargo run -p rustlink-discord-bot --example slash
 
 ---
 
-## 🧩 一鍵部署節點＋音樂機器人
+## 一鍵部署節點＋音樂機器人
 
 `quickstart/` 腳本提供零門檻互動式體驗：依序詢問節點密碼（留空自動產生）、Discord Bot Token 與連接埠後，自動完成編譯並同時啟動 Rustlink 節點與完整音樂機器人；按下 `Ctrl+C` 即可優雅關閉兩者。
 
@@ -184,7 +184,7 @@ cargo run -p rustlink-discord-bot --example music
 
 ---
 
-## 🛠️ 打造自己的 Rust 機器人
+## 打造自己的 Rust 機器人
 
 透過隨附的 `rustlink-client` 非同步 SDK，數十行程式碼即可在自有機器人中接入完整語音播放能力：
 
@@ -235,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## 🐳 Docker 與 VPS 部署
+## Docker 與 VPS 部署
 
 ```sh
 RUSTLINK_PASSWORD=your-strong-password docker compose up --build -d
@@ -245,7 +245,7 @@ RUSTLINK_PASSWORD=your-strong-password docker compose up --build -d
 
 ---
 
-## 📦 Workspace 模組職責
+## Workspace 模組職責
 
 | Crate | 核心職責與技術亮點 |
 | --- | --- |
@@ -284,7 +284,7 @@ cargo test -p rustlink-source --test live_youtube -- --ignored --nocapture
 ---
 
 <a id="docs"></a>
-## 📚 文件索引
+## 文件索引
 
 | 文件 | 內容說明 |
 | --- | --- |
@@ -301,6 +301,6 @@ cargo test -p rustlink-source --test live_youtube -- --ignored --nocapture
 
 ---
 
-## 📄 授權
+## 授權
 
 本專案採用 **GPL-3.0-or-later** 授權條款，詳見 [LICENSE](LICENSE)。協定規格參考與第三方開源聲明請見 [NOTICE](NOTICE)。
