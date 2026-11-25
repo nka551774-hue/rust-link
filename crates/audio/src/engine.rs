@@ -69,6 +69,9 @@ impl Body {
 
 impl Read for Body {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let buffered = self.head();
         if !buffered.is_empty() {
             let count = buffered.len().min(buf.len());
@@ -80,7 +83,14 @@ impl Read for Body {
             }
             return Ok(count);
         }
-        self.inner.read(buf)
+        if self.eof {
+            return Ok(0);
+        }
+        let read = self.inner.read(buf)?;
+        if read == 0 {
+            self.eof = true;
+        }
+        Ok(read)
     }
 }
 
@@ -174,6 +184,13 @@ pub struct Engine {
     pub complexity: i32,
 }
 
+/// Returns `true` when an ADTS header uses CRC protection, MPEG-2 framing, or
+/// a profile other than AAC-LC, none of which Symphonia's AAC decoder handles.
+#[inline]
+fn adts_needs_ffmpeg(head: &[u8]) -> bool {
+    matches!(head, [0xff, b1, b2, ..] if *b1 != 0xf1 || ((*b2 >> 6) & 0x3) != 1)
+}
+
 impl Engine {
     /// Starts playback, returning the frames to send.
     pub fn start(
@@ -196,7 +213,10 @@ impl Engine {
         // An Ogg page header with 255 lacing segments takes 282 bytes before
         // `OpusHead` or `\x01vorbis` starts; 512 bytes always covers it.
         body.peek(512)?;
-        if detect(body.head()) == Container::Unknown {
+        let container = detect(body.head());
+        if container == Container::Unknown
+            || (container == Container::Adts && adts_needs_ffmpeg(body.head()))
+        {
             return self.start_ffmpeg(body, position_ms, &set);
         }
         PureFrames::start(track, body, position_ms, &set, self.bitrate, self.complexity)
@@ -215,5 +235,85 @@ impl Engine {
         let frames =
             FfmpegFrames::start(program, body, position_ms, set, self.bitrate, self.complexity)?;
         Ok(Box::new(frames))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StrictEofReader {
+        data: Vec<u8>,
+        offset: usize,
+        saw_eof: bool,
+    }
+
+    impl Read for StrictEofReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.saw_eof, "inner reader polled again after returning Ok(0)");
+            if self.offset == self.data.len() {
+                self.saw_eof = true;
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.offset);
+            buf[..n].copy_from_slice(&self.data[self.offset..self.offset + n]);
+            self.offset += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn body_does_not_read_past_eof_after_peek_or_drain() {
+        let mut peeked = Body::new(Box::new(StrictEofReader {
+            data: vec![1, 2, 3, 4],
+            offset: 0,
+            saw_eof: false,
+        }));
+        peeked.peek(512).unwrap();
+        let mut out = Vec::new();
+        peeked.read_to_end(&mut out).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4]);
+        let mut tail = [0u8; 8];
+        assert_eq!(peeked.read(&mut tail).unwrap(), 0);
+
+        let mut direct =
+            Body::new(Box::new(StrictEofReader { data: vec![9, 8], offset: 0, saw_eof: false }));
+        assert_eq!(direct.read(&mut tail).unwrap(), 2);
+        assert_eq!(&tail[..2], &[9, 8]);
+        assert_eq!(direct.read(&mut tail).unwrap(), 0);
+        assert_eq!(direct.read(&mut tail).unwrap(), 0);
+    }
+
+    #[test]
+    fn adts_routing_accepts_mpeg4_lc_without_crc_and_routes_other_variants_to_ffmpeg() {
+        // MPEG-4 (ID=0), no CRC (protection_absent=1 -> 0xf1), profile=1 (AAC-LC -> 0x50).
+        let aac_lc = [0xff, 0xf1, 0x50, 0x80, 0x00, 0x1f, 0xfc];
+        assert_eq!(detect(&aac_lc), Container::Adts);
+        assert!(!adts_needs_ffmpeg(&aac_lc));
+
+        // CRC-protected MPEG-4 AAC-LC (`0xf0`), MPEG-2 AAC-LC (`0xf9`), and MPEG-4 AAC Main (`0x10`).
+        for unsupported in [
+            [0xff, 0xf0, 0x50, 0x80],
+            [0xff, 0xf9, 0x50, 0x80],
+            [0xff, 0xf1, 0x10, 0x80],
+            [0xff, 0xf1, 0x90, 0x80],
+        ] {
+            assert_eq!(detect(&unsupported), Container::Adts);
+            assert!(adts_needs_ffmpeg(&unsupported));
+            let engine = Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 5 };
+            let track = Track::new("adts".into(), Default::default());
+            let err = engine
+                .start(
+                    &track,
+                    Body::new(Box::new(io::Cursor::new(unsupported.to_vec()))),
+                    0,
+                    100,
+                    &Object::default(),
+                    Preference::Auto,
+                )
+                .err()
+                .expect("unsupported ADTS variant should route directly to start_ffmpeg");
+            assert!(matches!(err, AudioError::FfmpegMissing));
+        }
     }
 }

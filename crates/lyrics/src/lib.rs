@@ -11,8 +11,9 @@ mod ytmusic;
 pub use lrclib::{LRCLIB, LRCLIB_BASE};
 pub use ytmusic::{YTMusic, YTMUSIC_ENDPOINT};
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::net::Ipv6Addr;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
@@ -67,7 +68,7 @@ impl Lyrics {
 }
 
 /// What a provider can answer.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LyricsError {
     /// The provider has no lyrics for this track. This is an answer rather than
     /// a failure, and the caller replies with no content.
@@ -106,61 +107,287 @@ const CACHE_BYTES: usize = 8 << 20;
 /// an enormous lyric cannot push everything else out of the cache.
 const MAX_ENTRY_BYTES: usize = 1 << 20;
 
+pub(crate) fn validate_base_url(raw: &str, label: &str) -> Result<String, LyricsError> {
+    let base = raw.trim().trim_end_matches('/');
+    if base.is_empty()
+        || !base.bytes().all(|b| (0x21..=0x7e).contains(&b) && !matches!(b, b'\\' | b'?' | b'#'))
+    {
+        return Err(LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")));
+    }
+    let after_scheme = base
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("http://"))
+        .map(|_| &base[7..])
+        .or_else(|| {
+            base.get(..8).filter(|p| p.eq_ignore_ascii_case("https://")).map(|_| &base[8..])
+        })
+        .ok_or_else(|| LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")))?;
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")));
+    }
+    let valid_host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').is_some_and(|(ipv6, tail)| {
+            ipv6.parse::<Ipv6Addr>().is_ok()
+                && match tail.strip_prefix(':') {
+                    None => tail.is_empty(),
+                    Some(port) => port.parse::<u16>().is_ok_and(|p| p > 0),
+                }
+        })
+    } else {
+        match authority.split_once(':') {
+            None => !authority.contains(['[', ']']),
+            Some((host, port)) => {
+                !host.is_empty()
+                    && !host.contains(['[', ']', ':'])
+                    && port.parse::<u16>().is_ok_and(|p| p > 0)
+            }
+        }
+    };
+    if !valid_host || base.parse::<ureq::http::Uri>().is_err() {
+        return Err(LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")));
+    }
+    Ok(base.to_owned())
+}
+
+pub(crate) fn valid_header_value(value: &str) -> bool {
+    value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        && ureq::http::HeaderValue::try_from(value).is_ok()
+}
+
+type Outcome = Result<Arc<Lyrics>, LyricsError>;
+
+#[derive(Default)]
+struct Flight {
+    outcome: Mutex<Option<Outcome>>,
+    ready: Condvar,
+}
+
+impl Flight {
+    fn wait(&self) -> Outcome {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(outcome) = held.as_ref() {
+                return outcome.clone();
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(LyricsError::Failed("lyrics: timed out waiting for lookup".into()));
+            }
+            held = self
+                .ready
+                .wait_timeout(held, remaining)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+    }
+
+    fn publish(&self, outcome: Outcome) {
+        let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
+        if held.is_none() {
+            *held = Some(outcome);
+            drop(held);
+            self.ready.notify_all();
+        }
+    }
+}
+
+struct Leader<'a> {
+    flight: Arc<Flight>,
+    key: &'a str,
+    inflight: &'a Mutex<HashMap<String, Arc<Flight>>>,
+    done: bool,
+}
+
+impl<'a> Leader<'a> {
+    fn new(
+        flight: Arc<Flight>,
+        key: &'a str,
+        inflight: &'a Mutex<HashMap<String, Arc<Flight>>>,
+    ) -> Self {
+        Self { flight, key, inflight, done: false }
+    }
+
+    fn finish(mut self, outcome: Outcome) -> Outcome {
+        self.flight.publish(outcome.clone());
+        self.done = true;
+        outcome
+    }
+}
+
+impl Drop for Leader<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.flight.publish(Err(LyricsError::Failed("lyrics: lookup was interrupted".into())));
+        }
+        let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
+        if inflight.get(self.key).is_some_and(|flight| Arc::ptr_eq(flight, &self.flight)) {
+            inflight.remove(self.key);
+        }
+    }
+}
+
 /// Asks the configured providers in order and remembers what they said.
 pub struct Manager {
     providers: Vec<Box<dyn Provider>>,
     ttl: Duration,
     limit: usize,
     cache: Mutex<Cache>,
+    inflight: Mutex<HashMap<String, Arc<Flight>>>,
 }
 
 #[derive(Default)]
 struct Cache {
-    entries: HashMap<Arc<str>, Entry>,
-    order: VecDeque<Arc<str>>,
+    entries: HashMap<Arc<str>, usize>,
+    slots: Vec<Option<Entry>>,
+    vacant: Vec<usize>,
+    first: Option<usize>,
+    last: Option<usize>,
     /// The sum of every entry's weight.
     bytes: usize,
 }
 
 struct Entry {
+    key: Arc<str>,
     lyrics: Option<Arc<Lyrics>>,
     at: Instant,
     /// What this entry counts against [`CACHE_BYTES`], key included.
     weight: usize,
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+impl Cache {
+    fn get(&mut self, key: &str, ttl: Duration) -> Option<Option<Arc<Lyrics>>> {
+        let index = *self.entries.get(key)?;
+        let entry = self.slots[index].as_ref().expect("indexed entry");
+        if entry.at.elapsed() > ttl {
+            self.remove(index);
+            return None;
+        }
+        let lyrics = entry.lyrics.clone();
+        if self.last != Some(index) {
+            self.detach(index);
+            self.append(index);
+        }
+        Some(lyrics)
+    }
+
+    fn put(&mut self, key: &str, lyrics: Option<Arc<Lyrics>>, limit: usize) {
+        let entry_weight = weight(key, lyrics.as_deref());
+        let reused_key = self.entries.remove(key).map(|index| self.take_slot(index).key);
+        if limit == 0 || entry_weight > MAX_ENTRY_BYTES {
+            return;
+        }
+        while self.entries.len() >= limit || self.bytes.saturating_add(entry_weight) > CACHE_BYTES {
+            let Some(oldest) = self.first else {
+                return;
+            };
+            self.remove(oldest);
+        }
+        let index = self.vacant.pop().unwrap_or_else(|| {
+            self.slots.push(None);
+            self.slots.len() - 1
+        });
+        let shared_key = reused_key.unwrap_or_else(|| Arc::from(key));
+        self.entries.insert(Arc::clone(&shared_key), index);
+        self.slots[index] = Some(Entry {
+            key: shared_key,
+            lyrics,
+            at: Instant::now(),
+            weight: entry_weight,
+            previous: None,
+            next: None,
+        });
+        self.bytes = self.bytes.saturating_add(entry_weight);
+        self.append(index);
+    }
+
+    fn detach(&mut self, index: usize) {
+        let entry = self.slots[index].as_ref().expect("indexed entry");
+        let (previous, next) = (entry.previous, entry.next);
+        if let Some(previous) = previous {
+            self.slots[previous].as_mut().expect("linked entry").next = next;
+        } else {
+            self.first = next;
+        }
+        if let Some(next) = next {
+            self.slots[next].as_mut().expect("linked entry").previous = previous;
+        } else {
+            self.last = previous;
+        }
+    }
+
+    fn append(&mut self, index: usize) {
+        let entry = self.slots[index].as_mut().expect("indexed entry");
+        entry.previous = self.last;
+        entry.next = None;
+        if let Some(last) = self.last {
+            self.slots[last].as_mut().expect("linked entry").next = Some(index);
+        } else {
+            self.first = Some(index);
+        }
+        self.last = Some(index);
+    }
+
+    fn take_slot(&mut self, index: usize) -> Entry {
+        self.detach(index);
+        let entry = self.slots[index].take().expect("indexed entry");
+        self.bytes = self.bytes.saturating_sub(entry.weight);
+        self.vacant.push(index);
+        entry
+    }
+
+    fn remove(&mut self, index: usize) {
+        let entry = self.take_slot(index);
+        self.entries.remove(&entry.key);
+    }
 }
 
 fn object_weight(object: &Object) -> usize {
-    object.iter().map(|(k, v)| k.len() + value_weight(v) + 32).fold(0usize, usize::saturating_add)
+    const NODE_OVERHEAD: usize =
+        size_of::<String>() + size_of::<serde_json::Value>() + size_of::<[usize; 8]>();
+    object.iter().fold(0usize, |acc, (k, v)| {
+        acc.saturating_add(k.capacity())
+            .saturating_add(NODE_OVERHEAD)
+            .saturating_add(value_weight(v))
+    })
 }
 
 fn value_weight(value: &serde_json::Value) -> usize {
     match value {
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(items) => {
-            items.iter().map(value_weight).fold(items.len() * 16, usize::saturating_add)
-        }
+        serde_json::Value::String(s) => s.capacity(),
+        serde_json::Value::Array(items) => items
+            .capacity()
+            .saturating_mul(size_of::<serde_json::Value>())
+            .saturating_add(items.iter().map(value_weight).fold(0usize, usize::saturating_add)),
         serde_json::Value::Object(map) => object_weight(map),
-        _ => 16,
+        _ => 0,
     }
 }
 
-/// What an answer costs the cache: its text, its lines and the key it is kept
-/// under, with a little for the structure around them.
+/// What an answer costs the cache: its text, its lines, container capacities
+/// and the key it is kept under.
 fn weight(key: &str, lyrics: Option<&Lyrics>) -> usize {
-    let Some(lyrics) = lyrics else { return key.len() + 64 };
-    let lines: usize = lyrics
-        .lines
-        .iter()
-        .flatten()
-        .map(|line| line.line.len() + object_weight(&line.plugin) + std::mem::size_of::<Line>())
-        .fold(0usize, usize::saturating_add);
-    key.len()
-        .saturating_add(lyrics.source_name.len())
-        .saturating_add(lyrics.provider.len())
-        .saturating_add(lyrics.text.as_ref().map_or(0, String::len))
+    let base = key.len().saturating_add(size_of::<Entry>()).saturating_add(4 * size_of::<usize>());
+    let Some(lyrics) = lyrics else {
+        return base;
+    };
+    let lines = lyrics.lines.as_ref().map_or(0usize, |vec| {
+        vec.capacity().saturating_mul(size_of::<Line>()).saturating_add(vec.iter().fold(
+            0usize,
+            |acc, line| {
+                acc.saturating_add(line.line.capacity()).saturating_add(object_weight(&line.plugin))
+            },
+        ))
+    });
+    base.saturating_add(size_of::<Lyrics>())
+        .saturating_add(lyrics.source_name.capacity())
+        .saturating_add(lyrics.provider.capacity())
+        .saturating_add(lyrics.text.as_ref().map_or(0, String::capacity))
         .saturating_add(object_weight(&lyrics.plugin))
         .saturating_add(lines)
-        .saturating_add(64)
 }
 
 /// What a lookup depends on. The providers search by title, author and length,
@@ -191,6 +418,7 @@ impl Manager {
             ttl: DEFAULT_TTL,
             limit: CACHE_LIMIT,
             cache: Mutex::new(Cache::default()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -200,7 +428,8 @@ impl Manager {
     /// The database answers most tracks and the catalogue answers the ones it
     /// has nothing for, which is where timed lines come from.
     pub fn from_config(config: &Config, agent: ureq::Agent) -> Option<Self> {
-        let youtube_agent = config.youtube_native.then(|| agent.clone());
+        let youtube_agent = (config.youtube_native && config.youtube_proxy.trim().is_empty())
+            .then(|| agent.clone());
         Self::from_config_with_youtube(config, agent, youtube_agent)
     }
 
@@ -257,76 +486,55 @@ impl Manager {
         if let Some(cached) = self.cached(&key) {
             return cached.ok_or(LyricsError::NotFound);
         }
-        let mut last: Option<LyricsError> = None;
-        for provider in &self.providers {
-            match provider.fetch(track) {
-                Ok(found) => {
-                    let shared = Arc::new(found);
-                    self.remember(&key, Some(Arc::clone(&shared)));
-                    return Ok(shared);
-                }
-                Err(LyricsError::NotFound) => {}
-                Err(error) => last = Some(error),
+        let flight = {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(flight) = inflight.get(&key) {
+                let flight = Arc::clone(flight);
+                drop(inflight);
+                return flight.wait();
             }
-        }
-        // A provider that failed is not the same as one that has nothing. The
-        // failure may pass, so it is reported rather than remembered as a miss:
-        // remembering it would answer every request for that track from the
-        // cache for the rest of the hour, including the ones made after the
-        // service came back.
-        if let Some(error) = last {
-            return Err(error);
-        }
-        self.remember(&key, None);
-        Err(LyricsError::NotFound)
+            if let Some(cached) = self.cached(&key) {
+                return cached.ok_or(LyricsError::NotFound);
+            }
+            let flight = Arc::new(Flight::default());
+            inflight.insert(key.clone(), Arc::clone(&flight));
+            flight
+        };
+        let leader = Leader::new(flight, &key, &self.inflight);
+        let outcome = (|| {
+            let mut last: Option<LyricsError> = None;
+            for provider in &self.providers {
+                match provider.fetch(track) {
+                    Ok(found) => {
+                        let shared = Arc::new(found);
+                        self.remember(&key, Some(Arc::clone(&shared)));
+                        return Ok(shared);
+                    }
+                    Err(LyricsError::NotFound) => {}
+                    Err(error) => last = Some(error),
+                }
+            }
+            // A provider that failed is not the same as one that has nothing.
+            // Report the failure rather than caching it as a miss.
+            if let Some(error) = last {
+                return Err(error);
+            }
+            self.remember(&key, None);
+            Err(LyricsError::NotFound)
+        })();
+        leader.finish(outcome)
     }
 
     fn cached(&self, key: &str) -> Option<Option<Arc<Lyrics>>> {
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-        let entry = cache.entries.get(key)?;
-        if entry.at.elapsed() > self.ttl {
-            if let Some(expired) = cache.entries.remove(key) {
-                cache.bytes = cache.bytes.saturating_sub(expired.weight);
-            }
-            cache.order.retain(|held| held.as_ref() != key);
-            return None;
-        }
-        Some(entry.lyrics.clone())
+        cache.get(key, self.ttl)
     }
 
     /// Stores a result, including a miss, so a track nobody has lyrics for is
     /// not looked up again on every request.
-    ///
-    /// Entries leave in the order they arrived, which is enough to keep the map
-    /// bounded.
     fn remember(&self, key: &str, lyrics: Option<Arc<Lyrics>>) {
-        let weight = weight(key, lyrics.as_deref());
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-        // An answer this large is not worth what it would push out.
-        if weight > MAX_ENTRY_BYTES {
-            if let Some(stale) = cache.entries.remove(key) {
-                cache.bytes = cache.bytes.saturating_sub(stale.weight);
-                cache.order.retain(|held| held.as_ref() != key);
-            }
-            return;
-        }
-        let shared_key = if let Some((existing_key, previous)) = cache.entries.remove_entry(key) {
-            cache.bytes = cache.bytes.saturating_sub(previous.weight);
-            cache.order.retain(|held| held.as_ref() != key);
-            existing_key
-        } else {
-            Arc::from(key)
-        };
-        // Oldest first, until both the count and the bytes are within bounds.
-        while cache.entries.len() >= self.limit || cache.bytes + weight > CACHE_BYTES {
-            let Some(oldest) = cache.order.pop_front() else { break };
-            if let Some(evicted) = cache.entries.remove(&oldest) {
-                cache.bytes = cache.bytes.saturating_sub(evicted.weight);
-            }
-        }
-        cache.order.push_back(Arc::clone(&shared_key));
-        cache.bytes += weight;
-        cache.entries.insert(shared_key, Entry { lyrics, at: Instant::now(), weight });
+        cache.put(key, lyrics, self.limit);
     }
 }
 
@@ -525,5 +733,122 @@ mod tests {
         let manager = Manager::new(Vec::new());
         assert!(!manager.enabled());
         assert!(matches!(manager.fetch(&track("youtube", "abc")), Err(LyricsError::NotFound)));
+    }
+
+    #[test]
+    fn singleflight_shares_concurrent_lookups_and_recovers_after_panic() {
+        struct Blocking {
+            calls: Arc<AtomicUsize>,
+            started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Provider for Blocking {
+            fn name(&self) -> &'static str {
+                "blocking"
+            }
+            fn fetch(&self, _track: &Track) -> Result<Lyrics, LyricsError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(tx) = self.started.lock().unwrap().take() {
+                    tx.send(()).unwrap();
+                }
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(found("blocking"))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let manager = Manager::new(vec![Box::new(Blocking {
+            calls: Arc::clone(&calls),
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+        })]);
+        let item = track("youtube", "coalesced");
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(|| manager.fetch_shared(&item));
+            started_rx.recv().unwrap();
+            let waiters: Vec<_> =
+                (0..6).map(|_| scope.spawn(|| manager.fetch_shared(&item))).collect();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while manager
+                .inflight
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .is_none_or(|f| Arc::strong_count(f) < waiters.len() + 2)
+            {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+            let first = leader.join().unwrap().unwrap();
+            for waiter in waiters {
+                assert!(Arc::ptr_eq(&first, &waiter.join().unwrap().unwrap()));
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(manager.inflight.lock().unwrap().is_empty());
+
+        struct PanicsOnce(AtomicUsize);
+        impl Provider for PanicsOnce {
+            fn name(&self) -> &'static str {
+                "panic"
+            }
+            fn fetch(&self, _track: &Track) -> Result<Lyrics, LyricsError> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    panic!("provider crashed");
+                }
+                Ok(found("recovered"))
+            }
+        }
+        let panic_mgr = Manager::new(vec![Box::new(PanicsOnce(AtomicUsize::new(0)))]);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = panic_mgr.fetch_shared(&item);
+        }));
+        assert!(unwound.is_err());
+        assert!(panic_mgr.inflight.lock().unwrap().is_empty());
+        assert_eq!(panic_mgr.fetch(&item).unwrap().provider, "recovered");
+    }
+
+    #[test]
+    fn lru_cache_promotes_recent_hits_and_charges_excess_vector_capacity() {
+        let (provider, calls) = scripted("db", || Ok(found("db")));
+        let mut manager = Manager::new(vec![provider]);
+        manager.limit = 2;
+        let a = titled("a", "song");
+        let b = titled("b", "song");
+        let c = titled("c", "song");
+        manager.fetch(&a).unwrap();
+        manager.fetch(&b).unwrap();
+        // Touch `a` so `b` becomes least-recently-used.
+        manager.fetch(&a).unwrap();
+        manager.fetch(&c).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        manager.fetch(&a).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "promoted entry remained cached");
+        manager.fetch(&b).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 4, "least-recently-used entry was evicted");
+
+        let mut oversized_cap = found("cap");
+        oversized_cap.lines = Some(Vec::with_capacity(MAX_ENTRY_BYTES / size_of::<Line>() + 16));
+        assert!(weight("k", Some(&oversized_cap)) > MAX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn from_config_omits_unproxied_youtube_when_youtube_proxy_is_configured() {
+        let mut proxied_cfg = Config::default();
+        proxied_cfg.youtube_native = true;
+        proxied_cfg.youtube_proxy = "socks5://127.0.0.1:40000".into();
+        let mgr = Manager::from_config(&proxied_cfg, ureq::Agent::new_with_defaults()).unwrap();
+        assert_eq!(mgr.providers.len(), 1);
+        assert_eq!(mgr.providers[0].name(), "lrclib");
+
+        let mut direct_cfg = Config::default();
+        direct_cfg.youtube_native = true;
+        let direct_mgr =
+            Manager::from_config(&direct_cfg, ureq::Agent::new_with_defaults()).unwrap();
+        assert_eq!(direct_mgr.providers.len(), 2);
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::body::Bytes;
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, OriginalUri, Path, Request, State};
 use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE};
@@ -45,6 +45,10 @@ const LYRICS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The number of tracks one `tracks/inspect-batch` request may carry.
 const MAX_DECODE_TRACKS: usize = 1000;
+
+const SMALL_BODY_LIMIT: usize = 16 << 10;
+const SINGLE_TOKEN_BODY_LIMIT: usize = 512 << 10;
+const LARGE_BODY_LIMIT: usize = 1 << 20;
 
 /// The response header identifying this service and its software version.
 static SERVER_HEADER: LazyLock<HeaderValue> = LazyLock::new(|| {
@@ -304,6 +308,8 @@ pub struct Server {
     counters: Arc<Counters>,
     /// What every player on the node is built with.
     player_deps: Arc<Deps>,
+    load_gate: Arc<tokio::sync::Semaphore>,
+    lyrics_gate: Arc<tokio::sync::Semaphore>,
     cpu: Arc<Cpu>,
     limits: Limits,
     /// Carries one pending request for a node-wide player report. A burst of
@@ -330,6 +336,7 @@ impl Server {
             engine: Arc::clone(&deps.engine),
             voice: Arc::clone(&deps.voice),
         });
+        let max_loads = (config.max_concurrent_loads as usize).max(1);
         let server = Arc::new(Server {
             config,
             deps,
@@ -341,6 +348,8 @@ impl Server {
             requests: AtomicU64::new(0),
             counters: Arc::new(Counters::default()),
             player_deps,
+            load_gate: Arc::new(tokio::sync::Semaphore::new(max_loads)),
+            lyrics_gate: Arc::new(tokio::sync::Semaphore::new(max_loads)),
             cpu: Arc::new(Cpu::new()),
             limits: Limits::new(),
             reports,
@@ -479,6 +488,8 @@ impl Server {
     fn start_background(self: &Arc<Self>, reports: mpsc::Receiver<()>) {
         let reaper = Arc::clone(self);
         self.handle.spawn(async move { reaper.reap().await });
+        let sampler = Arc::clone(self);
+        self.handle.spawn(async move { sampler.cpu_loop().await });
         if self.deps.webhook.is_some() {
             let reporter = Arc::clone(self);
             self.handle.spawn(async move { reporter.report_loop(reports).await });
@@ -642,11 +653,32 @@ impl Server {
         Ok(())
     }
 
+    fn rate_limit_key<'a>(&self, route: Route, path: &'a str) -> Cow<'a, str> {
+        if matches!(route, Route::Root) {
+            return Cow::Borrowed("node");
+        }
+        let key = session_key(path);
+        if key == "node" {
+            return Cow::Borrowed("node");
+        }
+        let active = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(key.as_ref())
+            .is_some_and(|session| session.is_usable());
+        if active {
+            key
+        } else {
+            Cow::Borrowed("unknown_session")
+        }
+    }
+
     /// Spends one token from the authenticated session's per-route bucket.
     #[allow(clippy::result_large_err)]
     fn rate_limit(&self, route: Route, path: &str) -> Result<(), Response> {
         if self.config.ratelimits.enable
-            && !self.limits.allow_authenticated(route, &session_key(path))
+            && !self.limits.allow_authenticated(route, &self.rate_limit_key(route, path))
         {
             return Err(self.fail(StatusCode::TOO_MANY_REQUESTS, "too many requests", path));
         }
@@ -738,14 +770,50 @@ impl Server {
         sessions.into_iter().filter(|session| session.is_usable()).collect()
     }
 
+    /// Active usable sessions currently held by the node, without allocating.
+    pub fn active_session_count(&self) -> usize {
+        self.sessions.lock().unwrap().values().filter(|session| session.is_usable()).count()
+    }
+
+    /// Actively playing players across all usable sessions, without allocating.
+    pub fn playing_count(&self) -> usize {
+        self.sessions.lock().unwrap().values().map(|session| session.playing_player_count()).sum()
+    }
+
+    fn session_and_playing_counts(&self) -> (usize, usize) {
+        let mut sessions = 0usize;
+        let mut playing = 0usize;
+        for session in self.sessions.lock().unwrap().values() {
+            if let Some(count) = session.usable_and_playing() {
+                sessions += 1;
+                playing += count;
+            }
+        }
+        (sessions, playing)
+    }
+
     /// Resolves an identifier into a load result, on a thread of its own so a
     /// slow source cannot stall the runtime, and inside the configured timeout
     /// so a client is answered either way.
     async fn load(&self, identifier: &str) -> Arc<LoadResult> {
+        let deadline = tokio::time::Instant::now() + self.config.load_timeout();
+        let permit =
+            match tokio::time::timeout_at(deadline, Arc::clone(&self.load_gate).acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => return Arc::new(LoadResult::from_error("server is shutting down")),
+                Err(_) => {
+                    return Arc::new(LoadResult::from_error("the source did not answer in time"))
+                }
+            };
         let loader = self.deps.loader.clone();
         let identifier = identifier.to_string();
-        let work = tokio::task::spawn_blocking(move || loader.load_shared(&identifier));
-        match tokio::time::timeout(self.config.load_timeout(), work).await {
+        let work = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            loader.load_shared(&identifier)
+        });
+        match tokio::time::timeout_at(deadline, work).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(error))) => Arc::new(LoadResult::from_error(error)),
             Ok(Err(error)) => Arc::new(LoadResult::from_error(error)),
@@ -764,8 +832,32 @@ impl Server {
         if !manager.enabled() {
             return StatusCode::NO_CONTENT.into_response();
         }
-        let work = tokio::task::spawn_blocking(move || manager.fetch_shared(&track));
-        match tokio::time::timeout(LYRICS_TIMEOUT, work).await {
+        let deadline = tokio::time::Instant::now() + LYRICS_TIMEOUT;
+        let permit =
+            match tokio::time::timeout_at(deadline, Arc::clone(&self.lyrics_gate).acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return self.fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "server is shutting down",
+                        path,
+                    )
+                }
+                Err(_) => {
+                    return self.fail(
+                        StatusCode::BAD_GATEWAY,
+                        "lyrics lookup failed: the provider did not answer in time",
+                        path,
+                    )
+                }
+            };
+        let work = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manager.fetch_shared(&track)
+        });
+        match tokio::time::timeout_at(deadline, work).await {
             Ok(Ok(Ok(lyrics))) => self.json(StatusCode::OK, lyrics.as_ref()),
             Ok(Ok(Err(LyricsError::NotFound))) => StatusCode::NO_CONTENT.into_response(),
             Ok(Ok(Err(error))) => {
@@ -901,6 +993,33 @@ struct PlayersResponse {
     players: Vec<rustlink_protocol::Player>,
 }
 
+fn is_length_limit_error(error: &axum::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        if err.to_string().contains("length limit") {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+#[allow(clippy::result_large_err)]
+async fn read_body(
+    server: &Server,
+    body: Body,
+    limit: usize,
+    path: &str,
+) -> Result<Bytes, Response> {
+    to_bytes(body, limit).await.map_err(|error| {
+        if is_length_limit_error(&error) {
+            server.fail(StatusCode::PAYLOAD_TOO_LARGE, "request body too large", path)
+        } else {
+            server.fail(StatusCode::BAD_REQUEST, "could not read request body", path)
+        }
+    })
+}
+
 #[allow(clippy::result_large_err)]
 fn read_json<T: serde::de::DeserializeOwned>(
     server: &Server,
@@ -910,6 +1029,17 @@ fn read_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(body).map_err(|error| {
         server.fail(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {error}"), path)
     })
+}
+
+#[allow(clippy::result_large_err)]
+async fn read_body_json<T: serde::de::DeserializeOwned>(
+    server: &Server,
+    body: Body,
+    limit: usize,
+    path: &str,
+) -> Result<T, Response> {
+    let bytes = read_body(server, body, limit, path).await?;
+    read_json(server, &bytes, path)
 }
 
 #[allow(clippy::result_large_err)]
@@ -924,10 +1054,10 @@ fn read_track_token(
 }
 
 #[allow(clippy::result_large_err)]
-async fn load_tracks(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
+async fn load_tracks(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/tracks/resolve";
     server.rate_limit(Route::ResolveTracks, path)?;
-    let request: ResolveRequest = read_json(&server, &body, path)?;
+    let request: ResolveRequest = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
     if request.query.trim().is_empty() || request.query.len() > 8192 {
         return Err(server.fail(StatusCode::BAD_REQUEST, "query must contain 1..8192 bytes", path));
     }
@@ -939,18 +1069,19 @@ async fn load_tracks(State(server): State<Arc<Server>>, body: Bytes) -> RouteRes
 }
 
 #[allow(clippy::result_large_err)]
-async fn decode_track_route(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
+async fn decode_track_route(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/tracks/inspect";
     server.rate_limit(Route::InspectTrack, path)?;
-    let track = read_track_token(&server, &body, path)?;
+    let bytes = read_body(&server, body, SINGLE_TOKEN_BODY_LIMIT, path).await?;
+    let track = read_track_token(&server, &bytes, path)?;
     Ok(server.json(StatusCode::OK, track))
 }
 
 #[allow(clippy::result_large_err)]
-async fn decode_tracks(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
+async fn decode_tracks(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/tracks/inspect-batch";
     server.rate_limit(Route::InspectTracks, path)?;
-    let request: TokensRequest = read_json(&server, &body, path)?;
+    let request: TokensRequest = read_body_json(&server, body, LARGE_BODY_LIMIT, path).await?;
     if request.tokens.len() > MAX_DECODE_TRACKS {
         return Err(server.fail(StatusCode::BAD_REQUEST, "at most 1000 tokens per request", path));
     }
@@ -967,10 +1098,11 @@ async fn decode_tracks(State(server): State<Arc<Server>>, body: Bytes) -> RouteR
 }
 
 #[allow(clippy::result_large_err)]
-async fn lyrics_for_track(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
+async fn lyrics_for_track(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/lyrics";
     server.rate_limit(Route::Lyrics, path)?;
-    let track = read_track_token(&server, &body, path)?;
+    let bytes = read_body(&server, body, SINGLE_TOKEN_BODY_LIMIT, path).await?;
+    let track = read_track_token(&server, &bytes, path)?;
     Ok(server.answer_lyrics(track, path).await)
 }
 
@@ -1047,23 +1179,11 @@ async fn update_player(
     State(server): State<Arc<Server>>,
     OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
-    body: Bytes,
+    body: Body,
 ) -> RouteResult {
     let path = uri.path();
     server.rate_limit(Route::UpdatePlayer, path)?;
     let session = server.session_and_guild(&session_id, &guild_id, path)?;
-    let update: PlayerUpdate = read_json(&server, &body, path)?;
-    let prepared = crate::player::prepare(update)
-        .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))?;
-    if let Some(filters) = &prepared.filters {
-        // Validate operator policy before mutating the player.
-        let disabled = rustlink_audio::disabled_filters(filters, &server.config.filters);
-        if !disabled.is_empty() {
-            let message =
-                format!("Following filters are disabled in the config: {}", disabled.join(", "));
-            return Err(server.fail(StatusCode::BAD_REQUEST, &message, path));
-        }
-    }
     let mut replace_param = None;
     let mut has_unknown_param = false;
     if let Some(raw_query) = uri.query() {
@@ -1095,36 +1215,62 @@ async fn update_player(
             path,
         ));
     }
+    let update: PlayerUpdate = read_body_json(&server, body, LARGE_BODY_LIMIT, path).await?;
+    let prepared = crate::player::prepare(update)
+        .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))?;
+    if let Some(filters) = &prepared.filters {
+        // Validate operator policy before mutating the player.
+        let disabled = rustlink_audio::disabled_filters(filters, &server.config.filters);
+        if !disabled.is_empty() {
+            let message =
+                format!("Following filters are disabled in the config: {}", disabled.join(", "));
+            return Err(server.fail(StatusCode::BAD_REQUEST, &message, path));
+        }
+    }
     let gate = session.update_gate(&guild_id);
     let _serialized = gate.lock().await;
-    let (player, created) = match session.get_or_insert(&guild_id, || {
-        if !server.reserve_player() {
-            return Err(());
+    let (player, created) = if let Some(existing) = session.player(&guild_id) {
+        if session.is_closed() {
+            return Err(server.fail(StatusCode::NOT_FOUND, "session is closed", path));
         }
-        let player = Player::with_load_timeout(
-            session.user.clone(),
-            guild_id.clone(),
-            Arc::clone(&server.player_deps),
-            session.emitter(),
-            Arc::clone(&server.counters),
-            server.config.load_timeout(),
-        );
-        log::info!(
-            "player created guild={guild_id} session={} players={}",
-            session.id,
-            server.players.load(Ordering::SeqCst)
-        );
-        server.request_report();
-        Ok(player)
-    }) {
-        Ok(Some(player)) => player,
-        Ok(None) => return Err(server.fail(StatusCode::NOT_FOUND, "session is closed", path)),
-        Err(()) => {
+        (existing, false)
+    } else {
+        if !server.reserve_player() {
             return Err(server.fail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "player capacity reached",
                 path,
+            ));
+        }
+        match session.get_or_insert(&guild_id, || {
+            Ok::<_, std::convert::Infallible>(Player::with_limits(
+                session.user.clone(),
+                guild_id.clone(),
+                Arc::clone(&server.player_deps),
+                session.emitter(),
+                Arc::clone(&server.counters),
+                server.config.load_timeout(),
+                Arc::clone(&server.load_gate),
             ))
+        }) {
+            Ok(Some((player, true))) => {
+                log::info!(
+                    "player created guild={guild_id} session={} players={}",
+                    session.id,
+                    server.players.load(Ordering::SeqCst)
+                );
+                server.request_report();
+                (player, true)
+            }
+            Ok(Some((player, false))) => {
+                server.player_destroyed();
+                (player, false)
+            }
+            Ok(None) => {
+                server.player_destroyed();
+                return Err(server.fail(StatusCode::NOT_FOUND, "session is closed", path));
+            }
+            Err(infallible) => match infallible {},
         }
     };
     let mut creation =
@@ -1133,6 +1279,9 @@ async fn update_player(
         Ok(body) => {
             creation.pending = false;
             Ok(server.json(StatusCode::OK, body))
+        }
+        Err(crate::player::PlayerError::Destroyed) => {
+            Err(server.fail(StatusCode::NOT_FOUND, "player is destroyed", path))
         }
         Err(error) => Err(server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path)),
     }
@@ -1190,10 +1339,10 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
 }
 
 #[allow(clippy::result_large_err)]
-async fn create_session(State(server): State<Arc<Server>>, body: Bytes) -> RouteResult {
+async fn create_session(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/sessions";
     server.rate_limit(Route::CreateSession, path)?;
-    let request: CreateSession = read_json(&server, &body, path)?;
+    let request: CreateSession = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
     if !rustlink_voice::valid_id(&request.bot_id)
         || request.resume_timeout_secs.is_some_and(|timeout| timeout == 0 || timeout > 86_400)
     {
@@ -1288,12 +1437,12 @@ async fn update_session(
     State(server): State<Arc<Server>>,
     OriginalUri(uri): OriginalUri,
     Path(id): Path<String>,
-    body: Bytes,
+    body: Body,
 ) -> RouteResult {
     let path = uri.path();
     server.rate_limit(Route::UpdateSession, path)?;
     let session = server.session(&id, path)?;
-    let update: UpdateSession = read_json(&server, &body, path)?;
+    let update: UpdateSession = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
     if update.resume_timeout_secs.is_some_and(|timeout| timeout == 0 || timeout > 86_400) {
         return Err(server.fail(
             StatusCode::BAD_REQUEST,
@@ -1478,6 +1627,10 @@ impl Server {
                             "error":{"code":"rest_required", "message":"use REST to change a player or session"}});
                         if control.send(Message::Text(error.to_string().into())).await.is_err() { break None; }
                     }
+                    Ok(Some(Ok(Message::Close(_)))) => {
+                        let _ = control.send(Message::Close(None)).await;
+                        break None;
+                    }
                     _ => break None,
                 }
             }
@@ -1535,7 +1688,7 @@ impl Server {
         }
     }
 
-    fn reserve_player(&self) -> bool {
+    fn try_increment_player(&self) -> bool {
         let limit = u64::from(self.config.max_players);
         let mut count = self.players.load(Ordering::SeqCst);
         while count < limit {
@@ -1552,11 +1705,44 @@ impl Server {
         false
     }
 
+    fn reserve_player(&self) -> bool {
+        if self.try_increment_player() {
+            return true;
+        }
+        if self.reap_expired_sessions() > 0 {
+            return self.try_increment_player();
+        }
+        false
+    }
+
+    fn reap_expired_sessions(&self) -> usize {
+        let mut expired = Vec::new();
+        self.sessions.lock().unwrap().retain(|_, session| {
+            if session.expired() {
+                expired.push(Arc::clone(session));
+                false
+            } else {
+                true
+            }
+        });
+        let count = expired.len();
+        for session in expired {
+            log::info!(
+                "session expired session={} user={} resumable={} timeoutSeconds={} players={}",
+                session.id,
+                session.user,
+                session.resuming(),
+                session.timeout(),
+                session.player_count()
+            );
+            session.destroy();
+        }
+        count
+    }
+
     /// What `GET /api/v1/stats` reports.
     fn stats_body(&self) -> Value {
-        let sessions = self.active_sessions();
-        let session_count = sessions.len();
-        let playing: usize = sessions.iter().map(|session| session.playing_player_count()).sum();
+        let (session_count, playing) = self.session_and_playing_counts();
         let (system_load, process_load, _) = self.cpu.values();
         let (used, total) = self.cpu.memory();
         json!({
@@ -1576,14 +1762,17 @@ impl Server {
     /// What `GET /metrics` reports, in the text exposition format Prometheus
     /// reads.
     fn metrics_body(&self) -> String {
-        let sessions = self.active_sessions().len();
+        let (sessions, playing) = self.session_and_playing_counts();
+        let (system_load, process_load, _) = self.cpu.values();
         let uptime = self.started.elapsed().as_secs_f64();
-        let mut out = String::with_capacity(1152);
+        let mut out = String::with_capacity(1664);
         let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
         };
         metric("rustlink_players", "gauge", "Current players", self.players.load(Ordering::SeqCst));
+        metric("rustlink_playing_players", "gauge", "Currently playing players", playing as u64);
         metric("rustlink_sessions", "gauge", "Current sessions", sessions as u64);
+        metric("rustlink_cpu_cores", "gauge", "Logical CPU cores", self.cpu.cores() as u64);
         metric(
             "rustlink_http_requests_total",
             "counter",
@@ -1628,18 +1817,22 @@ impl Server {
         );
         let _ = writeln!(
             out,
+            "# HELP rustlink_cpu_system_load System CPU load fraction\n# TYPE rustlink_cpu_system_load gauge\nrustlink_cpu_system_load {system_load:.6}"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP rustlink_cpu_process_load Process CPU load fraction\n# TYPE rustlink_cpu_process_load gauge\nrustlink_cpu_process_load {process_load:.6}"
+        );
+        let _ = writeln!(
+            out,
             "# HELP rustlink_uptime_seconds Uptime in seconds\n# TYPE rustlink_uptime_seconds gauge\nrustlink_uptime_seconds {uptime:.3}"
         );
         out
     }
 
-    /// Samples the machine and expires the sessions that have waited too long,
-    /// which is what keeps a node that is left running from filling up with
-    /// sessions nobody is coming back for.
+    /// Expires sessions that have waited past their resume window on a steady
+    /// 1-second cadence, decoupled from blocking OS CPU sampling.
     async fn reap(self: Arc<Self>) {
-        if !self.sample_cpu().await {
-            return;
-        }
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
@@ -1649,28 +1842,29 @@ impl Server {
             tokio::select! {
                 _ = self.shutdown_requested() => return,
                 _ = ticker.tick() => {
+                    self.reap_expired_sessions();
+                }
+            }
+        }
+    }
+
+    /// Samples machine and process CPU/memory independently so slow OS table
+    /// refreshes never delay session expiry.
+    async fn cpu_loop(self: Arc<Self>) {
+        if !self.sample_cpu().await {
+            return;
+        }
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = self.shutdown_requested() => return,
+                _ = ticker.tick() => {
                     if !self.sample_cpu().await {
                         return;
-                    }
-                    let mut expired = Vec::new();
-                    self.sessions.lock().unwrap().retain(|_, session| {
-                        if session.expired() {
-                            expired.push(Arc::clone(session));
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    for session in expired {
-                        log::info!(
-                            "session expired session={} user={} resumable={} timeoutSeconds={} players={}",
-                            session.id,
-                            session.user,
-                            session.resuming(),
-                            session.timeout(),
-                            session.player_count()
-                        );
-                        session.destroy();
                     }
                 }
             }
@@ -1681,6 +1875,9 @@ impl Server {
     /// first sample takes seconds on Windows) that must not stall a runtime
     /// worker. Returns false when the node shut down meanwhile.
     async fn sample_cpu(&self) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
         let cpu = Arc::clone(&self.cpu);
         tokio::select! {
             _ = self.shutdown_requested() => false,
@@ -1786,12 +1983,15 @@ async fn write_loop(
         tokio::time::Instant::now() + Duration::from_secs(update_seconds),
         Duration::from_secs(update_seconds),
     );
+    updates.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stats = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(stats_seconds),
         Duration::from_secs(stats_seconds),
     );
+    stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous_sent = server.counters.sent.load(Ordering::Relaxed);
     let mut previous_deficit = server.counters.deficit.load(Ordering::Relaxed);
     if let Some(unsent) = session.take_unsent() {
@@ -1804,22 +2004,39 @@ async fn write_loop(
         tokio::select! {
             biased;
             _ = session.stopped() => {
-                let mut sink_ok = true;
-                while let Ok(event) = inbox.try_recv() {
-                    if send_frame(&mut sink, Message::Text(event.to_string().into())).await.is_err() {
-                        sink_ok = false;
-                        break;
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while let Ok(event) = inbox.try_recv() {
+                        if sink.feed(Message::Text(event.to_string().into())).await.is_err() {
+                            return;
+                        }
                     }
-                }
-                if sink_ok {
-                    let _ = send_frame(&mut sink, Message::Close(None)).await;
-                }
+                    if sink.send(Message::Close(None)).await.is_ok() {
+                        let _ = sink.close().await;
+                    }
+                })
+                .await;
                 break;
             }
             command = control.recv() => match command {
+                Some(Message::Close(frame)) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                        let _ = sink.send(Message::Close(frame)).await;
+                        let _ = sink.close().await;
+                    })
+                    .await;
+                    break;
+                }
                 Some(command) => if send_frame(&mut sink, command).await.is_err() { break },
-                None => break,
+                None => {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sink.flush()).await;
+                    break;
+                }
             },
+            _ = ping.tick() => {
+                if send_frame(&mut sink, Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             event = inbox.recv() => match event {
                 Some(event) => {
                     if send_frame(&mut sink, Message::Text(event.to_string().into())).await.is_err() {
@@ -1839,24 +2056,32 @@ async fn write_loop(
                     guild_id: &'a str,
                     state: rustlink_protocol::PlayerState,
                 }
-                let mut failed = false;
-                for player in session.players() {
-                    let (guild_id, state) = player.state_snapshot();
-                    let payload = PlayerUpdated {
-                        kind: "player.updated",
-                        session_id: &session.id,
-                        timestamp_ms: now_millis(),
-                        guild_id,
-                        state,
-                    };
-                    let Ok(text) = serde_json::to_string(&payload) else { continue };
-                    if send_frame(&mut sink, Message::Text(text.into())).await.is_err() {
-                        failed = true;
+                let players = session.players();
+                if !players.is_empty() {
+                    let batch = tokio::time::timeout(Duration::from_secs(10), async {
+                        let mut fed = false;
+                        for player in players {
+                            let (guild_id, state) = player.state_snapshot();
+                            let payload = PlayerUpdated {
+                                kind: "player.updated",
+                                session_id: &session.id,
+                                timestamp_ms: now_millis(),
+                                guild_id,
+                                state,
+                            };
+                            let Ok(text) = serde_json::to_string(&payload) else { continue };
+                            sink.feed(Message::Text(text.into())).await?;
+                            fed = true;
+                        }
+                        if fed {
+                            sink.flush().await?;
+                        }
+                        Ok::<(), axum::Error>(())
+                    })
+                    .await;
+                    if !matches!(batch, Ok(Ok(()))) {
                         break;
                     }
-                }
-                if failed {
-                    break;
                 }
             }
             _ = stats.tick() => {
@@ -1873,11 +2098,6 @@ async fn write_loop(
                 previous_sent = sent;
                 previous_deficit = deficit;
                 if send_frame(&mut sink, Message::Text(body.to_string().into())).await.is_err() {
-                    break;
-                }
-            }
-            _ = ping.tick() => {
-                if send_frame(&mut sink, Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }
@@ -1988,5 +2208,74 @@ mod tests {
         assert!(!session.has_connected());
         assert!(session.expired());
         assert!(session.take_inbox().is_some());
+    }
+
+    #[tokio::test]
+    async fn fake_session_ids_and_not_found_routes_do_not_create_per_session_rate_keys() {
+        struct StubMedia;
+        impl crate::playback::Loader for StubMedia {
+            fn load(
+                &self,
+                _: &str,
+            ) -> Result<rustlink_protocol::LoadResult, rustlink_source::SourceError> {
+                Ok(rustlink_protocol::LoadResult::Empty)
+            }
+            fn open(
+                &self,
+                _: &rustlink_protocol::Track,
+            ) -> Result<Box<dyn std::io::Read + Send>, rustlink_source::SourceError> {
+                Ok(Box::new(std::io::empty()))
+            }
+        }
+        impl crate::playback::Engine for StubMedia {
+            fn start(
+                &self,
+                _: &rustlink_protocol::Track,
+                _: i64,
+                _: i64,
+                _: &rustlink_protocol::Object,
+            ) -> Result<Box<dyn rustlink_audio::Frames>, rustlink_audio::AudioError> {
+                Err(rustlink_audio::AudioError::FfmpegMissing)
+            }
+        }
+        impl rustlink_voice::Factory for StubMedia {
+            fn connect(
+                &self,
+                _: String,
+                _: String,
+                _: rustlink_protocol::VoiceState,
+                _: rustlink_voice::CloseHandler,
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<Arc<dyn rustlink_voice::Connection>, rustlink_voice::VoiceError>,
+            > {
+                Box::pin(async { Err(rustlink_voice::VoiceError::NotReady) })
+            }
+        }
+        let mut config = Config::default();
+        config.password = "secret".into();
+        let server = Server::new(
+            config,
+            Dependencies {
+                loader: Arc::new(StubMedia),
+                engine: Arc::new(StubMedia),
+                voice: Arc::new(StubMedia),
+                lyrics: None,
+                webhook: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(server.rate_limit_key(Route::Root, "/api/v1/sessions/fake-1/unknown"), "node");
+        assert_eq!(
+            server.rate_limit_key(Route::GetPlayer, "/api/v1/sessions/fake-1/players/1"),
+            "unknown_session"
+        );
+        let active = Session::new("real-session".into(), "123".into(), Arc::downgrade(&server), 4);
+        server.sessions.lock().unwrap().insert("real-session".into(), active);
+        assert_eq!(
+            server.rate_limit_key(Route::GetPlayer, "/api/v1/sessions/real-session/players/1"),
+            "real-session"
+        );
+        server.close();
     }
 }

@@ -1,4 +1,5 @@
 //! Discord voice gateway v8. A single task orders speaking, DAVE transitions and media.
+use std::collections::VecDeque;
 use std::future::{pending, Future};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -11,9 +12,9 @@ use rustlink_dave::{Outbound, Session};
 use rustlink_protocol::VoiceState;
 use serde_json::{json, Value};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+use tokio_tungstenite::tungstenite::{self, protocol::WebSocketConfig, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
@@ -29,12 +30,14 @@ const COMMAND_CAPACITY: usize = 32;
 /// always find room there, however far behind the gateway task is.
 const CONTROL_RESERVE: usize = 4;
 const MAX_RETAINED_PACKET: usize = 4096;
+const MAX_PENDING_OUTBOUND: usize = 64;
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Probe = Pin<Box<dyn Future<Output = Result<Discovered, VoiceError>> + Send>>;
 
 struct SharedState {
     ready: AtomicBool,
     closed: AtomicBool,
+    closed_notify: Notify,
     ping: AtomicI64,
     audio_buffers: Mutex<Vec<Vec<u8>>>,
     /// Audio frames dropped because the gateway task was behind.
@@ -49,10 +52,11 @@ impl SharedState {
             .ok()
             .and_then(|mut buffers| buffers.pop())
             .unwrap_or_default();
-        let needed = payload.len() + 16;
+        let needed = (transport::HEADER_LEN + payload.len() + 16 + 20).max(1500);
         if packet.capacity() < needed {
-            packet.reserve(needed.max(512) - packet.len());
+            packet.reserve(needed - packet.len());
         }
+        packet.extend_from_slice(&[0u8; transport::HEADER_LEN]);
         packet.extend_from_slice(payload);
         packet
     }
@@ -92,14 +96,19 @@ impl DiscordConnection {
             .map_err(|_| VoiceError::Gateway("voice command queue unavailable".into()))
     }
 
-    fn drop_frame(&self, packet: Vec<u8>) {
-        self.recycle(packet);
+    fn record_dropped_frame(&self) {
         let dropped = self.shared.dropped_frames.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 || dropped.is_multiple_of(500) {
             log::warn!("voice gateway is behind; audio frames dropped={dropped}");
         }
     }
 
+    fn drop_frame(&self, packet: Vec<u8>) {
+        self.recycle(packet);
+        self.record_dropped_frame();
+    }
+
+    #[cfg(test)]
     fn packet(&self, payload: &[u8]) -> Vec<u8> {
         self.shared.packet(payload)
     }
@@ -123,7 +132,11 @@ impl Connection for DiscordConnection {
         if self.commands.is_closed() {
             return Err(VoiceError::Gateway("voice command queue unavailable".into()));
         }
-        let packet = self.packet(payload);
+        if self.commands.capacity() <= CONTROL_RESERVE {
+            self.record_dropped_frame();
+            return Ok(());
+        }
+        let packet = self.shared.packet(payload);
         match self.commands.try_reserve() {
             Ok(permit) if self.commands.capacity() >= CONTROL_RESERVE => {
                 permit.send(Command::Audio(packet));
@@ -155,7 +168,8 @@ impl Connection for DiscordConnection {
     fn close(&self) {
         if !self.shared.closed.swap(true, Ordering::AcqRel) {
             self.shared.ready.store(false, Ordering::Release);
-            // If the bounded queue is full, the task notices closed before its next send.
+            self.shared.closed_notify.notify_waiters();
+            // If the bounded queue is full, the task notices closed_notify / closed immediately.
             let _ = self.commands.try_send(Command::Close);
         }
     }
@@ -178,7 +192,6 @@ struct Gateway {
     probe: Option<Probe>,
     socket: Option<Arc<UdpSocket>>,
     transport: Option<Transport>,
-    udp_discard: Box<[u8; 1500]>,
     ssrc: Option<u32>,
     mode: Option<Mode>,
     interval: Duration,
@@ -188,7 +201,9 @@ struct Gateway {
     outstanding: Option<(i64, Instant)>,
     sequence: i64,
     identify: Option<Value>,
+    pending_outbound: VecDeque<Outbound>,
     resuming: bool,
+    transient_fault: bool,
     speaking: bool,
     /// When to check whether the DAVE session is the call's only member.
     alone_at: Option<Instant>,
@@ -204,7 +219,7 @@ pub async fn connect(
     if !crate::valid_id(user) || !crate::valid_id(guild) {
         return Err(VoiceError::Invalid("invalid voice user or guild ID".into()));
     }
-    let url = format!("wss://{}/?v={}", state.endpoint.trim(), crate::GATEWAY_VERSION);
+    let url = format!("wss://{}/?v={}", state.endpoint, crate::GATEWAY_VERSION);
     connect_url(&url, user, guild, state, on_close).await
 }
 
@@ -239,6 +254,7 @@ async fn connect_url(
         let shared = Arc::new(SharedState {
             ready: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            closed_notify: Notify::new(),
             ping: AtomicI64::new(-1),
             audio_buffers: Mutex::new(Vec::with_capacity(COMMAND_CAPACITY)),
             dropped_frames: AtomicU64::new(0),
@@ -258,7 +274,6 @@ async fn connect_url(
             probe: None,
             socket: None,
             transport: None,
-            udp_discard: Box::new([0u8; 1500]),
             ssrc: None,
             mode: None,
             interval: Duration::from_secs(5),
@@ -267,7 +282,9 @@ async fn connect_url(
             last_nonce: 0,
             outstanding: None,
             sequence: -1,
+            pending_outbound: VecDeque::new(),
             resuming: false,
+            transient_fault: false,
             speaking: false,
             alone_at: None,
             identify: Some(
@@ -291,22 +308,52 @@ async fn connect_url(
 
 impl Gateway {
     fn audio(&mut self, mut frame: Vec<u8>) -> Result<(), VoiceError> {
-        let result =
-            self.dave.encrypt_opus_in_place(&mut frame).map_err(dave_error).and_then(|()| {
-                self.transport.as_mut().ok_or(VoiceError::NotReady)?.write_mut(&frame)
+        let result = self
+            .dave
+            .encrypt_opus_in_place_from(&mut frame, transport::HEADER_LEN)
+            .map_err(dave_error)
+            .and_then(|()| {
+                self.transport
+                    .as_mut()
+                    .ok_or(VoiceError::NotReady)?
+                    .write_frame_in_place_mut(&mut frame)
             });
         self.shared.recycle(frame);
         result
     }
 
+    fn ws_error(&mut self, error: tungstenite::Error) -> VoiceError {
+        if is_transient_tungstenite_error(&error) {
+            self.transient_fault = true;
+        }
+        VoiceError::Gateway(error.to_string())
+    }
+
+    fn transient_gateway_error(&mut self, msg: &'static str) -> VoiceError {
+        self.transient_fault = true;
+        VoiceError::Gateway(msg.into())
+    }
+
+    fn is_resumable(&self, error: &VoiceError) -> bool {
+        match error {
+            VoiceError::Closed { code, by_remote: true, .. } => is_resumable_close_code(*code),
+            VoiceError::Io(_) => true,
+            VoiceError::Gateway(_) => self.transient_fault,
+            _ => false,
+        }
+    }
+
     async fn try_resume(&mut self) -> Result<(), VoiceError> {
+        let _ = tokio::time::timeout(Duration::from_millis(250), self.stream.close(None)).await;
         let config = WebSocketConfig::default()
             .max_message_size(Some(1024 * 1024))
             .max_frame_size(Some(1024 * 1024));
-        let (stream, _) =
-            tokio_tungstenite::connect_async_with_config(&self.url, Some(config), true)
-                .await
-                .map_err(gateway_error)?;
+        let connected =
+            tokio_tungstenite::connect_async_with_config(&self.url, Some(config), true).await;
+        let (stream, _) = connected.map_err(|err| {
+            self.transient_fault = true;
+            gateway_error(err)
+        })?;
         self.stream = stream;
         self.outstanding = None;
         self.has_heartbeat = false;
@@ -330,20 +377,52 @@ impl Gateway {
     async fn run(mut self, on_close: CloseHandler) {
         let mut resume_attempts = 0u8;
         let error = loop {
-            if let Err(error) = self.step().await {
-                if resume_attempts < 2
-                    && !self.shared.closed.load(Ordering::Acquire)
-                    && matches!(error, VoiceError::Closed { code: 4015, by_remote: true, .. })
-                {
-                    resume_attempts += 1;
-                    let resumed =
-                        tokio::time::timeout(Duration::from_secs(10), self.try_resume()).await;
-                    if matches!(resumed, Ok(Ok(()))) {
-                        log::debug!("voice gateway v8 session resumed");
-                        continue;
-                    }
+            let step_result = self.step().await;
+            match step_result {
+                Ok(()) => {
+                    resume_attempts = 0;
                 }
-                break error;
+                Err(mut error) => {
+                    if !self.shared.closed.load(Ordering::Acquire) && self.is_resumable(&error) {
+                        let mut resumed_ok = false;
+                        while resume_attempts < 2 && !self.shared.closed.load(Ordering::Acquire) {
+                            resume_attempts += 1;
+                            let resume_result =
+                                tokio::time::timeout(Duration::from_secs(10), self.try_resume())
+                                    .await;
+                            match resume_result {
+                                Ok(Ok(())) => {
+                                    log::debug!("voice gateway v8 session resumed");
+                                    resumed_ok = true;
+                                    break;
+                                }
+                                Ok(Err(resume_error)) => {
+                                    self.resuming = false;
+                                    self.identify = None;
+                                    if self.shared.closed.load(Ordering::Acquire) {
+                                        error = local_close();
+                                        break;
+                                    }
+                                    if !self.is_resumable(&resume_error) {
+                                        error = resume_error;
+                                        break;
+                                    }
+                                    if matches!(resume_error, VoiceError::Closed { .. }) {
+                                        error = resume_error;
+                                    }
+                                }
+                                Err(_) => {
+                                    self.resuming = false;
+                                    self.identify = None;
+                                }
+                            }
+                        }
+                        if resumed_ok {
+                            continue;
+                        }
+                    }
+                    break error;
+                }
             }
         };
         self.shared.ready.store(false, Ordering::Release);
@@ -369,40 +448,64 @@ impl Gateway {
     }
 
     async fn send_message(&mut self, message: Message) -> Result<(), VoiceError> {
-        tokio::time::timeout(Duration::from_secs(5), self.stream.send(message))
-            .await
-            .map_err(|_| VoiceError::Gateway("voice gateway write timed out".into()))?
-            .map_err(gateway_error)
+        let sent = tokio::time::timeout(Duration::from_secs(5), self.stream.send(message)).await;
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(self.ws_error(err)),
+            Err(_) => Err(self.transient_gateway_error("voice gateway write timed out")),
+        }
     }
 
-    async fn outbound(&mut self, messages: Vec<Outbound>) -> Result<(), VoiceError> {
-        for message in messages {
-            match message {
-                Outbound::Json(value) => {
+    fn enqueue_outbound(&mut self, messages: Vec<Outbound>) -> Result<(), VoiceError> {
+        if self.pending_outbound.len().saturating_add(messages.len()) > MAX_PENDING_OUTBOUND {
+            return Err(VoiceError::Gateway("excessive pending outbound gateway frames".into()));
+        }
+        self.pending_outbound.extend(messages);
+        Ok(())
+    }
+
+    async fn flush_outbound(&mut self) -> Result<(), VoiceError> {
+        loop {
+            let ws_message = match self.pending_outbound.front() {
+                Some(Outbound::Json(value)) => {
                     log::debug!("voice gateway sent op {}", value["op"]);
-                    self.send(&value).await?;
+                    Message::Text(serde_json::to_string(value).map_err(gateway_error)?.into())
                 }
-                Outbound::Binary(bytes) => {
+                Some(Outbound::Binary(bytes)) => {
                     log::debug!(
                         "voice gateway sent binary op {} ({} bytes)",
                         bytes.first().copied().unwrap_or_default(),
                         bytes.len()
                     );
-                    self.send_message(Message::Binary(bytes.into())).await?;
+                    Message::Binary(bytes.clone().into())
                 }
-            }
+                None => break,
+            };
+            self.send_message(ws_message).await?;
+            self.pending_outbound.pop_front();
         }
         Ok(())
     }
 
     async fn step(&mut self) -> Result<(), VoiceError> {
-        if self.shared.closed.load(Ordering::Acquire) {
+        self.transient_fault = false;
+        let shared = Arc::clone(&self.shared);
+        let closed = shared.closed_notify.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if shared.closed.load(Ordering::Acquire) {
             return Err(local_close());
         }
         tokio::select! {
             biased;
+            _ = &mut closed => return Err(local_close()),
             message = self.stream.next() => {
-                match message.ok_or_else(|| VoiceError::Gateway("voice gateway hung up".into()))?.map_err(gateway_error)? {
+                let raw = match message {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => return Err(self.ws_error(err)),
+                    None => return Err(self.transient_gateway_error("voice gateway hung up")),
+                };
+                match raw {
                     Message::Text(text) => {
                         let value: Value = serde_json::from_str(&text).map_err(gateway_error)?;
                         let next_seq = match value.get("seq").filter(|v| !v.is_null()) {
@@ -423,32 +526,52 @@ impl Gateway {
                         } else {
                             log::debug!("voice gateway received op {op} {}", value["d"]);
                         }
-                        self.json(op, &value["d"]).await?;
+                        let identify_to_send = self.json(op, &value["d"])?;
                         if let Some(seq) = next_seq {
                             self.sequence = seq;
                         }
+                        if let Some(identify) = identify_to_send {
+                            self.send(&identify).await?;
+                        }
+                        if !self.resuming && self.identify.is_none() {
+                            self.flush_outbound().await?;
+                        }
                     }
                     Message::Binary(bytes) => {
+                        if self.identify.is_some() {
+                            return Err(VoiceError::Gateway(
+                                "expected voice hello before binary opcodes".into(),
+                            ));
+                        }
                         let &[s0, s1, op, ref payload @ ..] = bytes.as_ref() else {
                             return Err(VoiceError::Gateway("truncated binary gateway message".into()));
                         };
                         let next_seq = i64::from(u16::from_be_bytes([s0, s1]));
                         log::debug!("voice gateway received binary op {op} ({} bytes)", bytes.len());
                         let outgoing = self.dave.handle_binary(op, payload).map_err(dave_error)?;
-                        self.outbound(outgoing).await?;
                         self.sequence = next_seq;
-                        if self.dave.ready() {
+                        if self.dave.active_version() == Some(1) {
                             self.alone_at = None;
                         } else if matches!(op, 25 | 29 | 30) {
                             self.alone_at = Some(Instant::now() + ALONE_GRACE);
                         }
+                        self.enqueue_outbound(outgoing)?;
+                        if !self.resuming && self.identify.is_none() {
+                            self.flush_outbound().await?;
+                        }
                     }
                     Message::Ping(_) => {
                         // tungstenite queues a Pong reply on Ping; flush it with a bounded timeout.
-                        tokio::time::timeout(Duration::from_secs(5), self.stream.flush())
-                            .await
-                            .map_err(|_| VoiceError::Gateway("voice gateway write timed out".into()))?
-                            .map_err(gateway_error)?;
+                        let flushed =
+                            tokio::time::timeout(Duration::from_secs(5), self.stream.flush()).await;
+                        match flushed {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => return Err(self.ws_error(err)),
+                            Err(_) => {
+                                return Err(self
+                                    .transient_gateway_error("voice gateway write timed out"))
+                            }
+                        }
                     }
                     Message::Close(frame) => {
                         let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1000, String::new()));
@@ -458,7 +581,9 @@ impl Gateway {
                 }
             }
             _ = self.heartbeat_sleep.as_mut(), if self.has_heartbeat => {
-                if self.outstanding.is_some() { return Err(VoiceError::Gateway("voice heartbeat was not acknowledged".into())); }
+                if self.outstanding.is_some() {
+                    return Err(self.transient_gateway_error("voice heartbeat was not acknowledged"));
+                }
                 let nonce = now_millis().max(self.last_nonce.saturating_add(1));
                 self.last_nonce = nonce;
                 let start = Instant::now();
@@ -466,7 +591,12 @@ impl Gateway {
                 self.outstanding = Some((nonce, start));
                 self.heartbeat_sleep.as_mut().reset(heartbeat_deadline(self.interval)?);
             }
-            _ = tokio::time::sleep_until(self.alone_at.unwrap_or_else(Instant::now)), if self.alone_at.is_some() => {
+            _ = async {
+                match self.alone_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => pending().await,
+                }
+            } => {
                 self.alone_at = None;
                 if self.dave.start_alone().map_err(dave_error)? {
                     log::debug!("voice DAVE: no other member joined; sending with the local group");
@@ -508,7 +638,7 @@ impl Gateway {
                     },
                 }).await?;
             }
-            command = self.commands.recv() => {
+            command = self.commands.recv(), if !self.resuming && self.identify.is_none() => {
                 match command {
                     Some(Command::Audio(opus)) => {
                         self.audio(opus)?;
@@ -524,25 +654,34 @@ impl Gateway {
                                 self.audio(self.shared.packet(&[0xf8, 0xff, 0xfe]))?;
                             }
                         }
-                        self.send_text(format!(
-                            r#"{{"op":5,"d":{{"speaking":{},"delay":0,"ssrc":{ssrc}}}}}"#,
-                            u8::from(on)
-                        ))
-                        .await?;
                         self.speaking = on;
+                        self.enqueue_outbound(vec![Outbound::Json(json!({
+                            "op": 5,
+                            "d": { "speaking": u8::from(on), "delay": 0, "ssrc": ssrc }
+                        }))])?;
+                        self.flush_outbound().await?;
                     }
                     Some(Command::Close) | None => return Err(local_close()),
                 }
             }
-            result = async { match &self.socket { Some(socket) => socket.recv(&mut *self.udp_discard).await, None => pending().await } } => {
+            result = async {
+                match &self.socket {
+                    Some(socket) => {
+                        let mut discard = [0u8; 1];
+                        socket.recv(&mut discard).await
+                    }
+                    None => pending().await,
+                }
+            } => {
                 // Connected UDP reports ICMP unreachable (WSAECONNRESET on Windows) on recv; one
                 // lost datagram must not end the voice session.
                 if let Err(error) = result {
                     if !transport::transient_udp_error(&error) { return Err(error.into()); }
                 }
                 if let Some(socket) = &self.socket {
+                    let mut discard = [0u8; 1];
                     for _ in 0..15 {
-                        match socket.try_recv(&mut *self.udp_discard) {
+                        match socket.try_recv(&mut discard) {
                             Ok(_) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(error) if transport::transient_udp_error(&error) => {}
@@ -555,7 +694,10 @@ impl Gateway {
         Ok(())
     }
 
-    async fn json(&mut self, opcode: u8, data: &Value) -> Result<(), VoiceError> {
+    fn json(&mut self, opcode: u8, data: &Value) -> Result<Option<Value>, VoiceError> {
+        if self.identify.is_some() && opcode != 8 {
+            return Err(VoiceError::Gateway("expected voice hello before other opcodes".into()));
+        }
         match opcode {
             8 => {
                 let identify = self
@@ -567,7 +709,7 @@ impl Gateway {
                 // ahead of the server-selected schedule.
                 self.heartbeat_sleep.as_mut().reset(heartbeat_deadline(self.interval)?);
                 self.has_heartbeat = true;
-                self.send(&identify).await?;
+                return Ok(Some(identify));
             }
             9 => {
                 if !self.resuming {
@@ -583,21 +725,20 @@ impl Gateway {
                 if ssrc == 0 {
                     return Err(VoiceError::Gateway("invalid voice SSRC".into()));
                 }
-                let ip: IpAddr = data
+                let raw_ip: IpAddr = data
                     .get("ip")
                     .and_then(Value::as_str)
                     .ok_or_else(|| VoiceError::Gateway("missing voice IP".into()))?
                     .parse()
                     .map_err(gateway_error)?;
                 let port: u16 = integer(data, "port")?;
-                if port == 0
-                    || ip.is_unspecified()
-                    || ip.is_multicast()
-                    || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
-                    || (self.url.starts_with("wss://") && ip.is_loopback())
-                {
+                let require_public = self.url.starts_with("wss://");
+                let Some(ip) = (port != 0)
+                    .then(|| transport::valid_voice_udp_ip(raw_ip, require_public))
+                    .flatten()
+                else {
                     return Err(VoiceError::Gateway("invalid voice UDP endpoint".into()));
-                }
+                };
                 let modes = data
                     .get("modes")
                     .and_then(Value::as_array)
@@ -629,10 +770,12 @@ impl Gateway {
                     })?
                     .describe(mode, *key)?;
                 let outgoing = self.dave.negotiate(version).map_err(dave_error)?;
-                self.outbound(outgoing).await?;
+                self.enqueue_outbound(outgoing)?;
                 // The external sender may already be here (op 25 before op 4).
-                if !self.dave.ready() {
+                if version == 1 && self.dave.active_version() != Some(1) {
                     self.alone_at = Some(Instant::now() + ALONE_GRACE);
+                } else {
+                    self.alone_at = None;
                 }
             }
             6 => {
@@ -649,29 +792,113 @@ impl Gateway {
             }
             11 | 13 | 21 | 22 | 24 => {
                 let outgoing = self.dave.handle_json(opcode, data).map_err(dave_error)?;
-                self.outbound(outgoing).await?;
-                if self.dave.ready() {
+                self.enqueue_outbound(outgoing)?;
+                if self.dave.active_version() == Some(1) {
                     self.alone_at = None;
-                } else if matches!(opcode, 13 | 24) {
+                } else if opcode == 13
+                    || (opcode == 24
+                        && data.get("protocol_version").and_then(Value::as_u64) == Some(1))
+                {
                     self.alone_at = Some(Instant::now() + ALONE_GRACE);
+                } else if opcode == 24 {
+                    self.alone_at = None;
                 }
             }
             _ => {}
         }
-        Ok(())
+        Ok(None)
     }
+}
+
+fn is_resumable_close_code(code: u16) -> bool {
+    code < 4000 || code == 4015
+}
+
+fn is_transient_tungstenite_error(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::AlreadyClosed
+            | tungstenite::Error::Io(_)
+            | tungstenite::Error::Tls(_)
+            | tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+                    | tungstenite::error::ProtocolError::SendAfterClosing
+                    | tungstenite::error::ProtocolError::ReceivedAfterClosing
+            )
+    )
+}
+
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &UdpSocket) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawSocket, RawSocket};
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(
+            s: RawSocket,
+            dwIoControlCode: u32,
+            lpvInBuffer: *const c_void,
+            cbInBuffer: u32,
+            lpvOutBuffer: *mut c_void,
+            cbOutBuffer: u32,
+            lpcbBytesReturned: *mut u32,
+            lpOverlapped: *mut c_void,
+            lpCompletionRoutine: *const c_void,
+        ) -> i32;
+    }
+
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let enable: i32 = 0;
+    let mut bytes_returned: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket(),
+            SIO_UDP_CONNRESET,
+            std::ptr::from_ref(&enable).cast::<c_void>(),
+            std::mem::size_of_val(&enable) as u32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::from_mut(&mut bytes_returned),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_udp_connreset(_socket: &UdpSocket) -> std::io::Result<()> {
+    Ok(())
 }
 
 async fn discover(remote: SocketAddr, ssrc: u32) -> Result<Discovered, VoiceError> {
     tokio::time::timeout(PROBE_TIMEOUT, async {
         let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        let raw_socket = UdpSocket::bind(bind).await?;
+        let _ = disable_udp_connreset(&raw_socket);
+        let socket = Arc::new(raw_socket);
         // Connected UDP accepts discovery answers and subsequent traffic only from this peer.
         socket.connect(remote).await?;
         let request = transport::ip_discovery_request(ssrc);
         let mut bytes = [0u8; 75];
         loop {
-            socket.send(&request).await?;
+            let sent = match socket.send(&request).await {
+                Err(error) if transport::retryable_udp_send_error(&error) => {
+                    socket.send(&request).await
+                }
+                other => other,
+            };
+            match sent {
+                Ok(_) => {}
+                Err(error) if transport::transient_udp_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
             let retry_at = Instant::now() + Duration::from_secs(1);
             loop {
                 match tokio::time::timeout_at(retry_at, socket.recv(&mut bytes)).await {

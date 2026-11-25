@@ -64,9 +64,30 @@ impl fmt::Debug for Client {
     }
 }
 
+fn wipe_string(secret: &mut String) {
+    // SAFETY: `write_volatile` cannot unwind, and overwriting initialized bytes
+    // with `0` (ASCII NUL) preserves UTF-8 validity before `clear()`.
+    unsafe {
+        for byte in secret.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    secret.clear();
+}
+
+struct SecretBuf(String);
+
+impl Drop for SecretBuf {
+    fn drop(&mut self) {
+        wipe_string(&mut self.0);
+    }
+}
+
 impl Client {
     /// `base` is the server origin, such as `http://127.0.0.1:2333`.
     pub fn new(base: &str, password: impl Into<String>) -> Result<Self, Error> {
+        let password = SecretBuf(password.into());
         let mut base = Url::parse(base).map_err(|error| Error::Invalid(error.to_string()))?;
         if !matches!(base.scheme(), "http" | "https")
             || base.host_str().is_none()
@@ -83,13 +104,17 @@ impl Client {
             base.set_path(&format!("{}/", base.path()));
         }
         let api_base = base.join("api/v1/").map_err(|error| Error::Invalid(error.to_string()))?;
-        let password = password.into();
-        let mut auth = (!password.is_empty())
-            .then(|| HeaderValue::from_str(&format!("Bearer {password}")).ok())
-            .flatten()
-            .ok_or_else(|| {
-                Error::Invalid("password is empty or contains invalid header characters".into())
-            })?;
+        if password.0.is_empty() {
+            return Err(Error::Invalid(
+                "password is empty or contains invalid header characters".into(),
+            ));
+        }
+        let bearer = SecretBuf(format!("Bearer {}", password.0));
+        drop(password);
+        let mut auth = HeaderValue::from_str(&bearer.0).map_err(|_| {
+            Error::Invalid("password is empty or contains invalid header characters".into())
+        })?;
+        drop(bearer);
         auth.set_sensitive(true);
         let http = reqwest::Client::builder()
             .tcp_nodelay(true)
@@ -174,6 +199,9 @@ impl Client {
         self.request::<_, ()>(Method::GET, "stats", None).await
     }
     pub async fn resolve(&self, query: &str) -> Result<LoadResult, Error> {
+        if query.trim().is_empty() || query.len() > 8192 {
+            return Err(Error::Invalid("query must contain 1..8192 bytes".into()));
+        }
         #[derive(Serialize)]
         struct Body<'a> {
             query: &'a str,
@@ -418,37 +446,39 @@ impl Session {
             )
             .await
     }
+    async fn patch_player(&self, guild: &str, update: &PlayerUpdate) -> Result<Player, Error> {
+        let path = self.player_path(guild)?;
+        self.client.request(Method::PATCH, &path, Some(update)).await
+    }
     pub async fn stop(&self, guild: &str) -> Result<Player, Error> {
         self.update_player(guild, &PlayerUpdate { track: Patch::Null, ..Default::default() }, true)
             .await
     }
     pub async fn pause(&self, guild: &str, paused: bool) -> Result<Player, Error> {
-        self.update_player(
-            guild,
-            &PlayerUpdate { paused: Some(paused), ..Default::default() },
-            true,
-        )
-        .await
+        self.patch_player(guild, &PlayerUpdate { paused: Some(paused), ..Default::default() }).await
     }
     pub async fn seek(&self, guild: &str, position_ms: i64) -> Result<Player, Error> {
-        self.update_player(
+        if position_ms < 0 {
+            return Err(Error::Invalid("position_ms must be nonnegative".into()));
+        }
+        self.patch_player(
             guild,
             &PlayerUpdate { position: Some(position_ms.into()), ..Default::default() },
-            true,
         )
         .await
     }
     pub async fn set_volume(&self, guild: &str, volume: i64) -> Result<Player, Error> {
-        self.update_player(
+        if !(0..=1000).contains(&volume) {
+            return Err(Error::Invalid("volume must be 0..1000".into()));
+        }
+        self.patch_player(
             guild,
             &PlayerUpdate { volume: Some(volume.into()), ..Default::default() },
-            true,
         )
         .await
     }
     pub async fn set_voice(&self, guild: &str, voice: VoiceState) -> Result<Player, Error> {
-        self.update_player(guild, &PlayerUpdate { voice: Some(voice), ..Default::default() }, true)
-            .await
+        self.patch_player(guild, &PlayerUpdate { voice: Some(voice), ..Default::default() }).await
     }
     pub async fn lyrics(&self, guild: &str) -> Result<Option<Value>, Error> {
         let path = format!("{}/lyrics", self.player_path(guild)?);
@@ -499,10 +529,31 @@ impl Events {
     pub async fn next(&mut self) -> Result<Option<Value>, Error> {
         loop {
             if self.needs_flush {
-                tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
-                    .await
-                    .map_err(|_| Error::Timeout)??;
-                self.needs_flush = false;
+                match tokio::time::timeout(Duration::from_secs(10), self.socket.flush()).await {
+                    Ok(Ok(())) => self.needs_flush = false,
+                    Ok(Err(
+                        tokio_tungstenite::tungstenite::Error::ConnectionClosed
+                        | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
+                    )) => {
+                        self.needs_flush = false;
+                        return Ok(None);
+                    }
+                    Ok(Err(tokio_tungstenite::tungstenite::Error::Io(ref io_err)))
+                        if matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::NotConnected
+                        ) =>
+                    {
+                        // Peer closed its half while our queued Pong was flushing; still drain
+                        // any buffered Text or Close frames before reporting EOF/error.
+                        self.needs_flush = false;
+                    }
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(_) => return Err(Error::Timeout),
+                }
             }
             let message = tokio::time::timeout(Duration::from_secs(60), self.socket.next())
                 .await
@@ -515,10 +566,18 @@ impl Events {
                     self.needs_flush = true;
                 }
                 Some(Ok(Message::Close(_))) => {
+                    self.needs_flush = false;
                     let _ = tokio::time::timeout(Duration::from_secs(2), self.socket.flush()).await;
                     return Ok(None);
                 }
-                None => return Ok(None),
+                None
+                | Some(Err(
+                    tokio_tungstenite::tungstenite::Error::ConnectionClosed
+                    | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
+                )) => {
+                    self.needs_flush = false;
+                    return Ok(None);
+                }
                 Some(Err(error)) => return Err(error.into()),
                 _ => {}
             }
@@ -611,5 +670,73 @@ mod tests {
             server.await.unwrap(),
             format!("/base/api/v1/sessions/{}/events", "a".repeat(48))
         );
+    }
+
+    #[tokio::test]
+    async fn client_validates_inputs_and_omits_replace_query_for_non_track_patches() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = Client::new(&format!("http://{address}"), "test-secret").unwrap();
+        assert!(matches!(client.resolve("   ").await, Err(Error::Invalid(_))));
+        assert!(matches!(client.resolve(&"x".repeat(8193)).await, Err(Error::Invalid(_))));
+
+        let session = Session { client: client.clone(), id: "b".repeat(48) };
+        assert!(matches!(session.seek("456", -1).await, Err(Error::Invalid(_))));
+        assert!(matches!(session.set_volume("456", -1).await, Err(Error::Invalid(_))));
+        assert!(matches!(session.set_volume("456", 1001).await, Err(Error::Invalid(_))));
+
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut http, _) = listener.accept().unwrap();
+            http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = http.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let head = String::from_utf8_lossy(&request);
+            let target = head.split_whitespace().nth(1).unwrap().to_owned();
+            let body = r#"{"guild_id":"456","track":null,"volume":80,"paused":false,"state":{"timestamp_ms":0,"position_ms":0,"connected":false,"ping_ms":-1},"voice":{"token":"","endpoint":"","session_id":"","channel_id":null},"filters":{}}"#;
+            write!(
+                http,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            target
+        });
+        let player = session.set_volume("456", 80).await.unwrap();
+        assert_eq!(player.volume, 80);
+        assert_eq!(
+            server.await.unwrap(),
+            format!("/api/v1/sessions/{}/players/456", "b".repeat(48))
+        );
+    }
+
+    #[tokio::test]
+    async fn events_next_clears_needs_flush_on_close_and_maps_closed_socket_to_none() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut ws = tokio_tungstenite::tungstenite::accept(socket).unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Close(None)).unwrap();
+            let _ = ws.flush();
+            while let Ok(msg) = ws.read() {
+                if msg.is_close() {
+                    break;
+                }
+            }
+        });
+        let (socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}")).await.unwrap();
+        let mut events = Events { socket, needs_flush: false };
+        assert_eq!(events.next().await.unwrap(), None);
+        assert!(!events.needs_flush);
+        assert_eq!(events.next().await.unwrap(), None);
+        server.await.unwrap();
     }
 }

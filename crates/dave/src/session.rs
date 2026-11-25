@@ -8,6 +8,7 @@ use openmls::prelude::{
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use serde_json::{json, Value};
+use zeroize::Zeroize;
 
 use crate::{check, media::MediaSender, Error, Result};
 
@@ -64,6 +65,7 @@ pub struct Session {
     recovery_attempts: u8,
     group_revision: u64,
     last_prepared: Option<(u64, u64)>,
+    alone_started: bool,
 }
 
 impl Session {
@@ -99,6 +101,7 @@ impl Session {
             recovery_attempts: 0,
             group_revision: 0,
             last_prepared: None,
+            alone_started: false,
         })
     }
 
@@ -137,7 +140,7 @@ impl Session {
     /// next epoch through the usual commit and transition.
     pub fn start_alone(&mut self) -> Result<bool> {
         let alone = self.version == Some(1)
-            && self.active.is_none()
+            && matches!(self.active, None | Some(ActiveSender::TransportOnly))
             && self.transitions.is_empty()
             && self.expected.iter().all(|&member| member == self.user)
             && self
@@ -149,6 +152,7 @@ impl Session {
         }
         let sender = self.sender()?;
         self.prepare(0, sender, false)?;
+        self.alone_started = true;
         Ok(true)
     }
 
@@ -170,9 +174,26 @@ impl Session {
     /// Encrypt an owned Opus packet without allocating once its capacity includes
     /// the 16-byte maximum DAVE footer. No mutation occurs before negotiation.
     pub fn encrypt_opus_in_place(&mut self, opus: &mut Vec<u8>) -> Result<()> {
+        self.encrypt_opus_in_place_from(opus, 0)
+    }
+
+    /// Encrypt `frame[payload_offset..]` in place without touching `frame[..payload_offset]`,
+    /// appending the DAVE footer when DAVE v1 is active. No mutation occurs before negotiation.
+    pub fn encrypt_opus_in_place_from(
+        &mut self,
+        frame: &mut Vec<u8>,
+        payload_offset: usize,
+    ) -> Result<()> {
         match self.active.as_mut() {
-            Some(ActiveSender::TransportOnly) => Ok(()),
-            Some(ActiveSender::Encrypted { media, .. }) => media.encrypt_in_place(opus),
+            Some(ActiveSender::TransportOnly) => {
+                if payload_offset > frame.len() {
+                    return Err(Error::Protocol("payload offset exceeds frame length"));
+                }
+                Ok(())
+            }
+            Some(ActiveSender::Encrypted { media, .. }) => {
+                media.encrypt_in_place_from(frame, payload_offset)
+            }
             None => Err(Error::NotReady),
         }
     }
@@ -217,15 +238,39 @@ impl Session {
                     self.version = Some(1);
                 }
                 if let Some(current) = self.current_context() {
-                    let already_in_flight = self.transitions.values().any(|t| {
-                        matches!(
-                            t.sender,
-                            TransitionSender::Encrypted { context, .. }
-                                | TransitionSender::RetainEncrypted(context)
-                                if context == current
-                        )
-                    });
+                    let already_in_flight =
+                        self.transitions.values().max_by_key(|t| t.order).is_some_and(|t| {
+                            matches!(
+                                t.sender,
+                                TransitionSender::Encrypted { context, .. }
+                                    | TransitionSender::RetainEncrypted(context)
+                                    if context == current
+                            )
+                        });
                     if !already_in_flight {
+                        let has_current_sender = matches!(
+                            self.active,
+                            Some(ActiveSender::Encrypted { context, .. }) if context == current
+                        ) || self
+                            .parked
+                            .as_ref()
+                            .is_some_and(|(ctx, _)| *ctx == current)
+                            || self.transitions.values().any(|t| {
+                                matches!(
+                                    t.sender,
+                                    TransitionSender::Encrypted { context, .. } if context == current
+                                )
+                            });
+                        if self.alone_started {
+                            self.alone_started = false;
+                            if has_current_sender {
+                                return self.prepare(
+                                    id,
+                                    TransitionSender::RetainEncrypted(current),
+                                    true,
+                                );
+                            }
+                        }
                         if matches!(self.active, Some(ActiveSender::TransportOnly))
                             && self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == current)
                         {
@@ -240,12 +285,7 @@ impl Session {
                             .transitions
                             .values()
                             .any(|t| matches!(t.sender, TransitionSender::TransportOnly));
-                        if has_pending_downgrade
-                            && matches!(
-                                self.active,
-                                Some(ActiveSender::Encrypted { context, .. }) if context == current
-                            )
-                        {
+                        if has_pending_downgrade && has_current_sender {
                             return self.prepare(
                                 id,
                                 TransitionSender::RetainEncrypted(current),
@@ -286,9 +326,9 @@ impl Session {
                     self.group = None;
                     self.own_commit = None;
                     self.parked = None;
-                    for (id, _) in self.transitions.drain() {
-                        push_cancelled(&mut self.cancelled, id);
-                    }
+                    self.alone_started = false;
+                    self.cancel_mls_transitions();
+                    zeroize_provider(&self.provider);
                     self.provider = OpenMlsRustCrypto::default();
                     return Ok(vec![]);
                 }
@@ -322,14 +362,22 @@ impl Session {
                     ExternalSender::tls_deserialize_exact_bytes(data),
                     "invalid external sender",
                 )?;
-                if self.external.as_ref().is_some_and(|old| old != &external) {
+                let changed = self.external.as_ref().is_some_and(|old| old != &external);
+                let can_rotate = self.group.as_ref().is_none_or(|g| g.epoch().as_u64() == 0);
+                if changed && !can_rotate {
                     return Err(Error::Protocol("external sender changed during a voice session"));
                 }
                 self.external = Some(external);
-                if self.version == Some(1) && self.group.is_none() {
-                    self.create_group()?;
-                    // The key package negotiate() held back until the external sender arrived.
-                    return Ok(vec![self.key_package()?]);
+                if self.version == Some(1) {
+                    if self.group.is_none() {
+                        self.create_group()?;
+                        // The key package negotiate() held back until the external sender arrived.
+                        return Ok(vec![self.key_package()?]);
+                    }
+                    if changed {
+                        self.reset_group()?;
+                        return Ok(vec![self.key_package()?]);
+                    }
                 }
                 Ok(vec![])
             }
@@ -374,10 +422,14 @@ impl Session {
 
     fn execute_transition(&mut self, order: u64, sender: TransitionSender) -> Result<()> {
         let current = self.current_context();
+        let can_salvage = matches!(
+            sender,
+            TransitionSender::TransportOnly | TransitionSender::RetainEncrypted(_)
+        );
         let mut salvaged = None;
         self.transitions.retain(|_, pending| {
             if pending.order < order {
-                if matches!(sender, TransitionSender::TransportOnly) && salvaged.is_none() {
+                if can_salvage && salvaged.is_none() {
                     let dummy = Transition { order: 0, sender: TransitionSender::TransportOnly };
                     if let TransitionSender::Encrypted { context, media } =
                         std::mem::replace(pending, dummy).sender
@@ -392,10 +444,10 @@ impl Session {
                 true
             }
         });
-        self.activate(sender)?;
         if let Some(salvaged) = salvaged {
             self.parked = Some(salvaged);
         }
+        self.activate(sender)?;
         self.last_executed = order;
         self.recovery_attempts = 0;
         Ok(())
@@ -480,6 +532,17 @@ impl Session {
         Ok(vec![Outbound::Json(json!({"op":23,"d":{"transition_id":id}}))])
     }
 
+    fn cancel_mls_transitions(&mut self) {
+        self.transitions.retain(|&id, transition| {
+            if matches!(transition.sender, TransitionSender::TransportOnly) {
+                true
+            } else {
+                push_cancelled(&mut self.cancelled, id);
+                false
+            }
+        });
+    }
+
     fn reset_group(&mut self) -> Result<()> {
         self.group_revision = self
             .group_revision
@@ -488,10 +551,10 @@ impl Session {
         self.group = None;
         self.own_commit = None;
         self.parked = None;
-        for (id, _) in self.transitions.drain() {
-            push_cancelled(&mut self.cancelled, id);
-        }
-        // Discard consumed key packages and obsolete MLS storage, retaining the signing identity.
+        self.alone_started = false;
+        self.cancel_mls_transitions();
+        // Zeroize and discard consumed key packages and obsolete MLS storage, retaining signing identity.
+        zeroize_provider(&self.provider);
         self.provider = OpenMlsRustCrypto::default();
         if self.external.is_some() {
             self.create_group()?;
@@ -546,6 +609,9 @@ impl Session {
     }
 
     fn proposals(&mut self, data: &[u8]) -> Result<Vec<Outbound>> {
+        if self.version.is_none() {
+            return Err(Error::Protocol("MLS message before DAVE negotiation"));
+        }
         let Some(group) = self.group.as_mut() else {
             return Ok(vec![]);
         };
@@ -557,9 +623,10 @@ impl Session {
         self.own_commit = None;
         match operation {
             0 => {
-                let mut pending_count = group.pending_proposals().count();
+                let pending_count = group.pending_proposals().count();
+                let mut staged = Vec::new();
                 while !remaining.is_empty() {
-                    if pending_count >= MAX_PENDING_PROPOSALS {
+                    if pending_count + staged.len() >= MAX_PENDING_PROPOSALS {
                         return Err(Error::Protocol("excessive pending proposals"));
                     }
                     let (message, rest) = check(
@@ -597,22 +664,56 @@ impl Session {
                         return Err(Error::Protocol("expected a proposal"));
                     };
                     validate_proposal(&proposal, &self.expected)?;
+                    staged.push(*proposal);
+                }
+                let removed: HashSet<_> = group
+                    .pending_proposals()
+                    .chain(staged.iter())
+                    .filter_map(|p| match p.proposal() {
+                        Proposal::Remove(r) => Some(r.removed()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut users = HashSet::new();
+                for member in group.members().filter(|m| !removed.contains(&m.index)) {
+                    if !users.insert(identity(&member.credential)?) {
+                        return Err(Error::Protocol("duplicate group identity"));
+                    }
+                }
+                for p in group.pending_proposals().chain(staged.iter()) {
+                    if let Proposal::Add(add) = p.proposal() {
+                        if !users.insert(identity(add.key_package().leaf_node().credential())?) {
+                            return Err(Error::Protocol("duplicate proposed identity"));
+                        }
+                    }
+                }
+                for proposal in staged {
                     check(
-                        group.store_pending_proposal(self.provider.storage(), *proposal),
+                        group.store_pending_proposal(self.provider.storage(), proposal),
                         "proposal storage failed",
                     )?;
-                    pending_count += 1;
                 }
             }
             1 => {
-                while !remaining.is_empty() {
-                    let (reference, rest) = check(
-                        ProposalRef::tls_deserialize_bytes(remaining),
-                        "invalid proposal reference",
-                    )?;
-                    remaining = rest;
+                let mut references = Vec::new();
+                {
+                    let mut known: HashSet<&ProposalRef> =
+                        group.pending_proposals().map(|p| p.proposal_reference_ref()).collect();
+                    while !remaining.is_empty() {
+                        let (reference, rest) = check(
+                            ProposalRef::tls_deserialize_bytes(remaining),
+                            "invalid proposal reference",
+                        )?;
+                        remaining = rest;
+                        if !known.remove(&reference) {
+                            return Err(Error::Protocol("unknown revoked proposal"));
+                        }
+                        references.push(reference);
+                    }
+                }
+                for reference in &references {
                     check(
-                        group.remove_pending_proposal(self.provider.storage(), &reference),
+                        group.remove_pending_proposal(self.provider.storage(), reference),
                         "unknown revoked proposal",
                     )?;
                 }
@@ -733,6 +834,7 @@ impl Session {
                 }
             }
         }
+        self.alone_started = false;
         Ok(())
     }
 
@@ -756,7 +858,8 @@ impl Session {
             "welcome verification failed",
         )?;
         let context = staged.group_context();
-        if context.group_id().as_slice() != self.channel.to_be_bytes()
+        if context.epoch().as_u64() < 1
+            || context.group_id().as_slice() != self.channel.to_be_bytes()
             || context.ciphersuite() != SUITE
             || context.extensions().iter().count() != 1
             || context.extensions().external_senders().map(Vec::as_slice)
@@ -768,6 +871,7 @@ impl Session {
         validate_roster(&group, Some(&self.expected))?;
         self.group = Some(group);
         self.own_commit = None;
+        self.alone_started = false;
         Ok(())
     }
 
@@ -786,6 +890,21 @@ impl Session {
             context: (self.group_revision, group.epoch().as_u64()),
             media: MediaSender::new(secret),
         })
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        zeroize_provider(&self.provider);
+    }
+}
+
+fn zeroize_provider(provider: &OpenMlsRustCrypto) {
+    let mut values =
+        provider.storage().values.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (mut key, mut value) in values.drain() {
+        key.zeroize();
+        value.zeroize();
     }
 }
 

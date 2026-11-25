@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine::{Body, Frames};
 use crate::error::AudioError;
@@ -339,7 +339,11 @@ impl FfmpegFrames {
 
     /// Waits for the child and turns a failure into the message FFmpeg printed.
     fn finish(&mut self) -> Result<(), AudioError> {
-        self.finish_with_wait(Child::wait)
+        self.finish_bounded(STALL)
+    }
+
+    fn finish_bounded(&mut self, timeout: Duration) -> Result<(), AudioError> {
+        self.finish_with_wait(|child| wait_child_bounded(child, timeout))
     }
 
     fn finish_with_wait(
@@ -348,6 +352,10 @@ impl FfmpegFrames {
     ) -> Result<(), AudioError> {
         let status = match wait(&mut self.child) {
             Ok(status) => status,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                self.terminate();
+                return Err(AudioError::Stuck);
+            }
             Err(error) => {
                 self.stderr.finish();
                 return Err(AudioError::Ffmpeg(error.to_string()));
@@ -377,6 +385,31 @@ impl FfmpegFrames {
             self.finished = true;
         }
         self.stderr.finish();
+    }
+}
+
+fn wait_child_bounded(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let started = Instant::now();
+    let mut poll = Duration::from_millis(1);
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None => {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ffmpeg did not exit within timeout",
+                    ));
+                }
+                let remaining = timeout - elapsed;
+                thread::sleep(poll.min(remaining));
+                poll = (poll * 2).min(Duration::from_millis(20));
+            }
+        }
     }
 }
 
@@ -433,7 +466,7 @@ impl Drop for FfmpegFrames {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn a_long_seek_is_given_time_to_skip_and_a_short_one_is_not() {
@@ -777,5 +810,31 @@ mod tests {
         let _ = std::fs::remove_file(survived);
         assert!(completed_before_release, "startup guard waited instead of killing the child");
         assert!(!child_survived, "child survived failed FFmpeg setup");
+    }
+
+    #[test]
+    fn finish_kills_hung_child_and_reports_stuck_when_bounded_wait_expires() {
+        let started = marker_path("ffmpeg-finish-started");
+        let release = marker_path("ffmpeg-finish-release");
+        let survived = marker_path("ffmpeg-finish-survived");
+        let child = gated_marker(&started, &release, &survived);
+        wait_for(&started);
+
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = frames_for_child(child, empty_stderr_collector(errors));
+        let begin = Instant::now();
+        let err = frames
+            .finish_bounded(Duration::from_millis(40))
+            .expect_err("a hung child must time out instead of blocking forever");
+        assert!(begin.elapsed() < Duration::from_secs(2));
+        assert!(matches!(err, AudioError::Stuck));
+        assert!(frames.finished);
+
+        std::fs::write(&release, b"release").unwrap();
+        let child_survived = appears_within(&survived, Duration::from_millis(100));
+        let _ = std::fs::remove_file(started);
+        let _ = std::fs::remove_file(release);
+        let _ = std::fs::remove_file(survived);
+        assert!(!child_survived, "hung child survived finish timeout");
     }
 }

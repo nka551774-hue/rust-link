@@ -4,9 +4,11 @@
 //! DISCORD_CHANNEL_ID, RUSTLINK_URL, RUSTLINK_PASSWORD.  The optional first
 //! argument is a Rustlink source query (the resolver itself is native Rust).
 
+use std::time::Duration;
+
 use rustlink_client::{Client, LoadResult};
 use rustlink_discord_bot::{
-    normalize_query, DiscordRest, Gateway, VoiceStatePairer, GUILDS, GUILD_VOICE_STATES,
+    normalize_query, BotEvent, DiscordRest, Gateway, VoiceStatePairer, GUILDS, GUILD_VOICE_STATES,
 };
 
 #[tokio::main]
@@ -37,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_query = std::env::args().nth(1).unwrap_or_else(|| "ytsearch:lofi".into());
     let query = normalize_query(&raw_query);
     let mut started = false;
+    let join_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     loop {
@@ -48,6 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ended = &mut event_task => {
                 ended??;
                 break;
+            }
+            _ = tokio::time::sleep_until(join_deadline), if !started => {
+                let _ = gateway.set_voice_state(&guild, None).await;
+                let _ = session.destroy().await;
+                event_task.abort();
+                return Err(format!(
+                    "timed out after 15s waiting to join voice channel {channel} in guild {guild}"
+                )
+                .into());
             }
             event = gateway.next_event() => {
                 let event = match event {
@@ -76,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         started = true;
                     }
+                }
+                if matches!(&event, BotEvent::Ready(new_ready) if new_ready.user_id == ready.user_id) {
+                    gateway.set_voice_state(&guild, Some(&channel)).await?;
                 }
             }
         }

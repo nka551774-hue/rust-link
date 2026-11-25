@@ -41,7 +41,9 @@ fn sized(body: Vec<u8>) -> (String, JoinHandle<()>) {
 }
 
 fn service() -> Service {
-    Service::new(Config { allow_private_networks: true, ..Config::default() })
+    let mut cfg = Config::default();
+    cfg.allow_private_networks = true;
+    Service::new(cfg)
 }
 
 fn track_of(result: LoadResult) -> rustlink_protocol::Track {

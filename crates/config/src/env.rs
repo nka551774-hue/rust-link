@@ -151,7 +151,8 @@ mod tests {
 
     #[test]
     fn environment_overrides_the_file() {
-        let mut config = Config { address: "127.0.0.1:2333".into(), ..Default::default() };
+        let mut config = Config::default();
+        config.address = "127.0.0.1:2333".into();
         let pairs = [("RUSTLINK_ADDRESS", "0.0.0.0:2333"), ("RUSTLINK_PASSWORD", "hunter2")];
         apply_env_with(&mut config, |name| lookup(&pairs, name));
         assert_eq!(config.address, "0.0.0.0:2333");

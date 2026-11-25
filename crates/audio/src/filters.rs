@@ -212,7 +212,14 @@ impl FilterSet {
     /// graph undoes its effect on length, so only speed and rate count.
     #[inline]
     pub fn tempo_factor(&self) -> f64 {
-        self.time.map_or(1.0, |time| time.speed * time.rate)
+        self.time.map_or(1.0, |time| {
+            let factor = time.speed * time.rate;
+            if factor.is_finite() && factor > 0.0 {
+                factor
+            } else {
+                1.0
+            }
+        })
     }
 
     /// Renders the FFmpeg filter graph in a single allocation.
@@ -227,7 +234,12 @@ impl FilterSet {
     }
 }
 
-fn write_tempo_chain(mut value: f64, mut emit: impl FnMut(fmt::Arguments<'_>)) {
+fn write_tempo_chain(value: f64, mut emit: impl FnMut(fmt::Arguments<'_>)) {
+    if !value.is_finite() || value <= 0.0 {
+        emit(format_args!("atempo=1.00000000"));
+        return;
+    }
+    let mut value = value.clamp(1e-4, 1e4);
     while value < 0.5 {
         emit(format_args!("atempo=0.5"));
         value /= 0.5;
@@ -490,7 +502,13 @@ impl fmt::Display for FilterSet {
             )?;
         }
         if let Some(t) = self.effective_time() {
-            write!(f, ",asetrate={:.8},aresample=48000", 48_000.0 * t.pitch * t.rate)?;
+            let raw_rate = 48_000.0 * t.pitch * t.rate;
+            let setrate = if raw_rate.is_finite() && raw_rate > 0.0 {
+                raw_rate.clamp(4.8, 480_000_000.0)
+            } else {
+                48_000.0
+            };
+            write!(f, ",asetrate={setrate:.8},aresample=48000")?;
             let mut status = Ok(());
             write_tempo_chain(t.speed / t.pitch, |args| {
                 if status.is_ok() {
@@ -674,6 +692,24 @@ mod tests {
     fn a_slow_tempo_becomes_several_stages() {
         let stages = tempo_chain(0.1);
         assert_eq!(stages, vec!["atempo=0.5", "atempo=0.5", "atempo=0.5", "atempo=0.80000000"]);
+    }
+
+    #[test]
+    fn non_finite_or_extreme_timescale_renders_bounded_ffmpeg_graph() {
+        for bad in [0.0, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(tempo_chain(bad), vec!["atempo=1.00000000"]);
+        }
+        assert!(tempo_chain(1e-30).len() <= 16);
+        assert!(tempo_chain(1e30).len() <= 16);
+
+        let degenerate = FilterSet {
+            time: Some(Timescale { speed: 0.0, pitch: -1.0, rate: f64::NAN }),
+            ..Default::default()
+        };
+        let graph = degenerate.render_ffmpeg();
+        assert!(graph.contains("asetrate=48000.00000000"));
+        assert!(graph.contains("atempo=1.00000000"));
+        assert_eq!(degenerate.tempo_factor(), 1.0);
     }
 
     #[test]

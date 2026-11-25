@@ -27,10 +27,18 @@ fn has_ascii_suffix(text: &str, suffix: &str) -> bool {
         .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix.as_bytes()))
 }
 
+fn has_ascii_whitespace_or_control(raw: &str) -> bool {
+    raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+}
+
 /// Checks a voice state before the node acts on it.
 pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
     let channel = state.channel_id.as_deref().unwrap_or_default();
-    if state.token.is_empty() || state.session_id.is_empty() || !valid_id(channel) {
+    if state.token.is_empty()
+        || state.session_id.is_empty()
+        || state.endpoint.is_empty()
+        || !valid_id(channel)
+    {
         return Err(VoiceError::Invalid(
             "voice requires token, session_id, endpoint and channel_id".into(),
         ));
@@ -38,11 +46,19 @@ pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
     if state.token.len() > 512 || state.session_id.len() > 256 || state.endpoint.len() > 512 {
         return Err(VoiceError::Invalid("voice credentials or endpoint are too long".into()));
     }
+    if has_ascii_whitespace_or_control(&state.token)
+        || has_ascii_whitespace_or_control(&state.session_id)
+        || has_ascii_whitespace_or_control(&state.endpoint)
+    {
+        return Err(VoiceError::Invalid(
+            "voice credentials or endpoint contain whitespace or control characters".into(),
+        ));
+    }
     // Discord sends the voice host with an optional port, for example
     // "c-iad21-1a2b3c.discord.media:443". A port is valid; userinfo, a path, a
     // query and a fragment are not. The hostname rule below is what keeps
     // non-Discord hosts out.
-    let endpoint = state.endpoint.trim();
+    let endpoint = &state.endpoint;
     let Some(host) = voice_host(endpoint) else {
         return Err(VoiceError::Invalid(format!("invalid Discord voice endpoint {endpoint:?}")));
     };
@@ -57,18 +73,20 @@ pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
 /// Returns the hostname of a voice endpoint, or `None` when the value is not a
 /// bare `host[:port]`.
 fn voice_host(endpoint: &str) -> Option<&str> {
-    if endpoint.is_empty() || endpoint.len() > 253 + 6 {
+    if endpoint.is_empty() || endpoint.len() > 253 + 6 || has_ascii_whitespace_or_control(endpoint)
+    {
         return None;
     }
-    if endpoint.contains(['/', '?', '#', '@', ' ', '\t']) {
+    if endpoint.contains(['/', '?', '#', '@']) {
         return None;
     }
     let host = match endpoint.rsplit_once(':') {
         // A bare IPv6 literal is not a Discord hostname, and a host with a port
-        // has to keep the port numeric and non-zero.
+        // has to keep the port canonical, numeric, and non-zero.
         Some((host, port)) => {
             if host.is_empty()
                 || port.is_empty()
+                || port.starts_with('0')
                 || !port.bytes().all(|byte| byte.is_ascii_digit())
                 || !port.parse::<u16>().is_ok_and(|value| value != 0)
             {
@@ -191,5 +209,28 @@ mod tests {
         assert_eq!(voice_host("a.discord.media"), Some("a.discord.media"));
         assert_eq!(voice_host("a.discord.media:443"), Some("a.discord.media"));
         assert_eq!(voice_host("a.discord.media:not-a-port"), None);
+        assert_eq!(voice_host("a.discord.media:0443"), None);
+        assert_eq!(voice_host("a.discord.media:00"), None);
+    }
+
+    #[test]
+    fn empty_endpoint_whitespace_controls_and_leading_zero_ports_are_refused() {
+        let err = validate(&state("", Some("123"))).unwrap_err();
+        assert!(err.to_string().contains("requires token, session_id, endpoint and channel_id"));
+
+        assert!(validate(&state("a.discord.media:0443", Some("123"))).is_err());
+        assert!(validate(&state(" a.discord.media:443", Some("123"))).is_err());
+        assert!(validate(&state("a.discord.media:443 ", Some("123"))).is_err());
+        assert!(validate(&state("a.discord.media\x7f", Some("123"))).is_err());
+
+        for bad in ["tok en", " token", "token\n", "token\0", "token\x1f", "token\x7f"] {
+            let mut s = state("a.discord.media:443", Some("123"));
+            s.token = bad.into();
+            assert!(validate(&s).is_err(), "bad token accepted: {bad:?}");
+
+            let mut s = state("a.discord.media:443", Some("123"));
+            s.session_id = bad.into();
+            assert!(validate(&s).is_err(), "bad session_id accepted: {bad:?}");
+        }
     }
 }

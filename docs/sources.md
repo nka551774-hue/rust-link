@@ -9,8 +9,9 @@
 | 識別字串 | 來源 |
 | --- | --- |
 | `ytsearch:<關鍵字>`、`ytmsearch:<關鍵字>` | YouTube；後者為 YouTube Music |
+| `youtube:playlist:<ID>` | YouTube 播放清單（含 `RD…` 合輯） |
 | 11 個 `A-Za-z0-9_-` 字元 | YouTube 影片 ID |
-| `scsearch:<關鍵字>` | SoundCloud 搜尋 |
+| `scsearch:<關鍵字>`、`soundcloud:<路徑>` | SoundCloud 搜尋或曲目／清單路徑 |
 | `spsearch:<關鍵字>`、`spotify:<…>` | Spotify |
 | `dzsearch:<關鍵字>`、`dzisrc:<ISRC>`、`deezer:<…>` | Deezer |
 | `https://youtube.com/…`、`https://youtu.be/…` | YouTube |
@@ -26,7 +27,7 @@
 
 ### YouTube
 
-- **解析**：用 InnerTube 用戶端取得中繼資料與直接的音訊網址。播放時依序嘗試 `IOS_PRODUCER`、`ANDROID_VR`、`ANDROID`、`IOS`；搜尋與播放清單固定用 `ANDROID`。中繼資料被某個用戶端拒絕時會換下一個；播放時 CDN 回應可重試的拒絕，會在同一個期限內換下一個用戶端。
+- **解析**：用 InnerTube 用戶端取得中繼資料與直接的音訊網址。播放時依序嘗試 `IOS_PRODUCER`、`VISIONOS`（自動透過 `/youtubei/v1/visitor_id` 與 `/sw.js_data` 引導並快取匿名 `visitorData`）、`ANDROID_VR`、`ANDROID`（未設定 `youtubePoToken` 且內容大於 1 MiB 時先探測尾端 1 位元組，攔截約 900 KiB 處 403 截斷）；搜尋與播放清單優先使用 `ANDROID`，失敗時自動退回 `VISIONOS`，而 `RD…` 合輯清單若 `/browse` 無項目則自動改走 `/next` 面板解析。中繼資料被某個用戶端拒絕時會換下一個；播放時 CDN 回應可重試的拒絕，會在同一個期限內換下一個用戶端。
 - **搜尋與清單**：搜尋最多回傳 `searchResults` 筆；播放清單最多讀 `maxPlaylistTracks` 首、最多六頁；影片是一首曲目，音訊網址從 player 回應取得。YouTube Music 搜尋用網頁音樂用戶端。
 - **全部在 Rust 內完成**：不執行播放器 JavaScript，也不啟動外部下載器。所有原生用戶端都失敗時，來源錯誤直接回給 API 客戶端。
 - **代理**：設定 `youtubeProxy` 後，YouTube 的 API 與音訊請求都改走該代理，其他來源不受影響。

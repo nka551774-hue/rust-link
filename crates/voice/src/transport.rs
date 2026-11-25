@@ -57,22 +57,28 @@ pub fn header(sequence: u16, timestamp: u32, ssrc: u32) -> [u8; HEADER_LEN] {
     bytes
 }
 
-/// Pre-initialize the AEAD cipher at Session Description, outside the 50 Hz packet path.
-pub(crate) enum PacketCipher {
+enum CipherInner {
     Aes(Box<Aes256Gcm>),
     // Boxed once per session so `ZeroizeOnDrop` runs on session teardown rather
     // than running volatile stack zeroization on every 20 ms packet.
     XChaCha(Box<XChaCha20Poly1305>),
 }
 
+/// Pre-initialize the AEAD cipher at Session Description, outside the 50 Hz packet path.
+pub(crate) struct PacketCipher {
+    inner: CipherInner,
+    counter: u64,
+}
+
 impl PacketCipher {
     pub(crate) fn new(mode: Mode, key: &[u8; 32]) -> Self {
-        match mode {
-            Mode::AeadAes256GcmRtpSize => Self::Aes(Box::new(Aes256Gcm::new(key.into()))),
+        let inner = match mode {
+            Mode::AeadAes256GcmRtpSize => CipherInner::Aes(Box::new(Aes256Gcm::new(key.into()))),
             Mode::AeadXChaCha20Poly1305RtpSize => {
-                Self::XChaCha(Box::new(XChaCha20Poly1305::new(key.into())))
+                CipherInner::XChaCha(Box::new(XChaCha20Poly1305::new(key.into())))
             }
-        }
+        };
+        Self { inner, counter: 0 }
     }
 
     #[inline]
@@ -87,33 +93,116 @@ impl PacketCipher {
         packet.reserve(HEADER_LEN + payload.len() + 20);
         packet.extend_from_slice(header);
         packet.extend_from_slice(payload);
+        self.seal_detached(packet, header, counter)
+    }
+
+    #[inline]
+    pub(crate) fn seal_in_place(
+        &mut self,
+        frame: &mut Vec<u8>,
+        header: &[u8; HEADER_LEN],
+    ) -> Result<(), VoiceError> {
+        if frame.len() < HEADER_LEN {
+            return Err(VoiceError::Crypto("transport frame missing RTP header space".into()));
+        }
+        let counter = u32::try_from(self.counter)
+            .map_err(|_| VoiceError::Crypto("transport nonce exhausted; reconnect voice".into()))?;
+        // Advance before sealing so a nonce is never reused even on error.
+        self.counter += 1;
+        frame[..HEADER_LEN].copy_from_slice(header);
+        frame.reserve(20);
+        self.seal_detached(frame, header, counter)
+    }
+
+    #[inline]
+    fn seal_detached(
+        &self,
+        frame: &mut Vec<u8>,
+        header: &[u8; HEADER_LEN],
+        counter: u32,
+    ) -> Result<(), VoiceError> {
         // RTP-size modes append the counter bytes; receivers copy these into the nonce.
         let counter = counter.to_be_bytes();
-        let tag = match self {
-            Self::Aes(cipher) => {
+        let tag = match &self.inner {
+            CipherInner::Aes(cipher) => {
                 let mut nonce = [0u8; 12];
                 nonce[..4].copy_from_slice(&counter);
                 cipher.encrypt_in_place_detached(
                     Nonce::from_slice(&nonce),
                     header,
-                    &mut packet[HEADER_LEN..],
+                    &mut frame[HEADER_LEN..],
                 )
             }
-            Self::XChaCha(cipher) => {
+            CipherInner::XChaCha(cipher) => {
                 let mut nonce = [0u8; 24];
                 nonce[..4].copy_from_slice(&counter);
                 cipher.encrypt_in_place_detached(
                     XNonce::from_slice(&nonce),
                     header,
-                    &mut packet[HEADER_LEN..],
+                    &mut frame[HEADER_LEN..],
                 )
             }
         }
         .map_err(|_| VoiceError::Crypto("transport encryption failed".into()))?;
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(&counter);
+        frame.extend_from_slice(&tag);
+        frame.extend_from_slice(&counter);
         Ok(())
     }
+}
+
+pub(crate) fn valid_voice_udp_ip(raw_ip: IpAddr, require_public: bool) -> Option<IpAddr> {
+    let ip = raw_ip.to_canonical();
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            if octets[0] == 0 || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+                return None;
+            }
+            if require_public {
+                let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+                let is_benchmark = octets[0] == 198 && (octets[1] & 0xfe) == 18;
+                let is_ietf_protocol = octets[..3] == [192, 0, 0];
+                let is_reserved = (octets[0] & 0xf0) == 240;
+                if v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_documentation()
+                    || is_cgnat
+                    || is_benchmark
+                    || is_ietf_protocol
+                    || is_reserved
+                {
+                    return None;
+                }
+            }
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            if v6.is_unspecified() || v6.is_multicast() {
+                return None;
+            }
+            if require_public {
+                let is_unique_local = (segments[0] & 0xfe00) == 0xfc00;
+                let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
+                let is_documentation = segments[..2] == [0x2001, 0x0db8];
+                let is_benchmark = segments[..3] == [0x2001, 0x0002, 0];
+                let is_discard = segments[..4] == [0x0100, 0, 0, 0];
+                let is_nat64 = segments[..2] == [0x0064, 0xff9b]
+                    && (segments[2..6] == [0, 0, 0, 0] || segments[2] == 1);
+                if v6.is_loopback()
+                    || is_unique_local
+                    || is_link_local
+                    || is_documentation
+                    || is_benchmark
+                    || is_discard
+                    || is_nat64
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(ip)
 }
 
 pub fn ip_discovery_request(ssrc: u32) -> [u8; 74] {
@@ -137,21 +226,17 @@ pub fn parse_ip_discovery_response(data: &[u8], ssrc: u32) -> Option<(String, u1
     let end = address.iter().position(|byte| *byte == 0)?;
     let address = std::str::from_utf8(&address[..end]).ok()?.parse::<IpAddr>().ok()?;
     let port = u16::from_be_bytes([data[72], data[73]]);
-    if port == 0
-        || address.is_unspecified()
-        || address.is_multicast()
-        || matches!(address, IpAddr::V4(v4) if v4.is_broadcast())
-    {
+    if port == 0 {
         return None;
     }
-    Some((address.to_string(), port))
+    let ip = valid_voice_udp_ip(address, false)?;
+    Some((ip.to_string(), port))
 }
 
 struct State {
     cipher: Option<PacketCipher>,
     sequence: u16,
     timestamp: u32,
-    counter: u64,
     packet: Vec<u8>,
 }
 
@@ -176,7 +261,6 @@ impl Transport {
                 cipher: None,
                 sequence: 0,
                 timestamp: 0,
-                counter: 0,
                 packet: Vec::with_capacity(1500),
             }),
         }
@@ -218,6 +302,29 @@ impl Transport {
         Self::write_locked(&self.socket, self.remote, self.connected, self.ssrc, state, payload)
     }
 
+    /// Seals `frame[HEADER_LEN..]` in place after writing the 12-byte RTP header into
+    /// `frame[..HEADER_LEN]`, appends the 16-byte AEAD tag + 4-byte nonce suffix, and sends `&frame`.
+    pub fn write_frame_in_place(&self, frame: &mut Vec<u8>) -> Result<(), VoiceError> {
+        let mut state =
+            self.state.lock().map_err(|_| VoiceError::Crypto("transport lock poisoned".into()))?;
+        Self::write_frame_locked(
+            &self.socket,
+            self.remote,
+            self.connected,
+            self.ssrc,
+            &mut state,
+            frame,
+        )
+    }
+
+    pub fn write_frame_in_place_mut(&mut self, frame: &mut Vec<u8>) -> Result<(), VoiceError> {
+        let state = self
+            .state
+            .get_mut()
+            .map_err(|_| VoiceError::Crypto("transport lock poisoned".into()))?;
+        Self::write_frame_locked(&self.socket, self.remote, self.connected, self.ssrc, state, frame)
+    }
+
     #[inline]
     fn write_locked(
         socket: &tokio::net::UdpSocket,
@@ -227,32 +334,92 @@ impl Transport {
         state: &mut State,
         payload: &[u8],
     ) -> Result<(), VoiceError> {
-        let counter = u32::try_from(state.counter)
-            .map_err(|_| VoiceError::Crypto("transport nonce exhausted; reconnect voice".into()))?;
         let rtp = header(state.sequence, state.timestamp, ssrc);
         let State { cipher, packet, .. } = state;
-        cipher.as_ref().ok_or(VoiceError::NotReady)?.seal_into(packet, &rtp, counter, payload)?;
-        state.counter += 1;
+        let cipher = cipher.as_mut().ok_or(VoiceError::NotReady)?;
+        let counter = u32::try_from(cipher.counter)
+            .map_err(|_| VoiceError::Crypto("transport nonce exhausted; reconnect voice".into()))?;
+        cipher.counter += 1;
+        cipher.seal_into(packet, &rtp, counter, payload)?;
         state.sequence = state.sequence.wrapping_add(1);
         state.timestamp = state.timestamp.wrapping_add(FRAME_SAMPLES);
-        let sent = if connected {
-            socket.try_send(&state.packet)
-        } else {
-            socket.try_send_to(&state.packet, remote)
-        };
-        match sent {
-            // UDP is lossy: a full send buffer or a stale ICMP error drops one frame, not the session.
-            Err(error) if transient_udp_error(&error) => Ok(()),
-            result => result.map(drop).map_err(VoiceError::from),
-        }
+        send_udp(socket, remote, connected, &state.packet)
     }
+
+    #[inline]
+    fn write_frame_locked(
+        socket: &tokio::net::UdpSocket,
+        remote: SocketAddr,
+        connected: bool,
+        ssrc: u32,
+        state: &mut State,
+        frame: &mut Vec<u8>,
+    ) -> Result<(), VoiceError> {
+        let rtp = header(state.sequence, state.timestamp, ssrc);
+        state.cipher.as_mut().ok_or(VoiceError::NotReady)?.seal_in_place(frame, &rtp)?;
+        state.sequence = state.sequence.wrapping_add(1);
+        state.timestamp = state.timestamp.wrapping_add(FRAME_SAMPLES);
+        send_udp(socket, remote, connected, frame)
+    }
+}
+
+#[inline]
+fn try_send_once(
+    socket: &tokio::net::UdpSocket,
+    remote: SocketAddr,
+    connected: bool,
+    packet: &[u8],
+) -> std::io::Result<usize> {
+    if connected {
+        socket.try_send(packet)
+    } else {
+        socket.try_send_to(packet, remote)
+    }
+}
+
+#[inline]
+fn send_udp(
+    socket: &tokio::net::UdpSocket,
+    remote: SocketAddr,
+    connected: bool,
+    packet: &[u8],
+) -> Result<(), VoiceError> {
+    let sent = match try_send_once(socket, remote, connected, packet) {
+        // Stale async ICMP or EINTR clears on the failed call; retry once so the new frame sends.
+        Err(error) if retryable_udp_send_error(&error) => {
+            try_send_once(socket, remote, connected, packet)
+        }
+        other => other,
+    };
+    match sent {
+        // UDP is lossy: a full send buffer or a stale ICMP error drops one frame, not the session.
+        Err(error) if transient_udp_error(&error) => Ok(()),
+        result => result.map(drop).map_err(VoiceError::from),
+    }
+}
+
+pub(crate) fn retryable_udp_send_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        ConnectionRefused, ConnectionReset, HostUnreachable, Interrupted, NetworkUnreachable,
+    };
+    if matches!(
+        error.kind(),
+        ConnectionRefused | ConnectionReset | HostUnreachable | NetworkUnreachable | Interrupted
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(10052 | 10054)) {
+        return true;
+    }
+    false
 }
 
 /// Errors a voice UDP socket reports for one lost datagram rather than a dead socket.
 pub(crate) fn transient_udp_error(error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{
-        ConnectionRefused, ConnectionReset, HostUnreachable, Interrupted, NetworkUnreachable,
-        WouldBlock,
+        ConnectionRefused, ConnectionReset, HostUnreachable, Interrupted, NetworkDown,
+        NetworkUnreachable, WouldBlock,
     };
     if matches!(
         error.kind(),
@@ -261,12 +428,27 @@ pub(crate) fn transient_udp_error(error: &std::io::Error) -> bool {
             | ConnectionReset
             | HostUnreachable
             | NetworkUnreachable
+            | NetworkDown
             | Interrupted
     ) {
         return true;
     }
     #[cfg(windows)]
-    if matches!(error.raw_os_error(), Some(10040 | 10052 | 10054)) {
+    if matches!(error.raw_os_error(), Some(10040 | 10050 | 10052 | 10054 | 10055 | 10064)) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(error.raw_os_error(), Some(105 | 112)) {
+        return true;
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    if matches!(error.raw_os_error(), Some(55 | 64)) {
         return true;
     }
     false
@@ -358,8 +540,155 @@ mod tests {
         let mode = Mode::AeadAes256GcmRtpSize;
         transport.describe(mode, [1; 32]).unwrap();
         assert!(transport.describe(mode, [1; 32]).is_err());
-        transport.state.lock().unwrap().counter = u32::MAX as u64 + 1;
+        transport.state.lock().unwrap().cipher.as_mut().unwrap().counter = u32::MAX as u64 + 1;
         assert!(matches!(transport.write(b"opus"), Err(VoiceError::Crypto(_))));
+        let mut frame = vec![0u8; HEADER_LEN + 4];
+        assert!(matches!(transport.write_frame_in_place(&mut frame), Err(VoiceError::Crypto(_))));
+    }
+
+    #[test]
+    fn seal_in_place_matches_seal_into_without_reallocating() {
+        let key = [55; 32];
+        let payload = b"dave-encrypted-opus-payload";
+        for mode in [Mode::AeadAes256GcmRtpSize, Mode::AeadXChaCha20Poly1305RtpSize] {
+            let ref_cipher = PacketCipher::new(mode, &key);
+            let mut inplace_cipher = PacketCipher::new(mode, &key);
+            let mut expected = Vec::with_capacity(1500);
+            let mut frame = Vec::with_capacity(1500);
+            let ptr = frame.as_ptr();
+
+            assert!(inplace_cipher
+                .seal_in_place(&mut vec![0u8; HEADER_LEN - 1], &header(0, 0, 1))
+                .is_err());
+
+            for seq in 0u16..5 {
+                let rtp = header(seq, u32::from(seq) * FRAME_SAMPLES, 999);
+                ref_cipher.seal_into(&mut expected, &rtp, u32::from(seq), payload).unwrap();
+
+                frame.clear();
+                frame.extend_from_slice(&[0u8; HEADER_LEN]);
+                frame.extend_from_slice(payload);
+                inplace_cipher.seal_in_place(&mut frame, &rtp).unwrap();
+
+                assert_eq!(frame, expected);
+                assert_eq!(frame.as_ptr(), ptr);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_in_place_delivers_identical_wire_packets() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket1 = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket2 = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let remote = receiver.local_addr().unwrap();
+        socket1.connect(remote).await.unwrap();
+        socket2.connect(remote).await.unwrap();
+        socket1.writable().await.unwrap();
+        socket2.writable().await.unwrap();
+
+        let legacy = Transport::new(socket1, remote, 42);
+        let zero_copy = Transport::new(socket2, remote, 42);
+        legacy.describe(Mode::AeadXChaCha20Poly1305RtpSize, [7; 32]).unwrap();
+        zero_copy.describe(Mode::AeadXChaCha20Poly1305RtpSize, [7; 32]).unwrap();
+
+        legacy.write(b"opus-frame").unwrap();
+        let mut buf1 = [0u8; 128];
+        let len1 = receiver.recv(&mut buf1).await.unwrap();
+
+        let mut frame = Vec::with_capacity(1500);
+        let ptr = frame.as_ptr();
+        frame.extend_from_slice(&[0u8; HEADER_LEN]);
+        frame.extend_from_slice(b"opus-frame");
+        zero_copy.write_frame_in_place(&mut frame).unwrap();
+        assert_eq!(frame.as_ptr(), ptr);
+        let mut buf2 = [0u8; 128];
+        let len2 = receiver.recv(&mut buf2).await.unwrap();
+
+        assert_eq!(&buf1[..len1], &buf2[..len2]);
+    }
+
+    #[test]
+    fn canonical_ip_validation_blocks_zero_network_and_ssrf_ranges() {
+        for always_bad in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "::ffff:0.0.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::ffff:255.255.255.255",
+            "::",
+            "ff02::1",
+        ] {
+            let ip: IpAddr = always_bad.parse().unwrap();
+            assert_eq!(valid_voice_udp_ip(ip, false), None, "{always_bad}");
+            assert_eq!(valid_voice_udp_ip(ip, true), None, "{always_bad}");
+        }
+
+        // Loopback is allowed on non-TLS local test sockets (canonicalized), rejected on wss://.
+        assert_eq!(
+            valid_voice_udp_ip("::ffff:127.0.0.1".parse().unwrap(), false),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        for non_public in [
+            "127.0.0.1",
+            "::ffff:127.0.0.1",
+            "10.0.0.1",
+            "::ffff:10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.1",
+            "169.254.169.254",
+            "::ffff:169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.0.1",
+            "240.0.0.1",
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "2001:db8::1",
+            "2001:2::1",
+            "100::1",
+            "64:ff9b::1",
+        ] {
+            let ip: IpAddr = non_public.parse().unwrap();
+            assert_eq!(valid_voice_udp_ip(ip, true), None, "accepted non-public {non_public}");
+        }
+
+        for public_ip in ["162.159.130.232", "2606:4700:4700::1111"] {
+            let ip: IpAddr = public_ip.parse().unwrap();
+            assert_eq!(valid_voice_udp_ip(ip, true), Some(ip));
+        }
+
+        let mut discovery = ip_discovery_request(55);
+        discovery[..2].copy_from_slice(&2u16.to_be_bytes());
+        discovery[8..22].copy_from_slice(b"::ffff:0.1.2.3");
+        discovery[72..].copy_from_slice(&5000u16.to_be_bytes());
+        assert!(parse_ip_discovery_response(&discovery, 55).is_none());
+    }
+
+    #[test]
+    fn transient_and_retryable_udp_errors_cover_network_down_and_icmp() {
+        assert!(transient_udp_error(&std::io::Error::from(std::io::ErrorKind::NetworkDown)));
+        assert!(retryable_udp_send_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(retryable_udp_send_error(&std::io::Error::from(std::io::ErrorKind::Interrupted)));
+        assert!(!retryable_udp_send_error(&std::io::Error::from(std::io::ErrorKind::WouldBlock)));
+        #[cfg(windows)]
+        for code in [10050, 10055, 10064] {
+            assert!(transient_udp_error(&std::io::Error::from_raw_os_error(code)));
+        }
+        #[cfg(target_os = "linux")]
+        for code in [105, 112] {
+            assert!(transient_udp_error(&std::io::Error::from_raw_os_error(code)));
+        }
     }
 
     #[tokio::test]

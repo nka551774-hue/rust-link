@@ -112,8 +112,13 @@ pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
     if valid_id3_header(head) {
         let length = synchsafe(&head[6..10]);
         let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
-        return head.len()
-            < 10usize.saturating_add(length).saturating_add(footer).saturating_add(256);
+        let audio_start = 10usize.saturating_add(length).saturating_add(footer);
+        if let Some(rest) = head.get(audio_start..) {
+            if rest.starts_with(b"fLaC") {
+                return can_gain_from_more(rest, size.saturating_sub(audio_start as i64));
+            }
+        }
+        return head.len() < audio_start.saturating_add(4096);
     }
     false
 }
@@ -246,17 +251,30 @@ fn probe_mp4(head: &[u8]) -> Probe {
     };
     let (audio, audio_mdhd) = moov_audio_info(moov);
     out.audio = audio;
-    if let Some(mvhd) = find_box(moov, b"mvhd") {
-        if let Some((timescale, duration)) = read_mvhd(mvhd) {
-            if timescale > 0 && duration > 0 {
-                out.duration_ms = milliseconds(duration as u128, timescale as u64);
-            }
+    let mvhd_info = find_box(moov, b"mvhd").and_then(read_mvhd);
+    if let Some((timescale, duration)) = mvhd_info {
+        if timescale > 0 && duration > 0 {
+            out.duration_ms = milliseconds(duration as u128, timescale as u64);
         }
     }
     if out.duration_ms == 0 {
         if let Some((timescale, duration)) = audio_mdhd {
             if timescale > 0 && duration > 0 {
                 out.duration_ms = milliseconds(duration as u128, timescale as u64);
+            }
+        }
+    }
+    if out.duration_ms == 0 {
+        if let Some(mehd_duration) =
+            find_box(moov, b"mvex").and_then(|mvex| find_box(mvex, b"mehd")).and_then(read_mehd)
+        {
+            let timescale = mvhd_info
+                .map(|(ts, _)| ts)
+                .filter(|&ts| ts > 0)
+                .or_else(|| audio_mdhd.map(|(ts, _)| ts).filter(|&ts| ts > 0))
+                .unwrap_or(0);
+            if timescale > 0 {
+                out.duration_ms = milliseconds(mehd_duration as u128, timescale as u64);
             }
         }
     }
@@ -292,13 +310,30 @@ fn read_mvhd(mvhd: &[u8]) -> Option<(u32, u64)> {
             // Version one widens the creation and modification times to 64 bits,
             // which pushes the timescale to byte 20 and the duration to 24.
             let timescale = be_u32(mvhd.get(20..24)?);
-            let duration = u64::from_be_bytes(mvhd.get(24..32)?.try_into().ok()?);
-            (duration != u64::MAX).then_some((timescale, duration))
+            let raw = u64::from_be_bytes(mvhd.get(24..32)?.try_into().ok()?);
+            let duration = if raw == u64::MAX { 0 } else { raw };
+            Some((timescale, duration))
         }
         0 => {
             let timescale = be_u32(mvhd.get(12..16)?);
-            let duration = u64::from(be_u32(mvhd.get(16..20)?));
-            (duration != u64::from(u32::MAX)).then_some((timescale, duration))
+            let raw = be_u32(mvhd.get(16..20)?);
+            let duration = if raw == u32::MAX { 0 } else { u64::from(raw) };
+            Some((timescale, duration))
+        }
+        _ => None,
+    }
+}
+
+/// Reads the fragment presentation duration out of `moov/mvex/mehd`.
+fn read_mehd(mehd: &[u8]) -> Option<u64> {
+    match *mehd.first()? {
+        1 => {
+            let duration = u64::from_be_bytes(mehd.get(4..12)?.try_into().ok()?);
+            (duration > 0 && duration != u64::MAX).then_some(duration)
+        }
+        0 => {
+            let duration = u64::from(be_u32(mehd.get(4..8)?));
+            (duration > 0 && duration != u64::from(u32::MAX)).then_some(duration)
         }
         _ => None,
     }
@@ -320,13 +355,12 @@ fn read_mp4_tags(moov: &[u8], out: &mut Probe) {
     else {
         return;
     };
+    let mut album_artist = String::new();
     for_each_box(ilst, |kind, body, _| {
-        let is_title = match kind {
-            b"\xa9nam" => true,
-            b"\xa9ART" => false,
+        if !matches!(kind, b"\xa9nam" | b"\xa9ART" | b"aART") {
             // Skip artwork (`covr`) and all unrelated atoms without scanning children.
-            _ => return,
-        };
+            return;
+        }
         let Some(data) = find_box(body, b"data") else {
             return;
         };
@@ -345,25 +379,52 @@ fn read_mp4_tags(moov: &[u8], out: &mut Probe) {
             }
             _ => return,
         };
-        if is_title {
-            out.title = decoded;
-        } else {
-            out.artist = decoded;
+        if decoded.is_empty() {
+            return;
+        }
+        match kind {
+            b"\xa9nam" => out.title = decoded,
+            b"\xa9ART" => out.artist = decoded,
+            b"aART" if album_artist.is_empty() => album_artist = decoded,
+            _ => {}
         }
     });
+    if out.artist.is_empty() && !album_artist.is_empty() {
+        out.artist = album_artist;
+    }
+}
+
+fn clean_tag_text(raw: &str) -> String {
+    let before_nul = match raw.find('\0') {
+        Some(pos) => &raw[..pos],
+        None => raw,
+    };
+    before_nul
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .to_owned()
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let pairs = bytes.as_chunks::<2>().0.iter().map(|pair| {
-        if little_endian {
-            u16::from_le_bytes(*pair)
-        } else {
-            u16::from_be_bytes(*pair)
-        }
-    });
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(
+            |pair| {
+                if little_endian {
+                    u16::from_le_bytes(*pair)
+                } else {
+                    u16::from_be_bytes(*pair)
+                }
+            },
+        )
+        .take_while(|&unit| unit != 0);
     let raw: String =
-        char::decode_utf16(pairs).map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
-    raw.trim_matches('\0').trim().to_owned()
+        char::decode_utf16(units).map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
+    clean_tag_text(&raw)
 }
 
 /// Decodes a tag value that may be UTF-8 or UTF-16.
@@ -376,7 +437,7 @@ fn decode_text(value: &[u8]) -> String {
     if let Some(rest) = value.strip_prefix(&[0xfe, 0xff]) {
         return decode_utf16(rest, false);
     }
-    String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned()
+    clean_tag_text(&String::from_utf8_lossy(value))
 }
 
 fn probe_flac(head: &[u8]) -> Probe {
@@ -462,6 +523,7 @@ fn probe_ogg(head: &[u8], size: i64) -> Probe {
         return out;
     };
     let mut rate = 0i64;
+    let mut is_flac = false;
     if payload.starts_with(b"OpusHead") && payload.len() >= 19 {
         out.audio = true;
         // Opus is always decoded at 48 kHz.
@@ -473,14 +535,28 @@ fn probe_ogg(head: &[u8], size: i64) -> Probe {
         rate = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as i64;
     } else if payload.starts_with(b"\x7fFLAC") {
         out.audio = true;
+        is_flac = true;
+        if let Some(streaminfo) = payload.get(17..51) {
+            if payload.get(9..13) == Some(b"fLaC")
+                && (payload[13] & 0x7f) == 0
+                && be_u24(&payload[14..17]) == 34
+            {
+                let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+                let flac_rate = (packed >> 44) & 0x000f_ffff;
+                let total = packed & 0x0000_000f_ffff_ffff;
+                if flac_rate > 0 && total > 0 {
+                    out.duration_ms = milliseconds(total as u128, flac_rate);
+                }
+                rate = flac_rate as i64;
+            }
+        }
     }
     if out.audio {
-        read_ogg_tags(&head[page1_end..], &serial, &mut out);
+        read_ogg_tags(&head[page1_end..], &serial, is_flac, &mut out);
     }
-    // The length of an Ogg stream is only stated by the granule of its last
-    // page, so a duration needs the tail. A stream with an unknown length is
-    // reported as live rather than guessed at.
-    if rate > 0 && size > 0 && head.len() as i64 == size {
+    // The length of an Ogg stream without STREAMINFO is stated by the granule
+    // of its last page, so a duration needs the tail.
+    if out.duration_ms == 0 && rate > 0 && size > 0 && head.len() as i64 == size {
         if let Some(granule) = last_granule(head, &serial) {
             if granule > 0 {
                 let skip = if payload.starts_with(b"OpusHead") {
@@ -496,23 +572,125 @@ fn probe_ogg(head: &[u8], size: i64) -> Probe {
     out
 }
 
-fn read_ogg_tags(data: &[u8], serial: &[u8; 4], out: &mut Probe) {
-    if data.len() < 27 || &data[..4] != b"OggS" || data[4] != 0 || &data[14..18] != serial {
-        return;
+fn inspect_ogg_comment_packet(pkt: &[u8], is_flac: bool, out: &mut Probe) -> bool {
+    if let Some(tags) = pkt.strip_prefix(b"OpusTags") {
+        read_vorbis_comment(tags, out);
+        return true;
     }
-    let segments = data[26] as usize;
-    let Some(table) = data.get(27..27 + segments) else {
-        return;
-    };
-    let body_len: usize = table.iter().map(|&n| usize::from(n)).sum();
-    let end = (27 + segments + body_len).min(data.len());
-    let Some(body) = data.get(27 + segments..end) else {
-        return;
-    };
-    if let Some(tags) = body.strip_prefix(b"OpusTags") {
+    if let Some(tags) = pkt.strip_prefix(&[0x03, b'v', b'o', b'r', b'b', b'i', b's']) {
         read_vorbis_comment(tags, out);
-    } else if let Some(tags) = body.strip_prefix(&[0x03, b'v', b'o', b'r', b'b', b'i', b's']) {
-        read_vorbis_comment(tags, out);
+        return true;
+    }
+    if is_flac {
+        let Some(&header) = pkt.first() else {
+            return true;
+        };
+        if header == 0xff {
+            return true;
+        }
+        let block_type = header & 0x7f;
+        let is_last = header & 0x80 != 0;
+        if block_type == 4 {
+            if let Some(tags) = pkt.get(4..) {
+                read_vorbis_comment(tags, out);
+            }
+            return true;
+        }
+        if block_type > 6 {
+            return true;
+        }
+        return is_last;
+    }
+    true
+}
+
+fn read_ogg_tags(data: &[u8], serial: &[u8; 4], is_flac: bool, out: &mut Probe) {
+    let mut at = 0usize;
+    let mut assembled: Vec<u8> = Vec::new();
+    let mut packets_seen = 0usize;
+    while let Some(header) = data.get(at..at.saturating_add(27)) {
+        if header.len() < 27 || &header[..4] != b"OggS" || header[4] != 0 {
+            break;
+        }
+        let segments = header[26] as usize;
+        let Some(table_end) = at.checked_add(27).and_then(|n| n.checked_add(segments)) else {
+            break;
+        };
+        let Some(table) = data.get(at + 27..table_end) else {
+            break;
+        };
+        let body_len: usize = table.iter().map(|&n| usize::from(n)).sum();
+        let full_end = table_end.saturating_add(body_len);
+        let available_end = full_end.min(data.len());
+        let body = &data[table_end..available_end];
+        let truncated_page = available_end < full_end;
+
+        if &header[14..18] == serial {
+            let continued = header[5] & 0x01 != 0;
+            if !continued && !assembled.is_empty() {
+                if inspect_ogg_comment_packet(&assembled, is_flac, out) {
+                    return;
+                }
+                assembled.clear();
+                packets_seen += 1;
+                if packets_seen >= 16 {
+                    return;
+                }
+            }
+            let mut body_pos = 0usize;
+            let mut seg_idx = 0usize;
+            while seg_idx < table.len() {
+                let pkt_start = body_pos;
+                let mut complete_pkt = false;
+                while seg_idx < table.len() {
+                    let seg_len = usize::from(table[seg_idx]);
+                    seg_idx += 1;
+                    body_pos = body_pos.saturating_add(seg_len);
+                    if seg_len < 255 {
+                        complete_pkt = true;
+                        break;
+                    }
+                }
+                let slice_end = body_pos.min(body.len());
+                let chunk = &body[pkt_start.min(slice_end)..slice_end];
+                if slice_end < body_pos {
+                    complete_pkt = false;
+                }
+                if assembled.is_empty() && complete_pkt {
+                    if inspect_ogg_comment_packet(chunk, is_flac, out) {
+                        return;
+                    }
+                    packets_seen += 1;
+                    if packets_seen >= 16 {
+                        return;
+                    }
+                } else {
+                    let room = MAX_PROBE.saturating_sub(assembled.len());
+                    assembled.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    if complete_pkt {
+                        if inspect_ogg_comment_packet(&assembled, is_flac, out) {
+                            return;
+                        }
+                        assembled.clear();
+                        packets_seen += 1;
+                        if packets_seen >= 16 {
+                            return;
+                        }
+                    }
+                }
+                if slice_end < body_pos {
+                    break;
+                }
+            }
+        }
+
+        if truncated_page {
+            break;
+        }
+        at = available_end;
+    }
+    if !assembled.is_empty() {
+        let _ = inspect_ogg_comment_packet(&assembled, is_flac, out);
     }
 }
 
@@ -557,6 +735,7 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
     let mut bits = 0u32;
     let mut avg_bytes_per_sec = 0u32;
     let mut data_len = 0i64;
+    let mut data_offset = 44i64;
     let mut saw_data = false;
     let mut streaming_data = false;
     let mut at = 12usize;
@@ -579,6 +758,7 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
             }
             b"data" => {
                 saw_data = true;
+                data_offset = (at + 8) as i64;
                 if raw_len == u32::MAX {
                     streaming_data = true;
                 } else {
@@ -596,6 +776,9 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
         else {
             break;
         };
+        if !saw_data {
+            data_offset = i64::try_from(next).unwrap_or(i64::MAX).max(44);
+        }
         if next > head.len() {
             break;
         }
@@ -614,16 +797,10 @@ fn probe_wav(head: &[u8], size: i64) -> Probe {
     };
     let payload_bytes = if data_len > 0 {
         data_len
-    } else if streaming_data {
-        if size > 0 {
-            size.saturating_sub(44)
-        } else {
-            0
-        }
-    } else if saw_data {
-        0
+    } else if (streaming_data || !saw_data) && size > data_offset {
+        size - data_offset
     } else {
-        size.saturating_sub(44)
+        0
     };
     if out.audio && bytes_per_sec > 0 && payload_bytes > 0 {
         out.duration_ms = milliseconds(payload_bytes as u128, bytes_per_sec);
@@ -636,20 +813,43 @@ fn read_riff_info(body: &[u8], out: &mut Probe) {
         return;
     }
     let mut at = 4usize;
-    while at + 8 <= body.len() {
-        let kind = &body[at..at + 4];
-        let length = le_u32(&body[at + 4..at + 8]) as usize;
-        let value = body.get(at + 8..at + 8 + length).unwrap_or_default();
+    while let Some(header) = body.get(at..at.saturating_add(8)) {
+        if header.len() < 8 {
+            break;
+        }
+        let kind = &header[..4];
+        let length = le_u32(&header[4..8]) as usize;
+        let Some(value_start) = at.checked_add(8) else {
+            break;
+        };
+        let Some(value_end) = value_start.checked_add(length) else {
+            break;
+        };
+        let Some(value) = body.get(value_start..value_end) else {
+            break;
+        };
         match kind {
             b"INAM" => {
-                out.title = String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned()
+                let decoded = clean_tag_text(&String::from_utf8_lossy(value));
+                if !decoded.is_empty() {
+                    out.title = decoded;
+                }
             }
             b"IART" => {
-                out.artist = String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned()
+                let decoded = clean_tag_text(&String::from_utf8_lossy(value));
+                if !decoded.is_empty() {
+                    out.artist = decoded;
+                }
             }
             _ => {}
         }
-        at = at.saturating_add(8).saturating_add(length).saturating_add(length & 1);
+        let Some(next) = value_end.checked_add(length & 1) else {
+            break;
+        };
+        if next > body.len() {
+            break;
+        }
+        at = next;
     }
 }
 
@@ -669,7 +869,10 @@ fn probe_mp3(head: &[u8], size: i64) -> Probe {
     let mut out = Probe::default();
     let mut audio_start = 0usize;
     let mut saw_id3 = false;
-    if valid_id3_header(head) {
+    if head.starts_with(b"ID3") {
+        if !valid_id3_header(head) {
+            return out;
+        }
         saw_id3 = true;
         let flags = head[5];
         let length = synchsafe(&head[6..10]);
@@ -679,10 +882,35 @@ fn probe_mp3(head: &[u8], size: i64) -> Probe {
         read_id3(&head[10..tag_end], head[3], flags, &mut out);
         audio_start = 10usize.saturating_add(length).saturating_add(footer);
     }
-    let Some(frame) = head.get(audio_start..).and_then(find_mpeg_sync) else {
-        // A tag with no frame after it is still an MP3 with metadata, which is
-        // all a stream needs to be described.
-        out.audio = out.audio || !out.title.is_empty() || saw_id3;
+    // A stream still inside its ID3 tag has no audio bytes buffered yet.
+    // Once bytes past the tag arrive, require an actual audio frame or header.
+    if saw_id3 && head.len() <= audio_start {
+        out.audio = true;
+        return out;
+    }
+    let Some(rest) = head.get(audio_start..) else {
+        return out;
+    };
+    if rest.starts_with(b"fLaC") {
+        let flac = probe_flac(rest);
+        out.audio = flac.audio;
+        out.duration_ms = flac.duration_ms;
+        if out.title.is_empty() {
+            out.title = flac.title;
+        }
+        if out.artist.is_empty() {
+            out.artist = flac.artist;
+        }
+        return out;
+    }
+    if rest.len() >= 2 && rest[0] == 0xff && (rest[1] & 0xf6) == 0xf0 {
+        let adts_size = if size > audio_start as i64 { size - audio_start as i64 } else { 0 };
+        let adts = probe_adts(rest, adts_size);
+        out.audio = adts.audio;
+        out.duration_ms = adts.duration_ms;
+        return out;
+    }
+    let Some(frame) = find_mpeg_sync(rest) else {
         return out;
     };
     out.audio = true;
@@ -765,8 +993,18 @@ fn read_id3(raw_data: &[u8], version: u8, flags: u8, out: &mut Probe) {
                 return;
             };
             match id {
-                b"TT2" => out.title = decode_id3_text(body),
-                b"TP1" => out.artist = decode_id3_text(body),
+                b"TT2" => {
+                    let decoded = decode_id3_text(body);
+                    if !decoded.is_empty() {
+                        out.title = decoded;
+                    }
+                }
+                b"TP1" => {
+                    let decoded = decode_id3_text(body);
+                    if !decoded.is_empty() {
+                        out.artist = decoded;
+                    }
+                }
                 _ => {}
             }
             at = body_end;
@@ -845,6 +1083,9 @@ fn read_id3(raw_data: &[u8], version: u8, flags: u8, out: &mut Probe) {
             std::borrow::Cow::Borrowed(body)
         };
         let decoded = decode_id3_text(frame_cow.as_ref());
+        if decoded.is_empty() {
+            continue;
+        }
         if is_title {
             out.title = decoded;
         } else {
@@ -857,31 +1098,28 @@ fn decode_id3_text(body: &[u8]) -> String {
     let Some((&encoding, value)) = body.split_first() else {
         return String::new();
     };
-    let raw = match encoding {
-        // UTF-16 with a byte order mark, little or big endian.
-        1 => decode_text(value),
+    match encoding {
+        // ISO-8859-1 (Latin-1).
+        0 => {
+            let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
+            let raw: String = value[..end].iter().map(|&byte| byte as char).collect();
+            clean_tag_text(&raw)
+        }
+        // UTF-16 with a byte order mark, or UTF-16LE when taggers omit the BOM.
+        1 => {
+            if let Some(rest) = value.strip_prefix(&[0xff, 0xfe]) {
+                decode_utf16(rest, true)
+            } else if let Some(rest) = value.strip_prefix(&[0xfe, 0xff]) {
+                decode_utf16(rest, false)
+            } else {
+                decode_utf16(value, true)
+            }
+        }
         // UTF-16BE without a byte order mark.
         2 => decode_utf16(value, false),
         // UTF-8.
-        3 => String::from_utf8_lossy(value).trim_matches('\0').trim().to_owned(),
-        // ISO-8859-1 (Latin-1), trimmed before decoding bytes to chars.
-        _ => {
-            let trimmed = value.iter().position(|&b| b != 0 && !b.is_ascii_whitespace()).map_or(
-                &[][..],
-                |start| {
-                    let end = value
-                        .iter()
-                        .rposition(|&b| b != 0 && !b.is_ascii_whitespace())
-                        .map_or(start, |i| i + 1);
-                    &value[start..end]
-                },
-            );
-            trimmed.iter().map(|&byte| byte as char).collect()
-        }
-    };
-    match raw.find('\0') {
-        Some(pos) => raw[..pos].trim().to_owned(),
-        None => raw,
+        3 => clean_tag_text(&String::from_utf8_lossy(value)),
+        _ => String::new(),
     }
 }
 
@@ -1021,7 +1259,7 @@ mod tests {
     fn wav(rate: u32, channels: u16, bits: u16, data_len: u32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(&36u32.saturating_add(data_len).to_le_bytes());
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(b"fmt ");
         out.extend_from_slice(&16u32.to_le_bytes());
@@ -1186,5 +1424,140 @@ mod tests {
         let probe = probe(&head, 3_200_000);
         assert!(probe.audio);
         assert!((99_900..=100_100).contains(&probe.duration_ms), "{}", probe.duration_ms);
+    }
+
+    #[test]
+    fn bomless_utf16_id3_invalid_encodings_and_utf8_boms_decode_cleanly() {
+        let mut utf16le_no_bom = vec![1u8];
+        for unit in "Song\0Extra".encode_utf16() {
+            utf16le_no_bom.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_id3_text(&utf16le_no_bom), "Song");
+        assert_eq!(decode_id3_text(&[4, b'b', b'a', b'd']), "");
+        assert_eq!(decode_id3_text(b"\x03\xef\xbb\xbfTitle"), "Title");
+    }
+
+    #[test]
+    fn id3_prefixed_flac_and_adts_keep_tags_and_reject_trailing_garbage() {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3\x03\x00\x00");
+        tag.extend_from_slice(&[0, 0, 0, 17]);
+        tag.extend_from_slice(b"TIT2\x00\x00\x00\x07\x00\x00\x00a song");
+
+        let mut flac = tag.clone();
+        flac.extend_from_slice(b"fLaC\x80\x00\x00\x22");
+        flac.extend_from_slice(&[0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
+        let packed: u64 = (44_100u64 << 44) | 88_200;
+        flac.extend_from_slice(&packed.to_be_bytes());
+        flac.extend_from_slice(&[0; 16]);
+        let flac_probe = probe(&flac, flac.len() as i64);
+        assert!(flac_probe.audio);
+        assert_eq!(flac_probe.title, "a song");
+        assert_eq!(flac_probe.duration_ms, 2000);
+
+        let mut adts = tag.clone();
+        // MPEG-4 ADTS, no CRC, 48 kHz (index 3), stereo (2), frame length = 200, 1 block.
+        adts.extend_from_slice(&[0xff, 0xf1, 0x4c, 0x80, 0x19, 0x00, 0xfc]);
+        let adts_probe = probe(&adts, tag.len() as i64 + 200 * 50);
+        assert!(adts_probe.audio);
+        assert_eq!(adts_probe.title, "a song");
+        assert_eq!(adts_probe.duration_ms, 1066);
+
+        let mut not_audio = tag;
+        not_audio.extend_from_slice(b"<html>not an audio stream</html>");
+        assert!(!probe(&not_audio, not_audio.len() as i64).audio);
+    }
+
+    #[test]
+    fn fmp4_mehd_duration_and_album_artist_fallback_are_supported() {
+        let box_of = |kind: &[u8; 4], body: &[u8]| {
+            let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(kind);
+            b.extend_from_slice(body);
+            b
+        };
+        let mut mvhd = vec![0u8; 20];
+        mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        mvhd[16..20].copy_from_slice(&0u32.to_be_bytes());
+        let mut mehd = vec![0u8; 8];
+        mehd[4..8].copy_from_slice(&45_000u32.to_be_bytes());
+        let mut aart_data = vec![0, 0, 0, 1, 0, 0, 0, 0];
+        aart_data.extend_from_slice(b"\xef\xbb\xbfAlbum Artist");
+        let ilst = box_of(b"aART", &box_of(b"data", &aart_data));
+        let mut meta = vec![0u8; 4];
+        meta.extend(box_of(b"ilst", &ilst));
+        let mut moov = box_of(b"mvhd", &mvhd);
+        moov.extend(box_of(b"mvex", &box_of(b"mehd", &mehd)));
+        moov.extend(box_of(b"udta", &box_of(b"meta", &meta)));
+        let mut head = box_of(b"ftyp", b"isom\0\0\0\0");
+        head.extend(box_of(b"moov", &moov));
+        let info = probe(&head, head.len() as i64);
+        assert_eq!(info.duration_ms, 45_000);
+        assert_eq!(info.artist, "Album Artist");
+    }
+
+    #[test]
+    fn ogg_flac_streaminfo_and_multipage_interleaved_comments_are_read() {
+        let make_page = |flags: u8, serial: [u8; 4], segs: &[u8], body: &[u8]| {
+            let mut p = b"OggS\0".to_vec();
+            p.push(flags);
+            p.extend_from_slice(&0i64.to_le_bytes());
+            p.extend_from_slice(&serial);
+            p.extend_from_slice(&[0u8; 8]);
+            p.push(segs.len() as u8);
+            p.extend_from_slice(segs);
+            p.extend_from_slice(body);
+            p
+        };
+        let mut flac_bos = b"\x7fFLAC\x01\x00\x00\x01fLaC\x00\x00\x00\x22".to_vec();
+        let mut streaminfo = vec![0u8; 34];
+        let packed: u64 = (48_000u64 << 44) | 144_000;
+        streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
+        flac_bos.extend_from_slice(&streaminfo);
+        let mut ogg_flac = make_page(2, [7, 7, 7, 7], &[flac_bos.len() as u8], &flac_bos);
+        // Interleaved page of another logical stream is skipped.
+        ogg_flac.extend(make_page(2, [9, 9, 9, 9], &[4], b"junk"));
+        // Multi-page Vorbis comment packet for serial [7,7,7,7].
+        let mut comment_pkt = vec![0x84, 0, 0, 0];
+        let vendor = vec![b'v'; 260];
+        comment_pkt.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        comment_pkt.extend_from_slice(&vendor);
+        comment_pkt.extend_from_slice(&2u32.to_le_bytes());
+        for field in ["TITLE=Ogg FLAC Song", "ARTIST=Ogg Artist"] {
+            comment_pkt.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            comment_pkt.extend_from_slice(field.as_bytes());
+        }
+        let block_len = (comment_pkt.len() - 4) as u32;
+        comment_pkt[1..4].copy_from_slice(&block_len.to_be_bytes()[1..]);
+        ogg_flac.extend(make_page(0, [7, 7, 7, 7], &[255], &comment_pkt[..255]));
+        let tail = &comment_pkt[255..];
+        ogg_flac.extend(make_page(1, [7, 7, 7, 7], &[tail.len() as u8], tail));
+
+        let info = probe(&ogg_flac, 999_999);
+        assert!(info.audio);
+        assert_eq!(info.duration_ms, 3000);
+        assert_eq!(info.title, "Ogg FLAC Song");
+        assert_eq!(info.artist, "Ogg Artist");
+    }
+
+    #[test]
+    fn streaming_wav_subtracts_actual_data_offset_and_bounds_riff_info() {
+        let mut head = wav(48_000, 2, 16, u32::MAX);
+        let data = head.split_off(36);
+        let mut info = b"INFOINAM\x04\0\0\0Keep".to_vec();
+        // Append a truncated INAM chunk that must not clobber the valid title.
+        info.extend_from_slice(b"INAM\xff\xff\xff\x7f");
+        head.extend_from_slice(b"LIST");
+        head.extend_from_slice(&(info.len() as u32).to_le_bytes());
+        head.extend_from_slice(&info);
+        if info.len() & 1 != 0 {
+            head.push(0);
+        }
+        head.extend_from_slice(&data);
+        let data_offset = head.len() as i64;
+        let info_probe = probe(&head, data_offset + 48_000 * 4);
+        assert!(info_probe.audio);
+        assert_eq!(info_probe.title, "Keep");
+        assert_eq!(info_probe.duration_ms, 1000);
     }
 }

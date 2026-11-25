@@ -39,7 +39,7 @@ impl MediaRange {
 
 /// Makes one request and returns its body, the length the server declared, and
 /// whether the range was honoured.
-pub(super) fn request(
+pub(crate) fn request(
     agent: &ureq::Agent,
     url: &str,
     headers: &std::collections::BTreeMap<String, String>,
@@ -64,7 +64,7 @@ struct Response {
     size: i64,
     partial: bool,
     validator: Option<String>,
-    effective_url: String,
+    redirected_url: Option<String>,
     provider_headers: bool,
     range: MediaRange,
 }
@@ -209,11 +209,18 @@ fn request_media(
         if hops > MAX_REDIRECTS {
             return Err(SourceError::Http("media URL redirected too many times".into()));
         }
-        let location = response
-            .headers()
-            .get("Location")
-            .and_then(|value| value.to_str().ok())
-            .ok_or(SourceError::Media { status })?;
+        let mut loc_iter = response.headers().get_all("Location").iter();
+        let location = match (loc_iter.next(), loc_iter.next()) {
+            (None, None) => return Err(SourceError::Media { status }),
+            (Some(value), None) => value.to_str().map_err(|_| {
+                SourceError::Http("media server returned an invalid Location".into())
+            })?,
+            _ => {
+                return Err(SourceError::Http(
+                    "media server returned multiple Location headers".into(),
+                ))
+            }
+        };
         let base =
             url::Url::parse(&current).map_err(|error| SourceError::Url(error.to_string()))?;
         let next = base
@@ -246,7 +253,6 @@ fn request_media(
     if offset.is_some() && range == MediaRange::Chunked && !partial {
         return Err(SourceError::Http("bounded media ranges require a 206 response".into()));
     }
-    let header = |name: &str| response.headers().get(name).and_then(|value| value.to_str().ok());
     if offset.is_some()
         && response.headers().get_all("Content-Encoding").iter().any(|value| {
             value
@@ -261,21 +267,39 @@ fn request_media(
     {
         return Err(SourceError::Http("media range response used content encoding".into()));
     }
+    let etag = {
+        let mut etag_iter = response.headers().get_all("ETag").iter();
+        match (etag_iter.next(), etag_iter.next()) {
+            (None, None) => None,
+            (Some(raw), None) => {
+                Some(raw.to_str().map_err(|_| {
+                    SourceError::Http("media server returned an invalid ETag".into())
+                })?)
+            }
+            _ => {
+                return Err(SourceError::Http("media server returned multiple ETag headers".into()))
+            }
+        }
+    };
     if let Some(validator) = validator {
-        if header("ETag") != Some(validator) {
+        if etag != Some(validator) {
             return Err(SourceError::Http("media representation changed while resuming".into()));
         }
     }
     // Weak tags and unqualified modification dates cannot prove byte-for-byte
-    // equality. Only use a strong entity tag for conditional continuation.
-    let next_validator = header("ETag")
-        .filter(|value| {
+    // equality. Only use a strong entity tag for conditional continuation, and
+    // only allocate it before a validator has been captured.
+    let next_validator = if validator.is_none() {
+        etag.filter(|value| {
             value
                 .strip_prefix('"')
                 .and_then(|inner| inner.strip_suffix('"'))
                 .is_some_and(|inner| !inner.contains('"'))
         })
-        .map(str::to_owned);
+        .map(str::to_owned)
+    } else {
+        None
+    };
     let mut size = {
         let mut cl_iter = response.headers().get_all("Content-Length").iter();
         match (cl_iter.next(), cl_iter.next()) {
@@ -336,7 +360,10 @@ fn request_media(
         size,
         partial,
         validator: next_validator,
-        effective_url: current.into_owned(),
+        redirected_url: match current {
+            std::borrow::Cow::Borrowed(_) => None,
+            std::borrow::Cow::Owned(redirected) => Some(redirected),
+        },
         provider_headers,
         range,
     })
@@ -355,13 +382,29 @@ impl<R: Read> Read for SliceReader<R> {
             return Ok(0);
         }
         if self.remaining == 0 {
-            return match self.reader.read(&mut [0])? {
-                0 => Ok(0),
-                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "media exceeds Content-Range")),
-            };
+            let mut extra = [0u8; 1];
+            loop {
+                match self.reader.read(&mut extra) {
+                    Ok(0) => return Ok(0),
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "media exceeds Content-Range",
+                        ))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
         }
         let count = self.remaining.min(buffer.len() as u64) as usize;
-        let read = self.reader.read(&mut buffer[..count])?;
+        let read = loop {
+            match self.reader.read(&mut buffer[..count]) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        };
         if read == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "media range body truncated"));
         }
@@ -393,7 +436,7 @@ fn parse_content_range(value: &str) -> Option<(i64, i64, Option<i64>)> {
     if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
-    let (range, total) = range.split_once('/')?;
+    let (range, total) = range.trim_start().split_once('/')?;
     let (start, end) = range.split_once('-')?;
     let (start, end) = (parse_digits_i64(start)?, parse_digits_i64(end)?);
     if start < 0 || end < start || end.checked_sub(start)?.checked_add(1).is_none() {
@@ -441,10 +484,11 @@ impl MediaBody {
     ) -> Result<Self, SourceError> {
         let origin_url = url.into();
         let response = request_media(&agent, &origin_url, &headers, true, Some(0), range, None)?;
+        let url = response.redirected_url.unwrap_or_else(|| origin_url.clone());
         Ok(Self {
             agent,
             origin_url,
-            url: response.effective_url,
+            url,
             headers,
             provider_headers: response.provider_headers,
             range: response.range,
@@ -474,6 +518,7 @@ impl MediaBody {
     /// Asks for the rest of the stream, starting at the byte after the last one
     /// delivered.
     fn resume(&mut self) -> Result<(), SourceError> {
+        let mut used_origin = false;
         let response = match request_media(
             &self.agent,
             &self.url,
@@ -485,6 +530,7 @@ impl MediaBody {
         ) {
             Ok(resp) => resp,
             Err(SourceError::Media { status: 403 | 404 | 410 }) if self.url != self.origin_url => {
+                used_origin = true;
                 let origin_range = MediaRange::for_url(&self.origin_url);
                 request_media(
                     &self.agent,
@@ -508,7 +554,11 @@ impl MediaBody {
         if self.validator.is_none() {
             self.validator = response.validator;
         }
-        self.url = response.effective_url;
+        if let Some(redirected) = response.redirected_url {
+            self.url = redirected;
+        } else if used_origin {
+            self.url.clone_from(&self.origin_url);
+        }
         self.provider_headers = response.provider_headers;
         self.range = response.range;
         self.reader = Some(response.body);
@@ -544,15 +594,9 @@ impl Read for MediaBody {
             let Some(reader) = self.reader.as_mut() else {
                 return Ok(0);
             };
-            let (error, stalled) = match reader.read(buffer) {
+            let (read_error, stalled) = match reader.read(buffer) {
                 Ok(0) if self.size < 0 || self.offset >= self.size => return Ok(0),
-                Ok(0) => (
-                    io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("media ended at {} of {} bytes", self.offset, self.size),
-                    ),
-                    self.offset == self.response_start,
-                ),
+                Ok(0) => (None, self.offset == self.response_start),
                 Ok(read) => {
                     self.offset += read as i64;
                     // The limit is for consecutive failures without progress.
@@ -561,18 +605,24 @@ impl Read for MediaBody {
                     self.attempts = RESUME_ATTEMPTS;
                     return Ok(read);
                 }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 // Retrying corrupt framing could silently splice later bytes
                 // onto an already invalid response. End this stream instead.
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                     self.reader = None;
                     return Err(error);
                 }
-                Err(error) => (error, self.offset == self.response_start),
+                Err(error) => (Some(error), self.offset == self.response_start),
             };
             if stalled {
                 if self.attempts == 0 {
                     self.reader = None;
-                    return Err(error);
+                    return Err(read_error.unwrap_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("media ended at {} of {} bytes", self.offset, self.size),
+                        )
+                    }));
                 }
                 self.attempts -= 1;
                 std::thread::sleep(RESUME_DELAY);
@@ -712,7 +762,9 @@ mod tests {
                 start += chunk.len();
             }
         });
-        let service = Service::new(Config { allow_private_networks: true, ..Config::default() });
+        let mut cfg = Config::default();
+        cfg.allow_private_networks = true;
+        let service = Service::new(cfg);
         let headers = std::collections::BTreeMap::from([
             ("Range".into(), "bytes=0-999".into()),
             ("rAnGe".into(), "bytes=0-".into()),
@@ -852,11 +904,81 @@ mod tests {
     #[test]
     fn a_total_is_read_out_of_a_content_range() {
         assert_eq!(parse_content_range("bytes 0-99/1234"), Some((0, 99, Some(1234))));
+        assert_eq!(parse_content_range("bytes   0-99/1234"), Some((0, 99, Some(1234))));
         assert_eq!(parse_content_range("bytes */1234"), None);
         assert_eq!(parse_content_range("nonsense"), None);
         assert_eq!(parse_content_range("bytes 100-199/*"), Some((100, 199, None)));
         assert_eq!(parse_content_range("bytes 100-99/1234"), None);
         assert_eq!(parse_content_range("bytes 0-99/99"), None);
         assert_eq!(parse_content_range("items 0-99/1234"), None);
+    }
+
+    #[test]
+    fn interrupted_reads_retry_in_place_without_tearing_down_the_stream() {
+        struct InterruptedOnce {
+            data: &'static [u8],
+            pos: usize,
+            interrupt_next: bool,
+        }
+        impl Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+                }
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut slice = SliceReader {
+            reader: InterruptedOnce { data: b"abc", pos: 0, interrupt_next: true },
+            remaining: 3,
+        };
+        let mut out = Vec::new();
+        slice.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"abc");
+
+        let mut body = MediaBody {
+            agent: netguard::agent(true),
+            origin_url: "http://127.0.0.1:1/unused".into(),
+            url: "http://127.0.0.1:1/unused".into(),
+            headers: Default::default(),
+            provider_headers: false,
+            range: MediaRange::OpenEnded,
+            reader: Some(Box::new(InterruptedOnce { data: b"xyz", pos: 0, interrupt_next: true })),
+            offset: 0,
+            response_start: 0,
+            size: 3,
+            attempts: 0,
+            validator: None,
+        };
+        out.clear();
+        body.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"xyz");
+    }
+
+    #[test]
+    fn duplicate_location_and_etag_headers_are_rejected() {
+        use std::io::Write;
+        for raw_response in [
+            "HTTP/1.1 302 Found\r\nLocation: /a\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/3\r\nContent-Length: 3\r\nETag: \"a\"\r\nETag: \"b\"\r\nConnection: close\r\n\r\nabc",
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/audio", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf);
+                let _ = socket.write_all(raw_response.as_bytes());
+            });
+            let result = request(&netguard::agent(true), &url, &Default::default(), Some(0));
+            server.join().unwrap();
+            assert!(result.is_err());
+        }
     }
 }

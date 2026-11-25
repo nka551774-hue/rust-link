@@ -322,7 +322,15 @@ impl<'de> Deserialize<'de> for LoadResult {
                 if let Some(done) = parsed {
                     return Ok(done);
                 }
-                let data = buffered.unwrap_or(Value::Null);
+                let Some(data) = buffered else {
+                    return match kind.as_str() {
+                        "empty" => Ok(LoadResult::Empty),
+                        "track" | "playlist" | "search" | "error" => {
+                            Err(de::Error::missing_field("result"))
+                        }
+                        other => Err(de::Error::custom(format_args!("unknown load type {other}"))),
+                    };
+                };
                 Ok(match kind.as_str() {
                     "track" => LoadResult::Track(Box::new(
                         serde_json::from_value(data).map_err(de::Error::custom)?,
@@ -348,6 +356,18 @@ impl<'de> Deserialize<'de> for LoadResult {
     }
 }
 
+fn wipe_string(secret: &mut String) {
+    // SAFETY: `write_volatile` cannot unwind, and overwriting initialized bytes
+    // with `0` (ASCII NUL) preserves UTF-8 validity before `clear()`.
+    unsafe {
+        for byte in secret.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    secret.clear();
+}
+
 /// What a bot reports about its voice connection, which the node needs before it
 /// can open one of its own.
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -361,6 +381,13 @@ pub struct VoiceState {
     pub session_id: String,
     #[serde(default)]
     pub channel_id: Option<String>,
+}
+
+impl Drop for VoiceState {
+    fn drop(&mut self) {
+        wipe_string(&mut self.token);
+        wipe_string(&mut self.session_id);
+    }
 }
 
 impl fmt::Debug for VoiceState {
@@ -546,5 +573,40 @@ mod tests {
         assert_eq!(value["token"], "rlt1.test");
         assert_eq!(value["metadata"]["duration_ms"], 0);
         assert!(value.get("encoded").is_none());
+    }
+
+    #[test]
+    fn load_result_requires_result_field_unless_empty() {
+        assert_eq!(
+            serde_json::from_value::<LoadResult>(json!({"kind": "empty"})).unwrap(),
+            LoadResult::Empty
+        );
+        assert_eq!(
+            serde_json::from_value::<LoadResult>(json!({"result": null, "kind": "empty"})).unwrap(),
+            LoadResult::Empty
+        );
+        for kind in ["track", "playlist", "search", "error"] {
+            let err = serde_json::from_value::<LoadResult>(json!({"kind": kind}))
+                .expect_err("non-empty LoadResult must require result")
+                .to_string();
+            assert!(err.contains("missing field `result`"), "{kind}: {err}");
+        }
+        let reversed: LoadResult =
+            serde_json::from_value(json!({"result": [], "kind": "search"})).unwrap();
+        assert_eq!(reversed, LoadResult::Search(Vec::new()));
+    }
+
+    #[test]
+    fn wipe_string_clears_secret_buffer() {
+        let mut token = String::from("discord-voice-token");
+        wipe_string(&mut token);
+        assert!(token.is_empty());
+        let voice = VoiceState {
+            token: "secret".into(),
+            endpoint: "voice.discord.media:443".into(),
+            session_id: "sess".into(),
+            channel_id: Some("1".into()),
+        };
+        drop(voice);
     }
 }

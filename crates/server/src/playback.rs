@@ -64,6 +64,9 @@ impl Engine for Playback {
         volume: i64,
         filters: &Object,
     ) -> Result<Box<dyn Frames>, AudioError> {
+        if !self.engine.in_process && self.engine.ffmpeg.is_none() {
+            return Err(AudioError::FfmpegMissing);
+        }
         let body = self.open(track)?;
         match self.engine.start(track, body, position_ms, volume, filters, Preference::Auto) {
             Ok(frames) => Ok(frames),
@@ -88,5 +91,48 @@ impl Playback {
             .open(track)
             .map(Body::new)
             .map_err(|error| AudioError::Decode(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustlink_protocol::{encode_track, TrackInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingLoader(AtomicUsize);
+
+    impl Loader for CountingLoader {
+        fn load(&self, _: &str) -> Result<LoadResult, SourceError> {
+            Ok(LoadResult::Empty)
+        }
+
+        fn open(&self, _: &Track) -> Result<Box<dyn std::io::Read + Send>, SourceError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::empty()))
+        }
+    }
+
+    #[test]
+    fn missing_ffmpeg_without_in_process_audio_fails_before_opening_source() {
+        let loader = Arc::new(CountingLoader(AtomicUsize::new(0)));
+        let playback = Playback {
+            engine: rustlink_audio::Engine {
+                ffmpeg: None,
+                in_process: false,
+                bitrate: 192_000,
+                complexity: 5,
+            },
+            source: loader.clone(),
+        };
+        let track = encode_track(&TrackInfo {
+            identifier: "id".into(),
+            source_name: "http".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = playback.start(&track, 0, 100, &Object::new());
+        assert!(matches!(result, Err(AudioError::FfmpegMissing)));
+        assert_eq!(loader.0.load(Ordering::SeqCst), 0);
     }
 }

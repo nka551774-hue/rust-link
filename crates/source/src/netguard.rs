@@ -19,6 +19,18 @@ pub(crate) fn parse_http_url(raw: &str) -> Result<url::Url, SourceError> {
     if raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\') {
         return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
     }
+    let after_scheme = raw
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        .map(|_| &raw[7..])
+        .or_else(|| {
+            raw.get(..8).filter(|prefix| prefix.eq_ignore_ascii_case("https://")).map(|_| &raw[8..])
+        })
+        .ok_or_else(|| SourceError::Url("expected an HTTP(S) URL without credentials".into()))?;
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
+    }
     let Ok(url) = url::Url::parse(raw) else {
         return Err(SourceError::Url("expected an HTTP(S) URL without credentials".into()));
     };
@@ -128,8 +140,72 @@ impl Resolver for GuardedResolver {
     }
 }
 
-/// Blocks literal private/loopback target IPs even when a proxy (`http://`,
-/// `https://`, `socks4a://`, `socks5h://`) defers target resolution to the proxy.
+fn domain_matches(domain: &str, suffix: &str) -> bool {
+    domain.eq_ignore_ascii_case(suffix)
+        || (domain.len() > suffix.len()
+            && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
+            && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
+}
+
+fn check_proxied_target(host: Option<&str>, proxy_host: Option<&str>) -> Result<(), Error> {
+    let Some(host) = host else {
+        return Err(Error::HostNotFound);
+    };
+    let bare = host.trim_end_matches('.');
+    if bare.is_empty() {
+        return Err(Error::HostNotFound);
+    }
+    let parsed = if !bare.starts_with('[') && bare.contains(':') {
+        bare.parse::<Ipv6Addr>().map(url::Host::Ipv6).map_err(|_| Error::HostNotFound)?
+    } else {
+        url::Host::parse(bare).map_err(|_| Error::HostNotFound)?
+    };
+    match parsed {
+        url::Host::Ipv4(v4) => {
+            if !is_public(IpAddr::V4(v4)) {
+                return Err(Error::HostNotFound);
+            }
+        }
+        url::Host::Ipv6(v6) => {
+            if !is_public(IpAddr::V6(v6)) {
+                return Err(Error::HostNotFound);
+            }
+        }
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            if domain.is_empty() {
+                return Err(Error::HostNotFound);
+            }
+            if !matches!(url::Host::parse(domain), Ok(url::Host::Domain(_))) {
+                return check_proxied_target(Some(domain), proxy_host);
+            }
+            if ["localhost", "local", "internal", "home.arpa"]
+                .iter()
+                .any(|reserved| domain_matches(domain, reserved))
+            {
+                return Err(Error::HostNotFound);
+            }
+            if let Some(proxy_bare) =
+                proxy_host.map(|p| p.trim_end_matches('.')).filter(|p| !p.is_empty())
+            {
+                let same_as_proxy = match url::Host::parse(proxy_bare) {
+                    Ok(url::Host::Domain(proxy_domain)) => {
+                        domain.eq_ignore_ascii_case(proxy_domain.trim_end_matches('.'))
+                    }
+                    _ => domain.eq_ignore_ascii_case(proxy_bare),
+                };
+                if same_as_proxy {
+                    return Err(Error::HostNotFound);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Blocks literal private/loopback target IPs and internal domains even when a
+/// proxy (`http://`, `https://`, `socks4a://`, `socks5h://`) defers target
+/// resolution to the proxy.
 #[derive(Debug)]
 struct TargetGuardConnector {
     allow_private: bool,
@@ -143,24 +219,9 @@ impl Connector<()> for TargetGuardConnector {
         details: &ConnectionDetails,
         chained: Option<()>,
     ) -> Result<Option<Self::Out>, Error> {
-        if !self.allow_private && details.config.proxy().is_some() {
-            if let Some(host) = details.uri.host() {
-                let bare = host.trim_end_matches('.');
-                if bare.eq_ignore_ascii_case("localhost")
-                    || bare
-                        .get(bare.len().saturating_sub(10)..)
-                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".localhost"))
-                {
-                    return Err(Error::HostNotFound);
-                }
-                let ip = match url::Host::parse(host) {
-                    Ok(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
-                    Ok(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
-                    _ => None,
-                };
-                if ip.is_some_and(|addr| !is_public(addr)) {
-                    return Err(Error::HostNotFound);
-                }
+        if !self.allow_private {
+            if let Some(proxy) = details.config.proxy() {
+                check_proxied_target(details.uri.host(), proxy.uri().host())?;
             }
         }
         Ok(chained)
@@ -229,17 +290,70 @@ pub fn agent(allow_private: bool) -> Agent {
     build(allow_private, None)
 }
 
-/// The same client, connecting through `proxy` (`http://`, `socks4://`,
-/// `socks5://` or `socks5h://`).
+const USER_AGENT: &str = concat!("Rustlink/", env!("CARGO_PKG_VERSION"));
+
+fn validate_proxy_url(proxy: &str) -> Result<&str, SourceError> {
+    const SCHEMES: [&str; 6] =
+        ["http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://"];
+    let raw = proxy.trim();
+    if raw.is_empty()
+        || !raw.bytes().all(|b| (0x21..=0x7e).contains(&b) && !matches!(b, b'\\' | b'?' | b'#'))
+    {
+        return Err(SourceError::Url(
+            "youtubeProxy must be an http://, https://, socks4://, socks4a://, socks5:// or socks5h:// URL with a host".into(),
+        ));
+    }
+    let Some(after_scheme) = SCHEMES.iter().find_map(|scheme| {
+        raw.get(..scheme.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            .map(|_| &raw[scheme.len()..])
+    }) else {
+        return Err(SourceError::Url(
+            "youtubeProxy must use http://, https://, socks4://, socks4a://, socks5:// or socks5h://".into(),
+        ));
+    };
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let valid_host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split_once(']').is_some_and(|(ipv6, tail)| {
+            ipv6.parse::<Ipv6Addr>().is_ok()
+                && match tail.strip_prefix(':') {
+                    None => tail.is_empty(),
+                    Some(port) => port.parse::<u16>().is_ok_and(|p| p > 0),
+                }
+        })
+    } else {
+        match host_port.split_once(':') {
+            None => !host_port.is_empty() && !host_port.contains(['[', ']']),
+            Some((host, port)) => {
+                !host.is_empty()
+                    && !host.contains(['[', ']', ':'])
+                    && port.parse::<u16>().is_ok_and(|p| p > 0)
+            }
+        }
+    };
+    if !valid_host {
+        return Err(SourceError::Url("youtubeProxy must include a valid host".into()));
+    }
+    Ok(raw)
+}
+
+/// The same client, connecting through `proxy` (`http://`, `https://`,
+/// `socks4://`, `socks4a://`, `socks5://` or `socks5h://`).
 pub fn proxied_agent(allow_private: bool, proxy: &str) -> Result<Agent, SourceError> {
-    let proxy = ureq::Proxy::new(proxy.trim())
+    let raw = validate_proxy_url(proxy)?;
+    let proxy = ureq::Proxy::new(raw)
         .map_err(|error| SourceError::Url(format!("youtubeProxy is not usable: {error}")))?;
+    if proxy.uri().host().is_none_or(str::is_empty) {
+        return Err(SourceError::Url("youtubeProxy must include a valid host".into()));
+    }
     Ok(build(allow_private, Some(proxy)))
 }
 
 fn build(allow_private: bool, proxy: Option<ureq::Proxy>) -> Agent {
     let exempt = proxy.as_ref().map(|p| p.uri().clone());
     let config = Agent::config_builder()
+        .user_agent(USER_AGENT)
         .accept_encoding("identity")
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
         .timeout_global(Some(std::time::Duration::from_secs(30)))
@@ -401,5 +515,96 @@ mod tests {
     fn a_name_that_resolves_to_a_private_address_is_refused() {
         assert!(resolve_all_public("localhost", 80, false).is_err());
         assert!(resolve_all_public("localhost", 80, true).is_ok());
+    }
+
+    #[test]
+    fn empty_userinfo_markers_in_url_authority_are_refused() {
+        assert!(validate_url("https://@example.com/a.mp3").is_err());
+        assert!(validate_url("https://:@example.com/a.mp3").is_err());
+        assert!(validate_url("https://user@example.com/a.mp3").is_err());
+        assert!(validate_url("https://example.com/@artist/a.mp3").is_ok());
+    }
+
+    #[test]
+    fn proxied_target_guard_blocks_noncanonical_ips_internal_domains_and_proxy_self() {
+        for blocked in [
+            "",
+            ".",
+            "127.0.0.1",
+            "127.0.0.1.",
+            "0177.0.0.1",
+            "2130706433",
+            "127.1",
+            "127.0.0.1%2e",
+            "0177.0.0.999",
+            "[::1]",
+            "::1",
+            "[::ffff:127.0.0.1]",
+            "[fe80::1%25eth0]",
+            "localhost",
+            "localhost.",
+            "sub.localhost.",
+            "printer.local",
+            "metadata.google.internal",
+            "router.home.arpa",
+            "proxy.corp.example",
+            "PROXY.CORP.EXAMPLE.",
+        ] {
+            assert!(
+                check_proxied_target(Some(blocked), Some("proxy.corp.example")).is_err(),
+                "{blocked} should be blocked through a proxy"
+            );
+        }
+        assert!(check_proxied_target(None, Some("127.0.0.1")).is_err());
+        for allowed in [
+            "youtube.test",
+            "rr1---sn-x.googlevideo.com.",
+            "1.1.1.1",
+            "1.1.1.1.",
+            "[2606:4700::1111]",
+            "2606:4700::1111",
+        ] {
+            assert!(
+                check_proxied_target(Some(allowed), Some("127.0.0.1")).is_ok(),
+                "{allowed} should be allowed through a proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn proxied_agent_validates_scheme_characters_and_host_and_agent_sets_rustlink_ua() {
+        for good in [
+            "http://127.0.0.1:8080",
+            "https://user:pass@proxy.example:8443",
+            "socks4://127.0.0.1:1080",
+            "socks4a://proxy.example:1080",
+            "socks5://[::1]:1080",
+            "socks5h://proxy.example",
+        ] {
+            assert!(proxied_agent(false, good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "127.0.0.1:8080",
+            "ftp://proxy.example:8080",
+            "socks5://",
+            "http://user@:8080",
+            "http://proxy.example:8080?x=1",
+            "http://proxy.example:8080#frag",
+            "http://proxy.example\\@evil",
+            "http://proxy.example:0",
+        ] {
+            assert!(proxied_agent(false, bad).is_err(), "{bad}");
+        }
+        let (base, server) = crate::test_http::serve(1, |_, head, _| {
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains(&format!("\r\nuser-agent: {}\r\n", USER_AGENT.to_ascii_lowercase())),
+                "{head}"
+            );
+            serde_json::json!({})
+        });
+        agent(true).get(&base).call().unwrap();
+        server.join().unwrap();
     }
 }

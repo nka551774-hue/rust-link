@@ -83,6 +83,10 @@ impl Client {
         if rustlink_source::netguard::validate_url(&target).is_err() {
             return None;
         }
+        let parsed = url::Url::parse(&target).ok()?;
+        if !allow_private_networks && is_disallowed_webhook_host(&parsed) {
+            return None;
+        }
         let discord = is_discord(&target);
         let agent = rustlink_source::netguard::agent(allow_private_networks);
         let (queue, inbox) = sync_channel(QUEUE);
@@ -225,6 +229,26 @@ fn deliver(
 const SCRUBBED_KEYS: [&str; 6] =
     ["token", "uri", "artwork_url", "identifier", "extra", "user_data"];
 
+fn is_disallowed_webhook_host(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            !rustlink_source::netguard::is_public(std::net::IpAddr::V4(v4))
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            !rustlink_source::netguard::is_public(std::net::IpAddr::V6(v6))
+        }
+        Some(url::Host::Domain(domain)) => {
+            let bare = domain.trim_end_matches('.');
+            bare.eq_ignore_ascii_case("localhost")
+                || bare
+                    .as_bytes()
+                    .get(bare.len().wrapping_sub(10)..)
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".localhost"))
+        }
+        None => true,
+    }
+}
+
 /// Removes fields that must not cross the webhook trust boundary.
 ///
 /// Events delivered through a session remain untouched; this function is only
@@ -232,32 +256,41 @@ const SCRUBBED_KEYS: [&str; 6] =
 /// walk is recursive so a future event shape cannot accidentally re-introduce
 /// a nested token or signed URL under a different wrapper.
 fn scrub_event(mut event: Value) -> Value {
-    scrub_value(&mut event);
+    scrub_value(&mut event, false);
     event
 }
 
 fn scrub_ref(value: &Value) -> Value {
+    scrub_ref_inner(value, false)
+}
+
+fn scrub_ref_inner(value: &Value, in_exception: bool) -> Value {
     match value {
         Value::Object(object) => {
             let mut out = Map::with_capacity(object.len());
             for (key, child) in object {
                 if !SCRUBBED_KEYS.contains(&key.as_str()) {
-                    out.insert(key.clone(), scrub_ref(child));
+                    out.insert(
+                        key.clone(),
+                        scrub_ref_inner(child, in_exception || key == "exception"),
+                    );
                 }
             }
             Value::Object(out)
         }
-        Value::Array(values) => Value::Array(values.iter().map(scrub_ref).collect()),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(|child| scrub_ref_inner(child, in_exception)).collect())
+        }
         Value::String(text) => {
             let mut copy = text.clone();
-            redact_urls_in_place(&mut copy, false, "<redacted-url>");
+            redact_urls_in_place(&mut copy, in_exception, "<redacted-url>");
             Value::String(copy)
         }
         other => other.clone(),
     }
 }
 
-fn scrub_value(value: &mut Value) {
+fn scrub_value(value: &mut Value, in_exception: bool) {
     match value {
         Value::Object(object) => {
             // `identifier` is normally a source ID, but the native HTTP source
@@ -266,19 +299,20 @@ fn scrub_value(value: &mut Value) {
             for key in SCRUBBED_KEYS {
                 object.remove(key);
             }
-            for child in object.values_mut() {
-                scrub_value(child);
+            for (key, child) in object.iter_mut() {
+                scrub_value(child, in_exception || key == "exception");
             }
         }
         Value::Array(values) => {
             for child in values {
-                scrub_value(child);
+                scrub_value(child, in_exception);
             }
         }
         // Source/media/voice failures can include the URL they were trying to
         // open in diagnostic text (`message`, `cause`, `reason`, etc.). Keep
-        // the diagnostic text, but replace URL tokens carrying credentials.
-        Value::String(text) => redact_urls_in_place(text, false, "<redacted-url>"),
+        // the diagnostic text, but replace URL tokens carrying credentials
+        // (and all URLs inside `exception` objects, including path-signed CDN URLs).
+        Value::String(text) => redact_urls_in_place(text, in_exception, "<redacted-url>"),
         _ => {}
     }
 }
@@ -353,11 +387,12 @@ fn post(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), Failure> {
         .build()
         .send(body)
         .map_err(|error| {
+            let retryable = !matches!(error, ureq::Error::BadUri(_) | ureq::Error::Http(_));
             let mut detail = error.to_string().replace(url, "<redacted webhook URL>");
             redact_urls_in_place(&mut detail, true, "<redacted webhook URL>");
             Failure {
                 message: format!("webhook endpoint could not be reached: {detail}"),
-                retryable: true,
+                retryable,
                 retry_after: None,
             }
         })?;
@@ -1170,5 +1205,43 @@ mod tests {
     #[test]
     fn extreme_duration_still_formats_as_a_nonnegative_time() {
         assert_eq!(format_duration(i64::MAX), "2562047788015:12:56");
+    }
+
+    #[test]
+    fn exception_scrubs_path_signed_urls_and_bad_uris_or_private_hosts_are_refused() {
+        let raw_event = json!({
+            "type": "track.failed",
+            "exception": {
+                "message": "stream https://cdn.example/sig/secret-path-token/ip/203.0.113.5/audio.opus reset",
+                "cause": "http://10.0.0.8:8080/internal/stream"
+            }
+        });
+        for scrubbed in [scrub_event(raw_event.clone()), scrub_ref(&raw_event)] {
+            assert_eq!(scrubbed["exception"]["message"], "stream <redacted-url> reset");
+            assert_eq!(scrubbed["exception"]["cause"], "<redacted-url>");
+            let text = scrubbed.to_string();
+            assert!(!text.contains("secret-path-token"));
+            assert!(!text.contains("10.0.0.8"));
+        }
+
+        for blocked in [
+            "http://127.0.0.1:8080/hook",
+            "http://localhost:8080/hook",
+            "http://sub.localhost./hook",
+            "http://[::1]:8080/hook",
+        ] {
+            let settings = Settings { enable: true, url: blocked.into(), state_latency_seconds: 5 };
+            assert!(Client::with_network_policy(&settings, false).is_none(), "{blocked}");
+        }
+        let local = Settings {
+            enable: true,
+            url: "http://127.0.0.1:8080/hook".into(),
+            state_latency_seconds: 5,
+        };
+        assert!(Client::with_network_policy(&local, true).is_some());
+
+        let agent = rustlink_source::netguard::agent(false);
+        let failure = post(&agent, "not-a-valid-uri", b"{}").err().unwrap();
+        assert!(!failure.retryable, "BadUri must not be retried");
     }
 }

@@ -196,7 +196,9 @@ pub struct Logger {
 impl Logger {
     /// The file being written to, or `None` when file logging is off.
     pub fn path(&self) -> Option<String> {
-        self.files.as_ref().map(|files| files.lock().unwrap().path())
+        self.files
+            .as_ref()
+            .map(|files| files.lock().unwrap_or_else(|error| error.into_inner()).path())
     }
 
     /// Writes one record to the console and mirrors it into the file.
@@ -215,9 +217,12 @@ impl Logger {
                 Format::Json => console,
                 Format::Text => text_line(label, message, at),
             };
-            let prune_job = files.lock().unwrap().write_line(&file_line, at.date_naive());
+            let prune_job = files
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .write_line(&file_line, at.date_naive());
             if let Some((directory, retention, today)) = prune_job {
-                prune(&directory, retention, today);
+                spawn_prune(directory, retention, today);
             }
         }
     }
@@ -243,10 +248,13 @@ impl Log for Logger {
     fn flush(&self) {
         let _ = std::io::stdout().flush();
         if let Some(files) = &self.files {
-            let _ = files.lock().unwrap().handle.flush();
+            let _ = files.lock().unwrap_or_else(|error| error.into_inner()).handle.flush();
         }
     }
 }
+
+const ROTATE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The daily file the log is mirrored into. Records are never coloured, even
 /// when the console is: an escape sequence in a file is noise for every tool
 /// that reads one.
@@ -256,16 +264,23 @@ struct Files {
     handle: File,
     /// How many days of files are kept.
     retention: u32,
+    /// Cooldown deadline after a failed rotation attempt so subsequent log
+    /// lines do not hammer the filesystem on every record.
+    retry_after: Option<std::time::Instant>,
 }
 
 impl Files {
     fn open(directory: &str, retention: u32) -> Result<Files, String> {
-        std::fs::create_dir_all(directory)
-            .map_err(|error| format!("log directory {directory}: {error}"))?;
         let date = Local::now().date_naive();
         let handle = open_day(Path::new(directory), date)?;
-        let files = Files { directory: PathBuf::from(directory), date, handle, retention };
-        files.prune(date);
+        let files = Files {
+            directory: PathBuf::from(directory),
+            date,
+            handle,
+            retention,
+            retry_after: None,
+        };
+        spawn_prune(files.directory.clone(), retention, date);
         Ok(files)
     }
 
@@ -277,27 +292,53 @@ impl Files {
     /// Appends one record, reopening the file when the date changes so a node
     /// that stays up for weeks does not grow one file forever.
     fn write_line(&mut self, line: &str, date: NaiveDate) -> Option<(PathBuf, u32, NaiveDate)> {
+        self.write_line_at(line, date, std::time::Instant::now())
+    }
+
+    fn write_line_at(
+        &mut self,
+        line: &str,
+        date: NaiveDate,
+        now: std::time::Instant,
+    ) -> Option<(PathBuf, u32, NaiveDate)> {
         let mut rotated = None;
-        if date > self.date {
+        if date != self.date && self.retry_after.is_none_or(|until| now >= until) {
             // Keeping the previous file when the new day cannot be opened is
             // the lesser loss: a misnamed log beats no log.
-            if let Ok(handle) = open_day(&self.directory, date) {
-                self.handle = handle;
-                self.date = date;
-                rotated = Some((self.directory.clone(), self.retention, date));
+            match open_day(&self.directory, date) {
+                Ok(handle) => {
+                    self.handle = handle;
+                    self.date = date;
+                    self.retry_after = None;
+                    rotated = Some((self.directory.clone(), self.retention, date));
+                }
+                Err(_) => {
+                    self.retry_after = Some(now + ROTATE_RETRY_COOLDOWN);
+                }
             }
         }
         let _ = self.handle.write_all(line.as_bytes());
         rotated
     }
+}
 
-    /// Removes the files that have aged out of the retention window.
-    fn prune(&self, today: NaiveDate) {
-        prune(&self.directory, self.retention, today);
+fn spawn_prune(directory: PathBuf, retention: u32, today: NaiveDate) {
+    if retention == 0 {
+        return;
+    }
+    let fallback = directory.clone();
+    if std::thread::Builder::new()
+        .name("log-prune".into())
+        .spawn(move || prune(&directory, retention, today))
+        .is_err()
+    {
+        prune(&fallback, retention, today);
     }
 }
 
 fn open_day(directory: &Path, date: NaiveDate) -> Result<File, String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("log directory {}: {error}", directory.display()))?;
     let path = directory.join(format!("{FILE_PREFIX}{date}.log"));
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -676,6 +717,65 @@ mod tests {
         let (directory, stale, _, _) = prepared_directory("keep");
         prune(&directory, 0, Local::now().date_naive());
         assert!(stale.exists(), "zero days means every file is kept");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn poisoned_file_mutex_recovers_without_panicking() {
+        let directory =
+            std::env::temp_dir().join(format!("rustlink-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let logger = std::sync::Arc::new(Logger {
+            level: LevelFilter::Info,
+            format: Format::Text,
+            color: false,
+            files: Some(Mutex::new(Files::open(&directory.display().to_string(), 0).unwrap())),
+        });
+        let poisoned = std::sync::Arc::clone(&logger);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.files.as_ref().unwrap().lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(logger.path().is_some());
+        logger.write("INFO", paint::GREEN, "recovered after poison");
+        logger.flush();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn rotation_recreates_missing_directory_and_throttles_failed_reopens() {
+        let directory =
+            std::env::temp_dir().join(format!("rustlink-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut files = Files::open(&directory.display().to_string(), 0).unwrap();
+        let start = std::time::Instant::now();
+        let earlier = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+
+        // Removing the directory before a date change must still rotate cleanly.
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(files.write_line_at("first\n", earlier, start).is_some());
+        assert_eq!(files.date, earlier);
+        assert!(directory.join("rustlink-2025-01-02.log").is_file());
+
+        // Block `create_dir_all` by pointing at a regular file as the directory.
+        let blocker = directory.join("blocker-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        files.directory = blocker.clone();
+        let next_day = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
+        assert!(files.write_line_at("second\n", next_day, start).is_none());
+        let cooldown_until = files.retry_after.expect("failed rotation sets a retry cooldown");
+        assert_eq!(files.date, earlier);
+
+        // Restoring a writable directory during the cooldown does not reopen until the cooldown expires.
+        files.directory = directory.clone();
+        assert!(files
+            .write_line_at("during-cooldown\n", next_day, start + std::time::Duration::from_secs(1))
+            .is_none());
+        assert_eq!(files.date, earlier);
+        assert!(files.write_line_at("after-cooldown\n", next_day, cooldown_until).is_some());
+        assert_eq!(files.date, next_day);
+        assert!(files.retry_after.is_none());
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

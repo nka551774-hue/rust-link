@@ -36,6 +36,9 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds a response, so a hostile or broken answer cannot fill memory.
 const BODY_LIMIT: u64 = 8 << 20;
 
+/// Caps upfront `Vec<Line>` capacity reservation before iterating timed lines.
+const MAX_TIMED_LINES: usize = 10_000;
+
 /// Marks the tab that holds the words. The title of the tab is localised, so the
 /// page type is what identifies it.
 const LYRICS_PAGE: &str = "MUSIC_PAGE_TYPE_TRACK_LYRICS";
@@ -92,14 +95,14 @@ impl Provider for YTMusic {
         let Some(video_id) = video_id(track) else {
             return Err(LyricsError::NotFound);
         };
-        let Some(page) = self.page(video_id)? else {
+        let Some((page, visitor_data)) = self.page(video_id)? else {
             return Err(LyricsError::NotFound);
         };
         // A shape that failed is not a reason to stop: the other one is a
         // separate request and may still answer. Only when neither has anything
         // is the failure raised, and the first one is the one worth reporting.
         let mut last: Option<LyricsError> = None;
-        match self.ask(&MOBILE, &page) {
+        match self.ask(&MOBILE, &page, &visitor_data) {
             Ok(answer) => {
                 if let Some(lyrics) = from_mobile(track, &answer) {
                     return Ok(lyrics);
@@ -108,7 +111,7 @@ impl Provider for YTMusic {
             Err(LyricsError::NotFound) => {}
             Err(error) => last = Some(error),
         }
-        match self.ask(&WEB, &page) {
+        match self.ask(&WEB, &page, &visitor_data) {
             Ok(answer) => {
                 if let Some(lyrics) = from_web(track, &answer) {
                     return Ok(lyrics);
@@ -129,12 +132,31 @@ impl Provider for YTMusic {
 }
 
 impl YTMusic {
-    /// Returns the lyrics page a track has, or `None` when it has none.
+    /// Returns the lyrics page a track has (and the visitor session token to
+    /// accompany it), or `None` when it has none.
     ///
     /// The words are not in this answer, so a missing browse id is the catalogue
     /// saying the track has no lyrics rather than a failure.
-    fn page(&self, video_id: &str) -> Result<Option<String>, LyricsError> {
-        let answer: Value = self.call(&WEB, "next", json!({ "videoId": video_id }))?;
+    fn page(&self, video_id: &str) -> Result<Option<(String, String)>, LyricsError> {
+        let configured_vd = self.visitor_data.trim();
+        let answer: Value =
+            self.call(&WEB, "next", configured_vd, json!({ "videoId": video_id }))?;
+        let effective_vd = if !configured_vd.is_empty() {
+            configured_vd.to_owned()
+        } else {
+            answer
+                .pointer("/responseContext/visitorData")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|vd| {
+                    !vd.is_empty()
+                        && vd.len() <= 512
+                        && vd.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                        && crate::valid_header_value(vd)
+                })
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
         let tabs = answer
             .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
             .and_then(Value::as_array);
@@ -148,30 +170,39 @@ impl YTMusic {
                     .get("browseId")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                    .map(str::to_owned));
+                    .map(|id| (id.to_owned(), effective_vd)));
             }
         }
         Ok(None)
     }
 
     /// Posts one browse request for the lyrics page.
-    fn ask(&self, client: &Client, page: &str) -> Result<Value, LyricsError> {
-        self.call(client, "browse", json!({ "browseId": page }))
+    fn ask(&self, client: &Client, page: &str, visitor_data: &str) -> Result<Value, LyricsError> {
+        self.call(client, "browse", visitor_data, json!({ "browseId": page }))
     }
 
     /// Posts one InnerTube request and decodes the answer.
-    fn call(&self, client: &Client, endpoint: &str, mut body: Value) -> Result<Value, LyricsError> {
+    fn call(
+        &self,
+        client: &Client,
+        endpoint: &str,
+        visitor_data: &str,
+        mut body: Value,
+    ) -> Result<Value, LyricsError> {
         let version = if client.name == WEB.name && !self.version.trim().is_empty() {
             self.version.trim()
         } else {
             client.version
         };
-        body["context"] =
-            json!({ "client": client_context(client, version, self.visitor_data.trim()) });
-        let base =
+        let visitor = visitor_data.trim();
+        if !crate::valid_header_value(version) || !crate::valid_header_value(visitor) {
+            return Err(LyricsError::Failed("lyrics: invalid YouTube Music header value".into()));
+        }
+        let raw_base =
             if self.endpoint.trim().is_empty() { YTMUSIC_ENDPOINT } else { self.endpoint.trim() };
-        let url =
-            format!("{}/youtubei/v1/{}?prettyPrint=false", base.trim_end_matches('/'), endpoint);
+        let base = crate::validate_base_url(raw_base, "youtube music")?;
+        body["context"] = json!({ "client": client_context(client, version, visitor) });
+        let url = format!("{base}/youtubei/v1/{endpoint}?prettyPrint=false");
         let mut request = self
             .agent
             .post(url)
@@ -180,8 +211,8 @@ impl YTMusic {
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("X-YouTube-Client-Name", client.id)
             .header("X-YouTube-Client-Version", version);
-        if !self.visitor_data.trim().is_empty() {
-            request = request.header("X-Goog-Visitor-Id", self.visitor_data.trim());
+        if !visitor.is_empty() {
+            request = request.header("X-Goog-Visitor-Id", visitor);
         }
         let response = request
             .config()
@@ -298,11 +329,10 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
     // without a cue means the catalogue has the words but not when they are
     // sung, which is still worth returning, as text.
     let timed = lines.iter().all(|line| line.get("cueRange").is_some_and(|cue| !cue.is_null()))
-        && (lines.len() <= 1
-            || lines.iter().any(|line| {
-                millis(line.pointer("/cueRange/startTimeMilliseconds")) > 0
-                    || millis(line.pointer("/cueRange/endTimeMilliseconds")) > 0
-            }));
+        && lines.iter().any(|line| {
+            millis(line.pointer("/cueRange/startTimeMilliseconds")) > 0
+                || millis(line.pointer("/cueRange/endTimeMilliseconds")) > 0
+        });
     if !timed {
         let mut joined = String::new();
         for (idx, line) in lines.iter().enumerate() {
@@ -318,7 +348,7 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
         out.text = Some(joined);
         return Some(out);
     }
-    let mut timed_lines = Vec::with_capacity(lines.len());
+    let mut timed_lines = Vec::with_capacity(lines.len().min(MAX_TIMED_LINES));
     for line in lines {
         let start = millis(line.pointer("/cueRange/startTimeMilliseconds"));
         let end = millis(line.pointer("/cueRange/endTimeMilliseconds"));
@@ -533,5 +563,110 @@ mod tests {
         let web = client_context(&WEB, WEB_VERSION, "");
         assert!(web.get("osName").is_none());
         assert!(web.get("visitorData").is_none());
+    }
+
+    #[test]
+    fn single_line_zero_cue_becomes_plain_text_and_next_visitor_data_is_forwarded() {
+        use std::io::{Read, Write};
+        let zero_cue = json!({
+            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
+                "timedLyricsModel": {"lyricsData": {
+                    "timedLyricsData": [{
+                        "lyricLine": "untimed single line",
+                        "cueRange": {"startTimeMilliseconds": "0", "endTimeMilliseconds": "0"}
+                    }]
+                }}
+            }}}}}}
+        });
+        let parsed = from_mobile(&track("youtube", "dQw4w9WgXcQ"), &zero_cue).unwrap();
+        assert_eq!(parsed.text.as_deref(), Some("untimed single line"));
+        assert!(parsed.lines.is_none());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (hdr_end, content_len) = loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = std::str::from_utf8(&req[..pos]).unwrap();
+                        let len = head
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .map_or(0, |(_, v)| v.trim().parse::<usize>().unwrap());
+                        break (pos + 4, len);
+                    }
+                };
+                while req.len() < hdr_end + content_len {
+                    let n = socket.read(&mut buf).unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let head = std::str::from_utf8(&req[..hdr_end]).unwrap().to_ascii_lowercase();
+                let body: Value =
+                    serde_json::from_slice(&req[hdr_end..hdr_end + content_len]).unwrap();
+                let resp_json = if step == 0 {
+                    assert!(head.starts_with("post /youtubei/v1/next?"));
+                    json!({
+                        "responseContext": {"visitorData": "harvested-vd"},
+                        "contents": {"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer": {
+                            "watchNextTabbedResultsRenderer": {"tabs": [{"tabRenderer": {"endpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "MPLYt_1",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {"pageType": LYRICS_PAGE}
+                                    }
+                                }
+                            }}}]}
+                        }}}
+                    })
+                } else {
+                    assert!(head.starts_with("post /youtubei/v1/browse?"));
+                    assert!(head.contains("\r\nx-goog-visitor-id: harvested-vd\r\n"));
+                    assert_eq!(body["context"]["client"]["visitorData"], "harvested-vd");
+                    json!({
+                        "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
+                            "timedLyricsModel": {"lyricsData": {"timedLyricsData": [{
+                                "lyricLine": "synced line",
+                                "cueRange": {"startTimeMilliseconds": "0", "endTimeMilliseconds": "2500"}
+                            }]}}
+                        }}}}}}
+                    })
+                };
+                let encoded = serde_json::to_vec(&resp_json).unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    encoded.len()
+                )
+                .unwrap();
+                socket.write_all(&encoded).unwrap();
+            }
+        });
+        let provider = YTMusic {
+            agent: ureq::Agent::new_with_defaults(),
+            endpoint,
+            version: String::new(),
+            visitor_data: String::new(),
+        };
+        let lyrics = provider.fetch(&track("youtube", "dQw4w9WgXcQ")).unwrap();
+        server.join().unwrap();
+        assert_eq!(lyrics.lines.unwrap()[0].line, "synced line");
+
+        let bad_header = YTMusic {
+            agent: ureq::Agent::new_with_defaults(),
+            endpoint: "https://music.youtube.com".into(),
+            version: "1.0\r\nX-Injected: 1".into(),
+            visitor_data: String::new(),
+        };
+        assert!(matches!(
+            bad_header.fetch(&track("youtube", "dQw4w9WgXcQ")),
+            Err(LyricsError::Failed(_))
+        ));
     }
 }

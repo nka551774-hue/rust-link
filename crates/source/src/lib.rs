@@ -503,6 +503,10 @@ fn path_name(identifier: &str) -> String {
 
 /// Reads the video id out of a YouTube URL of any of the shapes they come in.
 fn youtube_video_from_url(identifier: &str) -> Option<String> {
+    youtube_video_from_url_inner(identifier, true)
+}
+
+fn youtube_video_from_url_inner(identifier: &str, allow_attribution: bool) -> Option<String> {
     let url = http_url(identifier)?;
     let host = url.host_str()?;
     let mut parts = url.path_segments()?;
@@ -527,13 +531,13 @@ fn youtube_video_from_url(identifier: &str) -> Option<String> {
             let (_, id) = url.query_pairs().find(|(key, _)| key == "v")?;
             youtube_id(&id).then(|| id.into_owned())
         }
-        Some("attribution_link") if parts.all(str::is_empty) => {
+        Some("attribution_link") if allow_attribution && parts.all(str::is_empty) => {
             let (_, inner) = url.query_pairs().find(|(key, _)| key == "u")?;
-            if !inner.starts_with('/') {
+            if !inner.starts_with('/') || inner.starts_with("//") {
                 return None;
             }
             let resolved = format!("https://www.youtube.com{inner}");
-            youtube_video_from_url(&resolved)
+            youtube_video_from_url_inner(&resolved, false)
         }
         Some("shorts") | Some("embed") | Some("live") | Some("v") | Some("e") => {
             let id = parts.next()?;
@@ -823,11 +827,10 @@ mod tests {
 
     #[test]
     fn disabled_native_sources_fail_for_resolution_and_playback() {
-        let service = Service::new(Config {
-            youtube_native: false,
-            soundcloud_native: false,
-            ..Config::default()
-        });
+        let mut cfg = Config::default();
+        cfg.youtube_native = false;
+        cfg.soundcloud_native = false;
+        let service = Service::new(cfg);
         for query in ["ytsearch:a song", "scsearch:a song", "youtube:playlist:PL123"] {
             assert!(matches!(service.load(query), Err(SourceError::Disabled(_))));
         }
@@ -926,6 +929,21 @@ mod tests {
         }
         assert!(youtube_video_from_url("https://youtube.com/shorts/dQw4w9WgXcQ/extra").is_none());
         assert!(youtube_video_from_url("https://youtube.com/watch?v=dQw4w9WgXcQ%23extra").is_none());
+        assert_eq!(
+            youtube_video_from_url(
+                "https://www.youtube.com/attribution_link?u=%2Fwatch%3Fv%3DdQw4w9WgXcQ"
+            )
+            .as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+        assert!(youtube_video_from_url(
+            "https://www.youtube.com/attribution_link?u=%2F%2Fyoutu.be%2FdQw4w9WgXcQ"
+        )
+        .is_none());
+        assert!(youtube_video_from_url(
+            "https://www.youtube.com/attribution_link?u=%2Fattribution_link%3Fu%3D%252Fwatch%253Fv%253DdQw4w9WgXcQ"
+        )
+        .is_none());
     }
 
     #[test]
@@ -966,11 +984,10 @@ mod tests {
                 "videoId":"dQw4w9WgXcQ","title":"Fixture song","author":"Fixture artist","lengthSeconds":"120"
             }})
         });
-        let service = Service::new(Config {
-            youtube_endpoint: base,
-            allow_private_networks: true,
-            ..Config::default()
-        });
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        let service = Service::new(cfg);
         for url in urls {
             let result = service.load(url).unwrap();
             let LoadResult::Track(track) = result else {
@@ -994,11 +1011,10 @@ mod tests {
                 "playlistVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Fixture song"},"lengthText":{"simpleText":"2:00"}}
             }})
         });
-        let service = Service::new(Config {
-            youtube_endpoint: base,
-            allow_private_networks: true,
-            ..Config::default()
-        });
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        let service = Service::new(cfg);
         for url in [
             "https://www.youtube.com/playlist?list=PL123&si=share#fragment",
             "https://music.youtube.com/watch?list=PL123#fragment",
@@ -1072,11 +1088,10 @@ mod tests {
                 }
             }
         });
-        let service = Service::new(Config {
-            youtube_endpoint: base,
-            allow_private_networks: true,
-            ..Config::default()
-        });
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        let service = Service::new(cfg);
         let track = rustlink_protocol::encode_track(&TrackInfo {
             identifier: "4cOdK2wGLETKBW3PvgPWqT".into(),
             title: "A Song".into(),
@@ -1154,11 +1169,10 @@ mod tests {
                 {"mimeType":"audio/webm; codecs=\"opus\"","bitrate":160000,"url":format!("{cdn}{path}")}
             ]}})
         });
-        let service = Service::new(Config {
-            youtube_endpoint: base,
-            allow_private_networks: true,
-            ..Config::default()
-        });
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        let service = Service::new(cfg);
         let LoadResult::Track(track) = service
             .load("<https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&si=paste>")
             .unwrap()

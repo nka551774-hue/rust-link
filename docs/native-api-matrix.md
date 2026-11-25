@@ -7,7 +7,7 @@
 | 層 | 模組 | 責任 | 不做的事 |
 | --- | --- | --- | --- |
 | Discord REST | `discord-bot::rest::DiscordRest` | Discord API v10 的認證、發訊息、斜線指令與互動回應 | 不把 bot token 放進錯誤、日誌或網址；自訂 base 只允許 Discord 主機或 loopback；不處理音訊資料 |
-| Discord 主 Gateway | `discord-bot::gateway` | HELLO、IDENTIFY、heartbeat、READY、reconnect／invalid-session 訊號與 dispatch | 不編碼 Opus、不管理播放器；退避重連與 RESUME 由上層負責 |
+| Discord 主 Gateway | `discord-bot::gateway` | HELLO、IDENTIFY、`Gateway::connect_with_messages`（`4014` 免特權自動降級）、`Gateway::resume`（`OP 6`）、`Gateway::reconnect`（有界退避與續傳／重新 IDENTIFY 切換）、heartbeat、READY 與 dispatch | 不編碼 Opus、不管理播放器或語音媒體傳輸 |
 | 語音狀態配對 | `discord-bot::voice_state` | 配對自己的 `VOICE_STATE_UPDATE` 與 `VOICE_SERVER_UPDATE`，產生 `VoiceState`；可鎖定單一 guild | 不接受其他使用者或未綁定 guild 的事件；不把 bot token 當 voice token |
 | Rustlink session | `rustlink-client`、`rustlink-server` | session、guild 播放器、事件與恢復 | 不依賴 NodeLink／Lavalink 的 encoded track 格式 |
 | 音源 | `rustlink-source` | 原生解析、直接媒體網址、範圍與 ETag 驗證 | 不啟動 yt-dlp、Node、Java 或 Go 的擷取器 |

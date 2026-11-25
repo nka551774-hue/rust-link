@@ -16,6 +16,7 @@ struct PageState {
     next_segment: usize,
     offset: usize,
     granule: u64,
+    continued: bool,
     end_of_stream: bool,
     last_complete: usize,
 }
@@ -158,6 +159,13 @@ impl<R: Read> OggOpusReader<R> {
                 self.page = Some(self.read_page_header()?);
             }
             let page = self.page.as_mut().expect("a page was just read");
+            if page.next_segment == 0 && page.continued != started {
+                self.page = None;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ogg page continuation mismatch",
+                ));
+            }
             let segs = &self.buffer[page.table + page.next_segment..page.table + page.count];
             let mut consumed_segs = 0usize;
             let mut chunk_len = 0usize;
@@ -271,7 +279,8 @@ impl<R: Read> OggOpusReader<R> {
         // No compaction takes place while a page is open, so the table can be
         // read from the input buffer without copying it into another array.
         let granule = u64::from_le_bytes(unconsumed[6..14].try_into().unwrap());
-        let end_of_stream = unconsumed[5] & 4 != 0;
+        let continued = (unconsumed[5] & 0x01) != 0;
+        let end_of_stream = (unconsumed[5] & 0x04) != 0;
         let segments = &unconsumed[PAGE_HEADER..PAGE_HEADER + count];
         let last_complete = segments.iter().rposition(|&size| size < 255).map_or(0, |i| i + 1);
         if end_of_stream && segments.last() == Some(&255) {
@@ -286,6 +295,7 @@ impl<R: Read> OggOpusReader<R> {
             next_segment: 0,
             offset: table + count,
             granule,
+            continued,
             end_of_stream,
             last_complete,
         })
@@ -529,5 +539,21 @@ mod tests {
         let mut reader = OggOpusReader::new(stream.as_slice());
         assert_eq!(reader.next_packet().unwrap().unwrap(), vec![9, 8, 7]);
         assert!(reader.next_packet().unwrap().is_none());
+    }
+
+    #[test]
+    fn mismatched_page_continuation_flags_are_rejected() {
+        let orphan_cont = stream_with_audio(vec![page(1, 2, &[4], &[1, 2, 3, 4])]);
+        assert_eq!(
+            OggOpusReader::new(orphan_cont.as_slice()).next_packet().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let missing_cont =
+            stream_with_audio(vec![page(0, 2, &[255], &[7; 255]), page(0, 3, &[5], &[9; 5])]);
+        assert_eq!(
+            OggOpusReader::new(missing_cont.as_slice()).next_packet().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

@@ -4,6 +4,7 @@
 mod media;
 mod session;
 
+pub use media::MediaSender;
 pub use session::{Outbound, Session, MAX_PROTOCOL_VERSION};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

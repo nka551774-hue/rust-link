@@ -68,7 +68,7 @@ impl Resolver {
 
     /// Removes the archives fetched during this run.
     pub fn close(&self) {
-        let directory = self.temp.lock().unwrap().take();
+        let directory = self.temp.lock().unwrap_or_else(|error| error.into_inner()).take();
         if let Some(directory) = directory {
             let _ = fs::remove_dir_all(directory);
         }
@@ -148,32 +148,53 @@ impl Resolver {
 
     /// The directory downloads land in, created on first use with private permissions.
     fn work_directory(&self) -> Result<PathBuf, String> {
-        let mut temp = self.temp.lock().unwrap();
+        let mut temp = self.temp.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(directory) = temp.as_ref() {
             return Ok(directory.clone());
         }
+        let base = std::env::temp_dir();
+        fs::create_dir_all(&base)
+            .map_err(|error| format!("temp directory {}: {error}", base.display()))?;
         let mut nonce = [0u8; 8];
-        let _ = getrandom::fill(&mut nonce);
+        getrandom::fill(&mut nonce)
+            .map_err(|error| format!("could not generate temporary directory nonce: {error}"))?;
         let suffix = hex_encode(&nonce);
-        let directory =
-            std::env::temp_dir().join(format!("rustlink-tools-{}-{suffix}", std::process::id()));
+        let directory = base.join(format!("rustlink-tools-{}-{suffix}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&directory)
-                .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
+            builder.mode(0o700);
         }
-        #[cfg(not(unix))]
-        {
-            fs::create_dir_all(&directory)
-                .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
-        }
+        builder
+            .create(&directory)
+            .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
         *temp = Some(directory.clone());
         Ok(directory)
     }
+}
+
+fn is_https(url: &str) -> bool {
+    url.as_bytes().get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
+}
+
+fn check_redirect_scheme(requested: &str, landed: &str) -> Result<(), String> {
+    if is_https(requested) && !is_https(landed) {
+        return Err(format!("refusing HTTPS downgrade redirect from {requested} to {landed}"));
+    }
+    Ok(())
+}
+
+fn create_exclusive_private(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Encodes bytes as lowercase hexadecimal in a single allocation.
@@ -195,17 +216,18 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
         .header("User-Agent", "rustlink")
         .call()
         .map_err(|error| format!("{url} could not be reached: {error}"))?;
+    // Where the download ended up, which is not `url` when that redirected.
+    let landed = ureq::ResponseExt::get_uri(&response).to_string();
+    check_redirect_scheme(url, &landed)?;
     let status = response.status().as_u16();
     if status != 200 {
         return Err(format!("{url} returned HTTP {status}"));
     }
-    // Where the download ended up, which is not `url` when that redirected.
-    let landed = ureq::ResponseExt::get_uri(&response).to_string();
     let total = response.body().content_length();
     let name = if source.asset.is_empty() { "download.bin" } else { source.asset.as_str() };
     let file = directory.join(name);
     let mut out =
-        fs::File::create(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+        create_exclusive_private(&file).map_err(|error| format!("{}: {error}", file.display()))?;
     let mut body = response.body_mut().as_reader();
     let (written, got_sum) = match copy(&mut body, &mut out, source.tool, total) {
         Ok(result) => result,
@@ -373,6 +395,8 @@ fn verify(
         .header("User-Agent", "rustlink")
         .call()
         .map_err(|error| format!("checksum list {sums_url}: {error}"))?;
+    let landed = ureq::ResponseExt::get_uri(&response).to_string();
+    check_redirect_scheme(sums_url, &landed)?;
     let status = response.status().as_u16();
     if status != 200 {
         return Err(format!("checksum list {sums_url} returned HTTP {status}"));
@@ -429,42 +453,81 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
         fs::File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|error| format!("{}: {error}", archive.display()))?;
+    let exact_bin = Path::new("bin").join(member);
+    let mut selected: Option<(usize, u8)> = None;
+    let mut saw_undersized = false;
     for index in 0..zip.len() {
-        let mut entry = zip.by_index(index).map_err(|error| error.to_string())?;
+        let entry = zip.by_index(index).map_err(|error| error.to_string())?;
         if entry.is_dir() || entry.is_symlink() {
             continue;
         }
-        let matched = entry
-            .enclosed_name()
-            .and_then(|path| path.file_name().map(|f| f == std::ffi::OsStr::new(member)))
-            .unwrap_or(false);
-        if matched {
-            if entry.size() > MAX_ARCHIVE_BYTES {
-                return Err(format!("{member} exceeds 512 MiB uncompressed safety cap"));
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue;
+        };
+        if enclosed.file_name() != Some(std::ffi::OsStr::new(member)) {
+            continue;
+        }
+        if entry.size() < MIN_SIZE {
+            saw_undersized = true;
+            continue;
+        }
+        let rank = if enclosed == exact_bin {
+            2
+        } else if enclosed
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir.eq_ignore_ascii_case("bin"))
+        {
+            1
+        } else {
+            0
+        };
+        if selected.is_none_or(|(_, best_rank)| rank > best_rank) {
+            selected = Some((index, rank));
+            if rank == 2 {
+                break;
             }
-            let mut bounded = (&mut entry).take(MAX_ARCHIVE_BYTES + 1);
-            return copy_into(&mut bounded, target);
         }
     }
-    Err(format!("{member} is not part of {}", archive.display()))
+    let Some((chosen_index, _)) = selected else {
+        if saw_undersized {
+            return Err(format!(
+                "{member} in {} is smaller than {MIN_SIZE} bytes",
+                archive.display()
+            ));
+        }
+        return Err(format!("{member} is not part of {}", archive.display()));
+    };
+    let mut entry = zip.by_index(chosen_index).map_err(|error| error.to_string())?;
+    if entry.size() > MAX_ARCHIVE_BYTES {
+        return Err(format!("{member} exceeds 512 MiB uncompressed safety cap"));
+    }
+    let mut bounded = (&mut entry).take(MAX_ARCHIVE_BYTES + 1);
+    copy_into(&mut bounded, target)
 }
 
 /// Writes through a temporary file with executable permissions applied before
 /// atomic rename, so `target` is never half-written or non-executable.
 fn copy_into(source: &mut impl Read, target: &Path) -> Result<(), String> {
     let mut nonce = [0u8; 8];
-    let _ = getrandom::fill(&mut nonce);
+    getrandom::fill(&mut nonce).map_err(|error| format!("{}: {error}", target.display()))?;
     let temp = PathBuf::from(format!(
         "{}.part-{}-{}",
         target.display(),
         std::process::id(),
         hex_encode(&nonce)
     ));
-    let write_result = fs::File::create(&temp)
+    let write_result = create_exclusive_private(&temp)
         .map_err(|error| format!("{}: {error}", target.display()))
         .and_then(|mut out| {
             let written = std::io::copy(source, &mut out)
                 .map_err(|e| format!("{}: {e}", target.display()))?;
+            if written < MIN_SIZE {
+                return Err(format!(
+                    "{} extracted only {written} bytes (minimum {MIN_SIZE})",
+                    target.display()
+                ));
+            }
             if written > MAX_ARCHIVE_BYTES {
                 return Err(format!(
                     "{} exceeded 512 MiB uncompressed safety cap",
@@ -800,5 +863,77 @@ mod tests {
         } else {
             assert_eq!(name, "ffmpeg");
         }
+    }
+
+    #[test]
+    fn https_redirect_downgrade_to_plain_http_is_refused() {
+        assert!(check_redirect_scheme(
+            "https://example.com/ffmpeg.zip",
+            "http://example.com/ffmpeg.zip"
+        )
+        .is_err());
+        assert!(check_redirect_scheme("HTTPS://example.com/sums", "HTTP://mirror.example/sums")
+            .is_err());
+        assert!(check_redirect_scheme(
+            "https://example.com/latest",
+            "HTTPS://cdn.example.com/build/1"
+        )
+        .is_ok());
+        assert!(check_redirect_scheme(
+            "http://127.0.0.1:8080/latest",
+            "http://127.0.0.1:8080/build/1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn extract_skips_undersized_entries_and_prefers_bin_member() {
+        let directory = work_dir("extract");
+        let archive = directory.join("bundle.zip");
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        {
+            let root_bytes = vec![b'R'; MIN_SIZE as usize + 8];
+            let bin_bytes = vec![b'B'; MIN_SIZE as usize + 16];
+            let file = fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("bin/ffmpeg", options).unwrap();
+            writer.write_all(b"tiny stub").unwrap();
+            writer.start_file("ffmpeg", options).unwrap();
+            writer.write_all(&root_bytes).unwrap();
+            writer.start_file("release/bin/ffmpeg", options).unwrap();
+            writer.write_all(&bin_bytes).unwrap();
+            writer.finish().unwrap();
+        }
+        let target = directory.join("ffmpeg-out");
+        extract(&archive, "ffmpeg", &target).unwrap();
+        let extracted = fs::read(&target).unwrap();
+        assert_eq!(extracted.len(), MIN_SIZE as usize + 16);
+        assert!(extracted.iter().all(|&b| b == b'B'));
+
+        let tiny_archive = directory.join("tiny.zip");
+        {
+            let file = fs::File::create(&tiny_archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("bin/ffmpeg", options).unwrap();
+            writer.write_all(b"too short").unwrap();
+            writer.finish().unwrap();
+        }
+        let tiny_target = directory.join("ffmpeg-tiny");
+        assert!(extract(&tiny_archive, "ffmpeg", &tiny_target).is_err());
+        assert!(!tiny_target.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn staged_files_and_work_directory_use_exclusive_creation() {
+        let resolver = Resolver::new(".tools", false);
+        let work = resolver.work_directory().unwrap();
+        assert!(work.is_dir());
+        let existing = work.join("existing.bin");
+        create_exclusive_private(&existing).unwrap();
+        assert!(create_exclusive_private(&existing).is_err());
+        resolver.close();
+        assert!(!work.exists());
     }
 }

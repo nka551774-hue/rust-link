@@ -8,14 +8,23 @@
 #   ./quickstart/start.sh
 set -euo pipefail
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
+HERE=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH='' cd -P -- "$HERE/.." && pwd)
 DATA=$HERE/data
 CONFIG=$DATA/config.yaml
 ENV_FILE=$DATA/.env
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
-saved() { sed -n "s/^$1=//p" "$ENV_FILE" | head -1; }
+saved() {
+    local value
+    value=$(sed -n "s/^$1=//p" "$ENV_FILE" | head -n 1)
+    value=${value%$'\r'}
+    case $value in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    printf '%s' "$value"
+}
 
 # --- Settings ---------------------------------------------------------------
 
@@ -28,7 +37,7 @@ fi
 if [ "$reuse" = 1 ]; then
     PASSWORD=$(saved RUSTLINK_PASSWORD)
     TOKEN=$(saved DISCORD_BOT_TOKEN)
-    PORT=$(saved RUSTLINK_URL | sed -e 's|^[a-zA-Z]*://||' -e 's|/.*||' -e 's|.*:||')
+    PORT=$(saved RUSTLINK_URL | sed -n -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' -e 's|/.*||' -e 's|^.*:\([0-9][0-9]*\)$|\1|p')
     case $PORT in '' | *[!0-9]*) PORT= ;; esac
     [ -n "$PASSWORD" ] && [ -n "$TOKEN" ] && [ -n "$PORT" ] ||
         fail "the saved settings in $DATA are incomplete; delete that folder and start again"
@@ -87,8 +96,8 @@ fi
 
 # The files are the source of truth: a variable left in this shell would
 # otherwise override them.
-export RUSTLINK_PASSWORD=$PASSWORD RUSTLINK_ADDRESS=127.0.0.1:$PORT
-export DISCORD_BOT_TOKEN=$TOKEN RUSTLINK_URL=http://127.0.0.1:$PORT
+export RUSTLINK_PASSWORD="$PASSWORD" RUSTLINK_ADDRESS="127.0.0.1:$PORT"
+export DISCORD_BOT_TOKEN="$TOKEN" RUSTLINK_URL="http://127.0.0.1:$PORT"
 
 # --- Build ------------------------------------------------------------------
 
@@ -131,7 +140,7 @@ for _ in $(seq 300); do
         fail "the node stopped; is port $PORT already in use?"
     fi
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/version" >/dev/null 2>&1; then
+        if curl --noproxy 127.0.0.1 -fsS --max-time 2 "http://127.0.0.1:$PORT/version" >/dev/null 2>&1; then
             ready=1
             break
         fi

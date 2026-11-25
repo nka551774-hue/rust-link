@@ -10,9 +10,10 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
-use symphonia::core::audio::{Channels, SampleBuffer, SignalSpec};
+use symphonia::core::audio::{AudioBufferRef, Channels, SampleBuffer, Signal, SignalSpec};
 use symphonia::core::codecs::{
-    Decoder as SymphoniaDecoder, DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_NULL, CODEC_TYPE_OPUS,
+    CodecParameters, Decoder as SymphoniaDecoder, DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_NULL,
+    CODEC_TYPE_OPUS,
 };
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader};
@@ -89,12 +90,24 @@ enum Inner {
 }
 
 #[inline]
-fn finite_or_zero(s: f32) -> f32 {
-    if s.is_finite() {
-        s
-    } else {
-        0.0
+fn map_symphonia_error(err: SymphoniaError) -> AudioError {
+    match err {
+        SymphoniaError::IoError(e) if e.kind() != io::ErrorKind::UnexpectedEof => AudioError::Io(e),
+        other => AudioError::Decode(other.to_string()),
     }
+}
+
+#[inline]
+fn param_channels(params: &CodecParameters) -> Option<Channels> {
+    params.channels.or_else(|| params.channel_layout.map(|l| l.into_channels()))
+}
+
+fn make_codec_decoder(params: &CodecParameters) -> Result<Box<dyn SymphoniaDecoder>, AudioError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        symphonia::default::get_codecs().make(params, &DecoderOptions::default())
+    }))
+    .map_err(|_| AudioError::Decode("the codec parameters are malformed".into()))?
+    .map_err(map_symphonia_error)
 }
 
 struct OpusStream {
@@ -147,12 +160,12 @@ impl OpusStream {
         }
         if self.gain == 1.0 {
             for s in &mut out[base..] {
-                *s = finite_or_zero(*s);
+                *s = crate::dsp::clean_f32(*s);
             }
         } else {
             let gain = self.gain;
             for s in &mut out[base..] {
-                *s = finite_or_zero(*s * gain);
+                *s = crate::dsp::clean_f32(*s * gain);
             }
         }
         Ok(true)
@@ -165,56 +178,55 @@ struct ContainerOpusDecoder {
     track_id: u32,
 }
 
-fn parse_container_opus_params(
-    params: &symphonia::core::codecs::CodecParameters,
-) -> Result<(u32, f32), AudioError> {
-    let channels = params.channels.map(|c| c.count()).unwrap_or(2);
+fn parse_container_opus_params(params: &CodecParameters) -> Result<(u32, f32), AudioError> {
+    let channels = param_channels(params).map(|c| c.count()).unwrap_or(2);
     if !(1..=2).contains(&channels) {
         return Err(AudioError::Decode("unsupported Opus channel count".into()));
     }
+    let Some(extra) = params.extra_data.as_deref() else {
+        return Err(AudioError::Decode("missing Opus header in container".into()));
+    };
     let mut skip = params.delay.unwrap_or(0);
-    let mut output_gain = 0i16;
-    if let Some(extra) = params.extra_data.as_deref() {
-        if let Some(rest) = extra.strip_prefix(b"OpusHead") {
-            let &[version, ch, s0, s1, _, _, _, _, g0, g1, family, ..] = rest else {
-                return Err(AudioError::Decode("unsupported OpusHead in container".into()));
-            };
-            if !(1..=2).contains(&ch) || family != 0 {
-                return Err(AudioError::Decode("unsupported OpusHead in container".into()));
-            }
-            match version {
-                // Symphonia's `isomp4` reader prepends `b"OpusHead"` onto the raw
-                // big-endian ISO-BMFF `dOps` (`OpusSpecificBox`, Version = 0) payload.
-                0 => {
-                    if skip == 0 {
-                        skip = u32::from(u16::from_be_bytes([s0, s1]));
-                    }
-                    output_gain = i16::from_be_bytes([g0, g1]);
-                }
-                // RFC 7845 `OpusHead` (Matroska/WebM CodecPrivate): little-endian, version 1..=15.
-                1..=15 => {
-                    if skip == 0 {
-                        skip = u32::from(u16::from_le_bytes([s0, s1]));
-                    }
-                    output_gain = i16::from_le_bytes([g0, g1]);
-                }
-                _ => {
-                    return Err(AudioError::Decode("unsupported OpusHead in container".into()));
-                }
-            }
-        } else if let &[0, ch, s0, s1, _, _, _, _, g0, g1, family, ..] = extra {
-            // ISO-MP4 `dOps` OpusSpecificBox payload: version=0, OutputChannelCount,
-            // PreSkip (BE u16), InputSampleRate (BE u32), OutputGain (BE i16), MappingFamily.
-            if !(1..=2).contains(&ch) || family != 0 {
-                return Err(AudioError::Decode("unsupported dOps channel mapping".into()));
-            }
-            if skip == 0 {
-                skip = u32::from(u16::from_be_bytes([s0, s1]));
-            }
-            output_gain = i16::from_be_bytes([g0, g1]);
-        } else {
-            return Err(AudioError::Decode("unsupported Opus header in container".into()));
+    let output_gain;
+    if let Some(rest) = extra.strip_prefix(b"OpusHead") {
+        let &[version, ch, s0, s1, _, _, _, _, g0, g1, family, ..] = rest else {
+            return Err(AudioError::Decode("unsupported OpusHead in container".into()));
+        };
+        if !(1..=2).contains(&ch) || family != 0 {
+            return Err(AudioError::Decode("unsupported OpusHead in container".into()));
         }
+        match version {
+            // Symphonia's `isomp4` reader prepends `b"OpusHead"` onto the raw
+            // big-endian ISO-BMFF `dOps` (`OpusSpecificBox`, Version = 0) payload.
+            0 => {
+                if skip == 0 {
+                    skip = u32::from(u16::from_be_bytes([s0, s1]));
+                }
+                output_gain = i16::from_be_bytes([g0, g1]);
+            }
+            // RFC 7845 `OpusHead` (Matroska/WebM CodecPrivate): little-endian, version 1..=15.
+            1..=15 => {
+                if skip == 0 {
+                    skip = u32::from(u16::from_le_bytes([s0, s1]));
+                }
+                output_gain = i16::from_le_bytes([g0, g1]);
+            }
+            _ => {
+                return Err(AudioError::Decode("unsupported OpusHead in container".into()));
+            }
+        }
+    } else if let &[0, ch, s0, s1, _, _, _, _, g0, g1, family, ..] = extra {
+        // ISO-MP4 `dOps` OpusSpecificBox payload: version=0, OutputChannelCount,
+        // PreSkip (BE u16), InputSampleRate (BE u32), OutputGain (BE i16), MappingFamily.
+        if !(1..=2).contains(&ch) || family != 0 {
+            return Err(AudioError::Decode("unsupported dOps channel mapping".into()));
+        }
+        if skip == 0 {
+            skip = u32::from(u16::from_be_bytes([s0, s1]));
+        }
+        output_gain = i16::from_be_bytes([g0, g1]);
+    } else {
+        return Err(AudioError::Decode("unsupported Opus header in container".into()));
     }
     let gain = 10.0f32.powf(output_gain as f32 / (20.0 * 256.0));
     Ok((skip, gain))
@@ -224,7 +236,7 @@ impl ContainerOpusDecoder {
     fn from_track(
         format: Box<dyn FormatReader>,
         track_id: u32,
-        params: &symphonia::core::codecs::CodecParameters,
+        params: &CodecParameters,
     ) -> Result<Self, AudioError> {
         let (skip, gain) = parse_container_opus_params(params)?;
         Ok(Self { format, opus: OpusStream::new(skip, gain)?, track_id })
@@ -248,7 +260,7 @@ impl ContainerOpusDecoder {
                     self.track_id = new_id;
                     continue;
                 }
-                Err(e) => return Err(AudioError::Decode(e.to_string())),
+                Err(e) => return Err(map_symphonia_error(e)),
             };
             if packet.track_id() != self.track_id {
                 continue;
@@ -503,7 +515,8 @@ impl Decoder {
 
         // Opus in Ogg is demuxed here rather than by symphonia, because
         // symphonia has no Opus decoder and libopus does.
-        if detect(body.head()) == Container::OggOpus {
+        let container = detect(body.head());
+        if container == Container::OggOpus {
             return Ok(Decoder {
                 inner: Inner::OggOpus(Box::new(OggDecoder::new(body)?)),
                 rate: 48_000,
@@ -523,8 +536,13 @@ impl Decoder {
             )
         }))
         .map_err(|_| AudioError::Decode("the stream header is malformed".into()))?
-        .map_err(|e| AudioError::Decode(e.to_string()))?;
+        .map_err(map_symphonia_error)?;
         let format = probed.format;
+        if container == Container::Mp4 && format.tracks().len() > 1 {
+            return Err(AudioError::Decode(
+                "multi-track MP4 on unseekable stream requires ffmpeg".into(),
+            ));
+        }
         let track = select_audio_track(format.as_ref())?;
         let track_id = track.id;
         if track.codec_params.codec == CODEC_TYPE_OPUS {
@@ -545,14 +563,12 @@ impl Decoder {
             // A zero rate would make the resampler expand every frame ~10^6 times.
             return Err(AudioError::Decode("the stream has a zero sample rate".into()));
         }
-        let channels =
-            track.codec_params.channels.unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
+        let channels = param_channels(&track.codec_params)
+            .unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
         if channels.count() == 0 {
             return Err(AudioError::Decode("the stream has zero audio channels".into()));
         }
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| AudioError::Decode(e.to_string()))?;
+        let decoder = make_codec_decoder(&track.codec_params)?;
         let spec = SignalSpec::new(rate, channels);
         Ok(Decoder {
             inner: Inner::Symphonia {
@@ -615,15 +631,14 @@ impl Decoder {
                             ));
                         }
                         let new_id = track.id;
-                        let new_channels = track.codec_params.channels.unwrap_or(spec.channels);
+                        let new_channels =
+                            param_channels(&track.codec_params).unwrap_or(spec.channels);
                         if new_channels.count() == 0 {
                             return Err(AudioError::Decode(
                                 "the stream has zero audio channels".into(),
                             ));
                         }
-                        *decoder = symphonia::default::get_codecs()
-                            .make(&track.codec_params, &DecoderOptions::default())
-                            .map_err(|e| AudioError::Decode(e.to_string()))?;
+                        *decoder = make_codec_decoder(&track.codec_params)?;
                         *track_id = new_id;
                         if new_channels != spec.channels {
                             *spec = SignalSpec::new(self.rate, new_channels);
@@ -632,7 +647,7 @@ impl Decoder {
                         }
                         continue;
                     }
-                    Err(e) => return Err(AudioError::Decode(e.to_string())),
+                    Err(e) => return Err(map_symphonia_error(e)),
                 };
                 if packet.track_id() != *track_id {
                     continue;
@@ -641,7 +656,7 @@ impl Decoder {
                     Ok(audio) => audio,
                     // A packet that does not decode is a packet lost.
                     Err(SymphoniaError::DecodeError(_)) => continue,
-                    Err(e) => return Err(AudioError::Decode(e.to_string())),
+                    Err(e) => return Err(map_symphonia_error(e)),
                 };
                 // Vorbis primes its overlap state with a packet that produces
                 // no PCM. Symphonia's interleaver indexes each channel even
@@ -655,22 +670,100 @@ impl Decoder {
                         "source sample rate changed during playback".into(),
                     ));
                 }
+                if decoded_spec.channels.count() == 0 {
+                    return Err(AudioError::Decode("the stream has zero audio channels".into()));
+                }
                 let channels_changed = decoded_spec.channels != spec.channels;
+                if channels_changed {
+                    *spec = decoded_spec;
+                    *mixer = Downmix::new(spec.channels);
+                }
+                if try_decode_direct(mixer, &audio, out) {
+                    return Ok(true);
+                }
                 let needed = audio.frames() * decoded_spec.channels.count();
                 if channels_changed || samples.capacity() < needed {
                     // Room for twice the packet means a stream of even packets
                     // reallocates once rather than on every step up.
                     *samples = SampleBuffer::new((audio.frames() * 2) as u64, decoded_spec);
                 }
-                if channels_changed {
-                    *spec = decoded_spec;
-                    *mixer = Downmix::new(spec.channels);
-                }
                 samples.copy_interleaved_ref(audio);
                 mixer.process(samples.samples(), out);
                 return Ok(true);
             },
         }
+    }
+}
+
+#[inline]
+fn append_stereo<T: Copy>(
+    left: &[T],
+    right: &[T],
+    out: &mut Vec<f32>,
+    mut map: impl FnMut(T) -> f32,
+) {
+    let frames = left.len().min(right.len());
+    let base = out.len();
+    out.reserve(frames * 2);
+    let dst = &mut out.spare_capacity_mut().as_chunks_mut::<2>().0[..frames];
+    for ((slot, &l), &r) in dst.iter_mut().zip(&left[..frames]).zip(&right[..frames]) {
+        slot[0].write(map(l));
+        slot[1].write(map(r));
+    }
+    // SAFETY: `out.reserve(frames * 2)` reserves at least `frames` stereo pairs,
+    // and every `slot[0]` and `slot[1]` in `0..frames` was initialized above.
+    unsafe {
+        out.set_len(base + frames * 2);
+    }
+}
+
+#[inline]
+fn append_mono<T: Copy>(mono: &[T], out: &mut Vec<f32>, mut map: impl FnMut(T) -> f32) {
+    let frames = mono.len();
+    let base = out.len();
+    out.reserve(frames * 2);
+    let dst = &mut out.spare_capacity_mut().as_chunks_mut::<2>().0[..frames];
+    for (slot, &m) in dst.iter_mut().zip(mono) {
+        let s = map(m);
+        slot[0].write(s);
+        slot[1].write(s);
+    }
+    // SAFETY: `out.reserve(frames * 2)` reserves at least `frames` stereo pairs,
+    // and every `slot[0]` and `slot[1]` in `0..frames` was initialized above.
+    unsafe {
+        out.set_len(base + frames * 2);
+    }
+}
+
+fn try_decode_direct(mixer: &Downmix, audio: &AudioBufferRef<'_>, out: &mut Vec<f32>) -> bool {
+    const S16_SCALE: f32 = 1.0 / 32_768.0;
+    const S32_SCALE: f32 = 1.0 / 2_147_483_648.0;
+    match (mixer, audio) {
+        (Downmix::Stereo, AudioBufferRef::F32(buf)) => {
+            append_stereo(buf.chan(0), buf.chan(1), out, crate::dsp::clean_f32);
+            true
+        }
+        (Downmix::Stereo, AudioBufferRef::S16(buf)) => {
+            append_stereo(buf.chan(0), buf.chan(1), out, |s| s as f32 * S16_SCALE);
+            true
+        }
+        (Downmix::Stereo, AudioBufferRef::S32(buf)) => {
+            append_stereo(buf.chan(0), buf.chan(1), out, |s| s as f32 * S32_SCALE);
+            true
+        }
+        (Downmix::Mono, AudioBufferRef::F32(buf)) => {
+            append_mono(buf.chan(0), out, crate::dsp::clean_f32);
+            true
+        }
+        (Downmix::Mono, AudioBufferRef::S16(buf)) => {
+            append_mono(buf.chan(0), out, |s| s as f32 * S16_SCALE);
+            true
+        }
+        (Downmix::Mono, AudioBufferRef::S32(buf)) => {
+            append_mono(buf.chan(0), out, |s| s as f32 * S32_SCALE);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -747,32 +840,45 @@ impl Downmix {
         match self {
             Self::Empty => {}
             Self::Mono => {
-                out.extend(samples.iter().flat_map(|&sample| {
-                    let s = finite_or_zero(sample);
-                    [s, s]
-                }));
+                out.reserve(samples.len() * 2);
+                for &sample in samples {
+                    let s = crate::dsp::clean_f32(sample);
+                    out.extend_from_slice(&[s, s]);
+                }
             }
             Self::Stereo => {
-                let len = (samples.len() / 2) * 2;
-                out.extend(samples[..len].iter().copied().map(finite_or_zero));
+                let pairs = samples.as_chunks::<2>().0;
+                out.reserve(pairs.len() * 2);
+                for &[l, r] in pairs {
+                    out.extend_from_slice(&[crate::dsp::clean_f32(l), crate::dsp::clean_f32(r)]);
+                }
             }
             Self::FallbackMono { count, inv_count } => {
-                out.extend(samples.chunks_exact(*count).flat_map(|frame| {
-                    let mono = frame.iter().copied().map(finite_or_zero).sum::<f32>() * inv_count;
-                    [mono, mono]
-                }));
+                let chunks = samples.chunks_exact(*count);
+                out.reserve(chunks.len() * 2);
+                for frame in chunks {
+                    let mono =
+                        frame.iter().copied().map(crate::dsp::clean_f32).sum::<f32>() * inv_count;
+                    let m = crate::dsp::clean_f32(mono);
+                    out.extend_from_slice(&[m, m]);
+                }
             }
             Self::Matrix { count, weights, inv_left, inv_right } => {
-                out.extend(samples.chunks_exact(*count).flat_map(|frame| {
+                let chunks = samples.chunks_exact(*count);
+                out.reserve(chunks.len() * 2);
+                for frame in chunks {
                     let mut l = 0.0f32;
                     let mut r = 0.0f32;
                     for (&sample, &[lw, rw]) in frame.iter().zip(weights) {
-                        let s = finite_or_zero(sample);
+                        let s = crate::dsp::clean_f32(sample);
                         l += s * lw;
                         r += s * rw;
                     }
-                    [l * inv_left, r * inv_right]
-                }));
+                    out.extend_from_slice(&[
+                        crate::dsp::clean_f32(l * inv_left),
+                        crate::dsp::clean_f32(r * inv_right),
+                    ]);
+                }
             }
         }
     }
@@ -909,8 +1015,6 @@ mod tests {
 
     #[test]
     fn symphonia_isomp4_dops_big_endian_vs_rfc7845_little_endian() {
-        use symphonia::core::codecs::CodecParameters;
-
         // Symphonia 0.5.5 `isomp4` prepends `b"OpusHead"` onto raw big-endian ISO-BMFF `dOps`
         // (`Version = 0`, PreSkip = 0x0138 = 312, OutputGain = 0x0100 = +1 dB in Q7.8).
         let mut mp4_extra = b"OpusHead".to_vec();
@@ -930,5 +1034,162 @@ mod tests {
         let (skip_le, gain_le) = parse_container_opus_params(&webm_params).unwrap();
         assert_eq!(skip_le, 312);
         assert!((gain_le - expected_gain).abs() < 1e-6, "gain_le={gain_le}");
+    }
+
+    #[test]
+    fn container_opus_params_require_header_and_honor_channel_layout() {
+        use symphonia::core::audio::Layout;
+
+        let headerless = CodecParameters::new();
+        assert!(parse_container_opus_params(&headerless).is_err());
+
+        let mut webm_extra = b"OpusHead".to_vec();
+        webm_extra.extend_from_slice(&[1, 2, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x00, 0x00, 0]);
+        let mut surround = CodecParameters::new();
+        surround
+            .with_channel_layout(Layout::FivePointOne)
+            .with_extra_data(webm_extra.into_boxed_slice());
+        assert!(parse_container_opus_params(&surround).is_err());
+
+        let mut mono = CodecParameters::new();
+        mono.with_channel_layout(Layout::Mono);
+        assert_eq!(param_channels(&mono), Some(Channels::FRONT_LEFT));
+    }
+
+    fn mp4_box(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn minimal_mp4(tracks: u32) -> Vec<u8> {
+        let mut out = mp4_box(b"ftyp", b"isom\0\0\0\0");
+        let mut mvhd = [0u8; 100];
+        mvhd[12..16].copy_from_slice(&48_000u32.to_be_bytes());
+        let mut moov_body = mp4_box(b"mvhd", &mvhd);
+        for id in 1..=tracks {
+            let mut tkhd = [0u8; 84];
+            tkhd[12..16].copy_from_slice(&id.to_be_bytes());
+            let mut mdhd = [0u8; 24];
+            mdhd[12..16].copy_from_slice(&48_000u32.to_be_bytes());
+            let mut hdlr = vec![0u8; 25];
+            hdlr[8..12].copy_from_slice(b"soun");
+            let mut sowt = vec![0u8; 28];
+            sowt[6..8].copy_from_slice(&1u16.to_be_bytes());
+            sowt[16..18].copy_from_slice(&2u16.to_be_bytes());
+            sowt[18..20].copy_from_slice(&16u16.to_be_bytes());
+            sowt[24..28].copy_from_slice(&(48_000u32 << 16).to_be_bytes());
+            let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1];
+            stsd_payload.extend_from_slice(&mp4_box(b"sowt", &sowt));
+            let empty_table = [0u8; 8];
+            let mut stsz = [0u8; 12];
+            stsz[4..8].copy_from_slice(&4u32.to_be_bytes());
+            let mut stbl_body = mp4_box(b"stsd", &stsd_payload);
+            stbl_body.extend_from_slice(&mp4_box(b"stts", &empty_table));
+            stbl_body.extend_from_slice(&mp4_box(b"stsc", &empty_table));
+            stbl_body.extend_from_slice(&mp4_box(b"stsz", &stsz));
+            stbl_body.extend_from_slice(&mp4_box(b"stco", &empty_table));
+            let minf = mp4_box(b"minf", &mp4_box(b"stbl", &stbl_body));
+            let mut mdia_body = mp4_box(b"mdhd", &mdhd);
+            mdia_body.extend_from_slice(&mp4_box(b"hdlr", &hdlr));
+            mdia_body.extend_from_slice(&minf);
+            let mut trak_body = mp4_box(b"tkhd", &tkhd);
+            trak_body.extend_from_slice(&mp4_box(b"mdia", &mdia_body));
+            moov_body.extend_from_slice(&mp4_box(b"trak", &trak_body));
+        }
+        out.extend_from_slice(&mp4_box(b"moov", &moov_body));
+        out.extend_from_slice(&mp4_box(b"mdat", &[0u8; 16]));
+        out
+    }
+
+    #[test]
+    fn multi_track_mp4_is_declined_while_single_track_mp4_opens() {
+        let single = Decoder::new(Body::new(Box::new(io::Cursor::new(minimal_mp4(1))))).unwrap();
+        assert_eq!(single.rate(), 48_000);
+
+        let err = Decoder::new(Body::new(Box::new(io::Cursor::new(minimal_mp4(2)))))
+            .err()
+            .expect("multi-track MP4 on unseekable stream must fall back");
+        assert!(err.to_string().contains("multi-track MP4"), "{err}");
+    }
+
+    #[test]
+    fn direct_pcm_fast_path_scales_and_sanitizes_without_sample_buffer() {
+        use symphonia::core::audio::{AsAudioBufferRef, AudioBuffer};
+
+        let stereo_spec = SignalSpec::new(48_000, Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
+        let mut f32_buf = AudioBuffer::<f32>::new(4, stereo_spec);
+        f32_buf.render_reserved(Some(3));
+        f32_buf.chan_mut(0).copy_from_slice(&[0.5, f32::NAN, f32::from_bits(1)]);
+        f32_buf.chan_mut(1).copy_from_slice(&[-0.25, f32::INFINITY, 1.0]);
+        let mut out = Vec::new();
+        assert!(try_decode_direct(&Downmix::Stereo, &f32_buf.as_audio_buffer_ref(), &mut out));
+        assert_eq!(out, vec![0.5, -0.25, 0.0, 0.0, 0.0, 1.0]);
+
+        let mono_spec = SignalSpec::new(48_000, Channels::FRONT_LEFT);
+        let mut s16_buf = AudioBuffer::<i16>::new(2, mono_spec);
+        s16_buf.render_reserved(Some(2));
+        s16_buf.chan_mut(0).copy_from_slice(&[i16::MIN, 16_384]);
+        out.clear();
+        assert!(try_decode_direct(&Downmix::Mono, &s16_buf.as_audio_buffer_ref(), &mut out));
+        assert_eq!(out, vec![-1.0, -1.0, 0.5, 0.5]);
+
+        let mut s32_buf = AudioBuffer::<i32>::new(2, mono_spec);
+        s32_buf.render_reserved(Some(2));
+        s32_buf.chan_mut(0).copy_from_slice(&[i32::MIN, 1_073_741_824]);
+        out.clear();
+        assert!(try_decode_direct(&Downmix::Mono, &s32_buf.as_audio_buffer_ref(), &mut out));
+        assert_eq!(out, vec![-1.0, -1.0, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn non_eof_source_read_errors_map_to_audio_error_io() {
+        struct ResettingWav {
+            header: io::Cursor<Vec<u8>>,
+        }
+        impl Read for ResettingWav {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.header.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "link dropped"))
+            }
+        }
+
+        let data_len = 48_000u32 * 4;
+        let mut header = Vec::with_capacity(70_044);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36 + data_len).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x02\0");
+        header.extend_from_slice(&48_000u32.to_le_bytes());
+        header.extend_from_slice(&192_000u32.to_le_bytes());
+        header.extend_from_slice(b"\x04\0\x10\0data");
+        header.extend_from_slice(&data_len.to_le_bytes());
+        let probe_err = match Decoder::new(Body::new(Box::new(ResettingWav {
+            header: io::Cursor::new(header.clone()),
+        }))) {
+            Err(err) => err,
+            Ok(_) => panic!("expected probe read error on short stream"),
+        };
+        assert!(
+            matches!(probe_err, AudioError::Io(ref e) if e.kind() == io::ErrorKind::ConnectionReset)
+        );
+
+        header.resize(header.len() + 70_000, 0);
+        let mut decoder =
+            Decoder::new(Body::new(Box::new(ResettingWav { header: io::Cursor::new(header) })))
+                .unwrap();
+        let mut out = Vec::new();
+        let err = loop {
+            match decoder.decode(&mut out) {
+                Ok(true) => continue,
+                Ok(false) => panic!("expected io error, got EOF"),
+                Err(err) => break err,
+            }
+        };
+        assert!(matches!(err, AudioError::Io(ref e) if e.kind() == io::ErrorKind::ConnectionReset));
     }
 }

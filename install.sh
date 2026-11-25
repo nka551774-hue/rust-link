@@ -14,8 +14,8 @@
 #
 set -euo pipefail
 
-PROGRAM=$(basename "$0")
-SOURCE=$(cd "$(dirname "$0")" && pwd)
+PROGRAM=$(basename -- "$0")
+SOURCE=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd)
 
 DIRECTORY=/opt/rustlink
 SERVICE_USER=rustlink
@@ -104,7 +104,13 @@ esac
 [ "$(id -u)" = 0 ] || die "this installer needs root: run it again with sudo"
 
 user_exists() { id -u "$1" >/dev/null 2>&1; }
-group_exists() { grep -q "^$1:" /etc/group; }
+group_exists() {
+    if command -v getent >/dev/null 2>&1; then
+        getent group "$1" >/dev/null 2>&1
+    else
+        grep -q "^$1:" /etc/group
+    fi
+}
 
 # Runs a command as the service user, which is how the configuration is checked
 # the way the service will read it.
@@ -206,9 +212,9 @@ build_node() {
     step "Building the node"
     if [ "$NATIVE" = 1 ]; then
         note "with -C target-cpu=native, which is right because the binary stays on this machine"
-        (cd "$SOURCE" && RUSTFLAGS="-C target-cpu=native" cargo build --release --locked --bin rustlink)
+        (cd "$SOURCE" && RUSTFLAGS="-C target-cpu=native" cargo build --release --locked --target-dir "$SOURCE/target" --bin rustlink)
     else
-        (cd "$SOURCE" && cargo build --release --locked --bin rustlink)
+        (cd "$SOURCE" && cargo build --release --locked --target-dir "$SOURCE/target" --bin rustlink)
     fi
 }
 

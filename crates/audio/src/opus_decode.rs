@@ -208,7 +208,7 @@ impl Decoder {
                 0,
             )
         };
-        if produced < 0 {
+        if produced < 0 || produced > expected {
             out[base..].fill(0.0);
             return Ok(frames);
         }
@@ -315,5 +315,17 @@ mod tests {
         packet.extend_from_slice(&[0xff, 0xfe]);
         assert!(decoder.decode(&packet, &mut decoded).is_err());
         assert!(decoder.decode(&[], &mut decoded).is_err());
+    }
+
+    #[test]
+    fn packet_loss_concealment_appends_bounded_frame_counts() {
+        let mut decoder = Decoder::new().unwrap();
+        let mut out = vec![0.25f32; 4];
+        assert!(decoder.conceal_float_append(0, &mut out).is_err());
+        assert!(decoder.conceal_float_append(MAX_PACKET_FRAMES as usize + 1, &mut out).is_err());
+        assert_eq!(out.len(), 4);
+        let frames = decoder.conceal_float_append(960, &mut out).unwrap();
+        assert_eq!(frames, 960);
+        assert_eq!(out.len(), 4 + 960 * 2);
     }
 }

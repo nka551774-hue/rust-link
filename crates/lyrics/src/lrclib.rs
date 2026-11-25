@@ -30,6 +30,9 @@ const RETRY_DELAY: Duration = Duration::from_millis(250);
 /// as a different recording.
 const SLACK: i64 = 4000;
 
+/// Largest duration difference tolerated in search before rejecting a candidate.
+const MAX_DURATION_OFFSET: i128 = 15_000;
+
 /// Fetches lyrics from lrclib.net.
 pub struct LRCLIB {
     pub agent: ureq::Agent,
@@ -125,7 +128,7 @@ impl Provider for LRCLIB {
 
 impl LRCLIB {
     fn get(&self, artist: &str, title: &str, length: i64) -> Result<Entry, LyricsError> {
-        let url = format!("{}/get", self.base_or_default());
+        let url = format!("{}/get", self.validated_base()?);
         if length > 0 {
             // The database files a track to the second, so the length is
             // rounded to the nearest one rather than truncated.
@@ -140,16 +143,13 @@ impl LRCLIB {
     }
 
     fn search(&self, query: &str) -> Result<Vec<Entry>, LyricsError> {
-        let url = format!("{}/search", self.base_or_default());
+        let url = format!("{}/search", self.validated_base()?);
         decode(&self.do_request(&url, &[("q", query)])?)
     }
 
-    fn base_or_default(&self) -> &str {
-        if self.base.is_empty() {
-            LRCLIB_BASE
-        } else {
-            &self.base
-        }
+    fn validated_base(&self) -> Result<String, LyricsError> {
+        let raw = if self.base.trim().is_empty() { LRCLIB_BASE } else { &self.base };
+        crate::validate_base_url(raw, "lrclib")
     }
 
     /// Performs one lookup, retrying once.
@@ -186,7 +186,11 @@ impl LRCLIB {
             .build()
             .call()
             .map_err(|error| {
-                (LyricsError::Failed(format!("lyrics: lrclib could not be reached: {error}")), true)
+                let retryable = is_transient_ureq_error(&error);
+                (
+                    LyricsError::Failed(format!("lyrics: lrclib could not be reached: {error}")),
+                    retryable,
+                )
             })?;
         match response.status().as_u16() {
             404 => return Err((LyricsError::NotFound, false)),
@@ -206,14 +210,26 @@ impl LRCLIB {
             .read_to_vec()
             .map(|body| (body, ()))
             .map_err(|error| {
+                let retryable = is_transient_ureq_error(&error);
                 (
                     LyricsError::Failed(format!(
                         "lyrics: lrclib sent an unreadable answer: {error}"
                     )),
-                    true,
+                    retryable,
                 )
             })
     }
+}
+
+fn is_transient_ureq_error(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::ConnectionFailed
+            | ureq::Error::ConnectProxyFailed(_)
+            | ureq::Error::Protocol(_)
+    )
 }
 
 fn rounded_seconds(milliseconds: i64) -> i64 {
@@ -290,11 +306,16 @@ fn bracketed(title: &str) -> String {
 }
 
 fn words(text: &str) -> Vec<String> {
-    text.to_lowercase()
+    let mut all: Vec<String> = text
+        .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_owned)
-        .collect()
+        .collect();
+    if all.iter().any(|w| w.chars().nth(1).is_some()) {
+        all.retain(|w| w.chars().nth(1).is_some());
+    }
+    all
 }
 
 fn shares_word(want: &[String], candidate: &str) -> bool {
@@ -342,25 +363,35 @@ fn best_for<'a>(
         if !has_synced && !has_plain {
             continue;
         }
-        let mut score = 0;
-        if !artist_words.is_empty()
-            && !entry.artist_name.trim().is_empty()
-            && shares_word(&artist_words, &entry.artist_name)
-        {
-            score += 2;
+        let mut duration_bonus = 0;
+        let mut tight_duration = false;
+        if length > 0 && entry.duration != 0.0 {
+            match duration_offset(entry.duration, length) {
+                Some(offset) if offset <= 2000 => {
+                    duration_bonus = 4;
+                    tight_duration = true;
+                }
+                Some(offset) if offset <= i128::from(SLACK) => {
+                    duration_bonus = 1;
+                    tight_duration = true;
+                }
+                Some(offset) if offset <= MAX_DURATION_OFFSET => {}
+                Some(_) | None => continue,
+            }
+        }
+        let mut score = duration_bonus;
+        if !artist_words.is_empty() && !entry.artist_name.trim().is_empty() {
+            if shares_word(&artist_words, &entry.artist_name) {
+                score += 2;
+            } else if !tight_duration {
+                continue;
+            }
         }
         if entry.instrumental {
             score -= 1;
         }
         if has_synced {
             score += 2;
-        }
-        if length > 0 && entry.duration != 0.0 {
-            match duration_offset(entry.duration, length) {
-                Some(offset) if offset <= 2000 => score += 4,
-                Some(offset) if offset <= i128::from(SLACK) => score += 1,
-                Some(_) | None => score -= 4,
-            }
         }
         if score > best_score {
             best = Some(entry);
@@ -542,7 +573,11 @@ fn strip_symbols(text: &str) -> String {
     const KEPT: &str = "-'&!?.,:;/()[]";
     let mut out = String::with_capacity(text.len());
     let mut pending_space = false;
-    for character in text.chars() {
+    for raw_char in text.chars() {
+        let character = match raw_char {
+            '\u{2013}' | '\u{2014}' => '-',
+            other => other,
+        };
         if character.is_alphanumeric() || KEPT.contains(character) {
             if pending_space && !out.is_empty() {
                 out.push(' ');
@@ -840,5 +875,65 @@ mod tests {
         assert!(entry.synced_lyrics.is_empty());
         assert_eq!(entry.duration, 0.0);
         assert!(!entry.instrumental);
+    }
+
+    #[test]
+    fn best_for_rejects_wrong_artists_large_duration_mismatches_and_single_char_noise() {
+        let wrong_artist = vec![Entry {
+            track_name: "Stay".into(),
+            artist_name: "Justin Bieber".into(),
+            duration: 141.0,
+            synced_lyrics: "[00:01.00]wrong".into(),
+            ..Default::default()
+        }];
+        assert!(best_for(&wrong_artist, "Stay", "Zedd", 210_000).is_none());
+        assert!(best_for(&wrong_artist, "Stay", "Zedd", 0).is_none());
+
+        // Different artist naming (such as channel/script mismatch) with tight
+        // duration proof within SLACK is still accepted.
+        let tight_channel = vec![Entry {
+            track_name: "Stay".into(),
+            artist_name: "Zedd".into(),
+            duration: 211.0,
+            synced_lyrics: "[00:01.00]right".into(),
+            ..Default::default()
+        }];
+        assert!(best_for(&tight_channel, "Stay", "Music Channel", 210_000).is_some());
+
+        // Same artist with a > 15s duration mismatch is rejected.
+        let far_duration = vec![Entry {
+            track_name: "Stay".into(),
+            artist_name: "Zedd".into(),
+            duration: 60.0,
+            synced_lyrics: "[00:01.00]snippet".into(),
+            ..Default::default()
+        }];
+        assert!(best_for(&far_duration, "Stay", "Zedd", 210_000).is_none());
+
+        // Single-character articles do not match unrelated titles.
+        let article_only = vec![Entry {
+            track_name: "A Different Tune".into(),
+            artist_name: "Zedd".into(),
+            duration: 210.0,
+            synced_lyrics: "[00:01.00]other".into(),
+            ..Default::default()
+        }];
+        assert!(best_for(&article_only, "A Song", "Zedd", 210_000).is_none());
+    }
+
+    #[test]
+    fn unicode_dashes_split_artist_from_title_and_bad_endpoints_fail_fast() {
+        let (artist, title) = names(&track("Someone \u{2013} A Song", ""));
+        assert_eq!((artist.as_str(), title.as_str()), ("Someone", "A Song"));
+        let (em_artist, em_title) = names(&track("Someone \u{2014} A Song", ""));
+        assert_eq!((em_artist.as_str(), em_title.as_str()), ("Someone", "A Song"));
+
+        let bad = LRCLIB {
+            agent: ureq::Agent::new_with_defaults(),
+            base: "https://user:pass@lrclib.net/api".into(),
+        };
+        assert!(matches!(bad.fetch(&track("A Song", "Someone")), Err(LyricsError::Failed(_))));
+        assert!(!is_transient_ureq_error(&ureq::Error::HostNotFound));
+        assert!(!is_transient_ureq_error(&ureq::Error::BodyExceedsLimit(1024)));
     }
 }

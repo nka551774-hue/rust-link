@@ -156,6 +156,27 @@ pub struct Gateway {
     session_id: Option<String>,
     resume_gateway_url: Option<String>,
     invalid_session_resumable: bool,
+    resuming: bool,
+    reconnect_attempts: u32,
+}
+
+fn reconnect_backoff(
+    attempts: u32,
+    close_code: Option<u16>,
+    invalid_unresumable: bool,
+) -> Duration {
+    let base = if close_code == Some(4008) {
+        Duration::from_secs(5)
+    } else if attempts > 0 {
+        Duration::from_secs(u64::from(attempts.min(5)))
+    } else {
+        Duration::ZERO
+    };
+    if invalid_unresumable {
+        base.max(Duration::from_secs(2))
+    } else {
+        base
+    }
 }
 
 fn apply_initial_heartbeat_jitter(gateway: &mut Gateway) {
@@ -272,6 +293,7 @@ impl Gateway {
         gateway.sequence = Some(sequence);
         gateway.session_id = Some(session_id.to_owned());
         gateway.resume_gateway_url = Some(resume_gateway_url.as_ref().to_owned());
+        gateway.resuming = true;
         gateway
             .send(json!({
                 "op": 6,
@@ -294,6 +316,14 @@ impl Gateway {
     /// Reconnects after `Reconnect`, `InvalidSession`, WebSocket error, or non-fatal
     /// close, resuming (`OP 6`) when valid and falling back to `IDENTIFY` (`OP 2`).
     pub async fn reconnect(&mut self, cause: Option<&BotError>) -> Result<(), BotError> {
+        self.reconnect_inner(cause, None).await
+    }
+
+    async fn reconnect_inner(
+        &mut self,
+        cause: Option<&BotError>,
+        identify_url: Option<&str>,
+    ) -> Result<(), BotError> {
         let stripped_message_content =
             self.close_code == Some(4014) && (self.intents & MESSAGE_CONTENT) != 0;
         if stripped_message_content {
@@ -303,27 +333,46 @@ impl Gateway {
         if let Some(code) = self.close_code.filter(|&c| Self::is_fatal_close_code(c)) {
             return Err(BotError::Protocol(format!("fatal Discord gateway close code {code}")));
         }
+        let close_code = self.close_code;
+        let was_resuming = self.resuming;
+        let attempts = self.reconnect_attempts;
+        let next_attempts = attempts.saturating_add(1);
+        self.reconnect_attempts = next_attempts;
         let _ = tokio::time::timeout(Duration::from_secs(1), self.socket.close(None)).await;
         let can_resume = !stripped_message_content
+            && !was_resuming
             && match cause {
                 Some(BotError::InvalidSession) => self.invalid_session_resumable,
-                _ => !matches!(self.close_code, Some(4007 | 4009)),
+                _ => !matches!(close_code, Some(4007 | 4009)),
             };
+        let invalid_unresumable = !can_resume && matches!(cause, Some(BotError::InvalidSession));
+        let delay = reconnect_backoff(attempts, close_code, invalid_unresumable);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         if can_resume {
             if let (Some(url), Some(session_id), Some(seq)) =
                 (self.resume_gateway_url.clone(), self.session_id.clone(), self.sequence)
             {
-                if let Ok(resumed) =
+                if let Ok(mut resumed) =
                     Self::resume(&url, self.token.as_str(), &session_id, seq, self.intents).await
                 {
+                    resumed.reconnect_attempts = next_attempts;
                     *self = resumed;
                     return Ok(());
                 }
             }
-        } else if matches!(cause, Some(BotError::InvalidSession)) {
-            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let fresh = Self::connect(self.token.as_str(), self.intents).await?;
+        let mut fresh = match identify_url {
+            Some(url) => {
+                let mut gateway =
+                    Self::connect_url(url.to_owned(), self.token.clone(), self.intents).await?;
+                apply_initial_heartbeat_jitter(&mut gateway);
+                gateway
+            }
+            None => Self::connect(self.token.as_str(), self.intents).await?,
+        };
+        fresh.reconnect_attempts = next_attempts;
         *self = fresh;
         Ok(())
     }
@@ -353,11 +402,32 @@ impl Gateway {
         )
         .await
         .map_err(|_| BotError::Protocol("gateway HELLO timed out".into()))??;
-        let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next())
-            .await
-            .map_err(|_| BotError::Protocol("gateway HELLO timed out".into()))?
-            .ok_or_else(|| BotError::Protocol("gateway closed before HELLO".into()))??;
-        let hello = text_json(hello)?;
+        let mut needs_flush = false;
+        let hello: Value = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .ok_or_else(|| BotError::Protocol("gateway closed before HELLO".into()))??;
+                match frame {
+                    Message::Ping(_) => {
+                        needs_flush = true;
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(_) => {
+                        return Err(BotError::Protocol("gateway closed before HELLO".into()));
+                    }
+                    Message::Text(text) => return Ok(serde_json::from_str(&text)?),
+                    _ => {
+                        return Err(BotError::Protocol(
+                            "gateway HELLO was not a text payload".into(),
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| BotError::Protocol("gateway HELLO timed out".into()))??;
         if hello.get("op").and_then(Value::as_u64) != Some(10) {
             return Err(BotError::Protocol("first gateway payload was not HELLO".into()));
         }
@@ -374,12 +444,14 @@ impl Gateway {
             heartbeat_interval: interval,
             next_heartbeat: Instant::now() + interval,
             heartbeat_acknowledged: true,
-            needs_flush: false,
+            needs_flush,
             close_code: None,
             sequence: None,
             session_id: None,
             resume_gateway_url: None,
             invalid_session_resumable: false,
+            resuming: false,
+            reconnect_attempts: 0,
         })
     }
 
@@ -407,21 +479,35 @@ impl Gateway {
             Some(seq) => format!(r#"{{"op":1,"d":{seq}}}"#),
             None => r#"{"op":1,"d":null}"#.to_owned(),
         };
-        self.send_text(text).await?;
+        self.feed_text(text).await?;
         self.heartbeat_acknowledged = false;
         self.next_heartbeat = Instant::now() + self.heartbeat_interval;
-        Ok(())
+        self.flush_socket().await
     }
 
     async fn send(&mut self, payload: Value) -> Result<(), BotError> {
         self.send_text(payload.to_string()).await
     }
 
-    async fn send_text(&mut self, text: String) -> Result<(), BotError> {
-        tokio::time::timeout(Duration::from_secs(10), self.socket.send(Message::Text(text.into())))
+    async fn feed_text(&mut self, text: String) -> Result<(), BotError> {
+        tokio::time::timeout(Duration::from_secs(10), self.socket.feed(Message::Text(text.into())))
             .await
             .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
+        self.needs_flush = true;
         Ok(())
+    }
+
+    async fn flush_socket(&mut self) -> Result<(), BotError> {
+        tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
+            .await
+            .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
+        self.needs_flush = false;
+        Ok(())
+    }
+
+    async fn send_text(&mut self, text: String) -> Result<(), BotError> {
+        self.feed_text(text).await?;
+        self.flush_socket().await
     }
 
     /// Sends OP 4 to join, move, or leave a guild voice channel.
@@ -477,10 +563,7 @@ impl Gateway {
     pub async fn next_event(&mut self) -> Result<Option<BotEvent>, BotError> {
         loop {
             if self.needs_flush {
-                tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
-                    .await
-                    .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
-                self.needs_flush = false;
+                self.flush_socket().await?;
             }
             tokio::select! {
                 // What has already arrived is read before the heartbeat timer is
@@ -499,6 +582,8 @@ impl Gateway {
                             }
                             match payload.get("op").and_then(Value::as_u64) {
                                 Some(0) => {
+                                    self.resuming = false;
+                                    self.reconnect_attempts = 0;
                                     let event = dispatch(payload)?;
                                     if let Some(BotEvent::Ready(ready)) = &event {
                                         self.session_id = Some(ready.session_id.clone());
@@ -602,14 +687,6 @@ fn validate_gateway_token(token: &str) -> Result<String, BotError> {
         ));
     }
     Ok(token.to_owned())
-}
-
-fn text_json(message: Message) -> Result<Value, BotError> {
-    match message {
-        Message::Text(text) => Ok(serde_json::from_str(&text)?),
-        Message::Close(_) => Err(BotError::Protocol("gateway closed before HELLO".into())),
-        _ => Err(BotError::Protocol("gateway HELLO was not a text payload".into())),
-    }
 }
 
 fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
@@ -1112,5 +1189,222 @@ mod tests {
         for value in ["", " token", "token ", "token\nvalue", "token\tvalue"] {
             assert!(validate_gateway_token(value).is_err(), "accepted token {value:?}");
         }
+    }
+
+    #[test]
+    fn reconnect_backoff_bounds_delays_and_honours_rate_limit_close_code() {
+        assert_eq!(reconnect_backoff(0, None, false), Duration::ZERO);
+        assert_eq!(reconnect_backoff(1, None, false), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(3, None, false), Duration::from_secs(3));
+        assert_eq!(reconnect_backoff(5, None, false), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff(99, None, false), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff(0, Some(4008), false), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff(2, Some(4008), false), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff(0, None, true), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(4, None, true), Duration::from_secs(4));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_hello_skips_ping_and_pong_frames_before_hello() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
+            socket.send(Message::Pong(Vec::new().into())).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"op": 10, "d": {"heartbeat_interval": 5000}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let mut saw_pong = false;
+            let mut saw_identify = false;
+            for _ in 0..2 {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Pong(payload) => {
+                        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+                        saw_pong = true;
+                    }
+                    Message::Text(text) => {
+                        let parsed: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(parsed["op"], 2);
+                        saw_identify = true;
+                    }
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+            assert!(saw_pong && saw_identify);
+            socket.close(None).await.unwrap();
+        });
+
+        let mut gateway = Gateway::connect_url(
+            format!("ws://{address}"),
+            Zeroizing::new("bot-token".to_owned()),
+            GUILDS,
+        )
+        .await
+        .unwrap();
+        assert!(!gateway.needs_flush);
+        assert!(gateway.next_event().await.unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconfirmed_resume_falls_back_to_identify_with_backoff() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ws_url = format!("ws://{address}");
+        let server_ws_url = ws_url.clone();
+
+        let server = tokio::spawn(async move {
+            let hello = json!({"op": 10, "d": {"heartbeat_interval": 5000}});
+
+            // 1. Initial IDENTIFY + READY.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let Message::Text(first) = socket.next().await.unwrap().unwrap() else { panic!() };
+            let first_json: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(first_json["op"], 2);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op": 0,
+                        "t": "READY",
+                        "s": 7,
+                        "d": {
+                            "session_id": "sess-1",
+                            "resume_gateway_url": server_ws_url,
+                            "user": {"id": "123"}
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+
+            // 2. First reconnect sends RESUME (op: 6), then server closes before op: 0.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let Message::Text(second) = socket.next().await.unwrap().unwrap() else { panic!() };
+            let second_json: Value = serde_json::from_str(&second).unwrap();
+            assert_eq!(second_json["op"], 6);
+            assert_eq!(second_json["d"]["session_id"], "sess-1");
+            assert_eq!(second_json["d"]["seq"], 7);
+            socket.close(None).await.unwrap();
+
+            // 3. Second reconnect must NOT loop on RESUME; it falls back to IDENTIFY (op: 2).
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let Message::Text(third) = socket.next().await.unwrap().unwrap() else { panic!() };
+            let third_json: Value = serde_json::from_str(&third).unwrap();
+            assert_eq!(third_json["op"], 2);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op": 0,
+                        "t": "READY",
+                        "s": 1,
+                        "d": {
+                            "session_id": "sess-2",
+                            "resume_gateway_url": server_ws_url,
+                            "user": {"id": "123"}
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let mut gateway =
+            Gateway::connect_url(ws_url.clone(), Zeroizing::new("bot-token".to_owned()), GUILDS)
+                .await
+                .unwrap();
+        let ready = gateway.next_ready().await.unwrap();
+        assert_eq!(ready.session_id, "sess-1");
+        assert!(!gateway.resuming);
+        assert_eq!(gateway.reconnect_attempts, 0);
+
+        // Connection 1 closes cleanly -> reconnect #1 resumes immediately.
+        assert!(gateway.next_event().await.unwrap().is_none());
+        gateway.reconnect_inner(None, Some(&ws_url)).await.unwrap();
+        assert!(gateway.resuming);
+        assert_eq!(gateway.reconnect_attempts, 1);
+
+        // Connection 2 closes before any op: 0 -> reconnect #2 backs off >= 1s and sends IDENTIFY.
+        assert!(gateway.next_event().await.unwrap().is_none());
+        let started = Instant::now();
+        gateway.reconnect_inner(None, Some(&ws_url)).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(!gateway.resuming);
+        assert_eq!(gateway.reconnect_attempts, 2);
+
+        // Receiving READY (op: 0) resets reconnect_attempts back to 0.
+        let ready2 = gateway.next_ready().await.unwrap();
+        assert_eq!(ready2.session_id, "sess-2");
+        assert_eq!(gateway.reconnect_attempts, 0);
+        assert!(!gateway.resuming);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_next_event_flushes_buffered_heartbeat_without_duplicating_it() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"op": 10, "d": {"heartbeat_interval": 500}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let _identify = socket.next().await.unwrap().unwrap();
+            let beat = socket.next().await.unwrap().unwrap();
+            let Message::Text(beat_text) = beat else { panic!("expected heartbeat text") };
+            let parsed: Value = serde_json::from_str(&beat_text).unwrap();
+            assert_eq!(parsed["op"], 1);
+            socket
+                .send(Message::Text(json!({"op": 11, "d": null}).to_string().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"op": 0, "t": "PING_CHECK", "s": 1, "d": {}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let mut gateway = Gateway::connect_url(
+            format!("ws://{address}"),
+            Zeroizing::new("bot-token".to_owned()),
+            GUILDS,
+        )
+        .await
+        .unwrap();
+        // Simulate feeding a heartbeat right before an outer `tokio::select!` cancels flush.
+        gateway.feed_text(r#"{"op":1,"d":null}"#.to_owned()).await.unwrap();
+        gateway.heartbeat_acknowledged = false;
+        gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval;
+        assert!(gateway.needs_flush);
+
+        let event = gateway.next_event().await.unwrap().unwrap();
+        assert!(!gateway.needs_flush);
+        assert!(gateway.heartbeat_acknowledged);
+        assert!(matches!(event, BotEvent::Other { name, .. } if name == "PING_CHECK"));
+        assert!(gateway.next_event().await.unwrap().is_none());
+        server.await.unwrap();
     }
 }

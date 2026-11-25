@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run from any working directory. Existing config files are never overwritten.
 set -euo pipefail
-RUSTLINK_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+RUSTLINK_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$RUSTLINK_ROOT"
 
 fail() { printf 'Rustlink: %s\n' "$*" >&2; exit 1; }

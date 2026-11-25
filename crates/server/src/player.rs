@@ -110,6 +110,7 @@ pub struct Player {
     emit: Emit,
     counters: Arc<Counters>,
     load_timeout: Duration,
+    load_gate: Arc<tokio::sync::Semaphore>,
     state: Mutex<State>,
     /// Wakes the playback thread when the state it waits on changes.
     wake: Condvar,
@@ -140,6 +141,26 @@ impl Player {
         counters: Arc<Counters>,
         load_timeout: Duration,
     ) -> Arc<Player> {
+        Self::with_limits(
+            user,
+            guild,
+            deps,
+            emit,
+            counters,
+            load_timeout,
+            Arc::new(tokio::sync::Semaphore::new(8)),
+        )
+    }
+
+    pub(crate) fn with_limits(
+        user: String,
+        guild: String,
+        deps: Arc<Deps>,
+        emit: Emit,
+        counters: Arc<Counters>,
+        load_timeout: Duration,
+        load_gate: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<Player> {
         Arc::new(Player {
             user,
             guild: guild.clone(),
@@ -147,6 +168,7 @@ impl Player {
             emit,
             counters,
             load_timeout,
+            load_gate,
             state: Mutex::new(State {
                 body: PlayerBody::new(guild),
                 end_time: None,
@@ -338,16 +360,17 @@ impl Player {
             let mut live_filter_update = None;
             if settings_changed {
                 if let Ok(new_set) = rustlink_audio::parse_filters(next_filters, next_volume) {
-                    if state.running
-                        && (state.live_filters || state.opening)
-                        && state.filter_set.effective_time() == new_set.effective_time()
-                    {
-                        live_filter_update = Some(new_set.clone());
-                    } else {
-                        need_stop = true;
+                    if state.running {
+                        if (state.live_filters || state.opening)
+                            && state.filter_set.effective_time() == new_set.effective_time()
+                        {
+                            live_filter_update = Some(new_set.clone());
+                        } else {
+                            need_stop = true;
+                        }
                     }
                     state.filter_set = new_set;
-                } else {
+                } else if state.running {
                     need_stop = true;
                 }
             }
@@ -447,10 +470,18 @@ impl Player {
     /// Resolves an identifier on a thread of its own, because it is network
     /// work and the runtime must stay free to answer other clients meanwhile.
     async fn resolve(&self, identifier: String) -> Result<Track, PlayerError> {
+        let deadline = tokio::time::Instant::now() + self.load_timeout;
+        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.load_gate).acquire_owned())
+            .await
+            .map_err(|_| PlayerError::Invalid("the source did not answer in time".into()))?
+            .map_err(|_| PlayerError::Destroyed)?;
         let loader = self.deps.loader.clone();
         let trimmed = identifier.trim().to_owned();
-        let work = tokio::task::spawn_blocking(move || loader.load_shared(&trimmed));
-        let result = tokio::time::timeout(self.load_timeout, work)
+        let work = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            loader.load_shared(&trimmed)
+        });
+        let result = tokio::time::timeout_at(deadline, work)
             .await
             .map_err(|_| PlayerError::Invalid("the source did not answer in time".into()))?
             .map_err(|error| PlayerError::Invalid(error.to_string()))??;
@@ -670,9 +701,11 @@ impl Player {
         };
         let mut output = VoiceOutput { connection: &connection, speaking: false };
         self.pump(generation, &mut frames, position, tempo, &mut output);
-        let state = self.state.lock().unwrap();
-        if state.generation == generation && output.speaking && output.connection.connected() {
-            let _ = output.connection.speaking(false);
+        if output.speaking {
+            let state = self.state.lock().unwrap();
+            if state.generation == generation && output.connection.connected() {
+                let _ = output.connection.speaking(false);
+            }
         }
     }
 
@@ -817,13 +850,15 @@ impl Player {
                 }
                 break;
             }
-            next += Duration::from_millis(FRAME_MILLIS as u64);
-            let late = Instant::now().saturating_duration_since(next);
+            let frame_duration = Duration::from_millis(FRAME_MILLIS as u64);
+            next += frame_duration;
+            let now = Instant::now();
+            let late = now.saturating_duration_since(next);
             if late > LATE {
                 self.counters
                     .deficit
                     .fetch_add((late.as_millis() / FRAME_MILLIS as u128) as u64, Ordering::Relaxed);
-                next = Instant::now();
+                next = now + frame_duration;
             }
         }
     }
@@ -975,6 +1010,33 @@ pub(crate) struct PreparedUpdate {
     voice: Option<VoiceState>,
 }
 
+const MAX_USER_DATA_BYTES: usize = 16 << 10;
+
+struct BoundedCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        if self.bytes > self.limit {
+            return Err(std::io::Error::other("user_data exceeds 16 KiB"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_user_data(user_data: &Object) -> Result<(), PlayerError> {
+    let mut counter = BoundedCounter { bytes: 0, limit: MAX_USER_DATA_BYTES };
+    serde_json::to_writer(&mut counter, user_data)
+        .map_err(|_| PlayerError::Invalid("user_data must not exceed 16 KiB".into()))
+}
+
 fn validate_scalar_fields(
     volume: Option<Int64>,
     position: Option<Int64>,
@@ -995,6 +1057,11 @@ fn validate_scalar_fields(
     if let Patch::Value(end_time) = end_time {
         if end_time.get() <= 0 {
             return Err(PlayerError::Invalid("end_ms must be positive or null".into()));
+        }
+        if let Some(position) = position {
+            if end_time.get() <= position.get() {
+                return Err(PlayerError::Invalid("end_ms must be greater than position_ms".into()));
+            }
         }
     }
     if let Some(filters) = filters {
@@ -1021,6 +1088,9 @@ pub(crate) fn prepare(update: PlayerUpdate) -> Result<PreparedUpdate, PlayerErro
         Patch::Null => (Patch::Null, None, None),
         Patch::Missing => (Patch::Missing, None, None),
     };
+    if let Some(data) = user_data.as_ref() {
+        validate_user_data(data)?;
+    }
     if !token.is_missing() && query.is_some() {
         return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
     }
@@ -1063,11 +1133,14 @@ pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
         update.filters.as_ref(),
         update.voice.as_ref(),
     )?;
-    let (token, query) = match &update.track {
-        Patch::Value(spec) => (&spec.token, spec.query.as_deref()),
-        Patch::Null => (&Patch::Null, None),
-        Patch::Missing => (&Patch::Missing, None),
+    let (token, query, user_data) = match &update.track {
+        Patch::Value(spec) => (&spec.token, spec.query.as_deref(), spec.user_data.as_ref()),
+        Patch::Null => (&Patch::Null, None, None),
+        Patch::Missing => (&Patch::Missing, None, None),
     };
+    if let Some(data) = user_data {
+        validate_user_data(data)?;
+    }
     if !token.is_missing() && query.is_some() {
         return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
     }
@@ -1697,5 +1770,196 @@ mod tests {
             "transient transport loss must keep the track parked for voice failover"
         );
         player.destroy();
+    }
+
+    #[test]
+    fn end_time_at_or_before_position_and_oversized_user_data_are_refused() {
+        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 5000 }))).is_err());
+        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 4999 }))).is_err());
+        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 5001 }))).is_ok());
+
+        let small = update(json!({ "track": { "user_data": { "k": "v" } } }));
+        assert!(validate(&small).is_ok());
+        assert!(prepare(small).is_ok());
+
+        let huge = update(json!({ "track": { "user_data": { "blob": "x".repeat(20_000) } } }));
+        assert!(validate(&huge).is_err());
+        assert!(prepare(huge).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_volume_and_filter_updates_do_not_bump_generation_or_send_speaking_false() {
+        struct CountingVoice {
+            speaking_off: AtomicUsize,
+        }
+        impl Connection for CountingVoice {
+            fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
+                Ok(())
+            }
+            fn speaking(&self, on: bool) -> Result<(), VoiceError> {
+                if !on {
+                    self.speaking_off.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            fn connected(&self) -> bool {
+                true
+            }
+            fn ping(&self) -> i64 {
+                5
+            }
+            fn close(&self) {}
+        }
+        struct CountingFactory(Arc<CountingVoice>);
+        impl Factory for CountingFactory {
+            fn connect(
+                &self,
+                _: String,
+                _: String,
+                _: VoiceState,
+                _: rustlink_voice::CloseHandler,
+            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
+            {
+                let conn = Arc::clone(&self.0);
+                Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
+            }
+        }
+        let conn = Arc::new(CountingVoice { speaking_off: AtomicUsize::new(0) });
+        let (sender, events) = channel();
+        let player = Player::new(
+            "1".into(),
+            "10".into(),
+            Arc::new(Deps {
+                loader: Arc::new(FakeLoader),
+                engine: Arc::new(FakeEngine { frames: 1 }),
+                voice: Arc::new(CountingFactory(Arc::clone(&conn))),
+            }),
+            Arc::new(move |e| {
+                let _ = sender.send(Value::Object(e));
+            }),
+            Arc::new(Counters::default()),
+        );
+        player.update(update(json!({ "voice": voice() })), false).await.unwrap();
+        wait_for(&events, "voice.connected");
+        let gen_before = player.state.lock().unwrap().generation;
+        let off_before = conn.speaking_off.load(Ordering::SeqCst);
+
+        player
+            .update(
+                update(json!({ "volume": 80, "filters": { "tremolo": { "depth": 0.5 } } })),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(player.state.lock().unwrap().generation, gen_before);
+        assert_eq!(conn.speaking_off.load(Ordering::SeqCst), off_before);
+        player.destroy();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_stall_pacing_waits_one_frame_interval_before_next_write() {
+        struct StallingFrames {
+            index: usize,
+        }
+        impl Frames for StallingFrames {
+            fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
+                match self.index {
+                    0 => {
+                        self.index += 1;
+                        packet.clear();
+                        packet.resize(8, 1);
+                        Ok(true)
+                    }
+                    1 => {
+                        self.index += 1;
+                        // Stall longer than LATE + 2*FRAME (140 ms) so `late > 100 ms` triggers.
+                        std::thread::sleep(Duration::from_millis(165));
+                        packet.clear();
+                        packet.resize(8, 2);
+                        Ok(true)
+                    }
+                    2 => {
+                        self.index += 1;
+                        packet.clear();
+                        packet.resize(8, 3);
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+        }
+        struct StallingEngine;
+        impl Engine for StallingEngine {
+            fn start(
+                &self,
+                _: &Track,
+                _: i64,
+                _: i64,
+                _: &Object,
+            ) -> Result<Box<dyn Frames>, AudioError> {
+                Ok(Box::new(StallingFrames { index: 0 }))
+            }
+        }
+        struct TimedConnection(Mutex<Vec<Instant>>);
+        impl Connection for TimedConnection {
+            fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
+                self.0.lock().unwrap().push(Instant::now());
+                Ok(())
+            }
+            fn speaking(&self, _: bool) -> Result<(), VoiceError> {
+                Ok(())
+            }
+            fn connected(&self) -> bool {
+                true
+            }
+            fn ping(&self) -> i64 {
+                1
+            }
+            fn close(&self) {}
+        }
+        struct TimedFactory(Arc<TimedConnection>);
+        impl Factory for TimedFactory {
+            fn connect(
+                &self,
+                _: String,
+                _: String,
+                _: VoiceState,
+                _: rustlink_voice::CloseHandler,
+            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
+            {
+                let conn = Arc::clone(&self.0);
+                Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
+            }
+        }
+        let writes = Arc::new(TimedConnection(Mutex::new(Vec::new())));
+        let counters = Arc::new(Counters::default());
+        let (sender, events) = channel();
+        let player = Player::new(
+            "1".into(),
+            "10".into(),
+            Arc::new(Deps {
+                loader: Arc::new(FakeLoader),
+                engine: Arc::new(StallingEngine),
+                voice: Arc::new(TimedFactory(Arc::clone(&writes))),
+            }),
+            Arc::new(move |e| {
+                let _ = sender.send(Value::Object(e));
+            }),
+            Arc::clone(&counters),
+        );
+        player
+            .update(
+                update(json!({ "track": { "token": sample().token }, "voice": voice() })),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for(&events, "track.ended");
+        let stamps = writes.0.lock().unwrap().clone();
+        assert_eq!(stamps.len(), 3);
+        assert!(counters.deficit.load(Ordering::Relaxed) >= 5);
+        // Frame 1 stalled, triggering the deficit reset; frame 2 must be paced ~20ms later, not 0ms.
+        let gap = stamps[2].saturating_duration_since(stamps[1]);
+        assert!(gap >= Duration::from_millis(14), "frame after stall burst too early: {gap:?}");
     }
 }

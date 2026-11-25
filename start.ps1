@@ -31,6 +31,21 @@ try {
         if (!(Test-Path -LiteralPath $bash)) { throw "MSYS2 was not found at $msysRoot. Set RUSTLINK_MSYS2_ROOT to its location." }
     }
 
+    $ucrtRustc = Join-Path $ucrt 'bin\rustc.exe'
+    $ucrtCargo = Join-Path $ucrt 'bin\cargo.exe'
+    if ((Test-Path -LiteralPath $ucrtRustc) -and (Test-Path -LiteralPath $ucrtCargo)) {
+        Remove-Item Env:RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue
+    } elseif (Get-Command rustup.exe -ErrorAction SilentlyContinue) {
+        $gnuRustc = & rustup.exe which --toolchain stable-x86_64-pc-windows-gnu rustc 2>$null
+        if ($LASTEXITCODE -eq 0 -and $gnuRustc) {
+            $env:RUSTUP_TOOLCHAIN = 'stable-x86_64-pc-windows-gnu'
+        } else {
+            Remove-Item Env:RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue
+        }
+    } else {
+        Remove-Item Env:RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue
+    }
+
     $rustc = Get-Command rustc.exe -ErrorAction SilentlyContinue
     $hostTarget = if ($rustc) { (& $rustc.Source -vV | Select-String '^host: (.+)$').Matches.Groups[1].Value } else { '' }
     $hasGnuRust = $hostTarget -eq 'x86_64-pc-windows-gnu' -and (Get-Command cargo.exe -ErrorAction SilentlyContinue)
@@ -43,6 +58,7 @@ try {
         Invoke-Checked $bash @('-lc','pacman -Syu --noconfirm')
         Invoke-Checked $bash @('-lc','pacman -Syu --noconfirm')
         Invoke-Checked $bash @('-lc','pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-rust mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-pkgconf')
+        Remove-Item Env:RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue
         $env:PATH = "$ucrt\bin;$env:PATH"
     }
     $env:OPUS_LIB_DIR = Join-Path $ucrt 'lib'

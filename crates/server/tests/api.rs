@@ -139,7 +139,8 @@ impl Node {
 impl Node {
     /// A node that keeps its rate limits, which the other tests switch off.
     fn limited() -> Self {
-        let mut config = Config { password: "test-secret".into(), ..Config::default() };
+        let mut config = Config::default();
+        config.password = "test-secret".into();
         config.ratelimits.enable = true;
         Self(
             Server::new(
@@ -218,8 +219,10 @@ async fn closing_before_background_tasks_start_releases_the_server() {
 
 #[tokio::test]
 async fn source_capabilities_follow_native_provider_switches() {
-    let node =
-        Node::new(Config { youtube_native: false, soundcloud_native: false, ..Config::default() });
+    let mut disabled = Config::default();
+    disabled.youtube_native = false;
+    disabled.soundcloud_native = false;
+    let node = Node::new(disabled);
     let (status, info) = node.request("GET", "/api/v1/info", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(info["sources"], json!(["http", "deezer"]));
@@ -435,7 +438,9 @@ async fn stats_counts_playback_and_tracks_pause_resume_and_stop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_player_creation_obeys_capacity_and_reuses_the_player() {
-    let node = Arc::new(Node::new(Config { max_players: 1, ..Config::default() }));
+    let mut config = Config::default();
+    config.max_players = 1;
+    let node = Arc::new(Node::new(config));
     let id = node.session().await;
     let mut tasks = Vec::new();
     for _ in 0..12 {
@@ -459,7 +464,9 @@ async fn concurrent_player_creation_obeys_capacity_and_reuses_the_player() {
 
 #[tokio::test]
 async fn a_failed_first_player_update_does_not_reserve_a_player_slot() {
-    let node = Node::new(Config { max_players: 1, ..Config::default() });
+    let mut config = Config::default();
+    config.max_players = 1;
+    let node = Node::new(config);
     let id = node.session().await;
     let player = format!("/api/v1/sessions/{id}/players/456");
 
@@ -500,11 +507,9 @@ fn blocking_player_node(
         entered: tokio::sync::Notify::new(),
         release: std::sync::Mutex::new(receiver),
     });
-    let node = Arc::new(Node::with_media(
-        Config { max_players, ..Config::default() },
-        loader.clone(),
-        Arc::new(Media),
-    ));
+    let mut config = Config::default();
+    config.max_players = max_players;
+    let node = Arc::new(Node::with_media(config, loader.clone(), Arc::new(Media)));
     (node, loader, release)
 }
 
@@ -610,7 +615,9 @@ async fn deleting_a_player_waits_for_an_inflight_update_on_the_same_guild() {
 
 #[tokio::test]
 async fn sessions_expire_and_capacity_is_released() {
-    let node = Node::new(Config { max_sessions: 1, ..Config::default() });
+    let mut config = Config::default();
+    config.max_sessions = 1;
+    let node = Node::new(config);
     let (_, session) = node
         .request("POST", "/api/v1/sessions", json!({"bot_id":"123", "resume_timeout_secs":1}))
         .await;
@@ -745,4 +752,124 @@ async fn rust_client_drives_the_real_http_and_event_contract() {
     events.close().await.unwrap();
     session.destroy().await.unwrap();
     task.abort();
+}
+
+#[tokio::test]
+async fn per_route_body_limits_metrics_gauges_and_lazy_player_reaping_work() {
+    let mut config = Config::default();
+    config.max_players = 1;
+    config.max_sessions = 2;
+    let node = Node::new(config);
+
+    // 16 KiB cap on session creation and tracks/resolve.
+    let over_small = "x".repeat((16 << 10) + 1);
+    let (status, _, _) =
+        node.raw("POST", "/api/v1/sessions", "Bearer test-secret", over_small.clone()).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, _, _) =
+        node.raw("POST", "/api/v1/tracks/resolve", "Bearer test-secret", over_small).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Unknown session returns 404 before buffering a >16 KiB update_session body.
+    let (status, _, _) = node
+        .raw(
+            "PATCH",
+            "/api/v1/sessions/nonexistent",
+            "Bearer test-secret",
+            "x".repeat((32 << 10) + 1),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Lazy reaping inside reserve_player() frees expired session's player slot immediately.
+    let first = node.session().await;
+    assert_eq!(
+        node.request("PATCH", &format!("/api/v1/sessions/{first}/players/100"), json!({})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(node.0.active_session_count(), 1);
+    assert_eq!(node.0.playing_count(), 0);
+    // Setting resume=false while disconnected makes `first` immediately expired; note update_session
+    // itself also reaps, so verify active_session_count and metrics too.
+    let second = node.session().await;
+    assert_eq!(node.0.active_session_count(), 2);
+    assert_eq!(
+        node.request("PATCH", &format!("/api/v1/sessions/{second}/players/200"), json!({})).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        node.request("PATCH", &format!("/api/v1/sessions/{first}"), json!({"resume": false}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        node.request("PATCH", &format!("/api/v1/sessions/{second}/players/200"), json!({})).await.0,
+        StatusCode::OK
+    );
+
+    // Check Prometheus metrics text output directly via oneshot.
+    let response = node
+        .0
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .header("authorization", "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(to_bytes(response.into_body(), 64 << 10).await.unwrap().to_vec())
+        .unwrap();
+    for expected in [
+        "rustlink_playing_players ",
+        "rustlink_cpu_cores ",
+        "rustlink_cpu_system_load ",
+        "rustlink_cpu_process_load ",
+    ] {
+        assert!(text.contains(expected), "missing {expected} in metrics:\n{text}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_semaphore_bounds_concurrent_blocking_resolutions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ConcurrencyLoader {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+    impl Loader for ConcurrencyLoader {
+        fn load(&self, _: &str) -> Result<LoadResult, SourceError> {
+            let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(40));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(LoadResult::Empty)
+        }
+        fn open(&self, t: &Track) -> Result<Box<dyn std::io::Read + Send>, SourceError> {
+            Media.open(t)
+        }
+    }
+    let loader =
+        Arc::new(ConcurrencyLoader { active: AtomicUsize::new(0), peak: AtomicUsize::new(0) });
+    let mut config = Config::default();
+    config.max_concurrent_loads = 2;
+    let node = Arc::new(Node::with_media(config, loader.clone(), Arc::new(Media)));
+    let mut handles = Vec::new();
+    for index in 0..6 {
+        let node = Arc::clone(&node);
+        handles.push(tokio::spawn(async move {
+            node.request("POST", "/api/v1/tracks/resolve", json!({"query": format!("q-{index}")}))
+                .await
+                .0
+        }));
+    }
+    for handle in handles {
+        assert_eq!(handle.await.unwrap(), StatusCode::OK);
+    }
+    assert!(loader.peak.load(Ordering::SeqCst) <= 2);
 }

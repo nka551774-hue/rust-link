@@ -10,6 +10,7 @@ mod linux;
 mod logging;
 mod tools;
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,34 +39,57 @@ struct Arguments {
     help: bool,
 }
 
+fn strip_ascii_os_prefix<'a>(value: &'a OsStr, prefix: &str) -> Option<&'a OsStr> {
+    debug_assert!(prefix.is_ascii());
+    let rest = value.as_encoded_bytes().strip_prefix(prefix.as_bytes())?;
+    // SAFETY: `prefix` is pure ASCII, which is a valid code-unit boundary in
+    // every platform `OsStr` encoding (UTF-8, WTF-8, and raw byte sequences).
+    Some(unsafe { OsStr::from_encoded_bytes_unchecked(rest) })
+}
+
 impl Arguments {
-    fn parse(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
+    fn parse<I, T>(arguments: I) -> Result<Arguments, String>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let mut arguments = arguments.into_iter().map(Into::into);
         let mut parsed = Arguments { config: None, version: false, check: false, help: false };
         while let Some(argument) = arguments.next() {
-            let (name, inline) = match argument.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (argument.as_str(), None),
-            };
-            match name {
-                "--config" | "-c" => {
-                    let path = match inline {
-                        Some(v) if !v.is_empty() && !v.starts_with('-') => PathBuf::from(v),
-                        Some(_) => return Err("--config needs a configuration file".into()),
-                        None => {
-                            let v =
-                                arguments.next().ok_or("--config needs a configuration file")?;
-                            if v.is_empty() || v.starts_with('-') {
-                                return Err("--config needs a configuration file".into());
-                            }
-                            PathBuf::from(v)
-                        }
-                    };
-                    parsed.config = Some(path);
+            let raw = argument.as_os_str();
+            if raw == "--config" || raw == "-c" {
+                let value = arguments.next().ok_or("--config needs a configuration file")?;
+                if value.is_empty() || value.as_encoded_bytes().starts_with(b"-") {
+                    return Err("--config needs a configuration file".into());
                 }
-                "--version" | "-V" if inline.is_none() => parsed.version = true,
-                "--check" if inline.is_none() => parsed.check = true,
-                "--help" | "-h" if inline.is_none() => parsed.help = true,
-                other => return Err(format!("unknown option {other}; use --help")),
+                parsed.config = Some(PathBuf::from(value));
+            } else if let Some(inline) = strip_ascii_os_prefix(raw, "--config=")
+                .or_else(|| strip_ascii_os_prefix(raw, "-c="))
+            {
+                if inline.is_empty() {
+                    return Err("--config needs a configuration file".into());
+                }
+                parsed.config = Some(PathBuf::from(inline));
+            } else if raw == "--version" || raw == "-V" {
+                parsed.version = true;
+            } else if strip_ascii_os_prefix(raw, "--version=").is_some()
+                || strip_ascii_os_prefix(raw, "-V=").is_some()
+            {
+                return Err("--version does not take a value".into());
+            } else if raw == "--check" {
+                parsed.check = true;
+            } else if strip_ascii_os_prefix(raw, "--check=").is_some() {
+                return Err("--check does not take a value".into());
+            } else if raw == "--help" || raw == "-h" {
+                parsed.help = true;
+            } else if strip_ascii_os_prefix(raw, "--help=").is_some()
+                || strip_ascii_os_prefix(raw, "-h=").is_some()
+            {
+                return Err("--help does not take a value".into());
+            } else {
+                let shown = raw.to_string_lossy();
+                let name = shown.split('=').next().unwrap_or(&shown);
+                return Err(format!("unknown option {name}; use --help"));
             }
         }
         Ok(parsed)
@@ -73,7 +97,7 @@ impl Arguments {
 }
 
 fn run() -> Result<(), String> {
-    let arguments = Arguments::parse(std::env::args().skip(1))?;
+    let arguments = Arguments::parse(std::env::args_os().skip(1))?;
     if arguments.help {
         println!("Rustlink — Rust Discord audio service\n\nUsage: rustlink [OPTIONS]\n\n  -c, --config PATH  Read this configuration file\n      --check        Validate configuration and media helpers, then exit\n  -V, --version      Print server and API versions\n  -h, --help         Show this help\n\nWithout a configuration, the first start writes config.yaml with a random password.\nVoice: Discord gateway v8, DAVE v1, Opus.");
         return Ok(());
@@ -270,16 +294,87 @@ async fn interrupt() {
     log::info!("shutdown signal received");
 }
 
+fn wipe_string(secret: &mut String) {
+    // SAFETY: `write_volatile` cannot unwind, and overwriting initialized bytes
+    // with `0` (ASCII NUL) preserves UTF-8 validity before `clear()`.
+    unsafe {
+        for byte in secret.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    secret.clear();
+}
+
 /// The configuration a node writes for itself when it was started without one.
 struct Starter {
     path: PathBuf,
     password: String,
 }
 
+impl Drop for Starter {
+    fn drop(&mut self) {
+        wipe_string(&mut self.password);
+    }
+}
+
 /// Whether a password was handed to the node through the environment, which is
 /// how a container is configured and why one never needs a file.
 fn password_from_environment() -> bool {
-    std::env::var("RUSTLINK_PASSWORD").is_ok_and(|value| !value.trim().is_empty())
+    std::env::var("RUSTLINK_PASSWORD").is_ok_and(|mut value| {
+        let present = !value.trim().is_empty();
+        wipe_string(&mut value);
+        present
+    })
+}
+
+fn write_starter_at(path: &Path, temp: &Path, contents: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_file = |target: &Path| -> std::io::Result<()> {
+        let mut file = options.open(target)?;
+        let result = {
+            use std::io::Write;
+            file.write_all(contents.as_bytes()).and_then(|()| file.sync_all())
+        };
+        drop(file);
+        if result.is_err() {
+            let _ = std::fs::remove_file(target);
+        }
+        result
+    };
+    match write_file(temp) {
+        Ok(()) => match std::fs::hard_link(temp, path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temp);
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(temp);
+                Err(err)
+            }
+            Err(_) => {
+                if path.exists() {
+                    let _ = std::fs::remove_file(temp);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "configuration file already exists",
+                    ))
+                } else if std::fs::rename(temp, path).is_ok() {
+                    Ok(())
+                } else {
+                    let _ = std::fs::remove_file(temp);
+                    write_file(path)
+                }
+            }
+        },
+        Err(_) => write_file(path),
+    }
 }
 
 /// Writes the configuration a first start runs with.
@@ -288,12 +383,12 @@ fn password_from_environment() -> bool {
 /// to its defaults and the environment, and the validation that follows names
 /// the password it is missing.
 fn write_starter() -> Option<Starter> {
-    let Some(password) = random_password() else {
+    let Some(mut password) = random_password() else {
         println!("no configuration file was found, and no password could be generated");
         return None;
     };
     let path = PathBuf::from(rustlink_config::STARTER_FILE);
-    let contents = rustlink_config::starter(&password);
+    let mut contents = rustlink_config::starter(&password);
     let mut nonce = [0u8; 8];
     let _ = getrandom::fill(&mut nonce);
     let temp = PathBuf::from(format!(
@@ -301,32 +396,8 @@ fn write_starter() -> Option<Starter> {
         rustlink_config::STARTER_FILE,
         tools::hex_encode(&nonce)
     ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let write_file = |target: &Path| {
-        options.open(target).and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()
-        })
-    };
-    let written = match write_file(&temp) {
-        Ok(()) => {
-            let linked = std::fs::hard_link(&temp, &path);
-            let _ = std::fs::remove_file(&temp);
-            match linked {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
-                Err(_) => write_file(&path),
-            }
-        }
-        Err(_) => write_file(&path),
-    };
+    let written = write_starter_at(&path, &temp, &contents);
+    wipe_string(&mut contents);
     match written {
         Ok(()) => {
             // The node is normally double-clicked, so the message names the file
@@ -336,6 +407,7 @@ fn write_starter() -> Option<Starter> {
             Some(Starter { path: shown, password })
         }
         Err(error) => {
+            wipe_string(&mut password);
             println!(
                 "no configuration file was found, and one could not be written to {}: {error}",
                 path.display()
@@ -353,7 +425,13 @@ fn write_starter() -> Option<Starter> {
 fn random_password() -> Option<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).ok()?;
-    Some(tools::hex_encode(&bytes))
+    let password = tools::hex_encode(&bytes);
+    for byte in &mut bytes {
+        // SAFETY: `byte` is an initialized stack byte.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    Some(password)
 }
 
 /// Reports a helper the configuration has switched off. Naming none is how a
@@ -552,12 +630,10 @@ mod tests {
     #[test]
     fn ffmpeg_is_resolved_from_the_tools_directory() {
         let directory = stub_tools();
-        let config = Config {
-            tools_directory: directory.display().to_string(),
-            auto_download: false,
-            ffmpeg: "ffmpeg".into(),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.tools_directory = directory.display().to_string();
+        config.auto_download = false;
+        config.ffmpeg = "ffmpeg".into();
         let resolver = tools::Resolver::new(&config.tools_directory, false);
         let ffmpeg =
             resolve_ffmpeg(&resolver, &config).unwrap().expect("ffmpeg is in the tools directory");
@@ -567,7 +643,8 @@ mod tests {
 
     #[test]
     fn a_helper_that_is_switched_off_is_not_looked_for() {
-        let config = Config { ffmpeg: "none".into(), ..Config::default() };
+        let mut config = Config::default();
+        config.ffmpeg = "none".into();
         let resolver = tools::Resolver::new(&config.tools_directory, false);
         assert!(resolve_ffmpeg(&resolver, &config).unwrap().is_none());
     }
@@ -576,13 +653,58 @@ mod tests {
     fn a_helper_that_is_missing_is_reported() {
         let directory =
             std::env::temp_dir().join(format!("rustlink-no-tools-{}", std::process::id()));
-        let config = Config {
-            tools_directory: directory.display().to_string(),
-            auto_download: false,
-            ffmpeg: "ffmpeg".into(),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.tools_directory = directory.display().to_string();
+        config.auto_download = false;
+        config.ffmpeg = "ffmpeg".into();
         let resolver = tools::Resolver::new(&config.tools_directory, false);
         assert!(resolve_ffmpeg(&resolver, &config).is_err());
+    }
+
+    #[test]
+    fn inline_config_supports_dash_prefixed_files_and_check_value_reports_clear_error() {
+        assert_eq!(
+            arguments("--config=-file.yaml").unwrap().config,
+            Some(PathBuf::from("-file.yaml"))
+        );
+        assert_eq!(arguments("-c=-file.yaml").unwrap().config, Some(PathBuf::from("-file.yaml")));
+        let err = arguments("--check=true").unwrap_err();
+        assert_eq!(err, "--check does not take a value");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(vec![b'-', b'c', 0xff, b'.', b'y', b'm', b'l']);
+            let parsed = Arguments::parse([OsString::from("--config"), raw.clone()])
+                .expect("non-UTF-8 path");
+            assert_eq!(parsed.config, Some(PathBuf::from(raw)));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let unpaired = OsString::from_wide(&[0xd800, u16::from(b'.'), u16::from(b'y')]);
+            let parsed = Arguments::parse([OsString::from("--config"), unpaired.clone()])
+                .expect("unpaired UTF-16 path");
+            assert_eq!(parsed.config, Some(PathBuf::from(unpaired)));
+        }
+    }
+
+    #[test]
+    fn starter_writes_atomically_preserves_existing_file_and_wipes_password_on_drop() {
+        let directory =
+            std::env::temp_dir().join(format!("rustlink-starter-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("config.yaml");
+        let temp = directory.join(".config.yaml.tmp-1");
+        write_starter_at(&target, &temp, "password: \"abc\"\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "password: \"abc\"\n");
+        assert!(!temp.exists());
+        assert!(write_starter_at(&target, &temp, "password: \"overwrite\"\n").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "password: \"abc\"\n");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let mut text = String::from("super-secret-starter-password");
+        wipe_string(&mut text);
+        assert!(text.is_empty());
     }
 }

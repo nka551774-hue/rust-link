@@ -96,8 +96,7 @@ fn strip_inline_stamps(words: &str) -> std::borrow::Cow<'_, str> {
         out.push_str(&rest[..open]);
         let candidate = &rest[open..];
         if let Some(end) = candidate.find('>') {
-            let bracketed = format!("[{}]", &candidate[1..end]);
-            if leading_stamp(&bracketed).is_some() {
+            if parse_stamp_body(&candidate[1..end]).is_some() {
                 rest = &candidate[end + 1..];
                 if out.ends_with(' ') && rest.starts_with(' ') {
                     rest = &rest[1..];
@@ -109,7 +108,15 @@ fn strip_inline_stamps(words: &str) -> std::borrow::Cow<'_, str> {
         rest = &rest[open + 1..];
     }
     out.push_str(rest);
-    std::borrow::Cow::Owned(out.trim().to_owned())
+    let trimmed_len = out.trim().len();
+    if trimmed_len != out.len() {
+        let leading = out.len() - out.trim_start().len();
+        if leading > 0 {
+            out.drain(..leading);
+        }
+        out.truncate(trimmed_len);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Reads one `[mm:ss.xx]` or `[hh:mm:ss.xx]` tag from the front of `text`,
@@ -119,7 +126,11 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
         return None;
     }
     let end = text.find(']')?;
-    let body = &text[1..end];
+    let timestamp = parse_stamp_body(&text[1..end])?;
+    Some((end + 1, timestamp))
+}
+
+fn parse_stamp_body(body: &str) -> Option<i64> {
     let colon = body.find(':')?;
     let decimal = |digits: &str| -> Option<i64> {
         if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -180,7 +191,7 @@ fn leading_stamp(text: &str) -> Option<(usize, i64)> {
     }
     let timestamp =
         minutes.checked_mul(60_000)?.checked_add(whole * 1000)?.checked_add(fraction)?;
-    Some((end + 1, timestamp))
+    Some(timestamp)
 }
 
 /// Gives every line but the last the gap to the next one, which is how long it
@@ -295,5 +306,13 @@ mod tests {
         assert_eq!(lines[1].duration, Some(3_000));
         assert_eq!(lines[2].line, "next");
         assert_eq!(lines[2].duration, None);
+    }
+
+    #[test]
+    fn inline_word_timestamps_strip_cleanly_without_bracket_truncation() {
+        let lines = parse("[00:01.00]<00:01.10>hello <00:01.50>world\n[00:02.00]<00:02.00]keep>");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, "hello world");
+        assert_eq!(lines[1].line, "<00:02.00]keep>");
     }
 }

@@ -20,7 +20,7 @@
 
 ---
 
-**Rustlink** 是專為高併發、低延遲與零抖動場景設計的原生日語音媒體伺服器。機器人透過簡潔嚴謹的 **Rustlink API v1**（REST 控制平面 + WebSocket 事件流）建立工作階段與播放器；從**音源解析、128 KiB HTTP 分段串流、容器探測、原生音訊解碼、48 kHz 雙聲道 DSP 濾波、Opus 編碼、Discord Voice Gateway v8 握手、RFC 9420 OpenMLS DAVE v1 端對端加密到 RTP UDP 封包發送**，全鏈路皆在單一原生 Rust 程序內一氣呵成。
+**Rustlink** 是專為高併發、低延遲與零抖動場景設計的原生即時語音媒體伺服器。機器人透過簡潔嚴謹的 **Rustlink API v1**（REST 控制平面 + WebSocket 事件流）建立工作階段與播放器；從**音源解析、128 KiB HTTP 分段串流、容器探測、原生音訊解碼、48 kHz 雙聲道 DSP 濾波、Opus 編碼、Discord Voice Gateway v8 握手、RFC 9420 OpenMLS DAVE v1 端對端加密到 RTP UDP 封包發送**，全鏈路皆在單一原生 Rust 程序內一氣呵成。
 
 - **零外部直譯器與零整檔下載**：不執行 `yt-dlp`、Node.js、JVM、Python 或 Go；音訊每次以 **128 KiB** 區間分段讀取（搭配強 `ETag` / `If-Range` 一致性校驗），讀入記憶體即刻解碼並送往語音頻道。
 - **獨立純淨協定**：不依賴亦不模仿 Lavalink、NodeLink 或 GoLink 的歷史包袱，採用自有的強型別 `/api/v1` 與版本化 `rlt1.` 曲目權杖（邊界對照見 [Rust 原生 API 對照](docs/native-api-matrix.md)）。
@@ -110,7 +110,7 @@
 - **次世代 Discord 語音與 E2EE**：完整支援 Discord Voice Gateway v8、UDP IP 探索、**DAVE v1（OpenMLS）端對端加密**、`aead_aes256_gcm_rtpsize` 與 `aead_xchacha20_poly1305_rtpsize` 傳輸加密。
 - **多平台原生音源解析**：
   - **YouTube / YouTube Music**：純 Rust 原生 InnerTube 多用戶端備援（`IOS_PRODUCER` + 自動引導匿名 `visitorData` 的 `VISIONOS` + 尾端區間防截斷校驗，支援搜尋、單曲、合輯與播放清單續頁、自動迴避 AI 配音音軌，完全不依賴 `yt-dlp`）。
-  - **SoundCloud**：原生 API v2 解析、HLS / 漸進式串流與 `client_id` 自動快取輪替。
+  - **SoundCloud**：原生 API v2 解析、漸進式串流與 `client_id` 自動快取輪替。
   - **Spotify / Deezer**：官方中繼資料擷取 + ISRC 優先雙向詞彙精準比對至可播放音源。
   - **Direct HTTP / HTTPS**：支援 MP3（ID3v2）、FLAC、Ogg Opus/Vorbis、MP4/M4A、WebM/Matroska、WAV 標頭探測與嚴格 SSRF 防護。
 - **高傳真音訊引擎與 10 種即時濾鏡**：Symphonia + 原生 WebM/MP4/Ogg Opus 解碼、ITU-R 多聲道立體聲混音、無爆音即時平滑切換 10 種濾鏡（`volume`、15 段 `equalizer`、`karaoke`、`timescale`、`tremolo`、`vibrato`、`rotation`、`distortion`、`channelMix`、`lowPass`）。

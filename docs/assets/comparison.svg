@@ -115,7 +115,7 @@
   <text x="235" y="347" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#e6edf3">Native Rust · Zero GC</text>
   <text x="425" y="347" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#e6edf3">128 KiB Range + Arc Cache</text>
   <text x="645" y="347" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#e6edf3">SIMD Biquad/Sinc (0 allocs)</text>
-  <text x="860" y="347" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#39c5bb">In-proc OpenMLS · 494 ns</text>
+  <text x="860" y="347" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#39c5bb">In-proc OpenMLS · 490 ns</text>
 
   <!-- Row 2: Lavalink -->
   <text x="52" y="381" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="600" fill="#f85149">Lavalink</text>

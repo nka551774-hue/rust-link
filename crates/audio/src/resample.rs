@@ -59,9 +59,17 @@ impl SincResampler {
     /// `ratio` is input frames per output frame: 48000 in and 48000 out is 1.0,
     /// 44100 in and 48000 out is 0.91875.
     pub fn new(ratio: f64) -> Self {
-        let ratio = ratio.max(1e-6);
+        let mut ratio = if ratio.is_finite() { ratio.clamp(1e-4, 1e4) } else { 1.0 };
+        if (ratio - 1.0).abs() < 1e-12 {
+            ratio = 1.0;
+        }
         let cutoff = if ratio > 1.0 { 1.0 / ratio } else { 1.0 };
         let half = half_window(cutoff);
+        // The unity ratio has its own path that needs no weights at all.
+        let phases = if ratio == 1.0 { None } else { Phases::new(ratio, cutoff, half) };
+        if let Some(ref p) = phases {
+            ratio = p.ratio;
+        }
         SincResampler {
             ratio,
             half,
@@ -74,8 +82,7 @@ impl SincResampler {
             finished: false,
             phase: 0,
             centre_frame: half,
-            // The unity ratio has its own path that needs no weights at all.
-            phases: if ratio == 1.0 { None } else { Phases::new(ratio, cutoff, half) },
+            phases,
             buffer: vec![0.0; half * CHANNELS],
         }
     }
@@ -105,7 +112,12 @@ impl SincResampler {
     }
 
     fn remaining(&self) -> usize {
-        let total = (self.input_frames as f64 / self.ratio - 1e-9).ceil().max(0.0) as u64;
+        let exact = self.input_frames as f64 / self.ratio - 1e-9;
+        let total = if exact.is_finite() && exact > 0.0 {
+            exact.ceil().min(u64::MAX as f64) as u64
+        } else {
+            0
+        };
         total.saturating_sub(self.output_frames).min(usize::MAX as u64) as usize
     }
 
@@ -120,7 +132,12 @@ impl SincResampler {
         }
         let frames = self.buffer.len() / CHANNELS;
         // floor(position) + half_window + 1 must fit in the input buffer.
-        ((frames as f64 - self.half as f64 - self.position) / self.ratio).ceil().max(0.0) as usize
+        let avail = (frames as f64 - self.half as f64 - self.position) / self.ratio;
+        if avail.is_finite() && avail > 0.0 {
+            avail.ceil().min(usize::MAX as f64) as usize
+        } else {
+            0
+        }
     }
 
     /// Produces up to `limit` output frames, appending them to `out`.
@@ -154,11 +171,17 @@ impl SincResampler {
     /// is what keeps them from paying for a filter that does not move them.
     fn produce_unity(&mut self, limit: usize, out: &mut Vec<f32>) -> usize {
         let frames = self.buffer.len() / CHANNELS;
+        if !self.position.is_finite() || self.position < 0.0 || self.position >= frames as f64 {
+            return 0;
+        }
         // The same window rule the filtered path uses, so both report the same
         // number of frames for the same input: the last frame that can be
         // produced has half a window of frames ahead of it.
         let centre = self.position as usize;
-        let count = limit.min(frames.saturating_sub(self.half).saturating_sub(centre));
+        if centre >= frames.saturating_sub(self.half) {
+            return 0;
+        }
+        let count = limit.min(frames - self.half - centre);
         if count == 0 {
             return 0;
         }
@@ -180,6 +203,7 @@ impl SincResampler {
         if let Some(phases) = &self.phases {
             let mut centre = self.centre_frame;
             let mut phase = self.phase;
+            let max_centre = frames.saturating_sub(self.half);
             if self.half == TAPS / 2 {
                 let rows = phases.weights.as_chunks::<TAPS>().0;
                 let steps = &phases.steps[..phases.period];
@@ -187,6 +211,9 @@ impl SincResampler {
                 let spare = out.spare_capacity_mut().as_chunks_mut::<CHANNELS>().0;
                 let batch = spare.len().min(limit);
                 for slot in &mut spare[..batch] {
+                    if centre >= max_centre || centre + 1 < TAPS / 2 {
+                        break;
+                    }
                     let start = centre + 1 - (TAPS / 2);
                     let Some(window) =
                         buf_frames.get(start..).and_then(|s| s.first_chunk::<TAPS>())
@@ -208,6 +235,9 @@ impl SincResampler {
                     out.set_len(base_len + produced * CHANNELS);
                 }
                 while produced < limit {
+                    if centre >= max_centre || centre + 1 < TAPS / 2 {
+                        break;
+                    }
                     let start = centre + 1 - (TAPS / 2);
                     let Some(window) =
                         buf_frames.get(start..).and_then(|s| s.first_chunk::<TAPS>())
@@ -224,11 +254,11 @@ impl SincResampler {
                 }
             } else {
                 while produced < limit {
-                    let start = centre + 1 - self.half;
-                    let end = centre + self.half + 1;
-                    if end > frames {
+                    if centre >= max_centre || centre + 1 < self.half {
                         break;
                     }
+                    let start = centre + 1 - self.half;
+                    let end = centre + self.half + 1;
                     let base = phase * width;
                     let row = &phases.weights[base..base + width];
                     let sample = convolve(&buf_frames[start..end], row);
@@ -252,13 +282,20 @@ impl SincResampler {
         let cutoff = if self.ratio > 1.0 { 1.0 / self.ratio } else { 1.0 };
         let mut weights = std::mem::take(&mut self.scratch);
         weights.resize(width, 0.0);
+        let max_centre = frames.saturating_sub(self.half);
         while produced < limit {
-            let centre = self.position as usize;
-            let start = centre + 1 - self.half;
-            let end = centre + self.half + 1;
-            if end > frames {
+            if !self.position.is_finite()
+                || self.position < 0.0
+                || self.position >= max_centre as f64
+            {
                 break;
             }
+            let centre = self.position as usize;
+            if centre >= max_centre || centre + 1 < self.half {
+                break;
+            }
+            let start = centre + 1 - self.half;
+            let end = centre + self.half + 1;
             let fraction = self.position - centre as f64;
             let mut sum = 0.0f64;
             for (tap_index, slot) in weights.iter_mut().enumerate() {
@@ -282,14 +319,24 @@ impl SincResampler {
     /// Drops the input behind the read position, which will never be read
     /// again because the filter only looks half a window back.
     fn compact(&mut self) {
-        let current_floor =
-            if self.phases.is_some() { self.centre_frame } else { self.position as usize };
+        let total_frames = self.buffer.len() / CHANNELS;
+        let current_floor = if self.phases.is_some() {
+            self.centre_frame
+        } else if self.position.is_finite() && self.position >= 0.0 {
+            if self.position >= total_frames as f64 {
+                total_frames
+            } else {
+                self.position as usize
+            }
+        } else {
+            0
+        };
         // Everything before the next read position's window is never read again.
         let keep_from = current_floor.saturating_sub(self.half + 1);
         // position is relative to the current buffer. Mixing an absolute
         // consumed count into it retained progressively more audio on long runs.
         if keep_from > 4096 {
-            let keep_from = keep_from.min(self.buffer.len() / CHANNELS);
+            let keep_from = keep_from.min(total_frames);
             let drop = keep_from * CHANNELS;
             self.buffer.drain(..drop);
             self.centre_frame = self.centre_frame.saturating_sub(keep_from);
@@ -349,6 +396,8 @@ fn convolve(frames: &[[f32; CHANNELS]], weights: &[f32]) -> [f32; CHANNELS] {
 /// The filter weights of every fractional read position a ratio repeats.
 #[derive(Debug, Clone)]
 struct Phases {
+    /// Exact rational ratio `turns / period` this table advances by.
+    ratio: f64,
     /// How many output frames the fractional position takes to come round.
     period: usize,
     /// Exact fractional read position `[0, 1)` of each row.
@@ -363,26 +412,35 @@ impl Phases {
     /// Builds the table for `ratio`, or nothing when the fractional positions
     /// do not come round within a period worth tabulating.
     fn new(ratio: f64, cutoff: f64, half: usize) -> Option<Phases> {
+        if !ratio.is_finite() || ratio <= 0.0 || half == 0 {
+            return None;
+        }
         let width = 2 * half;
         // A wider window means a bigger row, so fewer rows fit in the budget.
         let max_phases = (MAX_TABLE_BYTES / (width * 8)).clamp(1, MAX_PHASES);
         let period = (1..=max_phases).find(|period| {
             let turns = ratio * *period as f64;
-            let nearest = (turns + 0.5) as usize;
-            (turns - nearest as f64).abs() < 1e-9
+            if !turns.is_finite() || turns < 0.5 || turns > (u64::MAX / MAX_PHASES as u64) as f64 {
+                return false;
+            }
+            let nearest = (turns + 0.5) as u64;
+            nearest > 0 && (turns - nearest as f64).abs() < 1e-12
         })?;
-        let turns = (ratio * period as f64 + 0.5) as usize;
+        let turns = (ratio * period as f64 + 0.5) as u64;
+        let period_u64 = period as u64;
+        let snapped_ratio = turns as f64 / period_u64 as f64;
+        let cutoff = if snapped_ratio > 1.0 { 1.0 / snapped_ratio } else { cutoff };
         let mut fractions = Vec::with_capacity(period);
         let mut steps = Vec::with_capacity(period);
         let mut weights = Vec::with_capacity(period * width);
         let mut row_f64 = vec![0.0f64; width];
         for phase in 0..period {
-            let num = phase * turns;
-            let q_curr = num / period;
-            let rem = num % period;
-            let q_next = ((phase + 1) * turns) / period;
-            steps.push(q_next - q_curr);
-            let fraction = rem as f64 / period as f64;
+            let num = (phase as u64) * turns;
+            let q_curr = num / period_u64;
+            let rem = num % period_u64;
+            let q_next = ((phase as u64 + 1) * turns) / period_u64;
+            steps.push((q_next - q_curr) as usize);
+            let fraction = rem as f64 / period_u64 as f64;
             fractions.push(fraction);
             let mut sum = 0.0f64;
             for (tap_index, slot) in row_f64.iter_mut().enumerate() {
@@ -393,7 +451,7 @@ impl Phases {
             let inv = if sum.abs() > 1e-9 { 1.0 / sum } else { 0.0 };
             weights.extend(row_f64.iter().map(|&w| (w * inv) as f32));
         }
-        Some(Phases { period, fractions, steps, weights })
+        Some(Phases { ratio: snapped_ratio, period, fractions, steps, weights })
     }
 }
 
@@ -505,6 +563,15 @@ fn energy_hop(window: &[f32; HOP]) -> f32 {
     dot_hop(window, window)
 }
 
+#[inline]
+fn clean_stretch_factor(factor: f64) -> f64 {
+    if factor.is_finite() {
+        factor.clamp(0.05, 5.0)
+    } else {
+        1.0
+    }
+}
+
 impl TimeStretcher {
     pub fn new() -> Self {
         let mut fades = [0.0f32; HOP];
@@ -539,7 +606,7 @@ impl TimeStretcher {
     /// A factor above one is faster: the output is shorter than the input by
     /// that factor, and the pitch is unchanged.
     pub fn produce(&mut self, factor: f64) {
-        let factor = factor.clamp(0.05, 5.0);
+        let factor = clean_stretch_factor(factor);
         // A faster factor consumes more input per output frame, which is what
         // makes the output shorter.
         let hop_step = HOP as f64 * factor;
@@ -618,7 +685,7 @@ impl TimeStretcher {
         if self.total_input_frames == 0 {
             return;
         }
-        let factor = factor.clamp(0.05, 5.0);
+        let factor = clean_stretch_factor(factor);
         let target_total = ((self.total_input_frames as f64 / factor + 0.5) as u64).max(1);
         let remaining_target = target_total.saturating_sub(self.total_output_frames) as usize;
         if !self.input.is_empty() || !self.primed {
@@ -1005,5 +1072,44 @@ mod tests {
         fast.finish(5.0, &mut fast_out);
         let frames = fast_out.len() / CHANNELS;
         assert!((frames as i64 - 9_600).abs() <= HOP as i64, "frames={frames}");
+    }
+
+    #[test]
+    fn non_finite_and_extreme_ratios_and_stretch_factors_stay_safe() {
+        let clip = tone(440.0, 2048);
+        for bad_ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -3.0, 1e-30, 1e30] {
+            let mut resampler = SincResampler::new(bad_ratio);
+            resampler.push(&clip);
+            let mut out = Vec::new();
+            let _ = resampler.produce(1024, &mut out);
+            resampler.finish();
+            let _ = resampler.produce(1024, &mut out);
+            assert!(out.iter().all(|s| s.is_finite()));
+        }
+        for bad_factor in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -2.0, 100.0] {
+            let mut stretcher = TimeStretcher::new();
+            stretcher.push(&clip);
+            stretcher.produce(bad_factor);
+            let mut out = stretcher.take_output();
+            stretcher.finish(bad_factor, &mut out);
+            assert!(!out.is_empty());
+            assert!(out.iter().all(|s| s.is_finite()));
+        }
+    }
+
+    #[test]
+    fn phases_table_uses_tight_snap_tolerance_u64_products_and_aligns_ratio() {
+        assert!(Phases::new(1.0 + 1e-10, 1.0, TAPS / 2).is_none());
+        let steep = Phases::new(10_000.0, 1e-4, MAX_HALF).expect("exact integer ratio tabulates");
+        assert_eq!(steep.period, 1);
+        assert_eq!(steep.ratio, 10_000.0);
+
+        let snapped_half = SincResampler::new(0.5 + 1e-13);
+        assert_eq!(snapped_half.ratio, 0.5);
+        assert!(snapped_half.phases.is_some());
+
+        let snapped_unity = SincResampler::new(1.0 + 1e-13);
+        assert_eq!(snapped_unity.ratio, 1.0);
+        assert!(snapped_unity.phases.is_none());
     }
 }

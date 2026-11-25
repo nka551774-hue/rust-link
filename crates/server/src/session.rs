@@ -198,9 +198,18 @@ impl Session {
         self.state.lock().unwrap().players.len()
     }
 
-    /// Number of actively playing players owned by the session without holding the session lock across player locks.
+    /// Number of actively playing players owned by the session without allocating.
     pub fn playing_player_count(&self) -> usize {
-        self.players().into_iter().filter(|player| player.playing()).count()
+        self.usable_and_playing().unwrap_or(0)
+    }
+
+    /// Returns `Some(playing_players)` when the session is usable, or `None` if closed/expired.
+    pub(crate) fn usable_and_playing(&self) -> Option<usize> {
+        let state = self.state.lock().unwrap();
+        if state.closing || state.closed || Self::expired_locked(&state) {
+            return None;
+        }
+        Some(state.players.values().filter(|player| player.playing()).count())
     }
 
     /// Appends sanitized webhook player reports and returns how many are actively playing.

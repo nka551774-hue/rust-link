@@ -12,6 +12,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use rustlink_audio::{opus_decode::Decoder, Encoder};
 use std::num::NonZeroU16;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 
 const USER: u64 = 123456789;
@@ -33,8 +34,8 @@ fn wire_mode(mode: Mode) -> &'static str {
 
 fn state() -> VoiceState {
     VoiceState {
-        token: "loopback-only token".into(),
-        session_id: "loopback-only session".into(),
+        token: "loopback-only-token".into(),
+        session_id: "loopback-only-session".into(),
         endpoint: "unused.discord.media".into(),
         channel_id: Some(CHANNEL.to_string()),
     }
@@ -469,6 +470,9 @@ async fn premature_dave_downgrade_fails_the_loopback_handshake() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        ws.send(Message::Text(json!({"op":8,"d":{"heartbeat_interval":250}}).to_string().into()))
+            .await
+            .unwrap();
         ws.send(Message::Text(
             json!({"op":21,"d":{"protocol_version":0,"transition_id":0}}).to_string().into(),
         ))
@@ -487,5 +491,152 @@ async fn premature_dave_downgrade_fails_the_loopback_handshake() {
     assert!(
         matches!(result, Err(VoiceError::Crypto(reason)) if reason.contains("before session description"))
     );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn v8_resume_preserves_dave_session_seq_ack_and_audio_continuity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (resumed_ready_tx, resumed_ready_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
+        peer.enable_dave().await;
+        assert_eq!(peer.packet(0).await, SILENCE);
+
+        // Send a DAVE downgrade prepare (seq=10, transition_id=15) and immediately crash (4015).
+        peer.send(json!({"op":21,"seq":10,"d":{"protocol_version":0,"transition_id":15}})).await;
+        peer.ws
+            .close(Some(CloseFrame {
+                code: CloseCode::from(4015),
+                reason: "voice server failover".into(),
+            }))
+            .await
+            .unwrap();
+
+        // Accept the v8 RESUME on the new WebSocket while reusing the existing UDP socket & DAVE state.
+        let (tcp2, _) = tokio::time::timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
+        peer.ws = tokio_tungstenite::accept_async(tcp2).await.unwrap();
+        peer.send(json!({"op":8,"d":{"heartbeat_interval":200}})).await;
+        let resume = peer.control(7).await;
+        assert_eq!(resume["d"]["seq_ack"], 10);
+        peer.send(json!({"op":9,"seq":11,"d":null})).await;
+
+        // Cancel the downgrade back to DAVE v1 (transition_id=16) and execute it!
+        peer.send(json!({"op":21,"seq":12,"d":{"protocol_version":1,"transition_id":16}})).await;
+        loop {
+            let msg = peer.message().await;
+            if let Message::Text(ref t) = msg {
+                let val: Value = serde_json::from_str(t).unwrap();
+                if val["op"] == 23 && val["d"]["transition_id"] == 16 {
+                    break;
+                }
+                if val["op"] == 23 {
+                    continue;
+                }
+            }
+            peer.handle(msg).await;
+        }
+        peer.send(json!({"op":22,"seq":13,"d":{"transition_id":16}})).await;
+        resumed_ready_tx.send(()).unwrap();
+        assert_eq!(peer.packet(1).await, SILENCE);
+        peer.remote_close().await;
+    });
+
+    let (close, mut closed) = mpsc::unbounded_channel();
+    let connection = connect_url(
+        &url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(move |event| {
+            let _ = close.send(event);
+        }),
+    )
+    .await
+    .unwrap();
+
+    connection.speaking(true).unwrap();
+    connection.write(SILENCE).unwrap();
+    resumed_ready_rx.await.unwrap();
+    connection.write(SILENCE).unwrap();
+
+    let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
+    assert_eq!(event.code, 4014);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn solo_upgrade_from_v0_arms_alone_timer_and_switches_to_dave_v1() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (alone_ready_tx, alone_ready_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
+        peer.describe(0).await;
+        // First packet in DAVE v0 is cleartext SILENCE inside RTP AEAD.
+        assert_eq!(peer.packet(0).await, SILENCE);
+
+        // Send external sender (op 25) and solo upgrade op 24 (v=1, epoch=1).
+        let suite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+        let signer = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
+        let external = ExternalSender::new(
+            signer.public().into(),
+            BasicCredential::new(b"solo upgrade peer".to_vec()).into(),
+        )
+        .tls_serialize_detached()
+        .unwrap();
+        let mut ext_msg = vec![0, 4, 25];
+        ext_msg.extend(&external);
+        peer.ws.send(Message::Binary(ext_msg.into())).await.unwrap();
+        peer.send(json!({"op":24,"seq":5,"d":{"protocol_version":1,"epoch":1}})).await;
+
+        // Expect op 26 KeyPackage.
+        loop {
+            let msg = peer.message().await;
+            if let Message::Binary(bytes) = &msg {
+                assert_eq!(bytes[0], 26);
+                break;
+            }
+            peer.handle(msg).await;
+        }
+
+        // Keep answering heartbeats across ALONE_GRACE (3s) so start_alone() activates DAVE v1!
+        let deadline = Instant::now() + ALONE_GRACE + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(100), peer.ws.next()).await
+            {
+                peer.handle(msg.unwrap().unwrap()).await;
+            }
+        }
+        alone_ready_tx.send(()).unwrap();
+
+        // Next RTP-decrypted frame must carry DAVE v1 magic footer 0xfafa!
+        let encrypted_dave = peer.packet(1).await;
+        assert_ne!(encrypted_dave, SILENCE);
+        assert_eq!(&encrypted_dave[encrypted_dave.len() - 2..], &[0xfa, 0xfa]);
+        peer.remote_close().await;
+    });
+
+    let (close, mut closed) = mpsc::unbounded_channel();
+    let connection = connect_url(
+        &url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(move |event| {
+            let _ = close.send(event);
+        }),
+    )
+    .await
+    .unwrap();
+
+    connection.speaking(true).unwrap();
+    connection.write(SILENCE).unwrap();
+    alone_ready_rx.await.unwrap();
+    connection.write(SILENCE).unwrap();
+
+    let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
+    assert_eq!(event.code, 4014);
     server.await.unwrap();
 }

@@ -246,7 +246,7 @@ impl Drop for Encoder {
 #[inline]
 pub fn to_i16(samples: &[f32], out: &mut [i16]) {
     for (target, &sample) in out.iter_mut().zip(samples) {
-        let clean = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
+        let clean = crate::dsp::clean_f32(sample).clamp(-1.0, 1.0);
         let scaled = clean * 32767.0;
         *target = (scaled + 0.5f32.copysign(scaled)) as i16;
     }
@@ -262,6 +262,14 @@ mod tests {
         let mut out = [0i16; 6];
         to_i16(&samples, &mut out);
         assert_eq!(out, [32767, -32767, 16384, -16384, 0, 0]);
+    }
+
+    #[test]
+    fn saturated_max_and_subnormals_convert_cleanly() {
+        let samples = [f32::MAX, -f32::MAX, f32::NEG_INFINITY, f32::from_bits(1), -0.0];
+        let mut out = [0i16; 5];
+        to_i16(&samples, &mut out);
+        assert_eq!(out, [32767, -32767, 0, 0, 0]);
     }
 
     #[cfg(feature = "native-opus")]

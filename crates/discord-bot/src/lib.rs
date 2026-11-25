@@ -45,7 +45,7 @@ pub enum BotError {
 
 impl From<reqwest::Error> for BotError {
     fn from(error: reqwest::Error) -> Self {
-        Self::Http(Box::new(error))
+        Self::Http(Box::new(error.without_url()))
     }
 }
 
@@ -123,7 +123,7 @@ const PREFIXES: [&str; 10] = [
     "youtube:playlist:",
 ];
 
-const KNOWN_MUSIC_HOSTS: [&str; 15] = [
+const KNOWN_MUSIC_HOSTS: [&str; 13] = [
     "youtu.be",
     "youtube.com",
     "www.youtube.com",
@@ -134,18 +134,160 @@ const KNOWN_MUSIC_HOSTS: [&str; 15] = [
     "soundcloud.com",
     "www.soundcloud.com",
     "m.soundcloud.com",
-    "on.soundcloud.com",
     "open.spotify.com",
     "deezer.com",
     "www.deezer.com",
-    "deezer.page.link",
 ];
 
-const DIRECT_AUDIO_EXTENSIONS: [&str; 9] =
-    [".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac", ".webm", ".mkv"];
+const DIRECT_AUDIO_EXTENSIONS: [&str; 7] =
+    [".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac"];
 
 fn is_known_music_host(host: &str) -> bool {
     KNOWN_MUSIC_HOSTS.iter().any(|candidate| host.eq_ignore_ascii_case(candidate))
+}
+
+fn host_is_or_subdomain(host: &str, domain: &str) -> bool {
+    host.eq_ignore_ascii_case(domain)
+        || (host.len() > domain.len() + 1
+            && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+            && host.as_bytes()[host.len() - domain.len()..].eq_ignore_ascii_case(domain.as_bytes()))
+}
+
+fn is_playable_music_url(url_without_scheme: &str) -> bool {
+    let without_fragment = url_without_scheme.split('#').next().unwrap_or_default();
+    let (authority_and_path, query) =
+        without_fragment.split_once('?').unwrap_or((without_fragment, ""));
+    let Some((authority, path)) = authority_and_path.split_once('/') else {
+        return false;
+    };
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.split_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    if !is_known_music_host(host) {
+        return false;
+    }
+    let mut segments = path.split('/').filter(|seg| !seg.is_empty());
+    if host.eq_ignore_ascii_case("youtu.be") {
+        return matches!((segments.next(), segments.next()), (Some(_), None));
+    }
+    if host_is_or_subdomain(host, "youtube.com")
+        || host_is_or_subdomain(host, "youtube-nocookie.com")
+    {
+        return match segments.next() {
+            Some("watch") => {
+                segments.next().is_none()
+                    && query.split('&').any(|pair| {
+                        pair.split_once('=').is_some_and(|(key, val)| {
+                            matches!(key, "v" | "list") && !val.is_empty()
+                        })
+                    })
+            }
+            Some("playlist") => {
+                segments.next().is_none()
+                    && query
+                        .split('&')
+                        .any(|pair| pair.strip_prefix("list=").is_some_and(|val| !val.is_empty()))
+            }
+            Some("attribution_link") => {
+                segments.next().is_none()
+                    && query
+                        .split('&')
+                        .any(|pair| pair.strip_prefix("u=").is_some_and(|val| !val.is_empty()))
+            }
+            Some("shorts" | "live" | "embed" | "v" | "e") => {
+                matches!((segments.next(), segments.next()), (Some(_), None))
+            }
+            _ => false,
+        };
+    }
+    if host.eq_ignore_ascii_case("open.spotify.com") {
+        let mut seg = segments.next().unwrap_or_default();
+        if seg.starts_with("intl-") {
+            seg = segments.next().unwrap_or_default();
+        }
+        if seg == "embed" {
+            seg = segments.next().unwrap_or_default();
+            if seg.starts_with("intl-") {
+                seg = segments.next().unwrap_or_default();
+            }
+        }
+        return matches!(seg, "track" | "album" | "playlist")
+            && matches!((segments.next(), segments.next()), (Some(_), None));
+    }
+    if host_is_or_subdomain(host, "deezer.com") {
+        return match (segments.next(), segments.next(), segments.next(), segments.next()) {
+            (Some("track" | "album" | "playlist"), Some(id), None, None) => !id.is_empty(),
+            (Some(locale), Some("track" | "album" | "playlist"), Some(id), None) => {
+                !id.is_empty()
+                    && locale.len() <= 8
+                    && locale.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+            }
+            _ => false,
+        };
+    }
+    if host_is_or_subdomain(host, "soundcloud.com") {
+        const RESERVED_ROOTS: [&str; 22] = [
+            "discover",
+            "search",
+            "stream",
+            "upload",
+            "you",
+            "charts",
+            "pages",
+            "messages",
+            "notifications",
+            "settings",
+            "people",
+            "stations",
+            "tags",
+            "popular",
+            "terms-of-use",
+            "imprint",
+            "jobs",
+            "creators",
+            "pro",
+            "go",
+            "mobile",
+            "feed",
+        ];
+        const RESERVED_USER_SUBPATHS: [&str; 10] = [
+            "tracks",
+            "albums",
+            "playlists",
+            "reposts",
+            "likes",
+            "followers",
+            "following",
+            "comments",
+            "popular-tracks",
+            "spotlight",
+        ];
+        let Some(user) = segments.next() else { return false };
+        if RESERVED_ROOTS.iter().any(|root| user.eq_ignore_ascii_case(root)) {
+            return false;
+        }
+        let Some(second) = segments.next() else { return false };
+        if second.eq_ignore_ascii_case("sets") {
+            let Some(_set_slug) = segments.next() else { return false };
+            return match segments.next() {
+                None => true,
+                Some(secret) => secret.starts_with("s-") && segments.next().is_none(),
+            };
+        }
+        if RESERVED_USER_SUBPATHS.iter().any(|sub| second.eq_ignore_ascii_case(sub)) {
+            return false;
+        }
+        return match segments.next() {
+            None => true,
+            Some(secret) => secret.starts_with("s-") && segments.next().is_none(),
+        };
+    }
+    false
 }
 
 fn has_direct_audio_extension(url_without_scheme: &str) -> bool {
@@ -267,6 +409,15 @@ pub fn normalize_query(text: &str) -> Cow<'_, str> {
             return Cow::Borrowed(text);
         }
     }
+    if let Some(&prefix) = PREFIXES.iter().find(|&&prefix| {
+        text.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }) {
+        return if text.starts_with(prefix) {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(format!("{prefix}{}", &text[prefix.len()..]))
+        };
+    }
     if let Some(url) = extract_http_url(text) {
         return Cow::Borrowed(url);
     }
@@ -275,12 +426,7 @@ pub fn normalize_query(text: &str) -> Cow<'_, str> {
     }
     let is_video_id = text.len() == 11
         && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if text.contains("://")
-        || is_video_id
-        || PREFIXES.iter().any(|prefix| {
-            text.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        })
-    {
+    if text.contains("://") || is_video_id {
         Cow::Borrowed(text)
     } else {
         Cow::Owned(format!("ytsearch:{text}"))
@@ -338,18 +484,14 @@ pub fn extract_message_query<'a>(
                     7
                 };
             let after_scheme = &url[scheme_len..];
-            let host_end = after_scheme.find(['/', '?', '#', ':']).unwrap_or(after_scheme.len());
-            let host = &after_scheme[..host_end];
-            let has_path =
-                after_scheme[host_end..].strip_prefix('/').is_some_and(|path| !path.is_empty());
-            if (is_known_music_host(host) && has_path) || has_direct_audio_extension(after_scheme) {
+            if is_playable_music_url(after_scheme) || has_direct_audio_extension(after_scheme) {
                 return Some((Cow::Borrowed(url), false));
             }
         }
         return None;
     }
     if let Some(schemeless) = extract_schemeless_music_url(bare) {
-        if schemeless == bare {
+        if schemeless == bare && is_playable_music_url(schemeless) {
             return Some((Cow::Owned(format!("https://{schemeless}")), false));
         }
     }
@@ -365,6 +507,30 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reqwest_error_conversion_strips_url_and_interaction_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dropper = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let secret = "super-secret-interaction-token-987654";
+        let url = format!("http://{addr}/api/v10/webhooks/123/{secret}/messages/@original");
+        let raw_error = reqwest::Client::new().patch(&url).send().await.unwrap_err();
+        assert!(
+            raw_error.to_string().contains(secret),
+            "precondition: raw reqwest error carries URL"
+        );
+        let bot_error = BotError::from(raw_error);
+        let display = bot_error.to_string();
+        let debug = format!("{bot_error:?}");
+        assert!(!display.contains(secret), "{display}");
+        assert!(!debug.contains(secret), "{debug}");
+        assert!(!display.contains("webhooks"), "{display}");
+        dropper.await.unwrap();
+    }
 
     #[test]
     fn normalize_query_handles_share_strings_wrappers_and_schemeless_links() {
@@ -401,6 +567,25 @@ mod tests {
     }
 
     #[test]
+    fn normalize_query_lowercases_uppercase_prefixes_without_allocating_lowercase_ones() {
+        assert!(matches!(normalize_query("ytsearch:lofi"), Cow::Borrowed("ytsearch:lofi")));
+        assert!(matches!(
+            normalize_query("YTSEARCH:lofi"),
+            Cow::Owned(ref value) if value == "ytsearch:lofi"
+        ));
+        assert!(matches!(
+            normalize_query("YouTube:Playlist:PL123"),
+            Cow::Owned(ref value) if value == "youtube:playlist:PL123"
+        ));
+        assert!(matches!(
+            normalize_query("SoundCloud:artist/song"),
+            Cow::Owned(ref value) if value == "soundcloud:artist/song"
+        ));
+        assert_eq!(normalize_query("on.soundcloud.com/short"), "ytsearch:on.soundcloud.com/short");
+        assert_eq!(normalize_query("deezer.page.link/short"), "ytsearch:deezer.page.link/short");
+    }
+
+    #[test]
     fn extract_message_query_accepts_bare_music_links_and_mentions_without_hijacking_chat() {
         assert_eq!(
             extract_message_query("https://youtu.be/dQw4w9WgXcQ?si=abc", "999"),
@@ -430,5 +615,64 @@ mod tests {
         assert_eq!(extract_message_query("今天天氣真好", "999"), None);
         assert_eq!(extract_message_query("https://github.com/rust-lang/rust", "999"), None);
         assert_eq!(extract_message_query("你看這個 https://youtu.be/dQw4w9WgXcQ", "999"), None);
+    }
+
+    #[test]
+    fn extract_message_query_checks_playable_paths_and_ignores_video_clips_or_profiles() {
+        for playable in [
+            "https://www.youtube.com/playlist?list=PL123",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/v/dQw4w9WgXcQ",
+            "https://www.youtube.com/e/dQw4w9WgXcQ",
+            "https://www.youtube.com/attribution_link?u=%2Fwatch%3Fv%3DdQw4w9WgXcQ",
+            "https://open.spotify.com/intl-zh-TW/track/4cOdK2wGLETKBW3PvgPWqT",
+            "https://open.spotify.com/embed/album/1ATL5GLyefJaxhQzSPVrLX",
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+            "https://www.deezer.com/track/3135556",
+            "https://www.deezer.com/fr/album/302127",
+            "https://soundcloud.com/artist/track-slug",
+            "https://soundcloud.com/artist/sets/ep-slug",
+            "https://soundcloud.com/artist/track-slug/s-secret",
+        ] {
+            assert_eq!(
+                extract_message_query(playable, "999"),
+                Some((Cow::Borrowed(playable), false)),
+                "expected playable: {playable}"
+            );
+        }
+
+        for non_playable in [
+            "https://cdn.discordapp.com/attachments/1/2/clip.webm",
+            "https://cdn.discordapp.com/attachments/1/2/movie.mkv",
+            "https://on.soundcloud.com/shortlink",
+            "https://deezer.page.link/shortlink",
+            "https://youtu.be/",
+            "https://www.youtube.com/@SomeChannel",
+            "https://www.youtube.com/channel/UC123456",
+            "https://www.youtube.com/results?search_query=lofi",
+            "https://www.youtube.com/shorts",
+            "https://www.youtube.com/watch",
+            "https://open.spotify.com/artist/4Z8W4fKeB5YxbusRsdQVPb",
+            "https://open.spotify.com/user/spotify",
+            "https://open.spotify.com/episode/4cOdK2wGLETKBW3PvgPWqT",
+            "https://www.deezer.com/artist/27",
+            "https://www.deezer.com/us/artist/27",
+            "https://soundcloud.com/artist",
+            "https://soundcloud.com/artist/tracks",
+            "https://soundcloud.com/artist/sets",
+            "https://soundcloud.com/artist/likes",
+            "https://soundcloud.com/discover",
+            "https://soundcloud.com/search/sounds?q=lofi",
+            "youtube.com/@SomeChannel",
+            "soundcloud.com/artist",
+        ] {
+            assert_eq!(
+                extract_message_query(non_playable, "999"),
+                None,
+                "expected ignored in bare chat: {non_playable}"
+            );
+        }
     }
 }

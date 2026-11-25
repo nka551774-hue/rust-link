@@ -6,7 +6,7 @@
 
 | 部分 | 內容 |
 | --- | --- |
-| `Gateway` | Discord 主 Gateway v10：HELLO、IDENTIFY、heartbeat、READY、dispatch、opcode 4 語音狀態；收到 reconnect／invalid-session 或遠端關閉時交還呼叫端 |
+| `Gateway` | Discord 主 Gateway v10：HELLO、IDENTIFY、heartbeat、READY、dispatch、opcode 4 語音狀態，以及 `Gateway::connect_with_messages`（`4014` 免特權自動降級）、`Gateway::resume`（`OP 6` 工作階段續傳）與 `Gateway::reconnect`（有界退避、自動選擇續傳或重新 IDENTIFY） |
 | `DiscordRest` | REST v10：發訊息、註冊 guild 斜線指令、回應與編輯互動（deferred response） |
 | `VoiceStatePairer` | 把機器人自己的 `VOICE_STATE_UPDATE` 與 `VOICE_SERVER_UPDATE` 依 guild 配對成 `VoiceState`；可鎖定單一 guild |
 | `Interaction`、`BotEvent` | 事件與互動資料；`Interaction::option` 讀指令參數 |
@@ -34,7 +34,7 @@ cargo run -p rustlink-discord-bot --example music -- my.env  # 指定別的檔�
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `DISCORD_BOT_TOKEN` | 必填 | 機器人 token；只要求 `Guilds` 與 `Voice States` intent，不需要 privileged intent |
+| `DISCORD_BOT_TOKEN` | 必填 | 機器人 token；透過 `Gateway::connect_with_messages` 連線，若已開啟 Message Content Intent 可自動播放頻道裸連結，未開啟（`4014`）則自動降級為免特權模式（`/play` 與 `@Bot` 皆可用） |
 | `RUSTLINK_PASSWORD` | 必填 | 節點設定檔的 `password` |
 | `RUSTLINK_URL` | `http://127.0.0.1:2333` | 節點位址 |
 | `DISCORD_GUILD_IDS` | 空 | 只在這些伺服器註冊指令（逗號分隔）；空表示機器人所在的每個伺服器 |
@@ -83,12 +83,12 @@ Rustlink Session::set_voice()
 7. 同時維持 Discord heartbeat、Rustlink 事件 WebSocket 與語音傳輸。被移動頻道、重新分配或斷線時，丟掉舊的配對，重新收齊兩個事件，再更新 `set_voice`。
 8. 收到 SIGINT／SIGTERM 時，先停止播放、銷毀 Rustlink session，再關閉 Gateway。
 
-`Gateway::next_event` 會把 Discord 的 reconnect、invalid-session 或遠端關閉（回傳 `None`）交回呼叫端。正式的機器人必須用退避迴圈重建 Gateway 並重新取得語音狀態，不能把一次 WebSocket 物件當成永久連線。本函式庫只提供全新的 IDENTIFY，沒有自動 RESUME 與退避。
+`Gateway::next_event` 會把 Discord 的 `Reconnect`（`OP 7`）、`InvalidSession`（`OP 9`）或遠端關閉（回傳 `None`）交回呼叫端。呼叫端可直接呼叫 `Gateway::reconnect(cause)`：當持有有效 `session_id`／`sequence` 且非前一次尚未收到 `OP 0` 確認的續傳時，會優先以 `Gateway::resume`（`OP 6`）續傳工作階段；若續傳在確認前中斷、收到不可續傳的 `OP 9`（`d: false`）或關閉碼 `4007`／`4009`，則自動退回全新的 `IDENTIFY`（`OP 2`）。重連內建有界退避（`1s..=5s`，遇 `4008` 限流固定退避 `5s`），遇 `4014` 且含 `MESSAGE_CONTENT` 時會自動剝離該特權 intent 重連，其餘永久設定或認證錯誤（`4004`、`4010..=4014`）則直接回傳錯誤停止重試。當退回 `IDENTIFY` 重新收到 `BotEvent::Ready` 時，機器人應清除舊的語音就緒標記，並對仍在播放或等待加入的伺服器重新送出 `OP 4`（`set_voice_state`）。
 
 ## 連線與安全界線
 
 - `VOICE_STATE_UPDATE` 要檢查 `guild_id`、`user_id` 與預期的 `channel_id`，避免別的機器人或別的 guild 的 session 綁進播放器。固定單一 guild 的機器人用 `VoiceStatePairer::for_guild`。
-- `VOICE_SERVER_UPDATE.endpoint` 為空或不符合 Discord 語音主機規則時要拒絕，保留可重試的錯誤；不可退回明文音訊。
+- `VOICE_SERVER_UPDATE.endpoint` 為 `null` 或空白時視為語音伺服器重新分配中，會清除已發送標記並等待下一個有效 `endpoint`（回傳 `Ok(None)`）；格式無效的端點則拒絕，不可退回明文音訊。
 - Rustlink 的 API password 只放在 Bearer 標頭，Discord bot token 只放在 Gateway IDENTIFY 與 REST 的授權標頭；兩者不可互換，也不可寫進 telemetry 或 webhook。語音傳輸層不會拿到 bot token。
 - `DiscordRest` 禁止 redirect、網址裡的認證資訊與無界的回應 body；自訂 base 只允許 Discord 主機或 loopback；bot token 以 `Zeroizing` 保存，`Debug` 輸出會遮蔽。
 - 事件佇列、heartbeat 與重連都要有上限與期限，不可用無界的 channel 或無限重試。

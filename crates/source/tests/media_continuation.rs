@@ -49,7 +49,9 @@ fn segment(range: &str, headers: &str, body: &str) -> String {
 }
 
 fn service() -> Service {
-    Service::new(Config { allow_private_networks: true, ..Config::default() })
+    let mut cfg = Config::default();
+    cfg.allow_private_networks = true;
+    Service::new(cfg)
 }
 
 #[test]
