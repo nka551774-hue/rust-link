@@ -1,11 +1,10 @@
-//! Per-identifier publication: every existing waiter sees the same completion,
-//! including failures and results too large to cache.
+//! Singleflight publication per identifier, panic-safe on unwind.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use crate::{LoadResult, SourceError};
+use crate::{lock, LoadResult, SourceError};
 
 type Outcome = Result<Arc<LoadResult>, SourceError>;
 
@@ -17,7 +16,7 @@ pub(super) struct Flight {
 
 impl Flight {
     pub(super) fn wait(&self, deadline: Instant) -> Outcome {
-        let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = lock(&self.outcome);
         loop {
             if let Some(outcome) = held.as_ref() {
                 return outcome.clone();
@@ -26,12 +25,12 @@ impl Flight {
             if left.is_zero() {
                 return Err(SourceError::Http("timed out waiting for source resolution".into()));
             }
-            held = self.ready.wait_timeout(held, left).unwrap_or_else(|error| error.into_inner()).0;
+            held = self.ready.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 
     fn publish(&self, outcome: Outcome) {
-        let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = lock(&self.outcome);
         if held.is_none() {
             *held = Some(outcome);
             drop(held);
@@ -66,12 +65,10 @@ impl<'a> Leader<'a> {
 impl Drop for Leader<'_> {
     fn drop(&mut self) {
         if !self.done {
-            // Unwinding must not leave callers sleeping until timeout or a key
-            // permanently registered. A completed result is never overwritten.
             self.flight.publish(Err(SourceError::Http("source resolver was interrupted".into())));
         }
-        let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
-        if inflight.get(self.key).is_some_and(|flight| Arc::ptr_eq(flight, &self.flight)) {
+        let mut inflight = lock(self.inflight);
+        if inflight.get(self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
             inflight.remove(self.key);
         }
     }

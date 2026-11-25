@@ -1,5 +1,4 @@
-//! Rustlink API v1 data types. JSON numbers are strict integers; patches
-//! distinguish omitted fields from null. Unknown update fields are rejected.
+//! Rustlink API v1 data types: strict integers, three-state patches, and unknown-field rejection.
 
 use std::fmt;
 
@@ -39,30 +38,23 @@ impl From<Int64> for i64 {
     }
 }
 
-/// A field that distinguishes an omitted value from an explicit `null`.
-///
-/// The protocol leans on that difference: an absent `end_ms` leaves the current
-/// limit alone while `"end_ms": null` clears it, and the same holds for the
-/// track token in a player update.
+/// Distinguishes an omitted JSON field (`Missing`) from an explicit `null` (`Null`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Patch<T> {
-    /// The client did not mention the field.
     #[default]
     Missing,
-    /// The client sent an explicit `null`.
     Null,
-    /// The client sent a value.
     Value(T),
 }
 
 impl<T> Patch<T> {
     #[inline]
     pub const fn is_missing(&self) -> bool {
-        matches!(self, Patch::Missing)
+        matches!(self, Self::Missing)
     }
     #[inline]
     pub const fn is_null(&self) -> bool {
-        matches!(self, Patch::Null)
+        matches!(self, Self::Null)
     }
     #[inline]
     pub const fn is_present(&self) -> bool {
@@ -71,32 +63,27 @@ impl<T> Patch<T> {
     #[inline]
     pub const fn value(&self) -> Option<&T> {
         match self {
-            Patch::Value(v) => Some(v),
-            Patch::Missing | Patch::Null => None,
+            Self::Value(v) => Some(v),
+            Self::Missing | Self::Null => None,
         }
     }
 }
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        match Option::<T>::deserialize(d)? {
-            None => Ok(Patch::Null),
-            Some(v) => Ok(Patch::Value(v)),
-        }
+        Option::<T>::deserialize(d).map(|opt| opt.map_or(Self::Null, Self::Value))
     }
 }
 
 impl<T: Serialize> Serialize for Patch<T> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
-            Patch::Missing | Patch::Null => s.serialize_none(),
-            Patch::Value(v) => v.serialize(s),
+            Self::Missing | Self::Null => s.serialize_none(),
+            Self::Value(v) => v.serialize(s),
         }
     }
 }
 
-/// One playable track: the encoded form, the metadata, and the two bags a client
-/// may put its own values in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub token: String,
@@ -109,11 +96,10 @@ pub struct Track {
 
 impl Track {
     pub fn new(token: String, metadata: TrackInfo) -> Self {
-        Track { token, metadata, extra: Object::new(), user_data: Object::new() }
+        Self { token, metadata, extra: Object::new(), user_data: Object::new() }
     }
 }
 
-/// The metadata a client shows and uses to decide what to do next.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackInfo {
@@ -123,13 +109,11 @@ pub struct TrackInfo {
     pub is_seekable: bool,
     #[serde(default)]
     pub author: String,
-    #[serde(default)]
-    #[serde(rename = "duration_ms")]
+    #[serde(default, rename = "duration_ms")]
     pub length: i64,
     #[serde(default)]
     pub is_stream: bool,
-    #[serde(default)]
-    #[serde(rename = "position_ms")]
+    #[serde(default, rename = "position_ms")]
     pub position: i64,
     #[serde(default)]
     pub title: String,
@@ -139,12 +123,10 @@ pub struct TrackInfo {
     pub artwork_url: Option<String>,
     #[serde(default)]
     pub isrc: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "source")]
+    #[serde(default, rename = "source")]
     pub source_name: String,
 }
 
-/// A playlist as `tracks/resolve` returns it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Playlist {
     pub metadata: PlaylistInfo,
@@ -156,7 +138,7 @@ pub struct Playlist {
 
 impl Playlist {
     pub fn new(name: impl Into<String>, selected_track: i64, tracks: Vec<Track>) -> Self {
-        Playlist {
+        Self {
             metadata: PlaylistInfo { name: name.into(), selected_track },
             extra: Object::new(),
             tracks,
@@ -173,7 +155,6 @@ pub struct PlaylistInfo {
     pub selected_track: i64,
 }
 
-/// A failure a source reports, which travels back inside a load result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exception {
@@ -185,9 +166,8 @@ pub struct Exception {
 }
 
 impl Exception {
-    /// The severity a source failure carries: the node is fine, the lookup was not.
     pub fn common(message: impl Into<String>) -> Self {
-        Exception {
+        Self {
             message: message.into(),
             severity: "common".into(),
             cause: "rustlink.source".into(),
@@ -195,9 +175,8 @@ impl Exception {
         }
     }
 
-    /// The severity a playback failure carries.
     pub fn fault(message: impl Into<String>, cause: impl Into<String>) -> Self {
-        Exception {
+        Self {
             message: message.into(),
             severity: "fault".into(),
             cause: cause.into(),
@@ -206,8 +185,6 @@ impl Exception {
     }
 }
 
-/// The four successful answers plus the failure, which is what `tracks/resolve`
-/// replies with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadResult {
     Track(Box<Track>),
@@ -221,23 +198,22 @@ impl LoadResult {
     #[inline]
     pub const fn load_type(&self) -> &'static str {
         match self {
-            LoadResult::Track(_) => "track",
-            LoadResult::Playlist(_) => "playlist",
-            LoadResult::Search(_) => "search",
-            LoadResult::Empty => "empty",
-            LoadResult::Error(_) => "error",
+            Self::Track(_) => "track",
+            Self::Playlist(_) => "playlist",
+            Self::Search(_) => "search",
+            Self::Empty => "empty",
+            Self::Error(_) => "error",
         }
     }
 
-    /// Wraps a source failure in the shape a client expects from `tracks/resolve`.
-    pub fn from_error(err: impl std::fmt::Display) -> Self {
-        LoadResult::Error(Box::new(Exception::common(err.to_string())))
+    pub fn from_error(err: impl fmt::Display) -> Self {
+        Self::Error(Box::new(Exception::common(err.to_string())))
     }
 
     #[inline]
     pub fn track(self) -> Option<Track> {
         match self {
-            LoadResult::Track(t) => Some(*t),
+            Self::Track(t) => Some(*t),
             _ => None,
         }
     }
@@ -249,29 +225,63 @@ impl Serialize for LoadResult {
         let mut m = s.serialize_map(Some(2))?;
         m.serialize_entry("kind", self.load_type())?;
         match self {
-            LoadResult::Track(t) => m.serialize_entry("result", t)?,
-            LoadResult::Playlist(p) => m.serialize_entry("result", p)?,
-            LoadResult::Search(ts) => m.serialize_entry("result", ts)?,
-            LoadResult::Empty => m.serialize_entry("result", &Value::Null)?,
-            LoadResult::Error(e) => m.serialize_entry("result", e)?,
+            Self::Track(t) => m.serialize_entry("result", t)?,
+            Self::Playlist(p) => m.serialize_entry("result", p)?,
+            Self::Search(ts) => m.serialize_entry("result", ts)?,
+            Self::Empty => m.serialize_entry("result", &Value::Null)?,
+            Self::Error(e) => m.serialize_entry("result", e)?,
         }
         m.end()
     }
 }
 
+fn parse_stream<'de, A: de::MapAccess<'de>>(
+    kind: &str,
+    map: &mut A,
+) -> Result<LoadResult, A::Error> {
+    Ok(match kind {
+        "track" => LoadResult::Track(Box::new(map.next_value()?)),
+        "playlist" => LoadResult::Playlist(Box::new(map.next_value()?)),
+        "search" => LoadResult::Search(map.next_value()?),
+        "empty" => {
+            let _: Option<de::IgnoredAny> = map.next_value()?;
+            LoadResult::Empty
+        }
+        "error" => LoadResult::Error(Box::new(map.next_value()?)),
+        other => return Err(de::Error::custom(format_args!("unknown load type {other}"))),
+    })
+}
+
+fn parse_buffered<E: de::Error>(kind: &str, buffered: Option<Value>) -> Result<LoadResult, E> {
+    if kind == "empty" {
+        return Ok(LoadResult::Empty);
+    }
+    if !matches!(kind, "track" | "playlist" | "search" | "error") {
+        return Err(E::custom(format_args!("unknown load type {kind}")));
+    }
+    let data = buffered.ok_or_else(|| E::missing_field("result"))?;
+    Ok(match kind {
+        "track" => LoadResult::Track(Box::new(serde_json::from_value(data).map_err(E::custom)?)),
+        "playlist" => {
+            LoadResult::Playlist(Box::new(serde_json::from_value(data).map_err(E::custom)?))
+        }
+        "search" => LoadResult::Search(serde_json::from_value(data).map_err(E::custom)?),
+        _ => LoadResult::Error(Box::new(serde_json::from_value(data).map_err(E::custom)?)),
+    })
+}
+
 impl<'de> Deserialize<'de> for LoadResult {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
         enum Field {
-            #[serde(rename = "kind")]
             Kind,
-            #[serde(rename = "result")]
             Result,
         }
 
-        struct LoadResultVisitor;
+        struct Visitor;
 
-        impl<'de> de::Visitor<'de> for LoadResultVisitor {
+        impl<'de> de::Visitor<'de> for Visitor {
             type Value = LoadResult;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -279,86 +289,36 @@ impl<'de> Deserialize<'de> for LoadResult {
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut kind: Option<String> = None;
-                let mut parsed: Option<LoadResult> = None;
-                let mut buffered: Option<Value> = None;
-
+                let (mut kind, mut parsed, mut buffered) = (None::<String>, None, None);
                 while let Some(field) = map.next_key::<Field>()? {
                     match field {
-                        Field::Kind => {
-                            if kind.is_some() {
-                                return Err(de::Error::duplicate_field("kind"));
-                            }
-                            kind = Some(map.next_value()?);
+                        Field::Kind if kind.is_some() => {
+                            return Err(de::Error::duplicate_field("kind"));
                         }
-                        Field::Result => {
-                            if parsed.is_some() || buffered.is_some() {
-                                return Err(de::Error::duplicate_field("result"));
-                            }
-                            if let Some(k) = kind.as_deref() {
-                                parsed = Some(match k {
-                                    "track" => LoadResult::Track(Box::new(map.next_value()?)),
-                                    "playlist" => LoadResult::Playlist(Box::new(map.next_value()?)),
-                                    "search" => LoadResult::Search(map.next_value()?),
-                                    "empty" => {
-                                        let _: Option<de::IgnoredAny> = map.next_value()?;
-                                        LoadResult::Empty
-                                    }
-                                    "error" => LoadResult::Error(Box::new(map.next_value()?)),
-                                    other => {
-                                        return Err(de::Error::custom(format_args!(
-                                            "unknown load type {other}"
-                                        )));
-                                    }
-                                });
-                            } else {
-                                buffered = Some(map.next_value()?);
-                            }
+                        Field::Kind => kind = Some(map.next_value()?),
+                        Field::Result if parsed.is_some() || buffered.is_some() => {
+                            return Err(de::Error::duplicate_field("result"));
                         }
+                        Field::Result => match kind.as_deref() {
+                            Some(k) => parsed = Some(parse_stream(k, &mut map)?),
+                            None => buffered = Some(map.next_value()?),
+                        },
                     }
                 }
-
                 let kind = kind.ok_or_else(|| de::Error::missing_field("kind"))?;
-                if let Some(done) = parsed {
-                    return Ok(done);
+                match parsed {
+                    Some(done) => Ok(done),
+                    None => parse_buffered(&kind, buffered),
                 }
-                let Some(data) = buffered else {
-                    return match kind.as_str() {
-                        "empty" => Ok(LoadResult::Empty),
-                        "track" | "playlist" | "search" | "error" => {
-                            Err(de::Error::missing_field("result"))
-                        }
-                        other => Err(de::Error::custom(format_args!("unknown load type {other}"))),
-                    };
-                };
-                Ok(match kind.as_str() {
-                    "track" => LoadResult::Track(Box::new(
-                        serde_json::from_value(data).map_err(de::Error::custom)?,
-                    )),
-                    "playlist" => LoadResult::Playlist(Box::new(
-                        serde_json::from_value(data).map_err(de::Error::custom)?,
-                    )),
-                    "search" => {
-                        LoadResult::Search(serde_json::from_value(data).map_err(de::Error::custom)?)
-                    }
-                    "empty" => LoadResult::Empty,
-                    "error" => LoadResult::Error(Box::new(
-                        serde_json::from_value(data).map_err(de::Error::custom)?,
-                    )),
-                    other => {
-                        return Err(de::Error::custom(format_args!("unknown load type {other}")));
-                    }
-                })
             }
         }
 
-        d.deserialize_struct("LoadResult", &["kind", "result"], LoadResultVisitor)
+        d.deserialize_struct("LoadResult", &["kind", "result"], Visitor)
     }
 }
 
 fn wipe_string(secret: &mut String) {
-    // SAFETY: `write_volatile` cannot unwind, and overwriting initialized bytes
-    // with `0` (ASCII NUL) preserves UTF-8 validity before `clear()`.
+    // SAFETY: Overwriting UTF-8 bytes with ASCII NUL (0) preserves UTF-8 validity before `clear()`.
     unsafe {
         for byte in secret.as_bytes_mut() {
             std::ptr::write_volatile(byte, 0);
@@ -368,8 +328,6 @@ fn wipe_string(secret: &mut String) {
     secret.clear();
 }
 
-/// What a bot reports about its voice connection, which the node needs before it
-/// can open one of its own.
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceState {
@@ -391,9 +349,8 @@ impl Drop for VoiceState {
 }
 
 impl fmt::Debug for VoiceState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("VoiceState")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VoiceState")
             .field("token", &"<redacted>")
             .field("endpoint", &self.endpoint)
             .field("session_id", &self.session_id)
@@ -402,7 +359,6 @@ impl fmt::Debug for VoiceState {
     }
 }
 
-/// The playback position and link quality a client sees in `player.updated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlayerState {
@@ -417,11 +373,10 @@ pub struct PlayerState {
 
 impl Default for PlayerState {
     fn default() -> Self {
-        PlayerState { time: 0, position: 0, connected: false, ping: -1 }
+        Self { time: 0, position: 0, connected: false, ping: -1 }
     }
 }
 
-/// The player body, which is both what `GET` returns and what `PATCH` answers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Player {
@@ -436,7 +391,7 @@ pub struct Player {
 
 impl Player {
     pub fn new(guild_id: impl Into<String>) -> Self {
-        Player {
+        Self {
             guild_id: guild_id.into(),
             track: None,
             volume: 100,
@@ -448,21 +403,17 @@ impl Player {
     }
 }
 
-/// The `track` object of a player update.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackUpdate {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Patch::is_missing")]
+    #[serde(default, skip_serializing_if = "Patch::is_missing")]
     pub token: Patch<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<Object>,
 }
 
-/// Partial player state. `track: null` stops playback; omission preserves it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlayerUpdate {
@@ -508,22 +459,21 @@ mod tests {
     #[test]
     fn patch_preserves_missing_null_and_value() {
         let u: PlayerUpdate = serde_json::from_value(json!({})).unwrap();
-        assert!(u.end_time.is_missing());
-        assert!(u.track_update().token.is_missing());
+        assert!(u.end_time.is_missing() && u.track_update().token.is_missing());
         let u: PlayerUpdate =
             serde_json::from_value(json!({"end_ms": null, "track": null})).unwrap();
-        assert!(u.end_time.is_null());
-        assert!(u.track_update().token.is_null());
+        assert!(u.end_time.is_null() && u.track_update().token.is_null());
         let u: PlayerUpdate =
             serde_json::from_value(json!({"end_ms": 5000, "track": {"query": "ytsearch:music"}}))
                 .unwrap();
         assert_eq!(u.end_time.value().unwrap().0, 5000);
         assert_eq!(u.track_update().query.as_deref(), Some("ytsearch:music"));
-        let roundtrip: PlayerUpdate =
-            serde_json::from_value(serde_json::to_value(PlayerUpdate::default()).unwrap()).unwrap();
-        assert!(roundtrip.track.is_missing());
-        assert!(roundtrip.end_time.is_missing());
-        assert_eq!(serde_json::to_value(PlayerUpdate::default()).unwrap(), json!({}));
+
+        let empty_json = serde_json::to_value(PlayerUpdate::default()).unwrap();
+        assert_eq!(empty_json, json!({}));
+        let roundtrip: PlayerUpdate = serde_json::from_value(empty_json).unwrap();
+        assert!(roundtrip.track.is_missing() && roundtrip.end_time.is_missing());
+
         let update = PlayerUpdate {
             track: Patch::Value(TrackUpdate {
                 token: Patch::Value("rlt1.example".into()),
@@ -558,8 +508,7 @@ mod tests {
             channel_id: Some("123".into()),
         };
         let rendered = format!("{voice:?}");
-        assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains("secret-voice-token"));
+        assert!(rendered.contains("<redacted>") && !rendered.contains("secret-voice-token"));
     }
 
     #[test]
@@ -568,8 +517,8 @@ mod tests {
             serde_json::to_value(LoadResult::Empty).unwrap(),
             json!({"kind":"empty", "result":null})
         );
-        let track = Track::new("rlt1.test".into(), TrackInfo::default());
-        let value = serde_json::to_value(track).unwrap();
+        let value =
+            serde_json::to_value(Track::new("rlt1.test".into(), TrackInfo::default())).unwrap();
         assert_eq!(value["token"], "rlt1.test");
         assert_eq!(value["metadata"]["duration_ms"], 0);
         assert!(value.get("encoded").is_none());
@@ -577,23 +526,19 @@ mod tests {
 
     #[test]
     fn load_result_requires_result_field_unless_empty() {
-        assert_eq!(
-            serde_json::from_value::<LoadResult>(json!({"kind": "empty"})).unwrap(),
-            LoadResult::Empty
-        );
-        assert_eq!(
-            serde_json::from_value::<LoadResult>(json!({"result": null, "kind": "empty"})).unwrap(),
-            LoadResult::Empty
-        );
+        for body in [json!({"kind": "empty"}), json!({"result": null, "kind": "empty"})] {
+            assert_eq!(serde_json::from_value::<LoadResult>(body).unwrap(), LoadResult::Empty);
+        }
         for kind in ["track", "playlist", "search", "error"] {
             let err = serde_json::from_value::<LoadResult>(json!({"kind": kind}))
-                .expect_err("non-empty LoadResult must require result")
+                .unwrap_err()
                 .to_string();
             assert!(err.contains("missing field `result`"), "{kind}: {err}");
         }
-        let reversed: LoadResult =
-            serde_json::from_value(json!({"result": [], "kind": "search"})).unwrap();
-        assert_eq!(reversed, LoadResult::Search(Vec::new()));
+        assert_eq!(
+            serde_json::from_value::<LoadResult>(json!({"result": [], "kind": "search"})).unwrap(),
+            LoadResult::Search(Vec::new())
+        );
     }
 
     #[test]
@@ -601,12 +546,11 @@ mod tests {
         let mut token = String::from("discord-voice-token");
         wipe_string(&mut token);
         assert!(token.is_empty());
-        let voice = VoiceState {
+        drop(VoiceState {
             token: "secret".into(),
             endpoint: "voice.discord.media:443".into(),
             session_id: "sess".into(),
             channel_id: Some("1".into()),
-        };
-        drop(voice);
+        });
     }
 }

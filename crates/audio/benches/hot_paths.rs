@@ -74,40 +74,59 @@ fn wav_fixture() -> Vec<u8> {
     out.extend_from_slice(b"\x04\0\x10\0data");
     out.extend_from_slice(&data_len.to_le_bytes());
     for i in 0..frames {
-        let sample =
-            ((i as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 12_000.0) as i16;
-        out.extend_from_slice(&sample.to_le_bytes());
-        out.extend_from_slice(&sample.to_le_bytes());
+        let s = ((i as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 12_000.0) as i16;
+        let le = s.to_le_bytes();
+        out.extend_from_slice(&[le[0], le[1], le[0], le[1]]);
     }
     out
 }
 
+#[cfg(feature = "native-opus")]
+fn run_engine(bytes: Vec<u8>, bitrate: i32) -> usize {
+    let engine = Engine { ffmpeg: None, in_process: true, bitrate, complexity: 10 };
+    let track = Track::new("bench".into(), TrackInfo::default());
+    let mut frames = engine
+        .start(
+            &track,
+            Body::new(Box::new(std::io::Cursor::new(bytes))),
+            0,
+            100,
+            &Default::default(),
+            Preference::Auto,
+        )
+        .unwrap();
+    let mut packet = Vec::new();
+    let mut count = 0;
+    while frames.next_frame(&mut packet).unwrap() {
+        black_box(&packet);
+        count += 1;
+    }
+    count
+}
+
 fn measure(name: &str, count: u64, mut run: impl FnMut()) {
     run();
-    let mut samples = Vec::new();
-    for _ in 0..7 {
+    let mut samples = std::array::from_fn::<_, 7, _>(|_| {
         let before = ALLOCATIONS.load(Ordering::Relaxed);
         let start = Instant::now();
         run();
-        let elapsed = start.elapsed();
-        let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
-        samples.push((elapsed, allocations));
-    }
+        (start.elapsed(), ALLOCATIONS.load(Ordering::Relaxed) - before)
+    });
     samples.sort_unstable();
     let (elapsed, allocations) = samples[3];
-    println!("{name}: {count} units, median {:.3} ms, {:.1} ns/unit, {allocations} Rust allocations/reallocations", elapsed.as_secs_f64() * 1000.0, elapsed.as_nanos() as f64 / count as f64);
+    println!(
+        "{name}: {count} units, median {:.3} ms, {:.1} ns/unit, {allocations} Rust allocations/reallocations",
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_nanos() as f64 / count as f64
+    );
 }
 
-/// Check every payload byte and packet boundary outside the timed region.
-/// This keeps checksum cost out of the parser measurements while ensuring all
-/// three implementations consume equivalent data on the benchmark fixture.
 fn inspect_packets(mut next: impl FnMut(&mut Vec<u8>) -> std::io::Result<bool>) -> (usize, u64) {
     let mut packet = Vec::new();
-    let mut count = 0;
-    let mut checksum = 0xcbf29ce484222325u64;
+    let (mut count, mut checksum) = (0usize, 0xcbf29ce484222325u64);
     while next(&mut packet).unwrap() {
-        for byte in (packet.len() as u64).to_le_bytes().iter().chain(packet.iter()) {
-            checksum = (checksum ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        for &byte in (packet.len() as u64).to_le_bytes().iter().chain(&packet) {
+            checksum = (checksum ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
         count += 1;
     }
@@ -117,23 +136,13 @@ fn inspect_packets(mut next: impl FnMut(&mut Vec<u8>) -> std::io::Result<bool>) 
 fn main() {
     let ogg = ogg_fixture();
     let mut legacy = legacy_ogg::OggOpusReader::new(ogg.as_slice());
-    let expected = inspect_packets(|packet| match legacy.next_packet()? {
-        Some(next) => {
-            *packet = next;
-            Ok(true)
-        }
-        None => Ok(false),
-    });
+    let expected =
+        inspect_packets(|pkt| Ok(legacy.next_packet()?.map(|next| *pkt = next).is_some()));
     let mut owned = OggOpusReader::new(ogg.as_slice());
-    let owned_result = inspect_packets(|packet| match owned.next_packet()? {
-        Some(next) => {
-            *packet = next;
-            Ok(true)
-        }
-        None => Ok(false),
-    });
+    let owned_result =
+        inspect_packets(|pkt| Ok(owned.next_packet()?.map(|next| *pkt = next).is_some()));
     let mut reused = OggOpusReader::new(ogg.as_slice());
-    let reused_result = inspect_packets(|packet| reused.next_packet_into(packet));
+    let reused_result = inspect_packets(|pkt| reused.next_packet_into(pkt));
     assert_eq!(expected.0, 200_000);
     assert_eq!(owned_result, expected, "owned reader differs from the frozen baseline");
     assert_eq!(reused_result, expected, "reused reader differs from the frozen baseline");
@@ -169,6 +178,7 @@ fn main() {
         }
         assert_eq!(count, 200_000);
     });
+
     let filter_json: rustlink_protocol::Object = serde_json::from_value(serde_json::json!({
         "volume": 0.9,
         "equalizer": [
@@ -196,10 +206,7 @@ fn main() {
     .unwrap();
     let parsed_filters = parse_filters(&filter_json, 95).unwrap();
     let mut chain = DspChain::new(&parsed_filters);
-    let mut pcm_frame = vec![0.25f32; 960 * 2];
-    for (idx, sample) in pcm_frame.iter_mut().enumerate() {
-        *sample = ((idx as f32 * 0.05).sin()) * 0.4;
-    }
+    let mut pcm_frame: Vec<f32> = (0..960 * 2).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
     measure("dsp_full_8stage_chain_frames", 5_000, || {
         for _ in 0..5_000 {
             let buf = black_box(pcm_frame.as_mut_slice());
@@ -212,7 +219,6 @@ fn main() {
     let mut resampler = SincResampler::new(44_100.0 / 48_000.0);
     let src_chunk = pcm_frame.clone();
     let mut resampled = Vec::with_capacity(2048 * 2);
-    // Warm up internal buffer capacity so steady-state heap allocations are measured cleanly.
     resampler.push(&src_chunk);
     resampler.produce(1024, &mut resampled);
     resampled.clear();
@@ -229,26 +235,7 @@ fn main() {
     {
         let wav = wav_fixture();
         measure("wav_48khz_stereo_opus_128k_complexity10", 501, || {
-            let engine =
-                Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 10 };
-            let track = Track::new("bench".into(), TrackInfo::default());
-            let mut frames = engine
-                .start(
-                    &track,
-                    Body::new(Box::new(std::io::Cursor::new(wav.clone()))),
-                    0,
-                    100,
-                    &Default::default(),
-                    Preference::Auto,
-                )
-                .unwrap();
-            let mut packet = Vec::new();
-            let mut count = 0;
-            while frames.next_frame(&mut packet).unwrap() {
-                black_box(&packet);
-                count += 1;
-            }
-            assert_eq!(count, 501); // Includes the encoder's delayed final samples.
+            assert_eq!(run_engine(wav.clone(), 128_000), 501);
         });
 
         let passthrough_ogg = {
@@ -270,8 +257,7 @@ fn main() {
             let pkt = enc.encode(&pcm).unwrap().to_vec();
             for seq in 2u32..502 {
                 let granule = u64::from(seq - 1) * 960;
-                out.extend_from_slice(b"OggS\0");
-                out.push(if seq == 501 { 4 } else { 0 });
+                out.extend_from_slice(&[b'O', b'g', b'g', b'S', 0, if seq == 501 { 4 } else { 0 }]);
                 out.extend_from_slice(&granule.to_le_bytes());
                 out.extend_from_slice(&1u32.to_le_bytes());
                 out.extend_from_slice(&seq.to_le_bytes());
@@ -285,26 +271,7 @@ fn main() {
             out
         };
         measure("opus_48khz_zero_transcode_passthrough_frames", 500, || {
-            let engine =
-                Engine { ffmpeg: None, in_process: true, bitrate: 192_000, complexity: 10 };
-            let track = Track::new("bench".into(), TrackInfo::default());
-            let mut frames = engine
-                .start(
-                    &track,
-                    Body::new(Box::new(std::io::Cursor::new(passthrough_ogg.clone()))),
-                    0,
-                    100,
-                    &Default::default(),
-                    Preference::Auto,
-                )
-                .unwrap();
-            let mut packet = Vec::new();
-            let mut count = 0;
-            while frames.next_frame(&mut packet).unwrap() {
-                black_box(&packet);
-                count += 1;
-            }
-            assert_eq!(count, 500);
+            assert_eq!(run_engine(passthrough_ogg.clone(), 192_000), 500);
         });
     }
 }

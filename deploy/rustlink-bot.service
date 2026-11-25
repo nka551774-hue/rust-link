@@ -1,0 +1,40 @@
+# Rustlink Discord music bot systemd unit (installed by install.sh --with-bot).
+[Unit]
+Description=Rustlink Discord music bot
+After=network-online.target rustlink.service
+Wants=network-online.target rustlink.service
+
+[Service]
+Type=simple
+User=rustlink
+Group=rustlink
+WorkingDirectory=/opt/rustlink
+ExecStart=/opt/rustlink/rustlink-bot /opt/rustlink/bot.env
+Restart=always
+RestartSec=5
+SyslogIdentifier=rustlink-bot
+Environment=MALLOC_ARENA_MAX=2
+LimitNOFILE=65535
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/opt/rustlink
+
+[Install]
+WantedBy=multi-user.target

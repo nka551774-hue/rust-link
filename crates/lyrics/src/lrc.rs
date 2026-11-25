@@ -1,35 +1,20 @@
-//! The LRC format, which is what a timed lyrics provider answers with.
-//!
-//! A line carries one or more `[mm:ss.xx]` tags and the words that follow them.
-//! A line with several tags is the same words at several times, which is how a
-//! repeated chorus is written once.
+//! Bounded LRC timed-lyrics parser.
 
-use crate::Line;
+use std::borrow::Cow;
+
+use crate::{trim_owned, Line};
 use rustlink_protocol::Object;
 
-// Repeated timestamps duplicate the following text. Bound the expanded result,
-// not only the provider's response, before allocating those copies.
 const MAX_LINES: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 8 << 20;
 
-/// Fast zero-allocation check for whether `text` contains at least one valid
-/// LRC timestamped line within resource bounds.
 pub(crate) fn has_lines(text: &str) -> bool {
     let mut found = false;
-    let ok = scan_lrc(text, |_, _, _| {
-        found = true;
-    });
-    ok && found
+    scan_lrc(text, |_, _, _| found = true) && found
 }
 
-/// Turns the text a timed provider returns into lines.
-///
-/// A tag that names a field rather than a time, such as `[ar:...]`, carries no
-/// lyrics and ends the scan for that line, so a header is skipped rather than
-/// read as a line at time zero.
 pub fn parse(text: &str) -> Vec<Line> {
-    let mut lines: Vec<Line> = Vec::new();
-    let mut stamps: Vec<i64> = Vec::new();
+    let (mut lines, mut stamps) = (Vec::new(), Vec::new());
     let ok = scan_lrc(text, |raw, words_offset, count| {
         stamps.clear();
         let mut rest = raw;
@@ -52,21 +37,17 @@ pub fn parse(text: &str) -> Vec<Line> {
     if !ok {
         return Vec::new();
     }
-    // Providers usually write in order, but a file with a tag out of place would
-    // otherwise show a line before the one that comes first.
-    lines.sort_by_key(|line| line.timestamp);
+    lines.sort_by_key(|l| l.timestamp);
     fill_durations(&mut lines);
     lines
 }
 
 fn scan_lrc(text: &str, mut on_line: impl FnMut(&str, usize, usize)) -> bool {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut line_count = 0usize;
-    let mut text_bytes = 0usize;
+    let (mut line_count, mut text_bytes) = (0usize, 0usize);
     for raw in text.split('\n') {
         let trimmed = raw.trim_end_matches('\r').trim_start_matches([' ', '\t']);
-        let mut rest = trimmed;
-        let mut stamps = 0usize;
+        let (mut rest, mut stamps) = (trimmed, 0usize);
         while let Some((taken, _)) = leading_stamp(rest) {
             stamps += 1;
             rest = rest[taken..].trim_start_matches([' ', '\t']);
@@ -74,143 +55,110 @@ fn scan_lrc(text: &str, mut on_line: impl FnMut(&str, usize, usize)) -> bool {
         if stamps == 0 {
             continue;
         }
-        let words_offset = trimmed.len() - rest.len();
-        let words_len = rest.trim().len();
         line_count = line_count.saturating_add(stamps);
-        text_bytes = text_bytes.saturating_add(stamps.saturating_mul(words_len));
+        text_bytes = text_bytes.saturating_add(stamps.saturating_mul(rest.trim().len()));
         if line_count > MAX_LINES || text_bytes > MAX_TEXT_BYTES {
             return false;
         }
-        on_line(trimmed, words_offset, stamps);
+        on_line(trimmed, trimmed.len() - rest.len(), stamps);
     }
     true
 }
 
-fn strip_inline_stamps(words: &str) -> std::borrow::Cow<'_, str> {
+fn strip_inline_stamps(words: &str) -> Cow<'_, str> {
     if !words.contains('<') {
-        return std::borrow::Cow::Borrowed(words);
+        return Cow::Borrowed(words);
     }
     let mut out = String::with_capacity(words.len());
     let mut rest = words;
     while let Some(open) = rest.find('<') {
         out.push_str(&rest[..open]);
-        let candidate = &rest[open..];
-        if let Some(end) = candidate.find('>') {
-            if parse_stamp_body(&candidate[1..end]).is_some() {
-                rest = &candidate[end + 1..];
-                if out.ends_with(' ') && rest.starts_with(' ') {
-                    rest = &rest[1..];
-                }
-                continue;
+        let cand = &rest[open..];
+        if let Some(end) = cand.find('>').filter(|&e| parse_stamp_body(&cand[1..e]).is_some()) {
+            rest = &cand[end + 1..];
+            if out.ends_with(' ') && rest.starts_with(' ') {
+                rest = &rest[1..];
             }
+            continue;
         }
         out.push('<');
         rest = &rest[open + 1..];
     }
     out.push_str(rest);
-    let trimmed_len = out.trim().len();
-    if trimmed_len != out.len() {
-        let leading = out.len() - out.trim_start().len();
-        if leading > 0 {
-            out.drain(..leading);
-        }
-        out.truncate(trimmed_len);
-    }
-    std::borrow::Cow::Owned(out)
+    Cow::Owned(trim_owned(out))
 }
 
-/// Reads one `[mm:ss.xx]` or `[hh:mm:ss.xx]` tag from the front of `text`,
-/// reporting how many bytes it took and the time it names in milliseconds.
 fn leading_stamp(text: &str) -> Option<(usize, i64)> {
-    if !text.starts_with('[') {
+    let rest = text.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    Some((end + 2, parse_stamp_body(&rest[..end])?))
+}
+
+fn decimal(s: &str) -> Option<i64> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
+}
+
+fn scale_frac(digits: &str, allow_dot_len: bool) -> Option<i64> {
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || (!allow_dot_len && !matches!(digits.len(), 2 | 3))
+    {
         return None;
     }
-    let end = text.find(']')?;
-    let timestamp = parse_stamp_body(&text[1..end])?;
-    Some((end + 1, timestamp))
+    let prefix = &digits[..digits.len().min(3)];
+    let v = decimal(prefix)?;
+    Some(match prefix.len() {
+        1 => v * 100,
+        2 => v * 10,
+        _ => v,
+    })
 }
 
 fn parse_stamp_body(body: &str) -> Option<i64> {
-    let colon = body.find(':')?;
-    let decimal = |digits: &str| -> Option<i64> {
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        digits.parse().ok()
-    };
-    let first = decimal(body[..colon].trim())?;
-    let mut rest = body[colon + 1..].trim();
-    let mut fraction = 0i64;
-    let mut has_dot_frac = false;
+    let (head, tail) = body.split_once(':')?;
+    let first = decimal(head.trim())?;
+    let mut rest = tail.trim();
+    let (mut frac, mut has_dot) = (0i64, false);
     if let Some(dot) = rest.find(['.', ',']) {
-        let frac_part = &rest[dot + 1..];
+        frac = scale_frac(&rest[dot + 1..], true)?;
         rest = &rest[..dot];
-        if frac_part.is_empty() || !frac_part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        let prefix = &frac_part[..frac_part.len().min(3)];
-        let value = decimal(prefix)?;
-        fraction = match prefix.len() {
-            1 => value * 100,
-            2 => value * 10,
-            _ => value,
-        };
-        has_dot_frac = true;
+        has_dot = true;
     }
     let (minutes, whole) = match rest.split_once(':') {
         None => (first, decimal(rest)?),
-        Some((mid, tail)) if has_dot_frac => {
-            let mins = decimal(mid)?;
-            if mins >= 60 {
-                return None;
-            }
-            (first.checked_mul(60)?.checked_add(mins)?, decimal(tail)?)
+        Some((mid, after)) if has_dot => {
+            let mins = decimal(mid).filter(|&m| m < 60)?;
+            (first.checked_mul(60)?.checked_add(mins)?, decimal(after)?)
         }
-        Some((mid, tail)) => match tail.split_once(':') {
+        Some((mid, after)) => match after.split_once(':') {
             Some((sec, colon_frac)) => {
-                let mins = decimal(mid)?;
-                if mins >= 60 || !matches!(colon_frac.len(), 2 | 3) {
-                    return None;
-                }
-                let fval = decimal(colon_frac)?;
-                fraction = if colon_frac.len() == 2 { fval * 10 } else { fval };
+                let mins = decimal(mid).filter(|&m| m < 60)?;
+                frac = scale_frac(colon_frac, false)?;
                 (first.checked_mul(60)?.checked_add(mins)?, decimal(sec)?)
             }
             None => {
-                if !matches!(tail.len(), 2 | 3) {
-                    return None;
-                }
-                let fval = decimal(tail)?;
-                fraction = if tail.len() == 2 { fval * 10 } else { fval };
+                frac = scale_frac(after, false)?;
                 (first, decimal(mid)?)
             }
         },
     };
-    if whole >= 60 {
-        return None;
-    }
-    let timestamp =
-        minutes.checked_mul(60_000)?.checked_add(whole * 1000)?.checked_add(fraction)?;
-    Some(timestamp)
+    (whole < 60)
+        .then(|| minutes.checked_mul(60_000)?.checked_add(whole * 1000)?.checked_add(frac))?
 }
 
-/// Gives every line but the last the gap to the next one, which is how long it
-/// stays on screen. The provider does not say, and the gap is what a line by
-/// line display wants.
 fn fill_durations(lines: &mut [Line]) {
-    let mut current_group_ts: Option<i64> = None;
-    let mut next_distinct_ts: Option<i64> = None;
+    let (mut group_ts, mut next_ts) = (None, None);
     for line in lines.iter_mut().rev() {
-        match current_group_ts {
-            None => current_group_ts = Some(line.timestamp),
-            Some(group_ts) if line.timestamp < group_ts => {
-                next_distinct_ts = Some(group_ts);
-                current_group_ts = Some(line.timestamp);
+        match group_ts {
+            None => group_ts = Some(line.timestamp),
+            Some(ts) if line.timestamp < ts => {
+                next_ts = Some(ts);
+                group_ts = Some(line.timestamp);
             }
             Some(_) => {}
         }
-        if let Some(next_ts) = next_distinct_ts {
-            line.duration = Some((next_ts - line.timestamp).max(0));
+        if let Some(next) = next_ts {
+            line.duration = Some((next - line.timestamp).max(0));
         }
     }
 }
@@ -223,44 +171,39 @@ mod tests {
     fn a_tagged_line_carries_its_time_and_words() {
         let lines = parse("[00:12.34]hello");
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].timestamp, 12_340);
-        assert_eq!(lines[0].line, "hello");
+        assert_eq!((lines[0].timestamp, lines[0].line.as_str()), (12_340, "hello"));
     }
 
     #[test]
     fn a_line_with_several_tags_becomes_several_lines() {
         let lines = parse("[00:01.00][00:02.00]again");
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].timestamp, 1_000);
-        assert_eq!(lines[1].timestamp, 2_000);
-        assert_eq!(lines[0].line, "again");
-        assert_eq!(lines[1].line, "again");
+        assert_eq!((lines[0].timestamp, lines[1].timestamp), (1_000, 2_000));
+        assert_eq!((lines[0].line.as_str(), lines[1].line.as_str()), ("again", "again"));
     }
 
     #[test]
     fn the_fraction_reads_as_tenths_hundredths_or_milliseconds() {
-        assert_eq!(parse("[00:00.5]a")[0].timestamp, 500);
-        assert_eq!(parse("[00:00.50]a")[0].timestamp, 500);
-        assert_eq!(parse("[00:00.500]a")[0].timestamp, 500);
+        for s in ["[00:00.5]a", "[00:00.50]a", "[00:00.500]a"] {
+            assert_eq!(parse(s)[0].timestamp, 500);
+        }
     }
 
     #[test]
     fn a_header_tag_is_not_a_line() {
-        assert!(parse("[ar:someone]\n[00:01.00]words").len() == 1);
+        assert_eq!(parse("[ar:someone]\n[00:01.00]words").len(), 1);
     }
 
     #[test]
     fn a_line_out_of_order_is_sorted() {
         let lines = parse("[00:05.00]second\n[00:01.00]first");
-        assert_eq!(lines[0].line, "first");
-        assert_eq!(lines[1].line, "second");
+        assert_eq!((lines[0].line.as_str(), lines[1].line.as_str()), ("first", "second"));
     }
 
     #[test]
     fn every_line_but_the_last_knows_how_long_it_lasts() {
         let lines = parse("[00:01.00]a\n[00:03.00]b");
-        assert_eq!(lines[0].duration, Some(2_000));
-        assert_eq!(lines[1].duration, None);
+        assert_eq!((lines[0].duration, lines[1].duration), (Some(2_000), None));
     }
 
     #[test]
@@ -282,8 +225,7 @@ mod tests {
         ] {
             let lines = parse(&format!("{stamp}invalid\n[00:01.00]valid"));
             assert_eq!(lines.len(), 1, "{stamp}");
-            assert_eq!(lines[0].timestamp, 1000, "{stamp}");
-            assert_eq!(lines[0].line, "valid");
+            assert_eq!((lines[0].timestamp, lines[0].line.as_str()), (1000, "valid"));
         }
         assert_eq!(parse("[153722867280912:55.807]last")[0].timestamp, i64::MAX);
     }
@@ -291,8 +233,7 @@ mod tests {
     #[test]
     fn repeated_timestamps_cannot_expand_an_answer_without_a_bound() {
         let large_line = format!("{}{}", "[00:01]".repeat(20), "a".repeat(512 << 10));
-        assert!(large_line.len() < 1 << 20);
-        assert!(parse(&large_line).is_empty());
+        assert!(large_line.len() < 1 << 20 && parse(&large_line).is_empty());
         assert!(parse(&format!("{}words", "[00:01]".repeat(MAX_LINES + 1))).is_empty());
     }
 
@@ -300,19 +241,18 @@ mod tests {
     fn utf8_bom_and_bilingual_equal_timestamps_share_next_distinct_duration() {
         let lines = parse("\u{feff}[00:01.00]jp\n[00:01.00]en\n[00:04.00]next");
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].line, "jp");
-        assert_eq!(lines[0].duration, Some(3_000));
-        assert_eq!(lines[1].line, "en");
-        assert_eq!(lines[1].duration, Some(3_000));
-        assert_eq!(lines[2].line, "next");
-        assert_eq!(lines[2].duration, None);
+        assert_eq!((lines[0].line.as_str(), lines[0].duration), ("jp", Some(3_000)));
+        assert_eq!((lines[1].line.as_str(), lines[1].duration), ("en", Some(3_000)));
+        assert_eq!((lines[2].line.as_str(), lines[2].duration), ("next", None));
     }
 
     #[test]
     fn inline_word_timestamps_strip_cleanly_without_bracket_truncation() {
         let lines = parse("[00:01.00]<00:01.10>hello <00:01.50>world\n[00:02.00]<00:02.00]keep>");
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].line, "hello world");
-        assert_eq!(lines[1].line, "<00:02.00]keep>");
+        assert_eq!(
+            (lines[0].line.as_str(), lines[1].line.as_str()),
+            ("hello world", "<00:02.00]keep>")
+        );
     }
 }

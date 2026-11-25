@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use openmls::prelude::{
     hash_ref::ProposalRef,
     tls_codec::{Serialize, Size},
-    *,
+    Sender as SenderType, *,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -36,6 +36,15 @@ enum TransitionSender {
     RetainEncrypted((u64, u64)),
 }
 
+impl TransitionSender {
+    fn targets(&self, target: (u64, u64)) -> bool {
+        matches!(
+            self,
+            Self::Encrypted { context, .. } | Self::RetainEncrypted(context) if *context == target
+        )
+    }
+}
+
 struct Transition {
     order: u64,
     sender: TransitionSender,
@@ -56,7 +65,6 @@ pub struct Session {
     own_commit: Option<Vec<u8>>,
     active: Option<ActiveSender>,
     /// Encrypted sender temporarily displaced by a transport-only downgrade on the same epoch.
-    /// Preserves the monotonic frame nonce counter if the call upgrades back without a new commit.
     parked: Option<((u64, u64), MediaSender)>,
     transitions: HashMap<u16, Transition>,
     cancelled: VecDeque<u16>,
@@ -116,13 +124,7 @@ impl Session {
             self.active = Some(ActiveSender::TransportOnly);
             Ok(vec![])
         } else {
-            self.reset_group()?;
-            // Discord's voice server only acts on a key package that follows its
-            // external sender (op 25); until then the package is held back.
-            if self.external.is_none() {
-                return Ok(vec![]);
-            }
-            Ok(vec![self.key_package()?])
+            self.reset_and_key_package()
         }
     }
 
@@ -130,19 +132,12 @@ impl Session {
         self.active.is_some()
     }
 
-    /// Starts sending with the local group when no one else is in the call.
-    ///
-    /// Per "Initial Group Creation", the first member holds a group of itself
-    /// and the gateway sends nothing until someone joins, so no transition
-    /// would ever arrive. The caller waits a grace period first, because the
-    /// roster (op 11) and a welcome may still be in flight. The key is the
-    /// local group's own, so media stays encrypted; a later join moves to the
-    /// next epoch through the usual commit and transition.
+    /// Starts sending with the local group when no one else is in the call after a grace period.
     pub fn start_alone(&mut self) -> Result<bool> {
         let alone = self.version == Some(1)
             && matches!(self.active, None | Some(ActiveSender::TransportOnly))
             && self.transitions.is_empty()
-            && self.expected.iter().all(|&member| member == self.user)
+            && self.expected.iter().all(|&m| m == self.user)
             && self
                 .group
                 .as_ref()
@@ -171,25 +166,22 @@ impl Session {
         }
     }
 
-    /// Encrypt an owned Opus packet without allocating once its capacity includes
-    /// the 16-byte maximum DAVE footer. No mutation occurs before negotiation.
+    #[inline]
     pub fn encrypt_opus_in_place(&mut self, opus: &mut Vec<u8>) -> Result<()> {
         self.encrypt_opus_in_place_from(opus, 0)
     }
 
-    /// Encrypt `frame[payload_offset..]` in place without touching `frame[..payload_offset]`,
-    /// appending the DAVE footer when DAVE v1 is active. No mutation occurs before negotiation.
+    /// Encrypt `frame[payload_offset..]` in place without touching `frame[..payload_offset]`.
+    #[inline]
     pub fn encrypt_opus_in_place_from(
         &mut self,
         frame: &mut Vec<u8>,
         payload_offset: usize,
     ) -> Result<()> {
         match self.active.as_mut() {
+            Some(ActiveSender::TransportOnly) if payload_offset <= frame.len() => Ok(()),
             Some(ActiveSender::TransportOnly) => {
-                if payload_offset > frame.len() {
-                    return Err(Error::Protocol("payload offset exceeds frame length"));
-                }
-                Ok(())
+                Err(Error::Protocol("payload offset exceeds frame length"))
             }
             Some(ActiveSender::Encrypted { media, .. }) => {
                 media.encrypt_in_place_from(frame, payload_offset)
@@ -238,38 +230,25 @@ impl Session {
                     self.version = Some(1);
                 }
                 if let Some(current) = self.current_context() {
-                    let already_in_flight =
-                        self.transitions.values().max_by_key(|t| t.order).is_some_and(|t| {
-                            matches!(
-                                t.sender,
-                                TransitionSender::Encrypted { context, .. }
-                                    | TransitionSender::RetainEncrypted(context)
-                                    if context == current
-                            )
-                        });
-                    if !already_in_flight {
-                        let has_current_sender = matches!(
+                    let in_flight = self
+                        .transitions
+                        .values()
+                        .max_by_key(|t| t.order)
+                        .is_some_and(|t| t.sender.targets(current));
+                    if !in_flight {
+                        let has_sender = matches!(
                             self.active,
                             Some(ActiveSender::Encrypted { context, .. }) if context == current
-                        ) || self
-                            .parked
-                            .as_ref()
-                            .is_some_and(|(ctx, _)| *ctx == current)
+                        ) || self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == current)
                             || self.transitions.values().any(|t| {
-                                matches!(
-                                    t.sender,
-                                    TransitionSender::Encrypted { context, .. } if context == current
-                                )
+                                matches!(t.sender, TransitionSender::Encrypted { context, .. } if context == current)
                             });
-                        if self.alone_started {
-                            self.alone_started = false;
-                            if has_current_sender {
-                                return self.prepare(
-                                    id,
-                                    TransitionSender::RetainEncrypted(current),
-                                    true,
-                                );
-                            }
+                        if std::mem::take(&mut self.alone_started) && has_sender {
+                            return self.prepare(
+                                id,
+                                TransitionSender::RetainEncrypted(current),
+                                true,
+                            );
                         }
                         if matches!(self.active, Some(ActiveSender::TransportOnly))
                             && self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == current)
@@ -281,11 +260,12 @@ impl Session {
                                 true,
                             );
                         }
-                        let has_pending_downgrade = self
-                            .transitions
-                            .values()
-                            .any(|t| matches!(t.sender, TransitionSender::TransportOnly));
-                        if has_pending_downgrade && has_current_sender {
+                        if has_sender
+                            && self
+                                .transitions
+                                .values()
+                                .any(|t| matches!(t.sender, TransitionSender::TransportOnly))
+                        {
                             return self.prepare(
                                 id,
                                 TransitionSender::RetainEncrypted(current),
@@ -299,7 +279,6 @@ impl Session {
             }
             22 => {
                 let id = number(data, "transition_id")?;
-                // The gateway may execute a timed-out transition we explicitly rejected.
                 if self.take_cancelled(id) {
                     return Ok(vec![]);
                 }
@@ -313,38 +292,22 @@ impl Session {
             24 => {
                 let version = number(data, "protocol_version")?;
                 validate_version(version)?;
-                if version == 0 {
-                    let _ = data
-                        .get("epoch")
-                        .and_then(Value::as_u64)
-                        .ok_or(Error::Protocol("invalid epoch"))?;
-                    self.group_revision = self
-                        .group_revision
-                        .checked_add(1)
-                        .ok_or(Error::Protocol("group revision exhausted"))?;
-                    self.version = Some(0);
-                    self.group = None;
-                    self.own_commit = None;
-                    self.parked = None;
-                    self.alone_started = false;
-                    self.cancel_mls_transitions();
-                    zeroize_provider(&self.provider);
-                    self.provider = OpenMlsRustCrypto::default();
-                    return Ok(vec![]);
-                }
                 let epoch = data
                     .get("epoch")
                     .and_then(Value::as_u64)
-                    .filter(|e| *e > 0)
                     .ok_or(Error::Protocol("invalid epoch"))?;
+                if version == 0 {
+                    self.clear_group()?;
+                    self.version = Some(0);
+                    return Ok(vec![]);
+                }
+                if epoch == 0 {
+                    return Err(Error::Protocol("invalid epoch"));
+                }
                 self.version = Some(1);
                 if epoch == 1 {
                     self.recovery_attempts = 0;
-                    self.reset_group()?;
-                    if self.external.is_none() {
-                        return Ok(vec![]);
-                    }
-                    return Ok(vec![self.key_package()?]);
+                    return self.reset_and_key_package();
                 }
                 if self.group.as_ref().map(|g| g.epoch().as_u64()) != Some(epoch) {
                     return Err(Error::Protocol("unexpected epoch"));
@@ -363,20 +326,17 @@ impl Session {
                     "invalid external sender",
                 )?;
                 let changed = self.external.as_ref().is_some_and(|old| old != &external);
-                let can_rotate = self.group.as_ref().is_none_or(|g| g.epoch().as_u64() == 0);
-                if changed && !can_rotate {
+                if changed && !self.group.as_ref().is_none_or(|g| g.epoch().as_u64() == 0) {
                     return Err(Error::Protocol("external sender changed during a voice session"));
                 }
                 self.external = Some(external);
                 if self.version == Some(1) {
                     if self.group.is_none() {
                         self.create_group()?;
-                        // The key package negotiate() held back until the external sender arrived.
                         return Ok(vec![self.key_package()?]);
                     }
                     if changed {
-                        self.reset_group()?;
-                        return Ok(vec![self.key_package()?]);
+                        return self.reset_and_key_package();
                     }
                 }
                 Ok(vec![])
@@ -392,22 +352,18 @@ impl Session {
                     return Err(Error::Protocol("truncated commit or welcome"));
                 };
                 let id = u16::from_be_bytes(*id_bytes);
-                let result = if opcode == 29 { self.commit(body) } else { self.welcome(body) };
-                match result.and_then(|_| self.sender()) {
+                let res = if opcode == 29 { self.commit(body) } else { self.welcome(body) };
+                match res.and_then(|()| self.sender()) {
                     Ok(sender) => self.prepare(id, sender, false),
                     Err(_) => {
                         self.recovery_attempts += 1;
                         if self.recovery_attempts > 3 {
                             return Err(Error::Protocol("repeated invalid commits or welcomes"));
                         }
-                        // The existing sender is retained until a valid transition executes.
-                        self.reset_group()?;
-                        self.cancel_transition(id);
                         let mut outbound =
                             vec![Outbound::Json(json!({"op":31,"d":{"transition_id":id}}))];
-                        if self.external.is_some() {
-                            outbound.push(self.key_package()?);
-                        }
+                        outbound.extend(self.reset_and_key_package()?);
+                        push_cancelled(&mut self.cancelled, id);
                         Ok(outbound)
                     }
                 }
@@ -428,21 +384,20 @@ impl Session {
         );
         let mut salvaged = None;
         self.transitions.retain(|_, pending| {
-            if pending.order < order {
-                if can_salvage && salvaged.is_none() {
-                    let dummy = Transition { order: 0, sender: TransitionSender::TransportOnly };
-                    if let TransitionSender::Encrypted { context, media } =
-                        std::mem::replace(pending, dummy).sender
-                    {
-                        if Some(context) == current {
-                            salvaged = Some((context, media));
-                        }
+            if pending.order >= order {
+                return true;
+            }
+            if can_salvage && salvaged.is_none() {
+                let dummy = Transition { order: 0, sender: TransitionSender::TransportOnly };
+                if let TransitionSender::Encrypted { context, media } =
+                    std::mem::replace(pending, dummy).sender
+                {
+                    if Some(context) == current {
+                        salvaged = Some((context, media));
                     }
                 }
-                false
-            } else {
-                true
             }
+            false
         });
         if let Some(salvaged) = salvaged {
             self.parked = Some(salvaged);
@@ -468,35 +423,26 @@ impl Session {
                 self.active = Some(ActiveSender::Encrypted { context, media });
             }
             TransitionSender::RetainEncrypted(expected) => {
-                if matches!(
-                    self.active,
-                    Some(ActiveSender::Encrypted { context, .. }) if context == expected
-                ) {
+                if matches!(self.active, Some(ActiveSender::Encrypted { context, .. }) if context == expected)
+                {
                     self.parked = None;
-                    return Ok(());
-                }
-                if self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == expected) {
+                } else if self.parked.as_ref().is_some_and(|(ctx, _)| *ctx == expected) {
                     let (context, media) = self.parked.take().unwrap();
                     self.active = Some(ActiveSender::Encrypted { context, media });
-                    return Ok(());
+                } else {
+                    return Err(Error::Protocol("retained epoch sender is unavailable"));
                 }
-                return Err(Error::Protocol("retained epoch sender is unavailable"));
             }
         }
         Ok(())
     }
 
-    fn cancel_transition(&mut self, id: u16) {
-        push_cancelled(&mut self.cancelled, id);
-    }
-
     fn take_cancelled(&mut self, id: u16) -> bool {
-        if let Some(pos) = self.cancelled.iter().position(|&item| item == id) {
-            self.cancelled.remove(pos);
-            true
-        } else {
-            false
-        }
+        let Some(pos) = self.cancelled.iter().position(|&item| item == id) else {
+            return false;
+        };
+        self.cancelled.remove(pos);
+        true
     }
 
     fn prepare(
@@ -512,10 +458,10 @@ impl Session {
             return Err(Error::Protocol("duplicate or excessive pending transitions"));
         }
         if let TransitionSender::Encrypted { context, .. } = &sender {
-            if !resumed && self.last_prepared.is_some_and(|previous| previous >= *context) {
-                return Err(Error::Protocol("refusing to reuse an outgoing epoch key"));
-            }
             if !resumed {
+                if self.last_prepared.is_some_and(|prev| prev >= *context) {
+                    return Err(Error::Protocol("refusing to reuse an outgoing epoch key"));
+                }
                 self.last_prepared = Some(*context);
             }
         }
@@ -533,17 +479,16 @@ impl Session {
     }
 
     fn cancel_mls_transitions(&mut self) {
-        self.transitions.retain(|&id, transition| {
-            if matches!(transition.sender, TransitionSender::TransportOnly) {
-                true
-            } else {
+        self.transitions.retain(|&id, t| {
+            let keep = matches!(t.sender, TransitionSender::TransportOnly);
+            if !keep {
                 push_cancelled(&mut self.cancelled, id);
-                false
             }
+            keep
         });
     }
 
-    fn reset_group(&mut self) -> Result<()> {
+    fn clear_group(&mut self) -> Result<()> {
         self.group_revision = self
             .group_revision
             .checked_add(1)
@@ -553,13 +498,26 @@ impl Session {
         self.parked = None;
         self.alone_started = false;
         self.cancel_mls_transitions();
-        // Zeroize and discard consumed key packages and obsolete MLS storage, retaining signing identity.
         zeroize_provider(&self.provider);
         self.provider = OpenMlsRustCrypto::default();
+        Ok(())
+    }
+
+    fn reset_group(&mut self) -> Result<()> {
+        self.clear_group()?;
         if self.external.is_some() {
             self.create_group()?;
         }
         Ok(())
+    }
+
+    fn reset_and_key_package(&mut self) -> Result<Vec<Outbound>> {
+        self.reset_group()?;
+        if self.external.is_some() {
+            Ok(vec![self.key_package()?])
+        } else {
+            Ok(vec![])
+        }
     }
 
     fn create_group(&mut self) -> Result<()> {
@@ -600,7 +558,6 @@ impl Session {
                 .build(SUITE, &self.provider, &self.signer, self.credential.clone()),
             "key package creation failed",
         )?;
-        // A bare KeyPackage, as libdave and davey send it (the clients Discord ships).
         let kp = bundle.key_package();
         let mut bytes = Vec::with_capacity(1 + kp.tls_serialized_len());
         bytes.push(26);
@@ -637,10 +594,7 @@ impl Session {
                     let protocol =
                         check(message.try_into_protocol_message(), "invalid proposal format")?;
                     match &protocol {
-                        ProtocolMessage::PublicMessage(p)
-                            if p.sender()
-                                == &SenderType::External(SenderExtensionIndex::new(0)) =>
-                        {
+                        ProtocolMessage::PublicMessage(p) if is_external_sender(p.sender()) => {
                             if self.recovery_attempts > 0
                                 && group.epoch().as_u64() == 0
                                 && p.epoch().as_u64() != 0
@@ -666,27 +620,7 @@ impl Session {
                     validate_proposal(&proposal, &self.expected)?;
                     staged.push(*proposal);
                 }
-                let removed: HashSet<_> = group
-                    .pending_proposals()
-                    .chain(staged.iter())
-                    .filter_map(|p| match p.proposal() {
-                        Proposal::Remove(r) => Some(r.removed()),
-                        _ => None,
-                    })
-                    .collect();
-                let mut users = HashSet::new();
-                for member in group.members().filter(|m| !removed.contains(&m.index)) {
-                    if !users.insert(identity(&member.credential)?) {
-                        return Err(Error::Protocol("duplicate group identity"));
-                    }
-                }
-                for p in group.pending_proposals().chain(staged.iter()) {
-                    if let Proposal::Add(add) = p.proposal() {
-                        if !users.insert(identity(add.key_package().leaf_node().credential())?) {
-                            return Err(Error::Protocol("duplicate proposed identity"));
-                        }
-                    }
-                }
+                check_projected_roster(group, group.pending_proposals().chain(&staged))?;
                 for proposal in staged {
                     check(
                         group.store_pending_proposal(self.provider.storage(), proposal),
@@ -723,36 +657,16 @@ impl Session {
         if group.pending_proposals().next().is_none() {
             return Ok(vec![]);
         }
-        // Validate the resulting roster, including remove+add replacements in one epoch.
-        let removed: HashSet<_> = group
-            .pending_proposals()
-            .filter_map(|p| match p.proposal() {
-                Proposal::Remove(r) => Some(r.removed()),
-                _ => None,
-            })
-            .collect();
+        let removed = check_projected_roster(group, group.pending_proposals())?;
         if removed.contains(&group.own_leaf_index()) {
             return Ok(vec![]);
-        }
-        let mut users = HashSet::new();
-        for member in group.members().filter(|m| !removed.contains(&m.index)) {
-            if !users.insert(identity(&member.credential)?) {
-                return Err(Error::Protocol("duplicate group identity"));
-            }
-        }
-        for p in group.pending_proposals() {
-            if let Proposal::Add(add) = p.proposal() {
-                if !users.insert(identity(add.key_package().leaf_node().credential())?) {
-                    return Err(Error::Protocol("duplicate proposed identity"));
-                }
-            }
         }
         let (commit, welcome, _) = check(
             group.commit_to_pending_proposals(&self.provider, &self.signer),
             "commit creation failed",
         )?;
         let welcome_body = match welcome.as_ref().map(MlsMessageOut::body) {
-            Some(MlsMessageBodyOut::Welcome(welcome)) => Some(welcome),
+            Some(MlsMessageBodyOut::Welcome(w)) => Some(w),
             Some(_) => return Err(Error::Protocol("invalid welcome format")),
             None => None,
         };
@@ -762,21 +676,15 @@ impl Session {
         payload.push(28);
         check(commit.tls_serialize(&mut payload), "commit serialization failed")?;
         self.own_commit = Some(payload[1..].to_vec());
-        if let Some(welcome) = welcome_body {
-            check(welcome.tls_serialize(&mut payload), "welcome serialization failed")?;
+        if let Some(w) = welcome_body {
+            check(w.tls_serialize(&mut payload), "welcome serialization failed")?;
         }
         Ok(vec![Outbound::Binary(payload)])
     }
 
     fn commit(&mut self, bytes: &[u8]) -> Result<()> {
         let group = self.group.as_mut().ok_or(Error::Protocol("no MLS group"))?;
-        let removed: HashSet<_> = group
-            .pending_proposals()
-            .filter_map(|p| match p.proposal() {
-                Proposal::Remove(r) => Some(r.removed()),
-                _ => None,
-            })
-            .collect();
+        let removed = removed_leaves(group.pending_proposals());
         let previous: HashMap<_, _> = group
             .members()
             .filter(|m| !removed.contains(&m.index))
@@ -806,9 +714,9 @@ impl Session {
             {
                 let known: HashSet<&ProposalRef> =
                     group.pending_proposals().map(|p| p.proposal_reference_ref()).collect();
-                let mut included: HashSet<&ProposalRef> = HashSet::with_capacity(known.len());
+                let mut included = HashSet::with_capacity(known.len());
                 for proposal in staged.queued_proposals() {
-                    if proposal.sender() != &SenderType::External(SenderExtensionIndex::new(0))
+                    if !is_external_sender(proposal.sender())
                         || proposal.proposal_or_ref_type() != ProposalOrRefType::Reference
                         || !matches!(proposal.proposal(), Proposal::Add(_) | Proposal::Remove(_))
                     {
@@ -828,8 +736,8 @@ impl Session {
         self.own_commit = None;
         validate_roster(group, None)?;
         for member in group.members() {
-            if let Some((credential, signature)) = previous.get(&member.index) {
-                if credential != &member.credential || signature != &member.signature_key {
+            if let Some((cred, sig)) = previous.get(&member.index) {
+                if cred != &member.credential || sig != &member.signature_key {
                     return Err(Error::Protocol("commit changed an existing signing identity"));
                 }
             }
@@ -857,12 +765,12 @@ impl Session {
             .build(),
             "welcome verification failed",
         )?;
-        let context = staged.group_context();
-        if context.epoch().as_u64() < 1
-            || context.group_id().as_slice() != self.channel.to_be_bytes()
-            || context.ciphersuite() != SUITE
-            || context.extensions().iter().count() != 1
-            || context.extensions().external_senders().map(Vec::as_slice)
+        let ctx = staged.group_context();
+        if ctx.epoch().as_u64() < 1
+            || ctx.group_id().as_slice() != self.channel.to_be_bytes()
+            || ctx.ciphersuite() != SUITE
+            || ctx.extensions().iter().count() != 1
+            || ctx.extensions().external_senders().map(Vec::as_slice)
                 != Some(std::slice::from_ref(external))
         {
             return Err(Error::Protocol("unexpected group context"));
@@ -900,16 +808,60 @@ impl Drop for Session {
 }
 
 fn zeroize_provider(provider: &OpenMlsRustCrypto) {
-    let mut values =
-        provider.storage().values.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut values = provider.storage().values.write().unwrap_or_else(|p| p.into_inner());
     for (mut key, mut value) in values.drain() {
         key.zeroize();
         value.zeroize();
     }
 }
 
-// Disambiguate MLS Sender from this module's outgoing media state.
-use openmls::prelude::Sender as SenderType;
+#[inline]
+fn is_external_sender(sender: &SenderType) -> bool {
+    *sender == SenderType::External(SenderExtensionIndex::new(0))
+}
+
+fn removed_leaves<'a>(
+    proposals: impl IntoIterator<Item = &'a QueuedProposal>,
+) -> HashSet<LeafNodeIndex> {
+    proposals
+        .into_iter()
+        .filter_map(|p| match p.proposal() {
+            Proposal::Remove(r) => Some(r.removed()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn check_projected_roster<'a>(
+    group: &MlsGroup,
+    proposals: impl IntoIterator<Item = &'a QueuedProposal>,
+) -> Result<HashSet<LeafNodeIndex>> {
+    let mut removed = HashSet::new();
+    let mut added = Vec::new();
+    for p in proposals {
+        match p.proposal() {
+            Proposal::Remove(r) => {
+                removed.insert(r.removed());
+            }
+            Proposal::Add(add) => {
+                added.push(identity(add.key_package().leaf_node().credential())?);
+            }
+            _ => {}
+        }
+    }
+    let mut users = HashSet::new();
+    for member in group.members().filter(|m| !removed.contains(&m.index)) {
+        if !users.insert(identity(&member.credential)?) {
+            return Err(Error::Protocol("duplicate group identity"));
+        }
+    }
+    for id in added {
+        if !users.insert(id) {
+            return Err(Error::Protocol("duplicate proposed identity"));
+        }
+    }
+    Ok(removed)
+}
 
 fn validate_version(version: u16) -> Result<()> {
     if version > MAX_PROTOCOL_VERSION {
@@ -930,7 +882,7 @@ fn snowflake(value: &Value) -> Result<u64> {
     value
         .as_str()
         .and_then(|v| v.parse::<u64>().ok())
-        .filter(|id| *id != 0)
+        .filter(|&id| id != 0)
         .ok_or(Error::Protocol("invalid user ID"))
 }
 
@@ -942,15 +894,14 @@ fn identity(credential: &Credential) -> Result<u64> {
         .serialized_content()
         .try_into()
         .map_err(|_| Error::Protocol("invalid member credential"))?;
-    let id = u64::from_be_bytes(bytes);
-    if id == 0 {
-        return Err(Error::Protocol("zero member identity"));
+    match u64::from_be_bytes(bytes) {
+        0 => Err(Error::Protocol("zero member identity")),
+        id => Ok(id),
     }
-    Ok(id)
 }
 
 fn validate_proposal(proposal: &QueuedProposal, expected: &HashSet<u64>) -> Result<()> {
-    if proposal.sender() != &SenderType::External(SenderExtensionIndex::new(0))
+    if !is_external_sender(proposal.sender())
         || proposal.proposal_or_ref_type() != ProposalOrRefType::Reference
     {
         return Err(Error::Protocol("unauthorized proposal sender or inline proposal"));
@@ -999,7 +950,7 @@ fn push_cancelled(cancelled: &mut VecDeque<u16>, id: u16) {
     }
 }
 
-/// Decodes a canonical RFC 9420 §2.1.2 variable-length byte slice without copying.
+/// Decodes a canonical RFC 9420 section 2.1.2 variable-length byte slice without copying.
 fn read_vlbytes_exact(bytes: &[u8]) -> Option<&[u8]> {
     let &first = bytes.first()?;
     let (header_len, len, min_len): (usize, usize, usize) = match first >> 6 {
@@ -1013,10 +964,7 @@ fn read_vlbytes_exact(bytes: &[u8]) -> Option<&[u8]> {
         ),
         _ => return None,
     };
-    if len < min_len || bytes.len() != header_len.checked_add(len)? {
-        return None;
-    }
-    Some(&bytes[header_len..])
+    (len >= min_len && bytes.len() == header_len.checked_add(len)?).then(|| &bytes[header_len..])
 }
 
 #[cfg(test)]

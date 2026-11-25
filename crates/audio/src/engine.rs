@@ -1,13 +1,4 @@
-//! The engines, and the body they read from.
-//!
-//! Two engines can play a track. The in-process one decodes, filters and
-//! encodes Opus inside the node; the FFmpeg one hands the whole job to a child
-//! process. They are chosen per track, because the in-process pipeline covers
-//! the common containers and FFmpeg covers everything else.
-//!
-//! Both are synchronous and take an already-open body. Opening a body is
-//! network work, which belongs to the source layer, and keeping it out of here
-//! means an engine can be tested by handing it a byte slice.
+//! Audio engines (`PureFrames` in-process and `FfmpegFrames` fallback) and peekable `Body`.
 
 use std::io::{self, Read};
 
@@ -18,11 +9,7 @@ use crate::ffmpeg::FfmpegFrames;
 use crate::filters::{self, FilterSet};
 use crate::pure::PureFrames;
 
-/// A track's bytes, with the first few readable twice.
-///
-/// The dispatcher has to look at the start of a stream to know what it is, and
-/// whichever engine takes it must still see those bytes, so the head is read
-/// into a buffer and served back before the rest of the stream.
+/// A track stream whose leading bytes can be inspected before playback consumes them.
 pub struct Body {
     head: Vec<u8>,
     position: usize,
@@ -32,15 +19,13 @@ pub struct Body {
 
 impl Body {
     pub fn new(inner: Box<dyn Read + Send>) -> Self {
-        Body { head: Vec::new(), position: 0, eof: false, inner }
+        Self { head: Vec::new(), position: 0, eof: false, inner }
     }
 
     /// Reads up to `count` unconsumed bytes ahead without consuming them.
     pub fn peek(&mut self, count: usize) -> io::Result<()> {
         let target = self.position.saturating_add(count);
         while !self.eof && self.head.len() < target {
-            // The bytes are read straight into the buffer that keeps them, so
-            // peeking does not allocate a chunk every time it needs more.
             let start = self.head.len();
             self.head.resize(target, 0);
             match self.inner.read(&mut self.head[start..]) {
@@ -49,19 +34,18 @@ impl Body {
                     self.eof = true;
                 }
                 Ok(read) => self.head.truncate(start + read),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                    self.head.truncate(start);
-                }
                 Err(error) => {
                     self.head.truncate(start);
-                    return Err(error);
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// The bytes that have been read ahead and not yet consumed.
+    /// The bytes read ahead and not yet consumed.
     pub fn head(&self) -> &[u8] {
         &self.head[self.position..]
     }
@@ -87,32 +71,22 @@ impl Read for Body {
             return Ok(0);
         }
         let read = self.inner.read(buf)?;
-        if read == 0 {
-            self.eof = true;
-        }
+        self.eof = read == 0;
         Ok(read)
     }
 }
 
-/// One Opus packet, which is one 20 ms frame.
+/// Stream of 20 ms Opus packets.
 pub trait Frames: Send {
-    /// Replaces `packet` with the next one and reports whether there was one.
-    ///
-    /// The buffer belongs to the caller, which is what keeps a player that runs
-    /// for hours from allocating once per twenty milliseconds. `false` means the
-    /// track has ended.
+    /// Writes the next 20 ms Opus packet into `packet`; returns `false` at EOF.
     fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError>;
 
-    /// Whether [`Frames::set_filters`] can update non-timescale DSP settings in
-    /// place without restarting the stream.
+    /// Whether [`Frames::set_filters`] can update non-timescale DSP in place.
     fn supports_live_filters(&self) -> bool {
         false
     }
 
-    /// Updates volume and filters in place without reopening or seeking the
-    /// stream when the active engine supports doing so (for example non-timescale
-    /// DSP changes in [`PureFrames`]). Returns `false` when a stream restart at
-    /// the current position is required.
+    /// Updates volume and filters in place when supported; `false` requires a stream restart.
     fn set_filters(&mut self, _set: &FilterSet) -> bool {
         false
     }
@@ -121,14 +95,11 @@ pub trait Frames: Send {
 /// Which engine to use for a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preference {
-    /// Use the in-process pipeline where it applies, and fall back when it does
-    /// not.
     Auto,
-    /// Use FFmpeg, which is what a caller retries with after a decline.
     Ffmpeg,
 }
 
-/// A container, as far as choosing an engine is concerned.
+/// Detected media container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
     Mp3,
@@ -143,27 +114,23 @@ pub enum Container {
     Unknown,
 }
 
-/// Works out the container from the leading bytes.
+/// Identifies the media container from leading stream bytes.
 pub fn detect(head: &[u8]) -> Container {
     if head.len() < 4 {
         return Container::Unknown;
     }
     match head {
         [b'O', b'g', b'g', b'S', ..] => {
-            // The first page's payload starts after the header and its segment
-            // table, and the codec names itself there.
-            let payload = 27 + usize::from(head.get(26).copied().unwrap_or(0));
-            match head.get(payload..) {
-                Some([b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', ..]) => Container::OggOpus,
-                Some([0x01, b'v', b'o', b'r', b'b', b'i', b's', ..]) => Container::OggVorbis,
-                Some([0x7f, b'F', b'L', b'A', b'C', ..]) => Container::OggFlac,
+            match head.get(27 + usize::from(*head.get(26).unwrap_or(&0))..) {
+                Some(p) if p.starts_with(b"OpusHead") => Container::OggOpus,
+                Some(p) if p.starts_with(b"\x01vorbis") => Container::OggVorbis,
+                Some(p) if p.starts_with(b"\x7fFLAC") => Container::OggFlac,
                 _ => Container::Unknown,
             }
         }
         [b'f', b'L', b'a', b'C', ..] => Container::Flac,
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'A', b'V', b'E', ..] => Container::Wav,
         [b'I', b'D', b'3', ..] => Container::Mp3,
-        // ADTS starts with a sync word and no layer.
         [0xff, b1, ..] if b1 & 0xf6 == 0xf0 => Container::Adts,
         [0xff, b1, ..] if b1 & 0xe0 == 0xe0 && b1 & 0x06 != 0 => Container::Mp3,
         [_, _, _, _, b'f', b't', b'y', b'p', ..] => Container::Mp4,
@@ -172,27 +139,21 @@ pub fn detect(head: &[u8]) -> Container {
     }
 }
 
-/// The engine, which knows how to play a track and not where it came from.
+/// Dispatcher configuring in-process and FFmpeg playback engines.
 pub struct Engine {
-    /// The FFmpeg executable, or `None` when there is none to run.
     pub ffmpeg: Option<String>,
-    /// Whether the in-process pipeline may be used.
     pub in_process: bool,
-    /// The Opus bitrate to encode at.
     pub bitrate: i32,
-    /// How hard the Opus encoder works, on its own scale of zero to ten.
     pub complexity: i32,
 }
 
-/// Returns `true` when an ADTS header uses CRC protection, MPEG-2 framing, or
-/// a profile other than AAC-LC, none of which Symphonia's AAC decoder handles.
+/// True when ADTS uses CRC protection, MPEG-2 framing, or a non-AAC-LC profile.
 #[inline]
 fn adts_needs_ffmpeg(head: &[u8]) -> bool {
     matches!(head, [0xff, b1, b2, ..] if *b1 != 0xf1 || ((*b2 >> 6) & 0x3) != 1)
 }
 
 impl Engine {
-    /// Starts playback, returning the frames to send.
     pub fn start(
         &self,
         track: &Track,
@@ -210,8 +171,7 @@ impl Engine {
         {
             return self.start_ffmpeg(body, position_ms, &set);
         }
-        // An Ogg page header with 255 lacing segments takes 282 bytes before
-        // `OpusHead` or `\x01vorbis` starts; 512 bytes always covers it.
+        // Up to 282 bytes precede the first Ogg page's codec signature; 512 always covers it.
         body.peek(512)?;
         let container = detect(body.head());
         if container == Container::Unknown
@@ -229,9 +189,7 @@ impl Engine {
         position_ms: i64,
         set: &FilterSet,
     ) -> Result<Box<dyn Frames>, AudioError> {
-        let Some(program) = self.ffmpeg.as_deref() else {
-            return Err(AudioError::FfmpegMissing);
-        };
+        let program = self.ffmpeg.as_deref().ok_or(AudioError::FfmpegMissing)?;
         let frames =
             FfmpegFrames::start(program, body, position_ms, set, self.bitrate, self.complexity)?;
         Ok(Box::new(frames))
@@ -246,6 +204,12 @@ mod tests {
         data: Vec<u8>,
         offset: usize,
         saw_eof: bool,
+    }
+
+    impl StrictEofReader {
+        fn body(data: &[u8]) -> Body {
+            Body::new(Box::new(Self { data: data.to_vec(), offset: 0, saw_eof: false }))
+        }
     }
 
     impl Read for StrictEofReader {
@@ -264,11 +228,7 @@ mod tests {
 
     #[test]
     fn body_does_not_read_past_eof_after_peek_or_drain() {
-        let mut peeked = Body::new(Box::new(StrictEofReader {
-            data: vec![1, 2, 3, 4],
-            offset: 0,
-            saw_eof: false,
-        }));
+        let mut peeked = StrictEofReader::body(&[1, 2, 3, 4]);
         peeked.peek(512).unwrap();
         let mut out = Vec::new();
         peeked.read_to_end(&mut out).unwrap();
@@ -276,8 +236,7 @@ mod tests {
         let mut tail = [0u8; 8];
         assert_eq!(peeked.read(&mut tail).unwrap(), 0);
 
-        let mut direct =
-            Body::new(Box::new(StrictEofReader { data: vec![9, 8], offset: 0, saw_eof: false }));
+        let mut direct = StrictEofReader::body(&[9, 8]);
         assert_eq!(direct.read(&mut tail).unwrap(), 2);
         assert_eq!(&tail[..2], &[9, 8]);
         assert_eq!(direct.read(&mut tail).unwrap(), 0);
@@ -286,12 +245,12 @@ mod tests {
 
     #[test]
     fn adts_routing_accepts_mpeg4_lc_without_crc_and_routes_other_variants_to_ffmpeg() {
-        // MPEG-4 (ID=0), no CRC (protection_absent=1 -> 0xf1), profile=1 (AAC-LC -> 0x50).
         let aac_lc = [0xff, 0xf1, 0x50, 0x80, 0x00, 0x1f, 0xfc];
         assert_eq!(detect(&aac_lc), Container::Adts);
         assert!(!adts_needs_ffmpeg(&aac_lc));
 
-        // CRC-protected MPEG-4 AAC-LC (`0xf0`), MPEG-2 AAC-LC (`0xf9`), and MPEG-4 AAC Main (`0x10`).
+        let engine = Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 5 };
+        let track = Track::new("adts".into(), Default::default());
         for unsupported in [
             [0xff, 0xf0, 0x50, 0x80],
             [0xff, 0xf9, 0x50, 0x80],
@@ -300,8 +259,6 @@ mod tests {
         ] {
             assert_eq!(detect(&unsupported), Container::Adts);
             assert!(adts_needs_ffmpeg(&unsupported));
-            let engine = Engine { ffmpeg: None, in_process: true, bitrate: 128_000, complexity: 5 };
-            let track = Track::new("adts".into(), Default::default());
             let err = engine
                 .start(
                     &track,

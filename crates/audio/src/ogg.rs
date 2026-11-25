@@ -1,14 +1,22 @@
-//! Streaming Ogg Opus packet reader. Packet boundaries may cross pages; the
-//! caller can reuse one packet buffer for the complete lifetime of a stream.
+//! Streaming Ogg Opus packet reader with reusable caller packet buffers.
 
 use std::io::{self, Read};
 
 const PAGE_HEADER: usize = 27;
-/// Reject damaged packets before their storage can grow without bound.
 const MAX_PACKET: usize = 1 << 20;
 /// `OpusTags` may carry embedded cover art larger than an audio packet.
 const MAX_TAGS_PACKET: usize = 64 << 20;
 const READ_CHUNK: usize = 16 * 1024;
+
+#[inline]
+fn bad_data(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+#[inline]
+fn unexpected_eof(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, msg)
+}
 
 struct PageState {
     table: usize,
@@ -31,7 +39,6 @@ pub struct OggOpusReader<R: Read> {
     packets: u64,
     pre_skip: u32,
     drop_samples: u32,
-    /// Signed Q8 dB gain from OpusHead, applied by the decoder.
     output_gain: i16,
     ended: bool,
     packet_page_end: Option<(u64, bool)>,
@@ -59,28 +66,26 @@ impl<R: Read> OggOpusReader<R> {
         self.pre_skip
     }
 
-    /// Returns the next audio packet, or `None` at EOF. Streaming consumers
-    /// should use `next_packet_into` to reuse their storage.
+    /// Returns the next audio packet, or `None` at EOF.
     pub fn next_packet(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut packet = Vec::new();
         self.next_packet_into(&mut packet).map(|found| found.then_some(packet))
     }
 
-    /// Reuses the caller's packet storage across headers, pages and packets.
-    /// The buffer is cleared before every packet and at EOF.
+    /// Clears `packet` and reads the next audio packet into it (`false` at EOF).
     pub fn next_packet_into(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
         packet.clear();
         self.append_next_packet(packet)
     }
 
-    /// Appends the next audio packet onto `packet` without clearing prior bytes,
-    /// allowing a page decoder to stage a full page in one contiguous buffer.
+    /// Appends the next audio packet onto `packet` without clearing prior bytes.
     #[inline]
     pub(crate) fn append_next_packet(&mut self, packet: &mut Vec<u8>) -> io::Result<bool> {
         if self.packets >= 2 {
-            return self.append_raw_packet(packet);
+            self.append_raw_packet(packet)
+        } else {
+            self.append_first_audio_packet(packet)
         }
-        self.append_first_audio_packet(packet)
     }
 
     #[cold]
@@ -113,15 +118,13 @@ impl<R: Read> OggOpusReader<R> {
             false,
             true,
             |span| {
-                if magic_len < 8 {
-                    let take = (8 - magic_len).min(span.len());
-                    magic[magic_len..magic_len + take].copy_from_slice(&span[..take]);
-                    magic_len += take;
-                }
+                let take = (8 - magic_len).min(span.len());
+                magic[magic_len..magic_len + take].copy_from_slice(&span[..take]);
+                magic_len += take;
             },
         )?;
-        if !found || magic_len < 8 || &magic != b"OpusTags" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "missing OpusTags"));
+        if !found || &magic[..magic_len] != b"OpusTags" {
+            return Err(bad_data("missing OpusTags"));
         }
         Ok(())
     }
@@ -132,8 +135,6 @@ impl<R: Read> OggOpusReader<R> {
         })
     }
 
-    /// Reads one complete laced packet across page boundaries, passing each
-    /// page's contiguous payload span to `on_span`.
     #[inline(always)]
     fn read_laced_packet(
         &mut self,
@@ -152,72 +153,55 @@ impl<R: Read> OggOpusReader<R> {
                     if !started && !require_packet {
                         return Ok(false);
                     }
-                    let msg =
-                        if require_packet { "missing OpusTags" } else { "truncated ogg packet" };
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, msg));
+                    return Err(unexpected_eof(if require_packet {
+                        "missing OpusTags"
+                    } else {
+                        "truncated ogg packet"
+                    }));
                 }
                 self.page = Some(self.read_page_header()?);
             }
             let page = self.page.as_mut().expect("a page was just read");
             if page.next_segment == 0 && page.continued != started {
                 self.page = None;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "ogg page continuation mismatch",
-                ));
+                return Err(bad_data("ogg page continuation mismatch"));
             }
             let segs = &self.buffer[page.table + page.next_segment..page.table + page.count];
-            let mut consumed_segs = 0usize;
-            let mut chunk_len = 0usize;
-            let mut done = false;
-            for &seg in segs {
-                consumed_segs += 1;
-                chunk_len += usize::from(seg);
-                if seg < 255 {
-                    done = true;
-                    break;
-                }
-            }
+            let (consumed_segs, chunk_len, done) = match segs.iter().position(|&s| s < 255) {
+                Some(i) => (i + 1, i * 255 + usize::from(segs[i]), true),
+                None => (segs.len(), segs.len() * 255, false),
+            };
             let start = page.offset;
             let end = start + chunk_len;
             if end > self.filled {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
+                return Err(unexpected_eof("truncated ogg page"));
             }
             total = total.saturating_add(chunk_len);
             if total > limit {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, too_large_msg));
+                return Err(bad_data(too_large_msg));
             }
             on_span(&self.buffer[start..end]);
             page.next_segment += consumed_segs;
             page.offset = end;
+            self.consumed = end;
             if done {
-                self.consumed = end;
-                // A page may finish one packet and start another. Its granule
-                // belongs to the last completed packet, even when that packet
-                // is not the page's final lacing segment.
                 if page.next_segment == page.last_complete {
                     if record_granule {
                         self.packet_page_end = Some((page.granule, page.end_of_stream));
                     }
-                    if page.end_of_stream {
-                        self.ended = true;
-                    }
+                    self.ended |= page.end_of_stream;
                 }
                 if page.next_segment >= page.count {
                     self.page = None;
                 }
                 return Ok(true);
             }
-            if page.end_of_stream {
-                self.ended = true;
-            }
+            self.ended |= page.end_of_stream;
             started |= consumed_segs > 0;
-            self.consumed = end;
             self.page = None;
         }
     }
 
-    /// Buffer one complete page before exposing its segment table.
     fn have_page(&mut self) -> io::Result<bool> {
         if self.ended {
             return Ok(false);
@@ -227,17 +211,13 @@ impl<R: Read> OggOpusReader<R> {
             let unconsumed = &self.buffer[self.consumed..self.filled];
             let available = unconsumed.len();
             if available >= 4 && &unconsumed[..4] != b"OggS" {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ogg page"));
+                return Err(bad_data("not an ogg page"));
             }
             if available >= 5 && unconsumed[4] != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported ogg page version",
-                ));
+                return Err(bad_data("unsupported ogg page version"));
             }
             if available >= PAGE_HEADER {
-                let segments = usize::from(unconsumed[26]);
-                let total = PAGE_HEADER + segments;
+                let total = PAGE_HEADER + usize::from(unconsumed[26]);
                 if let Some(table) = unconsumed.get(PAGE_HEADER..total) {
                     let payload: usize = table.iter().map(|&n| usize::from(n)).sum();
                     if available >= total + payload {
@@ -250,44 +230,31 @@ impl<R: Read> OggOpusReader<R> {
                 return if available == 0 {
                     Ok(false)
                 } else {
-                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"))
+                    Err(unexpected_eof("truncated ogg page"))
                 };
             }
         }
     }
 
     fn read_page_header(&mut self) -> io::Result<PageState> {
-        let Some(unconsumed) = self.buffer.get(self.consumed..self.filled) else {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
-        };
-        if unconsumed.len() < PAGE_HEADER {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
-        }
+        let unconsumed = self
+            .buffer
+            .get(self.consumed..self.filled)
+            .filter(|b| b.len() >= PAGE_HEADER)
+            .ok_or_else(|| unexpected_eof("truncated ogg page"))?;
         let serial = u32::from_le_bytes(unconsumed[14..18].try_into().unwrap());
-        if let Some(expected) = self.serial {
-            if serial != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "multiplexed ogg stream requires ffmpeg",
-                ));
-            }
-        } else {
-            self.serial = Some(serial);
+        if *self.serial.get_or_insert(serial) != serial {
+            return Err(bad_data("multiplexed ogg stream requires ffmpeg"));
         }
         let count = usize::from(unconsumed[26]);
         let table = self.consumed + PAGE_HEADER;
-        // No compaction takes place while a page is open, so the table can be
-        // read from the input buffer without copying it into another array.
         let granule = u64::from_le_bytes(unconsumed[6..14].try_into().unwrap());
         let continued = (unconsumed[5] & 0x01) != 0;
         let end_of_stream = (unconsumed[5] & 0x04) != 0;
         let segments = &unconsumed[PAGE_HEADER..PAGE_HEADER + count];
         let last_complete = segments.iter().rposition(|&size| size < 255).map_or(0, |i| i + 1);
         if end_of_stream && segments.last() == Some(&255) {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unfinished final ogg packet",
-            ));
+            return Err(unexpected_eof("unfinished final ogg packet"));
         }
         Ok(PageState {
             table,
@@ -302,8 +269,6 @@ impl<R: Read> OggOpusReader<R> {
     }
 
     fn compact(&mut self) {
-        // FFmpeg commonly writes small pages. Moving the unread tail at each
-        // page made parsing proportional to page count times read chunk size.
         if self.consumed > 0 && (self.consumed == self.filled || self.consumed >= READ_CHUNK) {
             self.buffer.copy_within(self.consumed..self.filled, 0);
             self.filled -= self.consumed;
@@ -335,30 +300,25 @@ impl<R: Read> OggOpusReader<R> {
         self.output_gain
     }
 
-    /// EOS granule for the packet most recently returned. It counts decoded
-    /// 48 kHz samples including pre-skip, and can trim the final packet's padding.
+    /// EOS granule (48 kHz samples including pre-skip) for the most recently completed page.
     pub fn packet_end_granule(&self) -> Option<u64> {
         self.packet_page_end.and_then(|(granule, eos)| eos.then_some(granule))
     }
 
-    /// Timing metadata after the last packet completed on a page. A trailing
-    /// partial packet belongs to the later page on which it completes.
     pub(crate) fn packet_page_end(&self) -> Option<(u64, bool)> {
         self.packet_page_end
     }
 }
 
-/// The native decoder accepts mono/stereo mapping family zero. Other layouts
-/// require a multistream decoder and must not silently play as stereo.
 fn read_head(packet: &[u8]) -> io::Result<(u32, i16)> {
     if packet.len() < 19 || !packet.starts_with(b"OpusHead") || packet[8] > 15 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid OpusHead"));
+        return Err(bad_data("invalid OpusHead"));
     }
     if !(1..=2).contains(&packet[9]) || packet[18] != 0 {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported Opus channel mapping"));
     }
     Ok((
-        u16::from_le_bytes([packet[10], packet[11]]) as u32,
+        u32::from(u16::from_le_bytes([packet[10], packet[11]])),
         i16::from_le_bytes([packet[16], packet[17]]),
     ))
 }
@@ -368,10 +328,8 @@ mod tests {
     use super::*;
 
     fn page(header_type: u8, sequence: u32, segments: &[u8], payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"OggS");
-        out.push(0);
-        out.push(header_type);
+        let mut out = Vec::with_capacity(PAGE_HEADER + segments.len() + payload.len());
+        out.extend_from_slice(&[b'O', b'g', b'g', b'S', 0, header_type]);
         out.extend_from_slice(&0u64.to_le_bytes());
         out.extend_from_slice(&1u32.to_le_bytes());
         out.extend_from_slice(&sequence.to_le_bytes());
@@ -383,9 +341,7 @@ mod tests {
     }
 
     fn opus_head(pre_skip: u16) -> Vec<u8> {
-        let mut head = b"OpusHead".to_vec();
-        head.push(1);
-        head.push(2);
+        let mut head = b"OpusHead\x01\x02".to_vec();
         head.extend_from_slice(&pre_skip.to_le_bytes());
         head.extend_from_slice(&48_000u32.to_le_bytes());
         head.extend_from_slice(&0i16.to_le_bytes());
@@ -393,11 +349,11 @@ mod tests {
         head
     }
 
-    fn stream_with_audio(pages: Vec<Vec<u8>>) -> Vec<u8> {
+    fn stream_with_audio(pages: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
         let head = opus_head(312);
-        let tags = b"OpusTags\x00\x00\x00\x00".to_vec();
+        let tags = b"OpusTags\x00\x00\x00\x00";
         let mut stream = page(2, 0, &[head.len() as u8], &head);
-        stream.extend_from_slice(&page(0, 1, &[tags.len() as u8], &tags));
+        stream.extend_from_slice(&page(0, 1, &[tags.len() as u8], tags));
         for entry in pages {
             stream.extend_from_slice(&entry);
         }
@@ -406,7 +362,7 @@ mod tests {
 
     #[test]
     fn the_headers_are_skipped_and_the_audio_packets_come_back_in_order() {
-        let stream = stream_with_audio(vec![page(0, 2, &[3, 4], &[1, 2, 3, 4, 5, 6, 7])]);
+        let stream = stream_with_audio([page(0, 2, &[3, 4], &[1, 2, 3, 4, 5, 6, 7])]);
         let mut reader = OggOpusReader::new(&stream[..]);
         assert_eq!(reader.next_packet().unwrap().unwrap(), vec![1, 2, 3]);
         assert_eq!(reader.next_packet().unwrap().unwrap(), vec![4, 5, 6, 7]);
@@ -417,7 +373,7 @@ mod tests {
     #[test]
     fn a_packet_split_across_pages_is_rejoined() {
         let stream =
-            stream_with_audio(vec![page(0, 2, &[255], &[7u8; 255]), page(1, 3, &[5], &[9u8; 5])]);
+            stream_with_audio([page(0, 2, &[255], &[7u8; 255]), page(1, 3, &[5], &[9u8; 5])]);
         let mut reader = OggOpusReader::new(&stream[..]);
         let packet = reader.next_packet().unwrap().unwrap();
         assert_eq!(packet.len(), 260);
@@ -427,24 +383,22 @@ mod tests {
 
     #[test]
     fn packets_are_read_one_page_at_a_time() {
-        let stream = stream_with_audio(vec![page(0, 2, &[1, 1, 1], &[1, 2, 3])]);
+        let stream = stream_with_audio([page(0, 2, &[1, 1, 1], &[1, 2, 3])]);
         let mut reader = OggOpusReader::new(&stream[..]);
-        assert_eq!(reader.next_packet().unwrap().unwrap(), vec![1]);
-        assert_eq!(reader.next_packet().unwrap().unwrap(), vec![2]);
-        assert_eq!(reader.next_packet().unwrap().unwrap(), vec![3]);
+        for expected in [1u8, 2, 3] {
+            assert_eq!(reader.next_packet().unwrap().unwrap(), vec![expected]);
+        }
         assert!(reader.next_packet().unwrap().is_none());
     }
 
     #[test]
     fn a_stream_that_is_not_ogg_is_refused() {
-        let mut reader = OggOpusReader::new(&b"not an ogg stream at all"[..]);
-        assert!(reader.next_packet().is_err());
+        assert!(OggOpusReader::new(&b"not an ogg stream at all"[..]).next_packet().is_err());
     }
 
     #[test]
     fn an_empty_stream_ends_immediately() {
-        let mut reader = OggOpusReader::new(&[][..]);
-        assert!(reader.next_packet().unwrap().is_none());
+        assert!(OggOpusReader::new(&[][..]).next_packet().unwrap().is_none());
     }
 
     #[test]
@@ -452,20 +406,24 @@ mod tests {
         let head = opus_head(0);
         let mut stream = page(2, 0, &[head.len() as u8], &head);
         stream.extend_from_slice(&page(0, 1, &[4], &[1, 2, 3, 4])[..20]);
-        let mut reader = OggOpusReader::new(&stream[..]);
-        assert_eq!(reader.next_packet().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            OggOpusReader::new(&stream[..]).next_packet().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
     fn a_packet_missing_its_continuation_is_rejected() {
-        let stream = stream_with_audio(vec![page(0, 2, &[255], &[7; 255])]);
-        let mut reader = OggOpusReader::new(stream.as_slice());
-        assert_eq!(reader.next_packet().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        let stream = stream_with_audio([page(0, 2, &[255], &[7; 255])]);
+        assert_eq!(
+            OggOpusReader::new(stream.as_slice()).next_packet().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
     fn caller_storage_is_reused_across_headers_pages_and_eof() {
-        let stream = stream_with_audio(vec![
+        let stream = stream_with_audio([
             page(0, 2, &[255], &[7; 255]),
             page(1, 3, &[5, 3], &[9, 9, 9, 9, 9, 1, 2, 3]),
         ]);
@@ -473,31 +431,24 @@ mod tests {
         let mut packet = Vec::with_capacity(1024);
         let storage = packet.as_ptr();
         assert!(reader.next_packet_into(&mut packet).unwrap());
-        assert_eq!(packet.len(), 260);
-        assert_eq!(packet.as_ptr(), storage);
+        assert_eq!((packet.len(), packet.as_ptr()), (260, storage));
         assert!(reader.next_packet_into(&mut packet).unwrap());
-        assert_eq!(packet, [1, 2, 3]);
-        assert_eq!(packet.as_ptr(), storage);
+        assert_eq!((packet.as_slice(), packet.as_ptr()), (&[1, 2, 3][..], storage));
         assert!(!reader.next_packet_into(&mut packet).unwrap());
-        assert!(packet.is_empty());
-        assert_eq!(packet.as_ptr(), storage);
+        assert!(packet.is_empty() && packet.as_ptr() == storage);
     }
 
     #[test]
     fn non_opus_and_multistream_headers_are_rejected() {
-        let stream = page(2, 0, &[19], &[0; 19]);
-        assert!(OggOpusReader::new(stream.as_slice()).next_packet().is_err());
+        assert!(OggOpusReader::new(page(2, 0, &[19], &[0; 19]).as_slice()).next_packet().is_err());
         let mut head = opus_head(0);
-        head[9] = 6;
-        head[18] = 1;
-        let stream = page(2, 0, &[19], &head);
-        assert!(OggOpusReader::new(stream.as_slice()).next_packet().is_err());
+        (head[9], head[18]) = (6, 1);
+        assert!(OggOpusReader::new(page(2, 0, &[19], &head).as_slice()).next_packet().is_err());
     }
 
     #[test]
     fn many_small_pages_survive_deferred_compaction() {
-        let pages = (2..2002).map(|sequence| page(0, sequence, &[3], &[1, 2, 3])).collect();
-        let stream = stream_with_audio(pages);
+        let stream = stream_with_audio((2..2002).map(|seq| page(0, seq, &[3], &[1, 2, 3])));
         let mut reader = OggOpusReader::new(stream.as_slice());
         let mut packet = Vec::new();
         let mut count = 0;
@@ -512,27 +463,20 @@ mod tests {
     fn large_opus_tags_cover_art_over_one_mib_is_stream_skipped() {
         let head = opus_head(312);
         let mut stream = page(2, 0, &[head.len() as u8], &head);
-        // Build a 1.5 MiB OpusTags packet spanning ~25 full Ogg pages.
         let mut tags = b"OpusTags".to_vec();
         tags.resize((3 << 19) + 17, b'A');
-        let mut rest = tags.as_slice();
-        let mut seq = 1u32;
-        while !rest.is_empty() {
-            let max_page = 255 * 255;
-            if rest.len() > max_page {
-                stream.extend_from_slice(&page(
-                    if seq == 1 { 0 } else { 1 },
-                    seq,
-                    &[255; 255],
-                    &rest[..max_page],
-                ));
-                rest = &rest[max_page..];
-            } else {
-                let mut segs = vec![255u8; rest.len() / 255];
-                segs.push((rest.len() % 255) as u8);
-                stream.extend_from_slice(&page(if seq == 1 { 0 } else { 1 }, seq, &segs, rest));
-                rest = &[];
-            }
+        let mut all_segs = vec![255u8; tags.len() / 255];
+        all_segs.push((tags.len() % 255) as u8);
+        let (mut offset, mut seq) = (0usize, 1u32);
+        for segs in all_segs.chunks(255) {
+            let len: usize = segs.iter().map(|&s| usize::from(s)).sum();
+            stream.extend_from_slice(&page(
+                u8::from(seq > 1),
+                seq,
+                segs,
+                &tags[offset..offset + len],
+            ));
+            offset += len;
             seq += 1;
         }
         stream.extend_from_slice(&page(4, seq, &[3], &[9, 8, 7]));
@@ -543,17 +487,14 @@ mod tests {
 
     #[test]
     fn mismatched_page_continuation_flags_are_rejected() {
-        let orphan_cont = stream_with_audio(vec![page(1, 2, &[4], &[1, 2, 3, 4])]);
-        assert_eq!(
-            OggOpusReader::new(orphan_cont.as_slice()).next_packet().unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
+        let orphan_cont = stream_with_audio([page(1, 2, &[4], &[1, 2, 3, 4])]);
         let missing_cont =
-            stream_with_audio(vec![page(0, 2, &[255], &[7; 255]), page(0, 3, &[5], &[9; 5])]);
-        assert_eq!(
-            OggOpusReader::new(missing_cont.as_slice()).next_packet().unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+            stream_with_audio([page(0, 2, &[255], &[7; 255]), page(0, 3, &[5], &[9; 5])]);
+        for bad in [orphan_cont, missing_cont] {
+            assert_eq!(
+                OggOpusReader::new(bad.as_slice()).next_packet().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 }

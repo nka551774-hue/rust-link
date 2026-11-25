@@ -1,47 +1,41 @@
 # Rustlink API v1
 
-預設 origin：`http://127.0.0.1:2333`。JSON 使用 snake_case；時間與位置以毫秒表示，只有 `resume_timeout_secs` 以秒表示。Discord ID 是字串；位置、音量與期限是 JSON 整數，濾鏡參數可以是浮點數。
+預設位址：`http://127.0.0.1:2333`。JSON 使用 `snake_case`；時間與位置單位皆為毫秒（僅 `resume_timeout_secs` 為秒）。Discord ID 為字串；位置、音量與時限為整數，濾鏡參數可為浮點數。
 
-除 `/healthz` 與 `/version` 外，所有端點（含 WebSocket 與 metrics）都要求 `Authorization` 標頭，且帶 JSON body 的請求需加上 `Content-Type: application/json`：
+除 `/healthz` 與 `/version` 外，所有端點（含 WebSocket 與 `/metrics`）皆須攜帶 `Authorization`（含 JSON body 時另須 `Content-Type: application/json`）：
 
 ```http
 Authorization: Bearer <設定檔 password>
 Content-Type: application/json
 ```
 
-password 是整個節點的存取金鑰，持有者可以管理節點上的所有 session。每個回應都帶 `Rustlink-Api-Version: 1` 與 `Server: Rustlink/<version>`。錯誤使用對應的 HTTP 狀態碼與統一結構：
+`password` 為全節點管理金鑰。所有回應皆附帶 `Rustlink-Api-Version: 1` 與 `Server: Rustlink/<version>`。錯誤採統一結構：
 
 ```json
 {"error":{"code":"bad_request","message":"query must contain 1..8192 bytes","path":"/api/v1/tracks/resolve"},"timestamp_ms":1790000000000}
 ```
 
-## 節點與曲目
+## 節點與曲目端點
 
 | 方法與路徑 | 輸入與回應 |
 | --- | --- |
-| `GET /healthz` | 免驗證；`status`、`name`、`version` |
-| `GET /version` | 免驗證；純文字版本 |
-| `GET /api/v1/info` | 軟體與 API 版本、音源、濾鏡、能力與容量 |
-| `GET /api/v1/stats` | players、sessions、playing_players、uptime_ms、memory、cpu |
-| `GET /api/v1/metrics`、`/metrics` | Prometheus 文字 |
-| `POST /api/v1/tracks/resolve` | `{"query":"ytsearch:lofi"}`，回傳解析結果 |
-| `POST /api/v1/tracks/inspect` | `{"token":"rlt1.…"}`，回傳曲目 |
-| `POST /api/v1/tracks/inspect-batch` | `{"tokens":["rlt1.…"]}`，回傳 `{"tracks":[…]}` |
-| `POST /api/v1/lyrics` | `{"token":"rlt1.…"}`，回傳歌詞，沒有則 204 |
+| `GET /healthz` | 免驗證；回傳 `status`、`name`、`version` |
+| `GET /version` | 免驗證；純文字版本號 |
+| `GET /api/v1/info` | 版本、音源、濾鏡、能力與容量設定 |
+| `GET /api/v1/stats` | `players`、`sessions`、`playing_players`、`uptime_ms`、`memory`、`cpu` |
+| `GET /api/v1/metrics`、`/metrics` | Prometheus 文字格式指標 |
+| `POST /api/v1/tracks/resolve` | `{"query":"ytsearch:lofi"}` → 解析結果 |
+| `POST /api/v1/tracks/inspect` | `{"token":"rlt1...."}` → 單首曲目 |
+| `POST /api/v1/tracks/inspect-batch` | `{"tokens":["rlt1...."]}` → `{"tracks":[...]}` |
+| `POST /api/v1/lyrics` | `{"token":"rlt1...."}` → 歌詞，無結果回 `204` |
 
-`resolve` 的 `query` 可以是網址、影片 ID 或音源搜尋前綴，見[音源](sources.md)。空白或超過 8192 位元組的 `query` 回 400；音源失敗回 502；沒有結果是 200 的 `{"kind":"empty","result":null}`。
+`resolve` 的 `query` 支援網址、影片 ID 或搜尋前綴（見 [音源](sources.md)）；空白或超過 8192 bytes 回 `400`，上游失敗回 `502`，無結果回 `200` `{"kind":"empty","result":null}`。成功時 `kind` 為 `track`（單曲）、`search`（曲目陣列）或 `playlist`（`{"metadata":{"name":"...","selected_track":-1},"extra":{},"tracks":[...]}`）。
 
-成功的結果：
-
-- `kind: track`：`result` 是一首曲目。
-- `kind: search`：`result` 是曲目陣列。
-- `kind: playlist`：`result` 是 `{"metadata":{"name":"…","selected_track":-1},"extra":{},"tracks":[…]}`。
-
-曲目：
+曲目結構：
 
 ```json
 {
-  "token": "rlt1.…",
+  "token": "rlt1....",
   "metadata": {
     "identifier": "source-id",
     "source": "youtube",
@@ -60,121 +54,96 @@ password 是整個節點的存取金鑰，持有者可以管理節點上的所�
 }
 ```
 
-token 是 `rlt1.` 加上不含 padding 的 Base64URL UTF-8 JSON，只攜帶曲目中繼資料；不含短效的媒體網址，也不是認證憑證或簽章。播放時才由音源重新解析並驗證網址。單一 token 最多 256 KiB、batch 最多 1000 筆、所有請求 body 最多 1 MiB。舊的二進位曲目格式會被拒絕。
+`token` 為 `rlt1.` 加上無填充 Base64URL UTF-8 JSON，僅含曲目中繼資料（不含短效 CDN 網址或認證憑證），播放時才重新解析驗證串流。單一 token 上限 256 KiB、批次上限 1000 筆、請求 body 上限 1 MiB。歌詞含 `source_name`、`provider`、`text`、`lines`（每行含 `timestamp_ms`、`duration_ms`、`text`、`extra`）與 `extra`。
 
-歌詞包含 `source_name`、`provider`、`text`、`lines`、`extra`。同步歌詞的每一行有 `timestamp_ms`、`duration_ms`、`text`、`extra`；沒有時間資料時 `lines` 可為 null。
+## 工作階段（Sessions）
 
-## 工作階段
-
-`POST /api/v1/sessions`：
+建立工作階段：`POST /api/v1/sessions`
 
 ```json
 {"bot_id":"123456789012345678","resume_timeout_secs":60}
 ```
 
-回 201，`Location` 指向該 session：
+回傳 `201 Created`（`Location` 指向該 session）：
 
 ```json
 {
-  "session_id":"48-character-random-hex-id",
-  "bot_id":"123456789012345678",
-  "connected":false,
-  "resume":true,
-  "resume_timeout_secs":60,
-  "event_url":"/api/v1/sessions/48-character-random-hex-id/events"
+  "session_id": "48-character-random-hex-id",
+  "bot_id": "123456789012345678",
+  "connected": false,
+  "resume": true,
+  "resume_timeout_secs": 60,
+  "event_url": "/api/v1/sessions/48-character-random-hex-id/events"
 }
 ```
 
-`resume_timeout_secs` 可省略，預設 60，範圍 1–86400。建立後要在這個期限內連上事件 WebSocket，並持續處理 Ping／Pong。連線存在時 session 不會過期；只有首次尚未連線或斷線後才開始倒數，REST 請求不會重新計時。
+`resume_timeout_secs` 預設 `60`（範圍 `1..=86400`）。建立後須在期限內連上事件 WebSocket；連線存活期間不過期，首次未連或斷線後才開始倒數（REST 請求不重置倒數）。
 
 | 方法與路徑 | 行為 |
 | --- | --- |
-| `GET /api/v1/sessions/{id}` | 取得 session 狀態 |
-| `PATCH /api/v1/sessions/{id}` | `{"resume":true,"resume_timeout_secs":120}`，欄位可省略 |
-| `DELETE /api/v1/sessions/{id}` | 銷毀播放器與語音連線，回 204，可重複呼叫 |
-| `GET /api/v1/sessions/{id}/events` | WebSocket upgrade；每個 session 只允許一個訂閱者 |
+| `GET /api/v1/sessions/{id}` | 查詢 session 狀態 |
+| `PATCH /api/v1/sessions/{id}` | 更新 `{"resume":true,"resume_timeout_secs":120}` |
+| `DELETE /api/v1/sessions/{id}` | 銷毀所有播放器與語音連線，回 `204`（冪等） |
+| `GET /api/v1/sessions/{id}/events` | WebSocket 升級（每 session 限單一訂閱者，重複回 `409`） |
 
-`resume: false` 會在事件連線結束後清掉 session；目前沒有連線時，session 立即成為過期狀態。過期或已銷毀回 404，重複訂閱回 409，容量用盡回 503。session 只存在記憶體，節點重啟後不保留。
+`resume: false` 會在事件連線關閉時立即銷毀 session。已過期回 `404`，容量滿回 `503`；節點重啟不保留記憶體 session。
 
-## 播放器
+## 播放器（Players）
 
-播放器以 Discord guild ID 為 key，同一個 session 每個 guild 一個。
+每個 session 依 Discord `guild_id` 管理獨立播放器：
 
 | 方法與路徑 | 行為 |
 | --- | --- |
-| `GET /api/v1/sessions/{id}/players` | `{"players":[…]}` |
-| `GET /api/v1/sessions/{id}/players/{guild}` | 取得播放器 |
-| `PATCH /api/v1/sessions/{id}/players/{guild}` | 建立或更新，回傳播放器 |
-| `DELETE /api/v1/sessions/{id}/players/{guild}` | 銷毀，回 204 |
-| `GET /api/v1/sessions/{id}/players/{guild}/lyrics` | 目前曲目的歌詞；沒有則 204 |
+| `GET /api/v1/sessions/{id}/players` | `{"players":[...]}` |
+| `GET /api/v1/sessions/{id}/players/{guild}` | 查詢播放器 |
+| `PATCH /api/v1/sessions/{id}/players/{guild}` | 建立或更新播放器（`?replace=false` 保留既有曲目） |
+| `DELETE /api/v1/sessions/{id}/players/{guild}` | 銷毀播放器，回 `204` |
+| `GET /api/v1/sessions/{id}/players/{guild}/lyrics` | 目前播放曲目歌詞，無結果回 `204` |
 
-播放：
-
-```json
-{"track":{"token":"rlt1.…","user_data":{"requester":"123"}},"volume":80}
-```
-
-也可以用 `{"track":{"query":"https://…"}}`，但 `query` 必須解析成單一曲目；搜尋與播放清單要先 `resolve` 再挑 token。`token` 與 `query` 互斥。加上 `?replace=false` 會保留已載入的曲目，預設則替換。
-
-其他操作可以合併在同一次 PATCH：
+播放與控制可合併於單次 `PATCH`（省略欄位保留原值）：
 
 ```json
-{"paused":true,"position_ms":30000,"end_ms":90000,"volume":75,"filters":{"timescale":{"speed":1.1}}}
+{
+  "track": {"token": "rlt1....", "user_data": {"play_id": 1}},
+  "paused": false,
+  "position_ms": 30000,
+  "end_ms": 90000,
+  "volume": 80,
+  "filters": {"timescale": {"speed": 1.1}}
+}
 ```
 
-- 省略的欄位保留現有值。
-- `{"track":null}` 停止曲目，但保留播放器與語音連線。
-- `{"end_ms":null}` 清除結束位置；`end_ms` 的整數值必須大於零。
-- `{"filters":{}}` 清除濾鏡；非空的 `filters` 會取代整組設定。
-- `volume` 範圍 0–1000，100 是原音量；`position_ms` 不得小於零。
-- 新曲目預設解除暫停，同一個請求可指定 `paused:true`。
-
-播放器回應包含 `guild_id`、`track`、`volume`、`paused`、`filters`、`voice` 與 `state`；`state` 有 `timestamp_ms`、`position_ms`、`connected`、`ping_ms`。PATCH 接受曲目之後，語音連線與解碼在背景進行，成功或失敗由事件回報。
+- `track` 可傳 `token` 或單曲 `query`（兩者互斥）；`{"track": null}` 停止播放並保留語音連線。
+- `{"end_ms": null}` 清除結束點（整數須 `> 0`）；`{"filters": {}}` 清除全部濾鏡；`volume` 範圍 `0..=1000`（`100` 為原音）。
+- 回應含 `guild_id`、`track`、`volume`、`paused`、`filters`、`voice` 與 `state`（`timestamp_ms`、`position_ms`、`connected`、`ping_ms`）。
 
 ## 轉送 Discord 語音狀態
 
-你的 Rust 機器人負責登入 Discord 並要求加入語音頻道。收齊同一個 guild 的兩種 gateway 事件後，呼叫 `Session::set_voice`，或 PATCH：
+機器人收齊同一伺服器的 `VOICE_STATE_UPDATE`（機器人自身 `session_id`、`channel_id`）與 `VOICE_SERVER_UPDATE`（非空 `endpoint`、`token`）後，呼叫 `Session::set_voice` 或 `PATCH`：
 
 ```json
 {"voice":{"token":"voice-server-token","endpoint":"host.discord.media:443","session_id":"discord-voice-session","channel_id":"987654321098765432"}}
 ```
 
-| Rustlink 欄位 | Discord 來源 |
-| --- | --- |
-| 建立 session 的 `bot_id` | 機器人的 user ID |
-| `voice.session_id`、`voice.channel_id` | 該機器人的 `VOICE_STATE_UPDATE` |
-| `voice.token`、`voice.endpoint` | 同一個 guild 的 `VOICE_SERVER_UPDATE` |
-
-只轉送機器人自己的語音狀態，且 endpoint 必須已就緒、非 null。重新加入或移動頻道時要更新整組 voice；離開頻道可以銷毀播放器。**不要**把 Discord bot token 填進 `voice.token`。
-
-節點支援 Discord voice gateway v8 與 DAVE v1：`/api/v1/info` 的 `capabilities.discord_dave` 為 true、`voice.max_dave_protocol_version` 為 1。這是伺服器能力，不是每條連線的即時加密狀態，實際版本由 Discord 協商。`voice.connected` 只在 UDP 傳輸與所需的 DAVE 金鑰都就緒後才發出，整個握手最多 30 秒。
-
-DAVE 的 key package、成員提案、Commit／Welcome、換金鑰與降級／升級都由 Rustlink 處理，機器人不必傳額外欄位（但 `channel_id` 必填，因為它是 MLS group ID）。沒有有效的 DAVE 金鑰、版本未知或驗證失敗時，不會暗中改送明文音訊。細節見 [DAVE 與語音](voice.md)。
-
-語音斷線時會發出 `voice.closed`、`voice.disconnected`。機器人應重新取得 Discord 的語音狀態再更新整組 `voice`；事件 WebSocket 的 session 恢復**不會**自動恢復 Discord 的語音 WebSocket。
+- **切勿**將 Discord Bot Token 填入 `voice.token`。`channel_id` 必填（作為 DAVE v1 MLS Group ID）。
+- 節點完整實作 Voice Gateway v8 與 DAVE v1（`/api/v1/info` 回報 `capabilities.discord_dave: true`）；`voice.connected` 僅在 UDP 與協商所需的 DAVE 金鑰皆就緒後發出（握手上限 30 秒，詳見 [DAVE 與語音](voice.md)）。
+- 收到 `voice.closed` 或移動頻道時，機器人應重新收齊語音狀態並更新整組 `voice`。
 
 ## WebSocket 事件
 
-把 session 的 `event_url` 接在 origin 後面，將 HTTP(S) 改成 WS(S)，並帶同樣的 Bearer 標頭。第一則一定是 `session.ready`，即使已有排隊的事件：
+將 `event_url` 改為 `ws(s)://` 並帶相同 Bearer 標頭連線；首則訊息必為 `session.ready`。所有事件皆含 `type`、`timestamp_ms`、`session_id`：
 
-```json
-{"type":"session.ready","timestamp_ms":1790000000000,"api_version":"1","session_id":"…","resumed":false,"players":[]}
-```
-
-| type | 主要的額外欄位 |
+| `type` | 主要欄位與觸發時機 |
 | --- | --- |
-| `player.updated` | `guild_id`、`state`；間隔由 `playerUpdateSeconds` 決定 |
-| `node.stats` | 節點統計與 `frames`；間隔由 `statsSeconds` 決定 |
+| `session.ready` | `api_version`、`resumed`、`players` |
+| `player.updated` | `guild_id`、`state`（每 `playerUpdateSeconds` 推送） |
+| `node.stats` | 節點資源與 `frames` 統計（每 `statsSeconds` 推送） |
 | `track.started` | `guild_id`、`track` |
-| `track.ended` | `guild_id`、`track`、`reason` |
+| `track.ended` | `guild_id`、`track`、`reason`（`finished` / `replaced` / `stopped` / `load_failed` / `cleanup`） |
 | `track.failed` | `guild_id`、`track`、`exception` |
 | `track.stalled` | `guild_id`、`track`、`threshold_ms` |
-| `voice.connected`、`voice.disconnected` | `guild_id`、`channel_id`；斷線可含 `reason` |
+| `voice.connected` / `voice.disconnected` | `guild_id`、`channel_id`（斷線可含 `reason`） |
 | `voice.closed` | `guild_id`、`code`、`reason`、`by_remote` |
-| `request.rejected` | `error.code: rest_required`，表示應改用 REST 控制 |
+| `request.rejected` | `error.code: rest_required`（控制命令請走 REST） |
 
-所有 session 事件都有 `type`、`timestamp_ms`、`session_id`。曲目結束原因是 `finished`、`replaced`、`stopped`、`load_failed` 或 `cleanup`。
-
-伺服器每 25 秒送一次 Ping，60 秒沒收到任何訊息就斷線；Rust 客戶端只要持續呼叫 `events.next()` 就會自動回 Pong。事件寫入超過 10 秒會斷線；事件佇列滿了會銷毀 session，避免悄悄漏事件。
-
-在期限內重新連同一個 URL，`session.ready.resumed` 為 true，並先送最新的播放器快照，再送排隊的事件。這些事件可能比快照早，請依 timestamp 處理；沒有事件游標，也沒有恰好一次的投遞保證。過期或節點重啟後要建立新 session。
+伺服器每 25 秒送 Ping（60 秒無回應斷線），寫入逾時 10 秒；佇列滿時關閉並銷毀 session，絕不靜默漏事件。期限內重連時 `resumed: true`，先送最新播放器快照再沖出暫存事件。

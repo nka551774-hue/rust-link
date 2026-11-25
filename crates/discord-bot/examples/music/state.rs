@@ -1,4 +1,4 @@
-//! The per-guild queue and the small pure helpers the commands rely on.
+//! Per-guild playback queue and pure formatting/parsing helpers.
 
 use std::collections::VecDeque;
 
@@ -9,20 +9,17 @@ struct QueuedItem {
     start_ms: Option<i64>,
 }
 
-/// What one guild is playing and what is waiting.
+/// Active track and waiting queue for one guild.
 pub struct Guild {
     queue: VecDeque<QueuedItem>,
     current: Option<Track>,
     current_play_id: Option<u64>,
     next_play_id: u64,
-    /// Tracks in a row that could not be loaded; a working one resets it.
     failures: u32,
     pub volume: i64,
 }
 
-/// How many tracks in a row may fail before the queue is given up on. When
-/// every track fails (YouTube refusing the host, say), playing on through a
-/// playlist only fills the log with the same error.
+/// Consecutive load failures tolerated before clearing the queue.
 pub const MAX_FAILURES_IN_A_ROW: u32 = 3;
 
 impl Guild {
@@ -37,22 +34,18 @@ impl Guild {
         }
     }
 
-    /// Adds tracks up to `max` waiting, and returns how many were accepted.
     #[allow(dead_code)]
     pub fn enqueue(&mut self, tracks: Vec<Track>, max: usize) -> usize {
         self.enqueue_with_start(tracks, None, max)
     }
 
-    /// Adds tracks up to `max` waiting, attaching `first_start_ms` to the first
-    /// track when a single-video timestamp link was requested.
     pub fn enqueue_with_start(
         &mut self,
         tracks: Vec<Track>,
         first_start_ms: Option<i64>,
         max: usize,
     ) -> usize {
-        let room = max.saturating_sub(self.queue.len());
-        let accepted = tracks.len().min(room);
+        let accepted = tracks.len().min(max.saturating_sub(self.queue.len()));
         for (idx, track) in tracks.into_iter().take(accepted).enumerate() {
             self.queue.push_back(QueuedItem {
                 track,
@@ -62,50 +55,37 @@ impl Guild {
         accepted
     }
 
-    /// Moves the next waiting track into `current` and returns it.
     #[allow(dead_code)]
     pub fn advance(&mut self) -> Option<Track> {
         self.advance_with_start().map(|(track, _)| track)
     }
 
-    /// Moves the next waiting track into `current` and returns `(track, start_ms)`.
     pub fn advance_with_start(&mut self) -> Option<(Track, Option<i64>)> {
-        match self.queue.pop_front() {
-            Some(item) => {
-                self.next_play_id = self.next_play_id.wrapping_add(1).max(1);
-                self.current_play_id = Some(self.next_play_id);
-                let cloned = item.track.clone();
-                self.current = Some(item.track);
-                Some((cloned, item.start_ms))
-            }
-            None => {
-                self.current = None;
-                self.current_play_id = None;
-                None
-            }
-        }
+        let Some(item) = self.queue.pop_front() else {
+            self.finish();
+            return None;
+        };
+        self.next_play_id = self.next_play_id.wrapping_add(1).max(1);
+        self.current_play_id = Some(self.next_play_id);
+        let cloned = item.track.clone();
+        self.current = Some(item.track);
+        Some((cloned, item.start_ms))
     }
 
     pub fn current_play_id(&self) -> Option<u64> {
         self.current_play_id
     }
 
-    /// The current track is over (finished, failed or skipped).
     pub fn finish(&mut self) {
         self.current = None;
         self.current_play_id = None;
     }
 
-    /// Forgets everything, as `/stop` and being removed from the channel do.
     pub fn clear(&mut self) {
         self.queue.clear();
-        self.current = None;
-        self.current_play_id = None;
+        self.finish();
     }
 
-    /// Records how the current track ended. Returns true once
-    /// [`MAX_FAILURES_IN_A_ROW`] have failed in a row, when the queue is
-    /// cleared rather than tried further.
     pub fn record(&mut self, loaded: bool) -> bool {
         self.failures = if loaded { 0 } else { self.failures + 1 };
         if self.failures < MAX_FAILURES_IN_A_ROW {
@@ -124,7 +104,6 @@ impl Guild {
         self.current.is_some()
     }
 
-    /// Anything playing or waiting, which is what keeps the bot in the channel.
     pub fn busy(&self) -> bool {
         self.current.is_some() || !self.queue.is_empty()
     }
@@ -142,14 +121,10 @@ impl Guild {
     }
 }
 
-/// Turns what a person typed into something Rustlink can resolve. A link, a
-/// video ID or a source prefix is passed through; plain words become a YouTube
-/// search, because Rustlink answers `empty` to text it cannot route.
 pub fn normalize_query(text: &str) -> std::borrow::Cow<'_, str> {
     rustlink_discord_bot::normalize_query(text)
 }
 
-/// `3:45` or `1:02:03`; a stream and an unknown length are named instead.
 pub fn format_length(milliseconds: i64, stream: bool) -> String {
     if stream {
         return "直播".into();
@@ -157,23 +132,17 @@ pub fn format_length(milliseconds: i64, stream: bool) -> String {
     if milliseconds <= 0 {
         return "未知長度".into();
     }
-    let seconds = milliseconds / 1000;
-    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
+    let s = milliseconds / 1000;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
     } else {
-        format!("{minutes}:{seconds:02}")
+        format!("{m}:{s:02}")
     }
 }
 
-/// Reads the `/volume` argument, which Discord delivers as text.
 pub fn parse_volume(text: &str) -> Option<i64> {
-    text.trim()
-        .trim_end_matches('%')
-        .trim()
-        .parse()
-        .ok()
-        .filter(|volume| (0..=200).contains(volume))
+    text.trim().trim_end_matches('%').trim().parse().ok().filter(|v| (0..=200).contains(v))
 }
 
 #[cfg(test)]
@@ -197,7 +166,7 @@ mod tests {
         guild.finish();
         assert_eq!(guild.advance().unwrap().metadata.title, "b");
         assert_eq!(guild.advance().unwrap().metadata.title, "c");
-        assert!(guild.advance().is_none() && !guild.busy(), "an empty queue ends the playback");
+        assert!(guild.advance().is_none() && !guild.busy());
     }
 
     #[test]
@@ -205,24 +174,19 @@ mod tests {
         let mut guild = Guild::new(100);
         guild.enqueue((0..10).map(|n| track(&n.to_string())).collect(), 20);
         guild.advance();
-        assert!(!guild.record(false) && !guild.record(false), "two failures are tolerated");
-        assert!(!guild.record(true), "a track that plays resets the count");
         assert!(!guild.record(false) && !guild.record(false));
-        assert!(guild.record(false), "the third in a row stops the queue");
-        assert!(!guild.busy(), "nothing is left to fail");
+        assert!(!guild.record(true));
+        assert!(!guild.record(false) && !guild.record(false));
+        assert!(guild.record(false) && !guild.busy());
     }
 
     #[test]
     fn the_queue_never_grows_past_its_limit() {
         let mut guild = Guild::new(100);
         assert_eq!(guild.enqueue(vec![track("a"), track("b"), track("c")], 2), 2);
-        assert_eq!(guild.enqueue(vec![track("d")], 2), 0, "full");
+        assert_eq!(guild.enqueue(vec![track("d")], 2), 0);
         guild.advance();
-        assert_eq!(
-            guild.enqueue(vec![track("e"), track("f")], 2),
-            1,
-            "the playing track is not waiting"
-        );
+        assert_eq!(guild.enqueue(vec![track("e"), track("f")], 2), 1);
         guild.clear();
         assert!(!guild.busy() && guild.waiting() == 0);
     }
@@ -238,17 +202,12 @@ mod tests {
             "scsearch:cloud",
             "spotify:track:4cOdK2wGLETKBW3PvgPWqT",
             "youtube:playlist:PL123",
+            "hello-world",
+            "",
         ] {
             assert_eq!(normalize_query(same), same);
         }
-        assert_eq!(
-            normalize_query("hello-worl"),
-            "ytsearch:hello-worl",
-            "10 characters is not a video ID"
-        );
-        // Rustlink itself routes any 11 characters of [A-Za-z0-9_-] to YouTube as a video ID.
-        assert_eq!(normalize_query("hello-world"), "hello-world");
-        assert_eq!(normalize_query(""), "");
+        assert_eq!(normalize_query("hello-worl"), "ytsearch:hello-worl");
     }
 
     #[test]

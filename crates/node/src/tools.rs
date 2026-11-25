@@ -1,57 +1,39 @@
 //! Locating the optional FFmpeg codec helper and installing it when missing.
 //!
-//! FFmpeg is an external program. A bare helper name is looked for in
-//! the tools directory and never on `PATH`, so every node runs the build it was
-//! given rather than whatever the machine happens to have installed; a missing
-//! helper is downloaded for the current platform and reused from then on.
+//! Bare helper names are resolved only inside `toolsDirectory` (never `PATH`)
+//! so every node runs the build it was given; missing helpers are downloaded,
+//! SHA-256 verified, and unpacked atomically.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-/// The smallest download that is treated as a real executable. A shorter body
-/// is an error page or a truncated transfer, never a helper.
+/// Minimum valid executable size (1 MiB) to reject error pages and truncated transfers.
 pub const MIN_SIZE: u64 = 1 << 20;
 
-/// How often a running download reports its position, so a slow link does not
-/// look like a hang.
+const MAX_ARCHIVE_BYTES: u64 = 512 << 20;
 const PROGRESS: Duration = Duration::from_secs(10);
 
-/// Where one helper comes from on this platform.
 struct Source {
-    /// The helper name, which is what a progress line names.
     tool: &'static str,
-    /// Tried in order; the first that answers is used.
     urls: Vec<String>,
-    /// Where the checksum of the asset is published.
     sums: Sums,
-    /// The file name used by the checksum listing and staged download.
     asset: String,
-    /// The base name to pull out of the zip archive.
     member: String,
 }
 
-/// How a download is checked. Either way the checksum comes from the same
-/// provider as the file, so it catches a corrupt or truncated transfer and a
-/// bad mirror, not a provider that is itself compromised.
 enum Sums {
-    /// A `<sha256>  <file>` listing at this URL.
     List(String),
-    /// A `<sha256>  <file>` file named `<file>.sha256`, next to wherever the
-    /// download landed. A "latest" URL redirects to a numbered build, and the
-    /// checksum belongs to that build, not to the redirecting address.
     Beside,
 }
 
-/// Locates the media helpers and installs the ones that are missing.
 pub struct Resolver {
     directory: String,
     download: bool,
-    /// The directory downloads land in, removed on the way out.
     temp: Mutex<Option<PathBuf>>,
 }
 
@@ -66,25 +48,18 @@ impl Resolver {
         Resolver { directory: directory.to_string(), download, temp: Mutex::new(None) }
     }
 
-    /// Removes the archives fetched during this run.
     pub fn close(&self) {
-        let directory = self.temp.lock().unwrap_or_else(|error| error.into_inner()).take();
+        let directory = self.temp.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(directory) = directory {
             let _ = fs::remove_dir_all(directory);
         }
     }
 
-    /// Returns something runnable for `name`.
-    ///
-    /// `configured` is what the configuration says: an explicit path, or a bare
-    /// helper name that is looked for in the tools directory. A bare name is
-    /// never looked up on `PATH`, which is what keeps every node on the same
-    /// build of a helper.
     pub fn resolve(&self, name: &str, configured: &str) -> Result<String, String> {
-        let configured = configured.trim();
-        let configured = if configured.is_empty() { name } else { configured };
-        // An explicit path is a deliberate choice, so it is never replaced by a
-        // download: a broken path is reported rather than papered over.
+        let configured = match configured.trim() {
+            "" => name,
+            trimmed => trimmed,
+        };
         if configured.contains('/') || configured.contains('\\') {
             return look_up(configured).ok_or_else(|| {
                 format!("{name} is configured as {configured:?} but cannot be run")
@@ -109,14 +84,13 @@ impl Resolver {
         self.install(name)
     }
 
-    /// Downloads and unpacks a helper for this platform.
     fn install(&self, name: &str) -> Result<String, String> {
         let source = source_for(name)?;
         if self.directory.trim().is_empty() {
             return Err(format!("toolsDirectory is empty, so {name} has nowhere to be installed"));
         }
         fs::create_dir_all(&self.directory)
-            .map_err(|error| format!("tools directory {}: {error}", self.directory))?;
+            .map_err(|e| format!("tools directory {}: {e}", self.directory))?;
         log::info!("downloading media helper tool={name} url={}", source.urls[0]);
         let started = Instant::now();
         let archive = self.fetch(&source)?;
@@ -130,7 +104,6 @@ impl Resolver {
         Ok(absolute(&target))
     }
 
-    /// Downloads the archive from the first available source.
     fn fetch(&self, source: &Source) -> Result<PathBuf, String> {
         let directory = self.work_directory()?;
         let mut last = None;
@@ -146,20 +119,18 @@ impl Resolver {
         Err(last.unwrap_or_else(|| format!("{} has nowhere to be downloaded from", source.tool)))
     }
 
-    /// The directory downloads land in, created on first use with private permissions.
     fn work_directory(&self) -> Result<PathBuf, String> {
-        let mut temp = self.temp.lock().unwrap_or_else(|error| error.into_inner());
+        let mut temp = self.temp.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(directory) = temp.as_ref() {
             return Ok(directory.clone());
         }
         let base = std::env::temp_dir();
-        fs::create_dir_all(&base)
-            .map_err(|error| format!("temp directory {}: {error}", base.display()))?;
+        fs::create_dir_all(&base).map_err(|e| format!("temp directory {}: {e}", base.display()))?;
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce)
-            .map_err(|error| format!("could not generate temporary directory nonce: {error}"))?;
-        let suffix = hex_encode(&nonce);
-        let directory = base.join(format!("rustlink-tools-{}-{suffix}", std::process::id()));
+            .map_err(|e| format!("could not generate temporary directory nonce: {e}"))?;
+        let directory =
+            base.join(format!("rustlink-tools-{}-{}", std::process::id(), hex_encode(&nonce)));
         let mut builder = fs::DirBuilder::new();
         builder.recursive(false);
         #[cfg(unix)]
@@ -169,7 +140,7 @@ impl Resolver {
         }
         builder
             .create(&directory)
-            .map_err(|error| format!("download directory {}: {error}", directory.display()))?;
+            .map_err(|e| format!("download directory {}: {e}", directory.display()))?;
         *temp = Some(directory.clone());
         Ok(directory)
     }
@@ -197,7 +168,6 @@ fn create_exclusive_private(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-/// Encodes bytes as lowercase hexadecimal in a single allocation.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -208,29 +178,39 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Streams one URL into the download directory and checks what arrived.
-fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, String> {
-    let agent = agent();
-    let mut response = agent
-        .get(url)
-        .header("User-Agent", "rustlink")
-        .call()
-        .map_err(|error| format!("{url} could not be reached: {error}"))?;
-    // Where the download ended up, which is not `url` when that redirected.
+fn get_ok(
+    agent: &ureq::Agent,
+    url: &str,
+    prefix: Option<&str>,
+) -> Result<(String, ureq::http::Response<ureq::Body>), String> {
+    let response =
+        agent.get(url).header("User-Agent", "rustlink").call().map_err(|e| match prefix {
+            Some(p) => format!("{p} {url}: {e}"),
+            None => format!("{url} could not be reached: {e}"),
+        })?;
     let landed = ureq::ResponseExt::get_uri(&response).to_string();
     check_redirect_scheme(url, &landed)?;
     let status = response.status().as_u16();
     if status != 200 {
-        return Err(format!("{url} returned HTTP {status}"));
+        return Err(match prefix {
+            Some(p) => format!("{p} {url} returned HTTP {status}"),
+            None => format!("{url} returned HTTP {status}"),
+        });
     }
+    Ok((landed, response))
+}
+
+fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, String> {
+    let agent = agent();
+    let (landed, mut response) = get_ok(agent, url, None)?;
     let total = response.body().content_length();
-    let name = if source.asset.is_empty() { "download.bin" } else { source.asset.as_str() };
+    let name = if source.asset.is_empty() { "download.bin" } else { &source.asset };
     let file = directory.join(name);
     let mut out =
-        create_exclusive_private(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+        create_exclusive_private(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut body = response.body_mut().as_reader();
     let (written, got_sum) = match copy(&mut body, &mut out, source.tool, total) {
-        Ok(result) => result,
+        Ok(res) => res,
         Err(error) => {
             drop(out);
             let _ = fs::remove_file(&file);
@@ -255,29 +235,24 @@ fn download(url: &str, directory: &Path, source: &Source) -> Result<PathBuf, Str
     Ok(file)
 }
 
-const MAX_ARCHIVE_BYTES: u64 = 512 << 20;
-
-/// Copies a download into a file while hashing its bytes, reporting where it is every so often.
 fn copy(
     reader: &mut impl Read,
     out: &mut impl Write,
     tool: &str,
     total: Option<u64>,
 ) -> Result<(u64, String), String> {
-    if let Some(total) = total {
-        if total > MAX_ARCHIVE_BYTES {
-            return Err(format!(
-                "refusing {tool} download of {} MiB (exceeds 512 MiB safety cap)",
-                total >> 20
-            ));
-        }
+    if let Some(total) = total.filter(|&t| t > MAX_ARCHIVE_BYTES) {
+        return Err(format!(
+            "refusing {tool} download of {} MiB (exceeds 512 MiB safety cap)",
+            total >> 20
+        ));
     }
     let mut buffer = vec![0u8; 64 << 10];
     let mut hasher = Sha256::new();
     let mut written = 0u64;
     let mut next = Instant::now() + PROGRESS;
     loop {
-        let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
             return Ok((written, hex_encode(&hasher.finalize())));
         }
@@ -289,20 +264,21 @@ fn copy(
             ));
         }
         hasher.update(&buffer[..read]);
-        out.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+        out.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
         let now = Instant::now();
         if now >= next {
             next = now + PROGRESS;
-            match total {
-                Some(total) => log::info!(
+            if let Some(total) = total {
+                log::info!(
                     "media helper download in progress tool={tool} receivedMiB={} totalMiB={}",
                     written >> 20,
                     total >> 20
-                ),
-                None => log::info!(
+                );
+            } else {
+                log::info!(
                     "media helper download in progress tool={tool} receivedMiB={}",
                     written >> 20
-                ),
+                );
             }
         }
     }
@@ -361,11 +337,9 @@ impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::
     }
 }
 
-/// A client suited to a large file: socket operations time out after 60 seconds
-/// of inactivity, while an active download on a slow link is allowed to finish.
 fn agent() -> &'static ureq::Agent {
     use ureq::unversioned::transport::Connector as _;
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         let config = ureq::Agent::config_builder()
             .accept_encoding("identity")
@@ -382,7 +356,7 @@ fn agent() -> &'static ureq::Agent {
         )
     })
 }
-/// Checks a download against a `<sha256>  <file>` listing (or bare `<sha256>` sidecar).
+
 fn verify(
     agent: &ureq::Agent,
     sums_url: &str,
@@ -390,23 +364,13 @@ fn verify(
     got: &str,
     allow_bare: bool,
 ) -> Result<(), String> {
-    let response = agent
-        .get(sums_url)
-        .header("User-Agent", "rustlink")
-        .call()
-        .map_err(|error| format!("checksum list {sums_url}: {error}"))?;
-    let landed = ureq::ResponseExt::get_uri(&response).to_string();
-    check_redirect_scheme(sums_url, &landed)?;
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(format!("checksum list {sums_url} returned HTTP {status}"));
-    }
+    let (_, response) = get_ok(agent, sums_url, Some("checksum list"))?;
     let list = response
         .into_body()
         .with_config()
         .limit(1 << 20)
         .read_to_string()
-        .map_err(|error| format!("checksum list {sums_url}: {error}"))?;
+        .map_err(|e| format!("checksum list {sums_url}: {e}"))?;
     let want = lookup_sum(&list, asset, allow_bare)
         .ok_or_else(|| format!("checksum list {sums_url} has no entry for {asset}"))?;
     if !want.eq_ignore_ascii_case(got) {
@@ -415,49 +379,40 @@ fn verify(
     Ok(())
 }
 
-/// Finds the hash a listing gives for one file. Accepts `<sha256>  <file>`,
-/// GNU `sha256sum -b` `<sha256> *<file>`, and (for a per-file `.sha256` sidecar)
-/// a single 64-digit SHA-256 hex token.
-fn lookup_sum(list: &str, asset: &str, allow_bare: bool) -> Option<String> {
+fn lookup_sum<'a>(list: &'a str, asset: &str, allow_bare: bool) -> Option<&'a str> {
+    let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
     list.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let hash = fields.next()?;
         match (fields.next(), fields.next()) {
-            (Some(raw_name), None) => {
-                let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
+            (Some(raw), None) => {
+                let name = raw.strip_prefix('*').unwrap_or(raw);
                 let name = name.strip_prefix("./").unwrap_or(name);
-                (name == asset && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-                    .then(|| hash.to_owned())
+                (name == asset && is_hex(hash)).then_some(hash)
             }
-            (None, None) if allow_bare => (hash.len() == 64
-                && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| hash.to_owned()),
+            (None, None) if allow_bare && hash.len() == 64 && is_hex(hash) => Some(hash),
             _ => None,
         }
     })
 }
 
-/// The SHA-256 of a file, as lowercase hexadecimal.
 #[cfg(test)]
 fn file_sum(file: &Path) -> Result<String, String> {
-    let handle = fs::File::open(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let handle = fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut reader = std::io::BufReader::with_capacity(64 << 10, handle);
     let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher).map_err(|error| error.to_string())?;
+    std::io::copy(&mut reader, &mut hasher).map_err(|e| e.to_string())?;
     Ok(hex_encode(&hasher.finalize()))
 }
 
-/// Copies one member of a zip archive onto the target.
 fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
-    let file =
-        fs::File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
-    let mut zip =
-        zip::ZipArchive::new(file).map_err(|error| format!("{}: {error}", archive.display()))?;
+    let file = fs::File::open(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", archive.display()))?;
     let exact_bin = Path::new("bin").join(member);
     let mut selected: Option<(usize, u8)> = None;
     let mut saw_undersized = false;
     for index in 0..zip.len() {
-        let entry = zip.by_index(index).map_err(|error| error.to_string())?;
+        let entry = zip.by_index(index).map_err(|e| e.to_string())?;
         if entry.is_dir() || entry.is_symlink() {
             continue;
         }
@@ -482,77 +437,62 @@ fn extract(archive: &Path, member: &str, target: &Path) -> Result<(), String> {
         } else {
             0
         };
-        if selected.is_none_or(|(_, best_rank)| rank > best_rank) {
+        if selected.is_none_or(|(_, best)| rank > best) {
             selected = Some((index, rank));
             if rank == 2 {
                 break;
             }
         }
     }
-    let Some((chosen_index, _)) = selected else {
-        if saw_undersized {
-            return Err(format!(
-                "{member} in {} is smaller than {MIN_SIZE} bytes",
-                archive.display()
-            ));
-        }
-        return Err(format!("{member} is not part of {}", archive.display()));
+    let Some((chosen, _)) = selected else {
+        return Err(if saw_undersized {
+            format!("{member} in {} is smaller than {MIN_SIZE} bytes", archive.display())
+        } else {
+            format!("{member} is not part of {}", archive.display())
+        });
     };
-    let mut entry = zip.by_index(chosen_index).map_err(|error| error.to_string())?;
+    let mut entry = zip.by_index(chosen).map_err(|e| e.to_string())?;
     if entry.size() > MAX_ARCHIVE_BYTES {
         return Err(format!("{member} exceeds 512 MiB uncompressed safety cap"));
     }
-    let mut bounded = (&mut entry).take(MAX_ARCHIVE_BYTES + 1);
-    copy_into(&mut bounded, target)
+    copy_into(&mut (&mut entry).take(MAX_ARCHIVE_BYTES + 1), target)
 }
 
-/// Writes through a temporary file with executable permissions applied before
-/// atomic rename, so `target` is never half-written or non-executable.
 fn copy_into(source: &mut impl Read, target: &Path) -> Result<(), String> {
     let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce).map_err(|error| format!("{}: {error}", target.display()))?;
+    getrandom::fill(&mut nonce).map_err(|e| format!("{}: {e}", target.display()))?;
     let temp = PathBuf::from(format!(
         "{}.part-{}-{}",
         target.display(),
         std::process::id(),
         hex_encode(&nonce)
     ));
-    let write_result = create_exclusive_private(&temp)
-        .map_err(|error| format!("{}: {error}", target.display()))
-        .and_then(|mut out| {
-            let written = std::io::copy(source, &mut out)
-                .map_err(|e| format!("{}: {e}", target.display()))?;
-            if written < MIN_SIZE {
-                return Err(format!(
-                    "{} extracted only {written} bytes (minimum {MIN_SIZE})",
-                    target.display()
-                ));
-            }
-            if written > MAX_ARCHIVE_BYTES {
-                return Err(format!(
-                    "{} exceeded 512 MiB uncompressed safety cap",
-                    target.display()
-                ));
-            }
-            out.sync_all().map_err(|e| format!("{}: {e}", target.display()))
-        });
-    write_result
-        .and_then(|()| make_executable(&temp))
-        .and_then(|()| {
-            fs::rename(&temp, target).map_err(|error| format!("{}: {error}", target.display()))
-        })
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&temp);
-        })
+    let result = (|| -> Result<(), String> {
+        let io_err = |e: std::io::Error| format!("{}: {e}", target.display());
+        let mut out = create_exclusive_private(&temp).map_err(io_err)?;
+        let written = std::io::copy(source, &mut out).map_err(io_err)?;
+        if written < MIN_SIZE {
+            return Err(format!(
+                "{} extracted only {written} bytes (minimum {MIN_SIZE})",
+                target.display()
+            ));
+        }
+        if written > MAX_ARCHIVE_BYTES {
+            return Err(format!("{} exceeded 512 MiB uncompressed safety cap", target.display()));
+        }
+        out.sync_all().map_err(io_err)?;
+        drop(out);
+        make_executable(&temp)?;
+        fs::rename(&temp, target).map_err(io_err)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
-/// The file name a helper is installed under.
 fn executable_name(name: &str) -> String {
-    if cfg!(windows)
-        && !name
-            .as_bytes()
-            .get(name.len().wrapping_sub(4)..)
-            .is_some_and(|ext| ext.eq_ignore_ascii_case(b".exe"))
+    if cfg!(windows) && !Path::new(name).extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
     {
         format!("{name}.exe")
     } else {
@@ -560,38 +500,33 @@ fn executable_name(name: &str) -> String {
     }
 }
 
-/// Gives a downloaded helper the permissions it needs to be run.
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions =
-        fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).map_err(|error| format!("{}: {error}", path.display()))
+    let mut perms =
+        fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Nothing has to be done on a platform where an executable bit is not a thing.
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A path as an operator would write it: absolute, but without resolving the
-/// symbolic links on the way.
 fn absolute(path: &Path) -> String {
     if path.is_absolute() {
         return path.display().to_string();
     }
     std::env::current_dir()
-        .map(|directory| directory.join(path).display().to_string())
+        .map(|dir| dir.join(path).display().to_string())
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-/// Validates an explicit helper path configured by the operator.
 fn look_up(program: &str) -> Option<String> {
     let check = |path: &Path| (path.is_file() && is_runnable(path)).then(|| absolute(path));
     if cfg!(windows)
-        && !Path::new(program).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        && !Path::new(program).extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
     {
         let with_exe = PathBuf::from(format!("{program}.exe"));
         if let Some(found) = check(&with_exe) {
@@ -612,7 +547,6 @@ fn is_runnable(_path: &Path) -> bool {
     true
 }
 
-/// Where a helper comes from on this platform.
 fn source_for(name: &str) -> Result<Source, String> {
     match name {
         "ffmpeg" => ffmpeg_source(name),
@@ -620,14 +554,18 @@ fn source_for(name: &str) -> Result<Source, String> {
     }
 }
 
-/// FFmpeg comes from BtbN on Windows and martin-riedl.de everywhere else. Both
-/// are GPL builds with libopus, which the encoder needs. The archive also holds
-/// ffprobe, which this node does not use: containers are parsed in process, so
-/// only the encoder is unpacked.
 fn ffmpeg_source(name: &str) -> Result<Source, String> {
-    match std::env::consts::OS {
+    let os = std::env::consts::OS;
+    let arch = match (os, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "win64",
+        ("windows", "aarch64") => "winarm64",
+        ("linux" | "macos", "x86_64") => "amd64",
+        ("linux" | "macos", "aarch64") => "arm64",
+        (_, arch) => return Err(format!("no FFmpeg build is known for {os}/{arch}")),
+    };
+    match os {
         "windows" => {
-            let asset = format!("ffmpeg-master-latest-{}-gpl.zip", windows_arch()?);
+            let asset = format!("ffmpeg-master-latest-{arch}-gpl.zip");
             let base = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/";
             Ok(Source {
                 tool: "ffmpeg",
@@ -638,20 +576,13 @@ fn ffmpeg_source(name: &str) -> Result<Source, String> {
             })
         }
         "linux" | "macos" => {
-            // The provider uses the platform names `std` does, so the current
-            // one is passed through unchanged.
-            let base = format!(
-                "https://ffmpeg.martin-riedl.de/redirect/latest/{}/{}/",
-                std::env::consts::OS,
-                posix_arch()?
-            );
+            let base = format!("https://ffmpeg.martin-riedl.de/redirect/latest/{os}/{arch}/");
             Ok(Source {
                 tool: "ffmpeg",
                 urls: vec![
                     format!("{base}release/{name}.zip"),
                     format!("{base}snapshot/{name}.zip"),
                 ],
-                // martin-riedl.de publishes `ffmpeg.zip.sha256` beside each build.
                 sums: Sums::Beside,
                 asset: format!("{name}.zip"),
                 member: name.to_string(),
@@ -661,28 +592,10 @@ fn ffmpeg_source(name: &str) -> Result<Source, String> {
     }
 }
 
-fn windows_arch() -> Result<&'static str, String> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("win64"),
-        "aarch64" => Ok("winarm64"),
-        arch => Err(format!("no FFmpeg build is known for windows/{arch}")),
-    }
-}
-
-fn posix_arch() -> Result<&'static str, String> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("amd64"),
-        "aarch64" => Ok("arm64"),
-        arch => Err(format!("no FFmpeg build is known for {}/{arch}", std::env::consts::OS)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serves `routes` as `(path, full response)`, one connection each, in the
-    /// order they are asked for, and reports the paths that were requested.
     fn serve(
         routes: Vec<(&'static str, Vec<u8>)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
@@ -695,13 +608,13 @@ mod tests {
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 1024];
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                while !request.windows(4).any(|b| b == b"\r\n\r\n") {
                     let count = socket.read(&mut buffer).unwrap();
                     assert!(count > 0);
                     request.extend_from_slice(&buffer[..count]);
                 }
-                let line = String::from_utf8_lossy(&request);
-                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                let path =
+                    String::from_utf8_lossy(&request).split_whitespace().nth(1).unwrap().to_owned();
                 let (_, response) =
                     routes.iter().find(|(route, _)| *route == path).expect("an expected path");
                 socket.write_all(response).unwrap();
@@ -733,10 +646,10 @@ mod tests {
     }
 
     fn work_dir(label: &str) -> PathBuf {
-        let directory = std::env::temp_dir()
+        let dir = std::env::temp_dir()
             .join(format!("rustlink-tools-test-{label}-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        directory
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -752,8 +665,6 @@ mod tests {
         let file = download(&format!("{base}/latest/ffmpeg.zip"), &directory, &beside_source())
             .expect("a matching checksum passes");
         assert!(file.is_file());
-        // The checksum asked for is the one for the numbered build, not for the
-        // address that redirected to it, which publishes none.
         assert_eq!(
             server.join().unwrap(),
             ["/latest/ffmpeg.zip", "/build/1/ffmpeg.zip", "/build/1/ffmpeg.zip.sha256"]
@@ -762,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn a_download_that_does_not_match_its_checksum_is_refused_and_removed() {
+    fn bad_or_missing_checksums_are_refused_and_cleaned_up() {
         let body = vec![7u8; MIN_SIZE as usize + 100];
         let wrong = format!("{}  ffmpeg.zip\n", "0".repeat(64));
         let (base, server) = serve(vec![
@@ -770,120 +681,74 @@ mod tests {
             ("/ffmpeg.zip.sha256", reply("200 OK", "", wrong.as_bytes())),
         ]);
         let directory = work_dir("bad");
-        let error = download(&format!("{base}/ffmpeg.zip"), &directory, &beside_source())
-            .expect_err("a different hash must not install");
+        let error =
+            download(&format!("{base}/ffmpeg.zip"), &directory, &beside_source()).unwrap_err();
         server.join().unwrap();
         assert!(error.contains("checksum mismatch"), "{error}");
-        assert!(!directory.join("ffmpeg.zip").exists(), "the unchecked file is not left behind");
+        assert!(!directory.join("ffmpeg.zip").exists());
         let _ = fs::remove_dir_all(directory);
-    }
 
-    #[test]
-    fn a_missing_checksum_is_a_failure_and_not_a_pass() {
-        let body = vec![7u8; MIN_SIZE as usize + 100];
         let (base, server) = serve(vec![
             ("/ffmpeg.zip", reply("200 OK", "", &body)),
             ("/ffmpeg.zip.sha256", reply("404 Not Found", "", b"gone")),
         ]);
         let directory = work_dir("missing");
-        let error = download(&format!("{base}/ffmpeg.zip"), &directory, &beside_source())
-            .expect_err("no checksum means no install");
+        let error =
+            download(&format!("{base}/ffmpeg.zip"), &directory, &beside_source()).unwrap_err();
         server.join().unwrap();
-        assert!(error.contains("no entry for ffmpeg.zip") || error.contains("checksum"), "{error}");
+        assert!(error.contains("checksum"), "{error}");
         assert!(!directory.join("ffmpeg.zip").exists());
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn a_listing_yields_the_hash_of_the_named_file() {
-        let list = "aaa  ffmpeg.zip\nbbb  ffmpeg.exe\nnot a listing\nccc  one two\n";
-        assert_eq!(lookup_sum(list, "ffmpeg.exe", false), Some("bbb".to_string()));
-        assert_eq!(lookup_sum(list, "ffmpeg.zip", false), Some("aaa".to_string()));
+    fn checksum_lookup_and_sha256_hashing_work() {
+        let list = "aaa  ffmpeg.zip\nbbb *./ffmpeg.exe\nnot a listing\nccc  one two\n";
+        assert_eq!(lookup_sum(list, "ffmpeg.exe", false), Some("bbb"));
+        assert_eq!(lookup_sum(list, "ffmpeg.zip", false), Some("aaa"));
         assert_eq!(lookup_sum(list, "one", false), None);
         assert_eq!(lookup_sum(list, "missing", false), None);
         let bare = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n";
         assert_eq!(lookup_sum(bare, "ffmpeg.zip", false), None);
-        assert_eq!(lookup_sum(bare, "ffmpeg.zip", true), Some(bare.trim().to_string()));
-    }
+        assert_eq!(lookup_sum(bare, "ffmpeg.zip", true), Some(bare.trim()));
 
-    #[test]
-    fn the_hash_of_a_file_is_its_sha256_in_lowercase_hexadecimal() {
         let file = std::env::temp_dir().join(format!("rustlink-sum-{}", std::process::id()));
-        std::fs::write(&file, b"abc").unwrap();
-        // The SHA-256 of "abc", which is the value every published listing uses.
-        assert_eq!(
-            file_sum(&file).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        let _ = std::fs::remove_file(&file);
+        fs::write(&file, b"abc").unwrap();
+        assert_eq!(file_sum(&file).unwrap(), bare.trim());
+        let _ = fs::remove_file(&file);
     }
 
     #[test]
-    fn a_helper_that_is_not_configured_is_looked_for_in_the_tools_directory() {
-        let directory = std::env::temp_dir().join(format!("rustlink-tools-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+    fn resolver_handles_cached_missing_and_explicit_paths() {
+        let directory = work_dir("cached");
         let name = executable_name("ffmpeg");
-        std::fs::write(directory.join(&name), b"stub").unwrap();
+        fs::write(directory.join(&name), b"stub").unwrap();
         let resolver = Resolver::new(&directory.display().to_string(), false);
-        let resolved = resolver.resolve("ffmpeg", "").unwrap();
-        assert!(resolved.ends_with(&name), "{resolved}");
+        assert!(resolver.resolve("ffmpeg", "").unwrap().ends_with(&name));
         resolver.close();
-        let _ = std::fs::remove_dir_all(&directory);
-    }
+        let _ = fs::remove_dir_all(&directory);
 
-    #[test]
-    fn a_missing_helper_is_refused_when_auto_download_is_off() {
-        let directory = std::env::temp_dir().join(format!("rustlink-empty-{}", std::process::id()));
-        let resolver = Resolver::new(&directory.display().to_string(), false);
-        let error = resolver.resolve("ffmpeg", "").unwrap_err();
-        assert!(error.contains("autoDownload is off"), "{error}");
-        assert!(error.contains(&directory.display().to_string()));
-    }
+        let empty = std::env::temp_dir().join(format!("rustlink-empty-{}", std::process::id()));
+        let error =
+            Resolver::new(&empty.display().to_string(), false).resolve("ffmpeg", "").unwrap_err();
+        assert!(error.contains("autoDownload is off"));
+        assert!(Resolver::new(".", true)
+            .resolve("ffmpeg", "/nowhere/ffmpeg")
+            .unwrap_err()
+            .contains("cannot be run"));
 
-    #[test]
-    fn an_explicit_path_that_cannot_be_run_is_reported_rather_than_replaced() {
-        let resolver = Resolver::new(".", true);
-        let error = resolver.resolve("ffmpeg", "/nowhere/ffmpeg").unwrap_err();
-        assert!(error.contains("cannot be run"), "{error}");
-    }
-
-    #[test]
-    fn every_helper_this_node_uses_has_a_source_on_this_platform() {
         let source = source_for("ffmpeg").unwrap();
-        assert!(!source.urls.is_empty());
-        assert!(source.urls.iter().all(|url| url.starts_with("https://")));
+        assert!(!source.urls.is_empty() && source.urls.iter().all(|u| u.starts_with("https://")));
         assert!(source_for("ffprobe").is_err());
-    }
-
-    #[test]
-    fn a_helper_name_carries_the_extension_of_this_platform() {
-        let name = executable_name("ffmpeg");
-        if cfg!(windows) {
-            assert_eq!(name, "ffmpeg.exe");
-        } else {
-            assert_eq!(name, "ffmpeg");
-        }
+        assert_eq!(executable_name("ffmpeg"), if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
     }
 
     #[test]
     fn https_redirect_downgrade_to_plain_http_is_refused() {
-        assert!(check_redirect_scheme(
-            "https://example.com/ffmpeg.zip",
-            "http://example.com/ffmpeg.zip"
-        )
-        .is_err());
-        assert!(check_redirect_scheme("HTTPS://example.com/sums", "HTTP://mirror.example/sums")
-            .is_err());
-        assert!(check_redirect_scheme(
-            "https://example.com/latest",
-            "HTTPS://cdn.example.com/build/1"
-        )
-        .is_ok());
-        assert!(check_redirect_scheme(
-            "http://127.0.0.1:8080/latest",
-            "http://127.0.0.1:8080/build/1"
-        )
-        .is_ok());
+        assert!(check_redirect_scheme("https://example.com/a", "http://example.com/a").is_err());
+        assert!(check_redirect_scheme("HTTPS://example.com/a", "HTTP://mirror.example/a").is_err());
+        assert!(check_redirect_scheme("https://example.com/a", "HTTPS://cdn.example.com/b").is_ok());
+        assert!(check_redirect_scheme("http://127.0.0.1:8080/a", "http://127.0.0.1:8080/b").is_ok());
     }
 
     #[test]
@@ -893,16 +758,13 @@ mod tests {
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
         {
-            let root_bytes = vec![b'R'; MIN_SIZE as usize + 8];
-            let bin_bytes = vec![b'B'; MIN_SIZE as usize + 16];
-            let file = fs::File::create(&archive).unwrap();
-            let mut writer = zip::ZipWriter::new(file);
+            let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
             writer.start_file("bin/ffmpeg", options).unwrap();
             writer.write_all(b"tiny stub").unwrap();
             writer.start_file("ffmpeg", options).unwrap();
-            writer.write_all(&root_bytes).unwrap();
+            writer.write_all(&vec![b'R'; MIN_SIZE as usize + 8]).unwrap();
             writer.start_file("release/bin/ffmpeg", options).unwrap();
-            writer.write_all(&bin_bytes).unwrap();
+            writer.write_all(&vec![b'B'; MIN_SIZE as usize + 16]).unwrap();
             writer.finish().unwrap();
         }
         let target = directory.join("ffmpeg-out");
@@ -913,8 +775,7 @@ mod tests {
 
         let tiny_archive = directory.join("tiny.zip");
         {
-            let file = fs::File::create(&tiny_archive).unwrap();
-            let mut writer = zip::ZipWriter::new(file);
+            let mut writer = zip::ZipWriter::new(fs::File::create(&tiny_archive).unwrap());
             writer.start_file("bin/ffmpeg", options).unwrap();
             writer.write_all(b"too short").unwrap();
             writer.finish().unwrap();

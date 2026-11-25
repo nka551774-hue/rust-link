@@ -1,23 +1,15 @@
-//! Sampling how busy the process and the machine are.
-//!
-//! The stats route reports both loads, and a node that cannot read them says so
-//! rather than reporting zero: the flag travels with the values, so a client
-//! can tell "idle" from "not measured".
+//! Lock-free system and process CPU/memory sampling.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-/// The machine load and the process load, each as a fraction of one, with a
-/// flag that says whether a sample has been taken yet.
+/// Machine and process CPU loads (in `0.0..=1.0`) plus resident/total memory.
 ///
-/// Readers (`values`, `memory`, `cores`) are completely lock-free so HTTP
-/// `/stats`, `/info`, `/metrics` and WebSocket ticks never contend with the
-/// background OS sampler.
+/// Readers (`values`, `memory`, `cores`) are lock-free so HTTP and WebSocket
+/// ticks never contend with the background OS sampler.
 pub struct Cpu {
-    /// Held only by the background `spawn_blocking` sampler so slow OS table
-    /// refreshes never block HTTP or WebSocket readers.
     sampler: Mutex<(System, bool)>,
     system_load: AtomicU64,
     process_load: AtomicU64,
@@ -25,7 +17,6 @@ pub struct Cpu {
     memory_used: AtomicU64,
     memory_total: AtomicU64,
     pid: Pid,
-    /// Read once: on Linux each query walks the cgroup files.
     cores: usize,
 }
 
@@ -42,17 +33,13 @@ impl Cpu {
             memory_used: AtomicU64::new(0),
             memory_total: AtomicU64::new(total),
             pid: Pid::from_u32(std::process::id()),
-            cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            cores: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
     }
 
-    /// Takes one sample.
-    ///
-    /// A load is the difference between two moments, so the first sample only
-    /// establishes the baseline and reports nothing: the values stay
-    /// unavailable until there is a second one to compare against.
+    /// Takes one OS sample; CPU loads become available starting on the second sample.
     pub fn sample(&self) {
-        let mut sampler = self.sampler.lock().unwrap();
+        let mut sampler = self.sampler.lock().unwrap_or_else(|e| e.into_inner());
         let (system, sampled) = &mut *sampler;
         system.refresh_cpu_usage();
         let pid = self.pid;
@@ -63,9 +50,9 @@ impl Cpu {
         );
         let cores = self.cores as f64;
         let system_load = f64::from(system.global_cpu_usage()) / 100.0;
-        let (process_load, used) = system.process(pid).map_or((0.0, 0), |process| {
-            (f64::from(process.cpu_usage()) / 100.0 / cores, process.memory())
-        });
+        let (process_load, used) = system
+            .process(pid)
+            .map_or((0.0, 0), |proc| (f64::from(proc.cpu_usage()) / 100.0 / cores, proc.memory()));
         let was_sampled = *sampled;
         *sampled = true;
         drop(sampler);
@@ -78,7 +65,6 @@ impl Cpu {
         }
     }
 
-    /// The two loads and whether they mean anything yet.
     pub fn values(&self) -> (f64, f64, bool) {
         let available = self.available.load(Ordering::Acquire);
         let sys = f64::from_bits(self.system_load.load(Ordering::Relaxed));
@@ -86,16 +72,10 @@ impl Cpu {
         (sys, proc, available)
     }
 
-    /// The logical cores the process may run on.
     pub fn cores(&self) -> usize {
         self.cores
     }
 
-    /// The memory this process holds and the machine has, as of the last sample.
-    ///
-    /// A Rust node has no equivalent of the heap statistics the reference
-    /// implementation reports, so what a client reads is the resident size of
-    /// the process and the total it is competing for.
     pub fn memory(&self) -> (u64, u64) {
         (self.memory_used.load(Ordering::Relaxed), self.memory_total.load(Ordering::Relaxed))
     }

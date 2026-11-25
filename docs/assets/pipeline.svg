@@ -11,74 +11,56 @@
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#d93a49"/>
     </marker>
   </defs>
-
   <rect width="1120" height="330" rx="14" fill="url(#bg2)" stroke="#30363d" stroke-width="1.5"/>
-
   <text x="32" y="38" font-family="ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#e6edf3">
     <tspan fill="#39c5bb">50 Hz REAL-TIME MEDIA PIPELINE</tspan>
     <tspan fill="#8b949e" font-weight="500" font-size="13.5">  ·  Every 20 ms Frame From HTTP Byte Range to Encrypted Discord UDP</tspan>
   </text>
   <line x1="32" y1="54" x2="1088" y2="54" stroke="#21262d" stroke-width="1"/>
-
-  <!-- Step 1 -->
   <rect x="30" y="78" width="184" height="132" rx="9" fill="#161b22" stroke="#39c5bb" stroke-opacity="0.6" stroke-width="1.2"/>
   <text x="44" y="102" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#39c5bb">01 · RANGE STREAM</text>
-  <text x="44" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">128 KiB Bounded Read</text>
-  <text x="44" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• No full-file download</text>
-  <text x="44" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• Strong ETag + If-Range</text>
-  <text x="44" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• Reused page buffers</text>
+  <text x="44" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">512 KiB + 2 MiB Prefetch</text>
+  <text x="44" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- No full-file download</text>
+  <text x="44" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- Strong ETag + If-Range</text>
+  <text x="44" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- Reused 64 KiB pool</text>
   <text x="44" y="199" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#39c5bb">Ogg: 19.9 ns · 5 allocs</text>
-
   <line x1="214" y1="144" x2="244" y2="144" stroke="#39c5bb" stroke-width="2" marker-end="url(#arrT)"/>
-
-  <!-- Step 2 -->
   <rect x="248" y="78" width="188" height="132" rx="9" fill="#161b22" stroke="#39c5bb" stroke-opacity="0.6" stroke-width="1.2"/>
-  <text x="262" y="102" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#39c5bb">02 · IN-PROCESS DECODE</text>
-  <text x="262" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">Symphonia + libopus</text>
-  <text x="262" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• WebM/MP4/Ogg Opus</text>
-  <text x="262" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• AAC / MP3 / FLAC / WAV</text>
-  <text x="262" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• ITU-R stereo downmix</text>
-  <text x="262" y="199" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#39c5bb">Pre-skip &amp; gain exact</text>
-
+  <text x="262" y="102" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#39c5bb">02 · PASSTHROUGH / DECODE</text>
+  <text x="262" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">Opus Direct + Symphonia</text>
+  <text x="262" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- 48 kHz Opus 0-transcode</text>
+  <text x="262" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- AAC / MP3 / FLAC / WAV</text>
+  <text x="262" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- ITU-R stereo downmix</text>
+  <text x="262" y="199" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#39c5bb">Passthrough: 445 ns/frame</text>
   <line x1="436" y1="144" x2="466" y2="144" stroke="#39c5bb" stroke-width="2" marker-end="url(#arrT)"/>
-
-  <!-- Step 3 -->
   <rect x="470" y="78" width="196" height="132" rx="9" fill="#161b22" stroke="#39c5bb" stroke-opacity="0.6" stroke-width="1.2"/>
   <text x="484" y="102" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#39c5bb">03 · 48 kHz DSP &amp; OPUS</text>
   <text x="484" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">960 Stereo Frames</text>
-  <text x="484" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• Windowed-Sinc + WSOLA</text>
-  <text x="484" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• 15-band EQ &amp; FX stages</text>
-  <text x="484" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• Inline [f32; 1920] buffers</text>
+  <text x="484" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- 32-tap Sinc + WSOLA</text>
+  <text x="484" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- 15-band EQ &amp; FX stages</text>
+  <text x="484" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- 24-bit float soft-clip</text>
   <text x="484" y="199" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#39c5bb">8-FX: 38.8 µs · 0 allocs</text>
-
   <line x1="666" y1="144" x2="696" y2="144" stroke="#d93a49" stroke-width="2" marker-end="url(#arrC)"/>
-
-  <!-- Step 4 -->
   <rect x="700" y="78" width="184" height="132" rx="9" fill="#161b22" stroke="#d93a49" stroke-opacity="0.7" stroke-width="1.2"/>
   <text x="714" y="102" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d93a49">04 · DAVE v1 E2EE</text>
   <text x="714" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">In-Place Frame Seal</text>
-  <text x="714" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• MLS sender ratchet</text>
-  <text x="714" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• AES-128-GCM 8B tag</text>
-  <text x="714" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• ULEB128 nonce + 0xfafa</text>
+  <text x="714" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- MLS sender ratchet</text>
+  <text x="714" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- AES-128-GCM 8B tag</text>
+  <text x="714" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- ULEB128 nonce + 0xfafa</text>
   <text x="714" y="199" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#d93a49">0 allocs · 226.4 ns/op</text>
-
   <line x1="884" y1="144" x2="914" y2="144" stroke="#d93a49" stroke-width="2" marker-end="url(#arrC)"/>
-
-  <!-- Step 5 -->
   <rect x="918" y="78" width="172" height="132" rx="9" fill="#161b22" stroke="#d93a49" stroke-opacity="0.7" stroke-width="1.2"/>
   <text x="932" y="102" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d93a49">05 · RTP TRANSPORT</text>
   <text x="932" y="124" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">UDP Voice Socket</text>
-  <text x="932" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• AES-256-GCM RTP-size</text>
-  <text x="932" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• XChaCha20-Poly1305</text>
-  <text x="932" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">• Control-slot reserve</text>
+  <text x="932" y="145" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- AES-256-GCM RTP-size</text>
+  <text x="932" y="163" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- XChaCha20-Poly1305</text>
+  <text x="932" y="181" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b949e">- Control-slot reserve</text>
   <text x="932" y="199" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#d93a49">0 allocs · 263.1 ns/op</text>
-
-  <!-- Comparison / Memory Metrics Bar -->
   <rect x="30" y="232" width="1060" height="72" rx="9" fill="#161b22" stroke="#21262d" stroke-width="1"/>
   <text x="50" y="258" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#39c5bb">WHY RUST MATTERS FOR AUDIO NODES</text>
   <text x="50" y="283" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#c9d1d9">
-    • <tspan font-weight="700" fill="#e6edf3">Arc&lt;LoadResult&gt; Cache Hit:</tspan> 43–53 ns (up to 4,944× faster)    ·
-    • <tspan font-weight="700" fill="#e6edf3">No Stop-The-World GC:</tspan> Steady 20.0 ms frame deadlines    ·
-    • <tspan font-weight="700" fill="#e6edf3">Zeroize-on-Drop:</tspan> MLS &amp; RTP keys wiped from RAM
+    <tspan font-weight="700" fill="#e6edf3">Arc&lt;LoadResult&gt; Cache Hit:</tspan> 43–53 ns (up to 4,944× faster)    ·
+    <tspan font-weight="700" fill="#e6edf3">No Stop-The-World GC:</tspan> Steady 20.0 ms frame deadlines    ·
+    <tspan font-weight="700" fill="#e6edf3">Zeroize-on-Drop:</tspan> MLS &amp; RTP keys wiped from RAM
   </text>
 </svg>

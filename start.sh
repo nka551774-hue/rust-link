@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run from any working directory. Existing config files are never overwritten.
 set -euo pipefail
-RUSTLINK_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+case ${BASH_SOURCE[0]} in */*) _dir=${BASH_SOURCE[0]%/*} ;; *) _dir=. ;; esac
+RUSTLINK_ROOT=$(CDPATH='' cd -P -- "${_dir:-/}" && pwd)
 cd "$RUSTLINK_ROOT"
 
 fail() { printf 'Rustlink: %s\n' "$*" >&2; exit 1; }
@@ -12,15 +12,15 @@ system_install() {
     fi
 }
 
-# Release archives place the executable beside this script.
 if [ ! -f Cargo.toml ] && [ -x ./rustlink ]; then
     exec ./rustlink "$@"
 fi
 [ -f Cargo.toml ] || fail "Cargo.toml or a packaged rustlink executable is required."
-if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck source=/dev/null
-    . "$HOME/.cargo/env"
-fi
+for p in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do
+    [ -d "$p" ] && case :$PATH: in *:"$p":*) ;; *) PATH="$PATH:$p" ;; esac
+done
+# shellcheck source=/dev/null
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
 if ! command -v cc >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1 ||
     { [ -z "${OPUS_LIB_DIR:-}" ] && ! pkg-config --exists opus 2>/dev/null; }; then
@@ -35,26 +35,22 @@ if ! command -v cc >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1 ||
         system_install pacman -Syu --noconfirm --needed base-devel pkgconf opus ca-certificates curl
     elif command -v apk >/dev/null 2>&1; then
         system_install apk add build-base pkgconf opus-dev ca-certificates curl
+    elif command -v brew >/dev/null 2>&1; then
+        brew install opus pkgconf
     else
-        fail "Install a C compiler, pkg-config and libopus development files for your distribution."
+        fail "Install a C compiler, pkg-config and libopus development files for your OS."
     fi
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
     [ "${RUSTLINK_SKIP_BOOTSTRAP:-0}" != 1 ] || fail "Install stable Rust from https://rustup.rs/ first."
     command -v curl >/dev/null 2>&1 || fail "curl is required to install Rust."
-    installer=$(mktemp)
-    trap 'rm -f -- "$installer"' EXIT
-    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$installer"
-    sh "$installer" -y --profile minimal --default-toolchain stable
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
     # shellcheck source=/dev/null
     . "$HOME/.cargo/env"
-    rm -f -- "$installer"
-    trap - EXIT
 fi
 
-printf 'Building Rustlink (the first build can take several minutes)...\n'
-# Explicit target and output directory keep external Cargo settings from hiding the executable.
+printf 'Building Rustlink (first build can take several minutes)...\n'
 RUSTLINK_HOST=$(rustc -vV | sed -n 's/^host: //p')
 [ -n "$RUSTLINK_HOST" ] || fail "Could not determine the Rust host target."
 cargo build --release --locked --bin rustlink --target "$RUSTLINK_HOST" --target-dir "$RUSTLINK_ROOT/target"

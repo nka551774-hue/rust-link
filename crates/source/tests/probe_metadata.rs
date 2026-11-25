@@ -1,4 +1,4 @@
-//! Container metadata is parsed from real nested headers, not isolated helpers.
+//! Nested container metadata and edge-case duration probing tests.
 
 use rustlink_source::probe::probe;
 
@@ -18,12 +18,11 @@ fn mp4(moov: &[u8]) -> Vec<u8> {
 fn tagged_mp4(fullbox: bool) -> Vec<u8> {
     let mut tags = Vec::new();
     for (kind, text) in [(b"\xa9nam", "夜空"), (b"\xa9ART", "歌手")] {
-        let mut value = vec![0, 0, 0, 1, 0, 0, 0, 0];
-        value.extend_from_slice(text.as_bytes());
-        tags.extend(atom(kind, &atom(b"data", &value)));
+        let mut val = vec![0, 0, 0, 1, 0, 0, 0, 0];
+        val.extend_from_slice(text.as_bytes());
+        tags.extend(atom(kind, &atom(b"data", &val)));
     }
     let mut meta = if fullbox { vec![0; 4] } else { Vec::new() };
-    // QuickTime also permits a meta atom starting directly with this child.
     let mut handler = vec![0; 8];
     handler.extend_from_slice(b"mdir");
     handler.extend_from_slice(&[0; 12]);
@@ -36,16 +35,14 @@ fn tagged_mp4(fullbox: bool) -> Vec<u8> {
 fn mp4_fullbox_metadata_retains_title_and_artist() {
     let bytes = tagged_mp4(true);
     let info = probe(&bytes, bytes.len() as i64);
-    assert_eq!(info.title, "夜空");
-    assert_eq!(info.artist, "歌手");
+    assert_eq!((info.title.as_str(), info.artist.as_str()), ("夜空", "歌手"));
 }
 
 #[test]
 fn quicktime_meta_without_a_fullbox_header_retains_tags() {
     let bytes = tagged_mp4(false);
     let info = probe(&bytes, bytes.len() as i64);
-    assert_eq!(info.title, "夜空");
-    assert_eq!(info.artist, "歌手");
+    assert_eq!((info.title.as_str(), info.artist.as_str()), ("夜空", "歌手"));
 }
 
 #[test]
@@ -64,20 +61,16 @@ fn flac_comments_after_padding_are_read_with_metadata_block_lengths() {
     bytes.push(0x84);
     bytes.extend_from_slice(&(comments.len() as u32).to_be_bytes()[1..]);
     bytes.extend(comments);
-    let result = probe(&bytes, bytes.len() as i64);
-    assert_eq!(result.duration_ms, 2000);
-    assert_eq!(result.title, "夜空");
-    assert_eq!(result.artist, "歌手");
+    let res = probe(&bytes, bytes.len() as i64);
+    assert_eq!((res.duration_ms, res.title.as_str(), res.artist.as_str()), (2000, "夜空", "歌手"));
 }
 
 fn ogg_page(flags: u8, granule: u64, payload: &[u8]) -> Vec<u8> {
-    assert!(payload.len() < 255);
     let mut page = b"OggS\0".to_vec();
     page.push(flags);
     page.extend_from_slice(&granule.to_le_bytes());
     page.extend_from_slice(&[0; 12]);
-    page.push(1);
-    page.push(payload.len() as u8);
+    page.extend_from_slice(&[1, payload.len() as u8]);
     page.extend_from_slice(payload);
     page
 }
@@ -97,8 +90,7 @@ fn an_ogg_prefix_does_not_claim_the_whole_tracks_duration() {
     let mut bytes = opus_head();
     bytes.extend(ogg_page(0, 960, &[0xf8, 0xff, 0xfe]));
     let info = probe(&bytes, 1_000_000);
-    assert!(info.audio);
-    assert_eq!(info.duration_ms, 0, "one buffered page is not the end of a long recording");
+    assert!(info.audio && info.duration_ms == 0);
 }
 
 #[test]
@@ -114,32 +106,31 @@ fn complete_ogg_opus_duration_excludes_preskip() {
 #[test]
 fn unknown_mp4_duration_does_not_become_a_huge_or_negative_track() {
     for version in [0u8, 1] {
-        let mut header = vec![0; if version == 0 { 20 } else { 32 }];
-        header[0] = version;
+        let mut hdr = vec![0; if version == 0 { 20 } else { 32 }];
+        hdr[0] = version;
         if version == 0 {
-            header[12..16].copy_from_slice(&1000u32.to_be_bytes());
-            header[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+            hdr[12..16].copy_from_slice(&1000u32.to_be_bytes());
+            hdr[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
         } else {
-            header[20..24].copy_from_slice(&1000u32.to_be_bytes());
-            header[24..32].copy_from_slice(&u64::MAX.to_be_bytes());
+            hdr[20..24].copy_from_slice(&1000u32.to_be_bytes());
+            hdr[24..32].copy_from_slice(&u64::MAX.to_be_bytes());
         }
-        let bytes = mp4(&atom(b"mvhd", &header));
+        let bytes = mp4(&atom(b"mvhd", &hdr));
         assert_eq!(probe(&bytes, bytes.len() as i64).duration_ms, 0);
     }
 }
 
 #[test]
 fn oversized_http_length_does_not_wrap_mp3_duration() {
-    let bytes = [0xff, 0xfb, 0x90, 0x00]; // 128 kbit/s MPEG-1 Layer III.
-    assert_eq!(probe(&bytes, i64::MAX).duration_ms, 576_460_752_303_423_487);
+    assert_eq!(probe(&[0xff, 0xfb, 0x90, 0x00], i64::MAX).duration_ms, 576_460_752_303_423_487);
 }
 
-fn synchsafe(length: usize) -> [u8; 4] {
+fn synchsafe(len: usize) -> [u8; 4] {
     [
-        ((length >> 21) & 0x7f) as u8,
-        ((length >> 14) & 0x7f) as u8,
-        ((length >> 7) & 0x7f) as u8,
-        (length & 0x7f) as u8,
+        ((len >> 21) & 0x7f) as u8,
+        ((len >> 14) & 0x7f) as u8,
+        ((len >> 7) & 0x7f) as u8,
+        (len & 0x7f) as u8,
     ]
 }
 
@@ -147,14 +138,15 @@ fn id3(version: u8, frames: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     let mut data = Vec::new();
     for (name, body) in frames {
         data.extend_from_slice(*name);
-        let length =
-            if version == 4 { synchsafe(body.len()) } else { (body.len() as u32).to_be_bytes() };
-        data.extend_from_slice(&length);
+        data.extend_from_slice(&if version == 4 {
+            synchsafe(body.len())
+        } else {
+            (body.len() as u32).to_be_bytes()
+        });
         data.extend_from_slice(&[0; 2]);
         data.extend_from_slice(body);
     }
-    let mut bytes = b"ID3".to_vec();
-    bytes.extend_from_slice(&[version, 0, 0]);
+    let mut bytes = vec![b'I', b'D', b'3', version, 0, 0];
     bytes.extend_from_slice(&synchsafe(data.len()));
     bytes.extend(data);
     bytes.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
@@ -169,19 +161,17 @@ fn id3v24_long_frames_keep_synchsafe_lengths_and_following_artist() {
     for version in [3, 4] {
         let bytes = id3(version, &[(b"TIT2", value.clone()), (b"TPE1", b"\x03Artist".to_vec())]);
         let info = probe(&bytes, bytes.len() as i64);
-        assert_eq!(info.title, title, "ID3v2.{version} title");
-        assert_eq!(info.artist, "Artist", "ID3v2.{version} artist");
+        assert_eq!((info.title.as_str(), info.artist.as_str()), (title.as_str(), "Artist"));
     }
 }
 
 #[test]
 fn id3_utf16_bom_titles_exclude_the_text_terminator() {
-    for little_endian in [true, false] {
+    for le in [true, false] {
         let mut value = vec![1];
-        value.extend_from_slice(if little_endian { &[0xff, 0xfe] } else { &[0xfe, 0xff] });
+        value.extend_from_slice(if le { &[0xff, 0xfe] } else { &[0xfe, 0xff] });
         for unit in "夜空\0".encode_utf16() {
-            let bytes = if little_endian { unit.to_le_bytes() } else { unit.to_be_bytes() };
-            value.extend_from_slice(&bytes);
+            value.extend_from_slice(&if le { unit.to_le_bytes() } else { unit.to_be_bytes() });
         }
         let bytes = id3(3, &[(b"TIT2", value)]);
         assert_eq!(probe(&bytes, bytes.len() as i64).title, "夜空");

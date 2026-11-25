@@ -1,17 +1,13 @@
 /target/
 /dist/
 /rustlink
+/rustlink-bot
 /rustlink.exe
-
-# Native runtime files belong in release archives, not source commits.
 *.exe
 *.dll
 *.so
 *.so.*
 *.dylib
-
-# A node reads its configuration and its downloaded helpers from the working
-# directory, and neither belongs in the repository.
 config.yaml
 config.yml
 config.json
@@ -24,10 +20,6 @@ config.local.*
 logs/
 *.log
 *.log.*
-
-# Local verification scripts may create Python bytecode caches.
 __pycache__/
 *.py[cod]
-
-# Settings and secrets written by the quickstart scripts.
 /quickstart/data/

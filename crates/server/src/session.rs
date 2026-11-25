@@ -1,12 +1,9 @@
-//! One client connection: the players it owns and the events it is told about.
-//!
-//! REST creates the session. Its event socket may disconnect for the configured
-//! grace period; players keep running and queued events survive reconnection.
+//! Client session state: owned players, per-guild update gates, and buffered events.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustlink_protocol::{Object, Player as PlayerBody};
 use serde_json::{json, Value};
@@ -15,16 +12,12 @@ use tokio::sync::{mpsc, Notify};
 use crate::player::Player;
 use crate::Server;
 
-/// How long a session waits to be resumed when the client does not say. The
-/// client can change it with a `PATCH` on the session.
 const DEFAULT_TIMEOUT: u32 = 60;
 
 struct State {
     players: HashMap<String, Arc<Player>>,
     updates: HashMap<String, Weak<tokio::sync::Mutex<()>>>,
-    /// Whether the client asked for its session to survive a disconnect.
     resuming: bool,
-    /// How long the session is kept after a disconnect, in seconds.
     timeout: u32,
     connected: bool,
     has_connected: bool,
@@ -33,37 +26,46 @@ struct State {
     disconnected: Option<Instant>,
 }
 
+impl State {
+    fn apply_config(&mut self, resuming: Option<bool>, timeout: Option<u32>) {
+        if let Some(resuming) = resuming {
+            self.resuming = resuming;
+        }
+        if let Some(timeout) = timeout {
+            self.timeout = timeout;
+        }
+    }
+
+    fn expired(&self) -> bool {
+        !self.connected
+            && (!self.resuming
+                || self
+                    .disconnected
+                    .is_none_or(|at| at.elapsed().as_secs() >= u64::from(self.timeout)))
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.closing && !self.closed && !self.expired()
+    }
+}
+
 pub struct Session {
     pub id: String,
     pub user: String,
     server: Weak<Server>,
     state: Mutex<State>,
-    /// Events waiting for the socket. A client that stops reading fills this
-    /// and is then closed, because a node that drops events silently leaves a
-    /// client showing something that is not happening.
     events: mpsc::Sender<Value>,
-    /// The receiving half, which belongs to the socket draining it. It is
-    /// parked here while a session has no socket, so the events that arrive in
-    /// the meantime are waiting for the client when it resumes.
     inbox: Mutex<Option<mpsc::Receiver<Value>>>,
-    /// One popped event whose WebSocket send failed mid-disconnect, preserved
-    /// so a resumed subscriber receives it ahead of newer events in `inbox`.
     unsent: Mutex<Option<Value>>,
-    /// How many events may wait, which the overflow warning names.
     buffer: usize,
-    /// Set when the buffer overflowed, so the warning and the close happen
-    /// once.
     overflowed: AtomicBool,
-    /// Wakes the writer when the session is destroyed.
     stop: Notify,
 }
 
-/// Keeps creation, update and rollback in one per-guild transaction. Weak map
-/// entries do not retain a gate after its final request (including cancellation).
+/// Serializes creation, update, and rollback per guild while sweeping idle gates on drop.
 pub(crate) struct PlayerUpdateGate<'a> {
     session: &'a Session,
     guild: String,
-    /// Always `Some` until drop, which releases it under the session lock.
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -75,10 +77,6 @@ impl PlayerUpdateGate<'_> {
 
 impl Drop for PlayerUpdateGate<'_> {
     fn drop(&mut self) {
-        // The borrowed mutex guard is already gone. Under the session lock no
-        // new caller can upgrade this weak entry while its last owner retires.
-        // The reference is released under that lock too: otherwise two gates
-        // dropping together can each see the other alive and leave a dead entry.
         let mut state = self.session.state.lock().unwrap();
         if self.lock.take().is_some_and(|lock| Arc::strong_count(&lock) == 1) {
             state.updates.remove(&self.guild);
@@ -87,9 +85,6 @@ impl Drop for PlayerUpdateGate<'_> {
 }
 
 impl Session {
-    /// Builds a session around the queue its socket will drain. The receiving
-    /// half stays inside the session, so a client that resumes can pick up the
-    /// events that arrived while it was away.
     pub fn new(id: String, user: String, server: Weak<Server>, buffer: usize) -> Arc<Session> {
         let (events, inbox) = mpsc::channel(buffer.max(1));
         Arc::new(Session {
@@ -116,14 +111,10 @@ impl Session {
         })
     }
 
-    /// Hands the queue to the socket that is about to drain it. A session has
-    /// one socket at a time, so a second caller gets nothing.
     pub fn take_inbox(&self) -> Option<mpsc::Receiver<Value>> {
         self.inbox.lock().unwrap().take()
     }
 
-    /// Puts the queue back once the socket is gone, so a client that resumes
-    /// finds the events that were sent while it was disconnected.
     pub fn restore_inbox(&self, inbox: mpsc::Receiver<Value>) {
         *self.inbox.lock().unwrap() = Some(inbox);
     }
@@ -136,8 +127,6 @@ impl Session {
         *self.unsent.lock().unwrap() = Some(event);
     }
 
-    /// The callback a player delivers its events through. It holds the session
-    /// weakly, so a player that outlives its session cannot keep it alive.
     pub fn emitter(self: &Arc<Self>) -> crate::Emit {
         let session = Arc::downgrade(self);
         Arc::new(move |event| {
@@ -147,7 +136,6 @@ impl Session {
         })
     }
 
-    /// Sends one event to the client, and to the webhook if one is configured.
     pub fn emit(&self, mut event: Object) {
         let (closing, closed) = {
             let state = self.state.lock().unwrap();
@@ -180,57 +168,43 @@ impl Session {
             );
             if let Some(owner) = server {
                 let id = self.id.clone();
-                // The node is moved into the task rather than borrowed from, so
-                // the task can outlive this call without holding the session.
                 let spawner = Arc::clone(&owner);
                 spawner.spawn(async move { owner.remove_session(&id) });
             }
         }
     }
 
-    /// What every player on the session reports.
     pub fn snapshots(&self) -> Vec<PlayerBody> {
         self.players().iter().map(|player| player.snapshot()).collect()
     }
 
-    /// Number of players owned by the session without cloning the map values.
     pub fn player_count(&self) -> usize {
         self.state.lock().unwrap().players.len()
     }
 
-    /// Number of actively playing players owned by the session without allocating.
     pub fn playing_player_count(&self) -> usize {
         self.usable_and_playing().unwrap_or(0)
     }
 
-    /// Returns `Some(playing_players)` when the session is usable, or `None` if closed/expired.
     pub(crate) fn usable_and_playing(&self) -> Option<usize> {
         let state = self.state.lock().unwrap();
-        if state.closing || state.closed || Self::expired_locked(&state) {
-            return None;
-        }
-        Some(state.players.values().filter(|player| player.playing()).count())
+        state.is_usable().then(|| state.players.values().filter(|p| p.playing()).count())
     }
 
-    /// Appends sanitized webhook player reports and returns how many are actively playing.
     pub(crate) fn collect_reports(&self, out: &mut Vec<Value>) -> usize {
         let mut playing = 0;
         for player in self.players() {
             let (is_playing, entry) = player.report_state();
-            if is_playing {
-                playing += 1;
-            }
+            playing += usize::from(is_playing);
             out.push(entry);
         }
         playing
     }
 
-    /// The players the session owns.
     pub fn players(&self) -> Vec<Arc<Player>> {
         self.state.lock().unwrap().players.values().cloned().collect()
     }
 
-    /// One player by the guild it serves.
     pub fn player(&self, guild: &str) -> Option<Arc<Player>> {
         self.state.lock().unwrap().players.get(guild).cloned()
     }
@@ -245,8 +219,6 @@ impl Session {
         PlayerUpdateGate { session: self, guild: guild.to_owned(), lock: Some(lock) }
     }
 
-    /// Serializes creation against other requests and session destruction.
-    /// `None` means the session was destroyed while the request was in flight.
     pub fn get_or_insert<E>(
         &self,
         guild: &str,
@@ -264,19 +236,11 @@ impl Session {
         Ok(Some((player, true)))
     }
 
-    /// Rolls back an uncommitted creation. The caller holds the guild's update
-    /// gate, so no successful update can race this rollback. Readers may retain
-    /// snapshots without retaining a player slot.
     pub fn remove_if_same(&self, guild: &str, expected: &Arc<Player>) -> Option<Arc<Player>> {
         let mut state = self.state.lock().unwrap();
-        let current = state.players.get(guild)?;
-        if !Arc::ptr_eq(current, expected) {
-            return None;
-        }
-        state.players.remove(guild)
+        Arc::ptr_eq(state.players.get(guild)?, expected).then(|| state.players.remove(guild))?
     }
 
-    /// Removes a player and reports whether there was one.
     pub fn remove(&self, guild: &str) -> Option<Arc<Player>> {
         self.state.lock().unwrap().players.remove(guild)
     }
@@ -287,9 +251,14 @@ impl Session {
 
     pub fn snapshot(&self) -> Value {
         let state = self.state.lock().unwrap();
-        json!({ "session_id": self.id, "bot_id": self.user, "connected": state.connected,
-            "resume": state.resuming, "resume_timeout_secs": state.timeout,
-            "event_url": format!("/api/v1/sessions/{}/events", self.id) })
+        json!({
+            "session_id": self.id,
+            "bot_id": self.user,
+            "connected": state.connected,
+            "resume": state.resuming,
+            "resume_timeout_secs": state.timeout,
+            "event_url": format!("/api/v1/sessions/{}/events", self.id),
+        })
     }
 
     pub fn is_connected(&self) -> bool {
@@ -310,19 +279,12 @@ impl Session {
     }
 
     pub(crate) fn configure(&self, resuming: Option<bool>, timeout: Option<u32>) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(resuming) = resuming {
-            state.resuming = resuming;
-        }
-        if let Some(timeout) = timeout {
-            state.timeout = timeout;
-        }
+        self.state.lock().unwrap().apply_config(resuming, timeout);
     }
 
-    /// The settings a `PATCH` on the session changes, and the answer it gets.
     pub fn update(&self, resuming: Option<bool>, timeout: Option<u32>) -> Value {
-        self.configure(resuming, timeout);
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.apply_config(resuming, timeout);
         json!({ "resume": state.resuming, "resume_timeout_secs": state.timeout })
     }
 
@@ -339,10 +301,6 @@ impl Session {
         state.disconnected = Some(Instant::now());
     }
 
-    /// Rolls back a gateway claim that failed before the WebSocket task took
-    /// ownership of the connection. `had_connected` preserves the distinction
-    /// between a first connection and a genuine resume for the next READY
-    /// event.
     pub(crate) fn rollback_connect(&self, had_connected: bool) {
         let mut state = self.state.lock().unwrap();
         state.connected = false;
@@ -350,37 +308,21 @@ impl Session {
         state.disconnected = Some(Instant::now());
     }
 
-    /// How long the session has been waiting to be resumed.
-    pub fn disconnected_for(&self) -> Option<std::time::Duration> {
+    pub fn disconnected_for(&self) -> Option<Duration> {
         self.state.lock().unwrap().disconnected.map(|at| at.elapsed())
     }
 
-    /// Whether the session has been away for longer than it was told to wait.
     pub fn expired(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        Self::expired_locked(&state)
+        self.state.lock().unwrap().expired()
     }
 
-    fn expired_locked(state: &State) -> bool {
-        !state.connected
-            && (!state.resuming
-                || state
-                    .disconnected
-                    .is_none_or(|at| at.elapsed().as_secs() >= u64::from(state.timeout)))
-    }
-
-    /// Single-lock check whether the session is open and has not expired.
     pub(crate) fn is_usable(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        !state.closing && !state.closed && !Self::expired_locked(&state)
+        self.state.lock().unwrap().is_usable()
     }
 
-    /// Atomically claims the session's single WebSocket event stream, returning
-    /// `Ok(Some(had_connected))` on success, `Ok(None)` if closed/expired, or `Err(())`
-    /// if another subscriber is already attached.
     pub(crate) fn claim_subscriber(&self) -> Result<Option<bool>, ()> {
         let mut state = self.state.lock().unwrap();
-        if state.closing || state.closed || Self::expired_locked(&state) {
+        if !state.is_usable() {
             return Ok(None);
         }
         if state.connected {
@@ -393,7 +335,6 @@ impl Session {
         Ok(Some(had_connected))
     }
 
-    /// Atomically marks the WebSocket stream disconnected and returns `(closed, players, resuming, timeout)`.
     pub(crate) fn detach_info(&self) -> (bool, usize, bool, u32) {
         let mut state = self.state.lock().unwrap();
         state.connected = false;
@@ -401,7 +342,6 @@ impl Session {
         (state.closing || state.closed, state.players.len(), state.resuming, state.timeout)
     }
 
-    /// Tears the session down, ending every track it owns.
     pub fn destroy(&self) {
         let players = {
             let mut state = self.state.lock().unwrap();
@@ -419,17 +359,13 @@ impl Session {
             }
         }
         self.state.lock().unwrap().closed = true;
-        // Notifying rather than notifying waiters leaves a permit behind, so a
-        // writer that starts after the session was destroyed sees it at once.
         self.stop.notify_one();
     }
 
-    /// Wakes the writer loop, which then sees the session is closed and stops.
     pub fn wake(&self) {
         self.stop.notify_one();
     }
 
-    /// Waits until the session is destroyed.
     pub async fn stopped(&self) {
         self.stop.notified().await;
     }

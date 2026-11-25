@@ -24,11 +24,13 @@ impl Host {
         .unwrap();
         Self { signer, external }
     }
+
     fn peer(&self, user: u64) -> DaveSession {
         let mut peer = DaveSession::new(NonZeroU16::new(1).unwrap(), user, CHANNEL, None).unwrap();
         peer.set_external_sender(&self.external).unwrap();
         peer
     }
+
     fn session(&self, user: u64) -> (Session, Vec<u8>) {
         let mut session = Session::new(user, CHANNEL).unwrap();
         session.handle_binary(25, &self.external).unwrap();
@@ -41,13 +43,14 @@ impl Host {
             .unwrap();
         (session, key_package)
     }
+
     fn add(&self, epoch: u64, raw_key_package: &[u8]) -> Vec<u8> {
         let provider = OpenMlsRustCrypto::default();
         let kp = KeyPackageIn::tls_deserialize_exact_bytes(raw_key_package)
             .unwrap()
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .unwrap();
-        let message = ExternalProposal::new_add::<OpenMlsRustCrypto>(
+        let msg = ExternalProposal::new_add::<OpenMlsRustCrypto>(
             kp,
             GroupId::from_slice(&CHANNEL.to_be_bytes()),
             GroupEpoch::from(epoch),
@@ -55,10 +58,15 @@ impl Host {
             SenderExtensionIndex::new(0),
         )
         .unwrap();
-        VLBytes::new(message.tls_serialize_detached().unwrap()).tls_serialize_detached().unwrap()
+        VLBytes::new(msg.tls_serialize_detached().unwrap()).tls_serialize_detached().unwrap()
     }
+
+    fn add_peer(&self, epoch: u64, peer: &mut DaveSession) -> Vec<u8> {
+        self.add(epoch, &peer.create_key_package().unwrap())
+    }
+
     fn remove(&self, epoch: u64, index: LeafNodeIndex) -> Vec<u8> {
-        let message = ExternalProposal::new_remove::<OpenMlsRustCrypto>(
+        let msg = ExternalProposal::new_remove::<OpenMlsRustCrypto>(
             index,
             GroupId::from_slice(&CHANNEL.to_be_bytes()),
             GroupEpoch::from(epoch),
@@ -66,7 +74,7 @@ impl Host {
             SenderExtensionIndex::new(0),
         )
         .unwrap();
-        VLBytes::new(message.tls_serialize_detached().unwrap()).tls_serialize_detached().unwrap()
+        VLBytes::new(msg.tls_serialize_detached().unwrap()).tls_serialize_detached().unwrap()
     }
 }
 
@@ -81,10 +89,19 @@ fn take_binary(messages: Vec<Outbound>, opcode: u8) -> Vec<u8> {
     }
 }
 
+fn op27(op: u8, vl_encoded: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + vl_encoded.len());
+    payload.push(op);
+    payload.extend_from_slice(vl_encoded);
+    payload
+}
+
+fn op27_vl(op: u8, raw: Vec<u8>) -> Vec<u8> {
+    op27(op, &VLBytes::new(raw).tls_serialize_detached().unwrap())
+}
+
 fn append(session: &mut Session, proposals: &[u8]) -> Vec<u8> {
-    let mut payload = vec![0];
-    payload.extend(proposals);
-    take_binary(session.handle_binary(27, &payload).unwrap(), 28)
+    take_binary(session.handle_binary(27, &op27(0, proposals)).unwrap(), 28)
 }
 
 fn split_commit_welcome(payload: &[u8]) -> (&[u8], &[u8]) {
@@ -94,23 +111,51 @@ fn split_commit_welcome(payload: &[u8]) -> (&[u8], &[u8]) {
 
 fn transition(session: &mut Session, op: u8, id: u16, bytes: &[u8]) -> Vec<Outbound> {
     let mut payload = id.to_be_bytes().to_vec();
-    payload.extend(bytes);
+    payload.extend_from_slice(bytes);
     session.handle_binary(op, &payload).unwrap()
 }
 
+fn welcome_peer(
+    session: &mut Session,
+    proposal: &[u8],
+    id: u16,
+    peer: &mut DaveSession,
+) -> Vec<Outbound> {
+    let payload = append(session, proposal);
+    let (commit, welcome) = split_commit_welcome(&payload);
+    let ready = transition(session, 29, id, commit);
+    peer.process_welcome(welcome).unwrap();
+    ready
+}
+
+fn prepare_v(session: &mut Session, version: u16, id: u16) -> Result<Vec<Outbound>> {
+    session.handle_json(21, &json!({"protocol_version":version,"transition_id":id}))
+}
+
+fn execute_res(session: &mut Session, id: u16) -> Result<Vec<Outbound>> {
+    session.handle_json(22, &json!({"transition_id":id}))
+}
+
 fn execute(session: &mut Session, id: u16) {
-    session.handle_json(22, &json!({"transition_id":id})).unwrap();
+    execute_res(session, id).unwrap();
+}
+
+fn announce_epoch(session: &mut Session, version: u16, epoch: u64) -> Result<Vec<Outbound>> {
+    session.handle_json(24, &json!({"protocol_version":version,"epoch":epoch}))
+}
+
+fn send_and_verify(session: &mut Session, peer: &mut DaveSession) -> Vec<u8> {
+    let encrypted = session.encrypt_opus(OPUS).unwrap();
+    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &encrypted).unwrap(), OPUS);
+    encrypted
 }
 
 fn established() -> (Host, Session, DaveSession) {
     let host = Host::new();
     let (mut session, _) = host.session(ALICE);
     let mut peer = host.peer(BOB);
-    let proposal = host.add(0, &peer.create_key_package().unwrap());
-    let payload = append(&mut session, &proposal);
-    let (commit, welcome) = split_commit_welcome(&payload);
-    transition(&mut session, 29, 1, commit);
-    peer.process_welcome(welcome).unwrap();
+    let proposal = host.add_peer(0, &mut peer);
+    welcome_peer(&mut session, &proposal, 1, &mut peer);
     execute(&mut session, 1);
     (host, session, peer)
 }
@@ -119,20 +164,17 @@ fn established() -> (Host, Session, DaveSession) {
 fn own_initial_commit_is_interoperable_and_waits_for_execute() {
     let host = Host::new();
     let (mut session, key_package) = host.session(ALICE);
-    // Op 26 is a bare KeyPackage, the form libdave and davey send and Discord answers.
     assert!(KeyPackageIn::tls_deserialize_exact_bytes(&key_package).is_ok());
     assert!(MlsMessageIn::tls_deserialize_exact_bytes(&key_package).is_err());
     let mut peer = host.peer(BOB);
-    let proposal = host.add(0, &peer.create_key_package().unwrap());
-    let payload = append(&mut session, &proposal);
-    let (commit, welcome) = split_commit_welcome(&payload);
-    let ready = transition(&mut session, 29, 7, commit);
-    assert!(matches!(&ready[0],Outbound::Json(v) if v["op"] == 23 && v["d"]["transition_id"] == 7));
-    peer.process_welcome(welcome).unwrap();
+    let proposal = host.add_peer(0, &mut peer);
+    let ready = welcome_peer(&mut session, &proposal, 7, &mut peer);
+    assert!(
+        matches!(&ready[0], Outbound::Json(v) if v["op"] == 23 && v["d"]["transition_id"] == 7)
+    );
     assert!(matches!(session.encrypt_opus(OPUS), Err(Error::NotReady)));
     execute(&mut session, 7);
-    let encrypted = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &encrypted).unwrap(), OPUS);
+    let encrypted = send_and_verify(&mut session, &mut peer);
     assert!(peer.decrypt(ALICE, MediaType::AUDIO, &encrypted).is_err(), "replay rejected");
     let mut tampered = session.encrypt_opus(OPUS).unwrap();
     tampered[1] ^= 1;
@@ -144,41 +186,33 @@ fn independent_peer_can_welcome_our_sender() {
     let host = Host::new();
     let (mut session, kp) = host.session(ALICE);
     let mut peer = host.peer(BOB);
-    let proposal = host.add(0, &kp);
     let produced = peer
-        .process_proposals(ProposalsOperationType::APPEND, &proposal, Some(&[ALICE, BOB]))
+        .process_proposals(ProposalsOperationType::APPEND, &host.add(0, &kp), Some(&[ALICE, BOB]))
         .unwrap()
         .unwrap();
     peer.process_commit(&produced.commit).unwrap();
     transition(&mut session, 30, 8, &produced.welcome.unwrap());
     assert!(!session.ready());
     execute(&mut session, 8);
-    assert_eq!(
-        peer.decrypt(ALICE, MediaType::AUDIO, &session.encrypt_opus(OPUS).unwrap()).unwrap(),
-        OPUS
-    );
+    send_and_verify(&mut session, &mut peer);
 }
 
 #[test]
 fn member_add_and_remove_preserve_old_sender_until_execute() {
     let (host, mut session, mut peer) = established();
     let mut newcomer = host.peer(CAROL);
-    let proposal = host.add(1, &newcomer.create_key_package().unwrap());
+    let proposal = host.add_peer(1, &mut newcomer);
     let ours = append(&mut session, &proposal);
     peer.process_proposals(ProposalsOperationType::APPEND, &proposal, Some(&[ALICE, BOB, CAROL]))
         .unwrap();
     let (commit, welcome) = split_commit_welcome(&ours);
     transition(&mut session, 29, 2, commit);
-    // Receiver has not moved epochs yet, so this verifies the OLD sender remains in use.
-    assert_eq!(
-        peer.decrypt(ALICE, MediaType::AUDIO, &session.encrypt_opus(OPUS).unwrap()).unwrap(),
-        OPUS
-    );
+    send_and_verify(&mut session, &mut peer);
     peer.process_commit(commit).unwrap();
     newcomer.process_welcome(welcome).unwrap();
     execute(&mut session, 2);
-    let frame = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(newcomer.decrypt(ALICE, MediaType::AUDIO, &frame).unwrap(), OPUS);
+    send_and_verify(&mut session, &mut newcomer);
+
     let removed = session
         .group
         .as_ref()
@@ -191,16 +225,11 @@ fn member_add_and_remove_preserve_old_sender_until_execute() {
     append(&mut session, &proposal);
     let theirs =
         peer.process_proposals(ProposalsOperationType::APPEND, &proposal, None).unwrap().unwrap();
-    // Exercise another member's winning commit, not just the local commit path.
     transition(&mut session, 29, 3, &theirs.commit);
-    assert_eq!(
-        peer.decrypt(ALICE, MediaType::AUDIO, &session.encrypt_opus(OPUS).unwrap()).unwrap(),
-        OPUS
-    );
+    send_and_verify(&mut session, &mut peer);
     peer.process_commit(&theirs.commit).unwrap();
     execute(&mut session, 3);
-    let frame = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &frame).unwrap(), OPUS);
+    let frame = send_and_verify(&mut session, &mut peer);
     assert!(newcomer.decrypt(ALICE, MediaType::AUDIO, &frame).is_err());
 }
 
@@ -209,8 +238,7 @@ fn revoked_proposals_do_not_enter_the_commit() {
     let host = Host::new();
     let (mut session, _) = host.session(ALICE);
     let mut peer = host.peer(BOB);
-    let proposal = host.add(0, &peer.create_key_package().unwrap());
-    append(&mut session, &proposal);
+    append(&mut session, &host.add_peer(0, &mut peer));
     let reference = session
         .group
         .as_ref()
@@ -221,9 +249,7 @@ fn revoked_proposals_do_not_enter_the_commit() {
         .proposal_reference_ref()
         .tls_serialize_detached()
         .unwrap();
-    let mut revoke = vec![1];
-    revoke.extend(VLBytes::new(reference).tls_serialize_detached().unwrap());
-    assert!(session.handle_binary(27, &revoke).unwrap().is_empty());
+    assert!(session.handle_binary(27, &op27_vl(1, reference)).unwrap().is_empty());
     assert!(session.own_commit.is_none());
 }
 
@@ -233,14 +259,9 @@ fn unknown_and_duplicate_members_are_rejected() {
     let (mut session, _) = host.session(ALICE);
     let mut peer = host.peer(BOB);
     session.handle_json(13, &json!({"user_id":BOB.to_string()})).unwrap();
-    let proposal = host.add(0, &peer.create_key_package().unwrap());
-    let mut bytes = vec![0];
-    bytes.extend(proposal);
-    assert!(session.handle_binary(27, &bytes).is_err());
+    assert!(session.handle_binary(27, &op27(0, &host.add_peer(0, &mut peer))).is_err());
     let mut duplicate = host.peer(ALICE);
-    let mut bytes = vec![0];
-    bytes.extend(host.add(0, &duplicate.create_key_package().unwrap()));
-    assert!(session.handle_binary(27, &bytes).is_err());
+    assert!(session.handle_binary(27, &op27(0, &host.add_peer(0, &mut duplicate))).is_err());
 }
 
 #[test]
@@ -249,11 +270,10 @@ fn invalid_welcome_recovers_without_cleartext_and_is_bounded() {
     let (mut session, _) = host.session(ALICE);
     for _ in 0..3 {
         let response = transition(&mut session, 30, 5, &[0, 0, 0]);
-        assert!(matches!(&response[0],Outbound::Json(v) if v["op"] == 31));
-        assert!(matches!(&response[1],Outbound::Binary(v) if v[0] == 26));
+        assert!(matches!(&response[0], Outbound::Json(v) if v["op"] == 31));
+        assert!(matches!(&response[1], Outbound::Binary(v) if v[0] == 26));
         assert!(!session.ready());
-        // A gateway transition timeout must not abort the recovery or enable clear audio.
-        session.handle_json(22, &json!({"transition_id":5})).unwrap();
+        execute(&mut session, 5);
         assert!(session.encrypt_opus(OPUS).is_err());
     }
     assert!(session.handle_binary(30, &[0, 5, 0, 0, 0]).is_err());
@@ -262,10 +282,10 @@ fn invalid_welcome_recovers_without_cleartext_and_is_bounded() {
 #[test]
 fn stale_execute_does_not_reactivate_an_old_transition() {
     let (_, mut session, _) = established();
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":10})).unwrap();
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":11})).unwrap();
+    prepare_v(&mut session, 0, 10).unwrap();
+    prepare_v(&mut session, 0, 11).unwrap();
     execute(&mut session, 11);
-    assert!(session.handle_json(22, &json!({"transition_id":10})).is_err());
+    assert!(execute_res(&mut session, 10).is_err());
 }
 
 #[test]
@@ -274,9 +294,8 @@ fn welcome_validates_channel_external_sender_and_roster() {
         let host = Host::new();
         let (mut session, kp) = host.session(ALICE);
         let mut peer = host.peer(BOB);
-        let proposal = host.add(0, &kp);
         let produced = peer
-            .process_proposals(ProposalsOperationType::APPEND, &proposal, None)
+            .process_proposals(ProposalsOperationType::APPEND, &host.add(0, &kp), None)
             .unwrap()
             .unwrap();
         match invalid {
@@ -291,7 +310,7 @@ fn welcome_validates_channel_external_sender_and_roster() {
             }
         }
         let response = transition(&mut session, 30, 9, &produced.welcome.unwrap());
-        assert!(matches!(&response[0],Outbound::Json(v) if v["op"] == 31), "{invalid}");
+        assert!(matches!(&response[0], Outbound::Json(v) if v["op"] == 31), "{invalid}");
         assert!(!session.ready());
     }
 }
@@ -299,36 +318,32 @@ fn welcome_validates_channel_external_sender_and_roster() {
 #[test]
 fn explicit_downgrade_upgrade_and_solo_reset_do_not_reuse_keys() {
     let (host, mut session, mut peer) = established();
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":4})).unwrap();
-    assert_eq!(
-        peer.decrypt(ALICE, MediaType::AUDIO, &session.encrypt_opus(OPUS).unwrap()).unwrap(),
-        OPUS
-    );
+    prepare_v(&mut session, 0, 4).unwrap();
+    send_and_verify(&mut session, &mut peer);
     execute(&mut session, 4);
     assert_eq!(session.encrypt_opus(OPUS).unwrap(), OPUS);
-    session.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap();
+    announce_epoch(&mut session, 1, 1).unwrap();
     assert_eq!(session.active_version(), Some(0));
-    session.handle_json(21, &json!({"protocol_version":1,"transition_id":0})).unwrap();
+    prepare_v(&mut session, 1, 0).unwrap();
     assert_eq!(session.active_version(), Some(1));
     let first = session.encrypt_opus(OPUS).unwrap();
-    assert!(session.handle_json(21, &json!({"protocol_version":1,"transition_id":0})).is_err());
-    session.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap();
-    session.handle_json(21, &json!({"protocol_version":1,"transition_id":0})).unwrap();
+    assert!(prepare_v(&mut session, 1, 0).is_err());
+    announce_epoch(&mut session, 1, 1).unwrap();
+    prepare_v(&mut session, 1, 0).unwrap();
     assert_ne!(first, session.encrypt_opus(OPUS).unwrap());
-    // External sender may arrive before or after Session Description.
+
     let mut late = Session::new(ALICE, CHANNEL).unwrap();
     late.negotiate(1).unwrap();
     assert!(!late.ready());
     late.handle_binary(25, &host.external).unwrap();
     assert!(late.group.is_some());
-    assert!(late.handle_json(22, &json!({"transition_id":99})).is_err());
+    assert!(execute_res(&mut late, 99).is_err());
 }
 
 #[test]
 fn foreign_initial_commits_and_unknown_versions_are_not_accepted() {
     let (host, session, _) = established();
     let (mut fresh, _) = host.session(ALICE);
-    // Any foreign public message is invalid before joining an established group.
     let bytes =
         session.group.as_ref().unwrap().export_ratchet_tree().tls_serialize_detached().unwrap();
     assert!(fresh.commit(&bytes).is_err());
@@ -345,96 +360,79 @@ fn transitions_before_session_description_cannot_enable_audio() {
         (24, json!({"protocol_version":1,"epoch":1})),
     ] {
         let mut session = Session::new(ALICE, CHANNEL).unwrap();
-        assert!(
-            session.handle_json(opcode, &data).is_err(),
-            "opcode {opcode} was accepted before the selected DAVE version"
-        );
+        assert!(session.handle_json(opcode, &data).is_err(), "opcode {opcode} accepted early");
         assert!(!session.ready());
         assert!(session.encrypt_opus(OPUS).is_err());
         session.negotiate(1).unwrap();
-        assert!(!session.ready(), "DAVE v1 must await its own valid transition");
+        assert!(!session.ready());
     }
 }
 
 #[test]
 fn a_lone_member_sends_with_its_local_group_until_someone_joins() {
     let host = Host::new();
-    // Someone else in the roster: wait for their welcome instead.
     let (mut crowded, _) = host.session(ALICE);
     assert!(!crowded.start_alone().unwrap());
     assert!(!crowded.ready());
 
     let mut session = Session::new(ALICE, CHANNEL).unwrap();
-    assert!(!session.start_alone().unwrap(), "nothing negotiated yet");
+    assert!(!session.start_alone().unwrap());
     session.negotiate(1).unwrap();
     take_binary(session.handle_binary(25, &host.external).unwrap(), 26);
     assert!(session.start_alone().unwrap());
     assert!(session.ready());
     let alone = session.encrypt_opus(OPUS).unwrap();
-    assert_ne!(alone, OPUS, "media stays encrypted while alone");
-    assert!(!session.start_alone().unwrap(), "only once");
+    assert_ne!(alone, OPUS);
+    assert!(!session.start_alone().unwrap());
 
-    // A member joins: the usual commit moves both to a key they share.
     session.handle_json(11, &json!({"user_ids":[BOB.to_string()]})).unwrap();
     let mut peer = host.peer(BOB);
-    let payload = append(&mut session, &host.add(0, &peer.create_key_package().unwrap()));
-    let (commit, welcome) = split_commit_welcome(&payload);
-    transition(&mut session, 29, 3, commit);
-    peer.process_welcome(welcome).unwrap();
+    let proposal = host.add_peer(0, &mut peer);
+    welcome_peer(&mut session, &proposal, 3, &mut peer);
     execute(&mut session, 3);
-    let shared = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &shared).unwrap(), OPUS);
-    assert!(peer.decrypt(ALICE, MediaType::AUDIO, &alone).is_err(), "the lone key is not shared");
+    send_and_verify(&mut session, &mut peer);
+    assert!(peer.decrypt(ALICE, MediaType::AUDIO, &alone).is_err());
 }
 
 #[test]
 fn the_key_package_waits_for_the_external_sender() {
-    // Discord sends Session Description (op 4) before the external sender (op 25) and
-    // ignores a key package that arrives ahead of it.
     let host = Host::new();
     let mut session = Session::new(ALICE, CHANNEL).unwrap();
     assert!(session.negotiate(1).unwrap().is_empty());
     let key_package = take_binary(session.handle_binary(25, &host.external).unwrap(), 26);
     assert!(KeyPackageIn::tls_deserialize_exact_bytes(&key_package).is_ok());
-    // A repeated external sender does not send a second key package.
     assert!(session.handle_binary(25, &host.external).unwrap().is_empty());
 }
 
 #[test]
 fn downgrade_and_reupgrade_on_unchanged_group_preserves_monotonic_nonces() {
     let (_, mut session, mut peer) = established();
-    let first = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &first).unwrap(), OPUS);
+    let first = send_and_verify(&mut session, &mut peer);
 
-    // Non-DAVE member joins: downgrade to transport-only.
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":10})).unwrap();
+    prepare_v(&mut session, 0, 10).unwrap();
     execute(&mut session, 10);
     assert_eq!(session.active_version(), Some(0));
     assert_eq!(session.encrypt_opus(OPUS).unwrap(), OPUS);
 
-    // Non-DAVE member leaves without changing MLS group: upgrade back on the same epoch.
-    session.handle_json(21, &json!({"protocol_version":1,"transition_id":11})).unwrap();
-    // Duplicate prepare while parked sender is already in flight must still fail closed.
-    assert!(session.handle_json(21, &json!({"protocol_version":1,"transition_id":12})).is_err());
+    prepare_v(&mut session, 1, 11).unwrap();
+    assert!(prepare_v(&mut session, 1, 12).is_err());
     execute(&mut session, 11);
     assert_eq!(session.active_version(), Some(1));
 
-    let resumed = session.encrypt_opus(OPUS).unwrap();
-    assert_ne!(first, resumed, "resumed sender must continue advancing its frame counter");
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &resumed).unwrap(), OPUS);
+    let resumed = send_and_verify(&mut session, &mut peer);
+    assert_ne!(first, resumed);
 }
 
 #[test]
 fn more_than_32_abandoned_transitions_evict_fifo_instead_of_failing_session() {
     let (_, mut session, _) = established();
     for round in 1u16..=40 {
-        session.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap();
-        session.handle_json(21, &json!({"protocol_version":1,"transition_id":round})).unwrap();
+        announce_epoch(&mut session, 1, 1).unwrap();
+        prepare_v(&mut session, 1, round).unwrap();
     }
-    session.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap();
+    announce_epoch(&mut session, 1, 1).unwrap();
     assert_eq!(session.cancelled.len(), 32);
-    // Recent cancelled IDs are still ignored on late execute.
-    assert!(session.handle_json(22, &json!({"transition_id":40})).unwrap().is_empty());
+    assert!(execute_res(&mut session, 40).unwrap().is_empty());
 }
 
 #[test]
@@ -472,35 +470,24 @@ fn session_offset_encryption_handles_v0_v1_and_bounds() {
 #[test]
 fn rapid_downgrade_upgrade_churn_and_superseded_sender_salvage() {
     let (host, mut session, mut peer) = established();
-    let first = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &first).unwrap(), OPUS);
+    send_and_verify(&mut session, &mut peer);
 
-    // Rapid v0 -> v1 -> v0 -> v1 churn before any op 22 executes.
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":10})).unwrap();
-    session.handle_json(21, &json!({"protocol_version":1,"transition_id":11})).unwrap();
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":12})).unwrap();
-    session.handle_json(21, &json!({"protocol_version":1,"transition_id":13})).unwrap();
-    // Duplicate v1 -> v1 without intervening downgrade still fails closed.
-    assert!(session.handle_json(21, &json!({"protocol_version":1,"transition_id":14})).is_err());
+    for (ver, id) in [(0, 10), (1, 11), (0, 12), (1, 13)] {
+        prepare_v(&mut session, ver, id).unwrap();
+    }
+    assert!(prepare_v(&mut session, 1, 14).is_err());
     execute(&mut session, 13);
     assert_eq!(session.active_version(), Some(1));
-    let second = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(peer.decrypt(ALICE, MediaType::AUDIO, &second).unwrap(), OPUS);
+    send_and_verify(&mut session, &mut peer);
 
-    // Now prepare a new MLS commit (Encrypted transition id=20), churn v0 (id=21) -> v1 (id=22),
-    // and execute id=22 directly; execute_transition must salvage id=20 into parked before activate.
     let mut newcomer = host.peer(CAROL);
-    let proposal = host.add(1, &newcomer.create_key_package().unwrap());
-    let ours = append(&mut session, &proposal);
-    let (commit, welcome) = split_commit_welcome(&ours);
-    transition(&mut session, 29, 20, commit);
-    newcomer.process_welcome(welcome).unwrap();
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":21})).unwrap();
-    session.handle_json(21, &json!({"protocol_version":1,"transition_id":22})).unwrap();
+    let proposal = host.add_peer(1, &mut newcomer);
+    welcome_peer(&mut session, &proposal, 20, &mut newcomer);
+    prepare_v(&mut session, 0, 21).unwrap();
+    prepare_v(&mut session, 1, 22).unwrap();
     execute(&mut session, 22);
     assert_eq!(session.active_version(), Some(1));
-    let third = session.encrypt_opus(OPUS).unwrap();
-    assert_eq!(newcomer.decrypt(ALICE, MediaType::AUDIO, &third).unwrap(), OPUS);
+    send_and_verify(&mut session, &mut newcomer);
 }
 
 #[test]
@@ -511,27 +498,21 @@ fn start_alone_from_transport_only_and_late_op21_reconciliation() {
     assert_eq!(session.active_version(), Some(0));
     session.handle_binary(25, &host.external).unwrap();
 
-    // Upgrade solo call from TransportOnly via op 24 (v=1, epoch=1), then start_alone().
-    take_binary(session.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap(), 26);
+    take_binary(announce_epoch(&mut session, 1, 1).unwrap(), 26);
     assert_eq!(session.active_version(), Some(0));
     assert!(session.start_alone().unwrap());
     assert_eq!(session.active_version(), Some(1));
     let first = session.encrypt_opus(OPUS).unwrap();
     assert_ne!(first, OPUS);
 
-    // Late Gateway op 21 (v=1) for the same solo (revision, epoch) reconciles via RetainEncrypted.
-    let outbound =
-        session.handle_json(21, &json!({"protocol_version":1,"transition_id":5})).unwrap();
+    let outbound = prepare_v(&mut session, 1, 5).unwrap();
     assert!(
         matches!(&outbound[0], Outbound::Json(v) if v["op"] == 23 && v["d"]["transition_id"] == 5)
     );
     execute(&mut session, 5);
     assert_eq!(session.active_version(), Some(1));
-    let second = session.encrypt_opus(OPUS).unwrap();
-    assert_ne!(first, second);
-
-    // A subsequent duplicate op 21 (v=1) on the same epoch still fails closed.
-    assert!(session.handle_json(21, &json!({"protocol_version":1,"transition_id":6})).is_err());
+    assert_ne!(first, session.encrypt_opus(OPUS).unwrap());
+    assert!(prepare_v(&mut session, 1, 6).is_err());
 }
 
 #[test]
@@ -539,17 +520,15 @@ fn transport_only_transitions_survive_op24_downgrade_and_group_reset() {
     let (_, mut session, _) = established();
     assert_eq!(session.active_version(), Some(1));
 
-    // Pending TransportOnly transition survives op 24 (v=0) and executes on op 22.
-    session.handle_json(21, &json!({"protocol_version":0,"transition_id":30})).unwrap();
-    session.handle_json(24, &json!({"protocol_version":0,"epoch":0})).unwrap();
+    prepare_v(&mut session, 0, 30).unwrap();
+    announce_epoch(&mut session, 0, 0).unwrap();
     execute(&mut session, 30);
     assert_eq!(session.active_version(), Some(0));
     assert_eq!(session.encrypt_opus(OPUS).unwrap(), OPUS);
 
-    // Re-enable DAVE v1, then verify TransportOnly transition also survives reset_group() (op 24 v=1).
     let (_, mut session2, _) = established();
-    session2.handle_json(21, &json!({"protocol_version":0,"transition_id":31})).unwrap();
-    session2.handle_json(24, &json!({"protocol_version":1,"epoch":1})).unwrap();
+    prepare_v(&mut session2, 0, 31).unwrap();
+    announce_epoch(&mut session2, 1, 1).unwrap();
     execute(&mut session2, 31);
     assert_eq!(session2.active_version(), Some(0));
 }
@@ -562,28 +541,16 @@ fn proposals_reject_pre_negotiation_and_validate_batches_atomically() {
     assert!(unnegotiated.handle_binary(27, &[0, 0]).is_err());
 
     let (mut session, _) = host.session(ALICE);
-    // Remove CAROL from expected so adding CAROL is invalid while BOB is valid.
     session.handle_json(13, &json!({"user_id":CAROL.to_string()})).unwrap();
     let mut bob = host.peer(BOB);
     let mut carol = host.peer(CAROL);
-    let bob_add =
-        read_vlbytes_exact(&host.add(0, &bob.create_key_package().unwrap())).unwrap().to_vec();
-    let carol_add =
-        read_vlbytes_exact(&host.add(0, &carol.create_key_package().unwrap())).unwrap().to_vec();
-    let mut combined = bob_add;
-    combined.extend_from_slice(&carol_add);
-    let mut payload = vec![0];
-    payload.extend(VLBytes::new(combined).tls_serialize_detached().unwrap());
-    assert!(session.handle_binary(27, &payload).is_err());
-    assert_eq!(
-        session.group.as_ref().unwrap().pending_proposals().count(),
-        0,
-        "failed batch must not leave earlier proposals stored"
-    );
+    let mut combined = read_vlbytes_exact(&host.add_peer(0, &mut bob)).unwrap().to_vec();
+    combined.extend_from_slice(read_vlbytes_exact(&host.add_peer(0, &mut carol)).unwrap());
+    assert!(session.handle_binary(27, &op27_vl(0, combined)).is_err());
+    assert_eq!(session.group.as_ref().unwrap().pending_proposals().count(), 0);
 
-    // Valid append of BOB, followed by atomic revoke batch with [valid_ref, unknown_ref].
     let mut bob2 = host.peer(BOB);
-    append(&mut session, &host.add(0, &bob2.create_key_package().unwrap()));
+    append(&mut session, &host.add_peer(0, &mut bob2));
     assert_eq!(session.group.as_ref().unwrap().pending_proposals().count(), 1);
     let valid_ref = session
         .group
@@ -596,44 +563,30 @@ fn proposals_reject_pre_negotiation_and_validate_batches_atomically() {
         .tls_serialize_detached()
         .unwrap();
     let mut bad_refs = valid_ref.clone();
-    // Duplicate/unknown second ref in the same revoke batch must fail without revoking valid_ref.
     bad_refs.extend_from_slice(&valid_ref);
-    let mut revoke = vec![1];
-    revoke.extend(VLBytes::new(bad_refs).tls_serialize_detached().unwrap());
-    assert!(session.handle_binary(27, &revoke).is_err());
+    assert!(session.handle_binary(27, &op27_vl(1, bad_refs)).is_err());
     assert_eq!(session.group.as_ref().unwrap().pending_proposals().count(), 1);
 }
 
 #[test]
 fn external_sender_rotation_and_storage_zeroization() {
-    let host1 = Host::new();
-    let host2 = Host::new();
+    let (host1, host2, host3) = (Host::new(), Host::new(), Host::new());
     let (mut session, _) = host1.session(ALICE);
     assert!(!session.provider.storage().values.read().unwrap().is_empty());
 
-    // Rotating external sender at epoch 0 is allowed and emits a fresh key package.
     let new_kp = take_binary(session.handle_binary(25, &host2.external).unwrap(), 26);
     assert!(KeyPackageIn::tls_deserialize_exact_bytes(&new_kp).is_ok());
 
-    // Proposals signed by the rotated host2 external sender now succeed!
     let mut bob = host2.peer(BOB);
-    let proposal = host2.add(0, &bob.create_key_package().unwrap());
-    let payload = append(&mut session, &proposal);
-    let (commit, welcome) = split_commit_welcome(&payload);
-    transition(&mut session, 29, 1, commit);
-    bob.process_welcome(welcome).unwrap();
+    let proposal = host2.add_peer(0, &mut bob);
+    welcome_peer(&mut session, &proposal, 1, &mut bob);
     execute(&mut session, 1);
 
-    // Rotating external sender during an established group (epoch >= 1) is rejected!
-    let host3 = Host::new();
     assert!(session.handle_binary(25, &host3.external).is_err());
-
-    // Downgrade via op 24 (v=0) clears group and wipes provider storage, allowing op 25 rotation.
-    let old_provider_len = session.provider.storage().values.read().unwrap().len();
-    assert!(old_provider_len > 0);
+    assert!(!session.provider.storage().values.read().unwrap().is_empty());
     zeroize_provider(&session.provider);
     assert!(session.provider.storage().values.read().unwrap().is_empty());
-    session.handle_json(24, &json!({"protocol_version":0,"epoch":0})).unwrap();
+    announce_epoch(&mut session, 0, 0).unwrap();
     assert!(session.provider.storage().values.read().unwrap().is_empty());
     assert!(session.handle_binary(25, &host3.external).unwrap().is_empty());
 }

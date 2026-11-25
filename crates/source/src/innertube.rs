@@ -1,28 +1,24 @@
-//! Native YouTube catalogue and media resolution over JSON HTTP endpoints.
-//! Client identities are tried in order when a provider rejects one; failures
-//! report the native API error without launching an external extractor.
+//! Native YouTube catalogue and media resolution over InnerTube JSON HTTP endpoints.
 
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashSet},
-};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
+use std::io::Read as _;
+use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
-use rustlink_protocol::{encode_track_owned, LoadResult, Playlist, Track, TrackInfo};
+use rustlink_protocol::{encode_track_owned, LoadResult, Track, TrackInfo};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::catalog::{
-    youtube_stream_ttl, CachedYoutubeStream, State as CatalogState, YoutubeStreamKey,
+    youtube_stream_ttl, CachedYoutubeStream, CredentialCache, State as CatalogState,
+    YoutubeStreamKey,
 };
-use crate::{deadline, netguard, youtube_id, SourceError};
+use crate::{
+    deadline, finish_playlist, host_matches, http_url, netguard, strip_ascii_prefix, youtube_id,
+    SourceError,
+};
 
-/// One of the client identities YouTube answers.
-///
-/// The order matters: it is the order the clients are tried in, and the first
-/// one that answers without demanding a proof of origin is the one that resolves
-/// a track. It was set against the live API rather than from documentation,
-/// because which clients are accepted changes often.
 #[derive(Debug, Clone)]
 pub struct Client {
     pub name: &'static str,
@@ -38,9 +34,6 @@ pub struct Client {
 }
 
 fn android_client(config: &Config) -> Client {
-    // This version still returns directly usable audio for videos newer Android
-    // identities expose only through SABR. Keep the HTTP identity consistent
-    // with a configured version override.
     let custom = config.youtube_client_version.trim();
     let (version, user_agent) = if custom.is_empty() {
         (
@@ -67,9 +60,7 @@ fn android_client(config: &Config) -> Client {
     }
 }
 
-/// Apple visionOS Safari client: with a valid `visitorData` session token,
-/// serves full-length WebM Opus (`itag 251`) and AAC-LC (`itag 140`) without
-/// a proof-of-origin token even on addresses where `ANDROID_VR` is bot-blocked.
+/// Apple visionOS Safari client serving native 48 kHz WebM Opus (`itag 251`) and AAC-LC (`itag 140`).
 pub fn visionos_client() -> Client {
     Client {
         name: "VISIONOS",
@@ -85,19 +76,12 @@ pub fn visionos_client() -> Client {
     }
 }
 
-/// The clients tried in order.
-///
-/// `VISIONOS` leads because it serves native 48 kHz WebM Opus (`itag 251`,
-/// ~160 kbps VBR) for bit-exact zero-transcode passthrough to Discord, while
-/// `IOS_PRODUCER` stands right behind as an instant sessionless AAC-LC fallback.
+/// Client identities tried in priority order (`VISIONOS` first, `IOS_PRODUCER` second).
 pub fn clients(config: &Config) -> [Client; 4] {
     [
         visionos_client(),
         Client {
             name: "IOS_PRODUCER",
-            // Serves whole files with no proof of origin and no visitor session,
-            // even to an address the other identities answer with a bot check.
-            // It offers AAC-LC (itag 140).
             version: Cow::Borrowed("0.147.945"),
             user_agent: Cow::Borrowed("com.google.ios.youtubeproducer/0.147.945 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"),
             sdk: None,
@@ -110,8 +94,6 @@ pub fn clients(config: &Config) -> [Client; 4] {
         },
         Client {
             name: "ANDROID_VR",
-            // Serves whole files with no proof of origin to an address YouTube
-            // trusts; newer VR versions stop after ~900 KiB like the others.
             version: Cow::Borrowed("1.60.19"),
             user_agent: Cow::Borrowed("com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
             sdk: Some(32),
@@ -126,14 +108,10 @@ pub fn clients(config: &Config) -> [Client; 4] {
     ]
 }
 
-/// The client searches and playlists are read with: Android answers them in
-/// the shape the parsers expect, whichever client plays best right now.
 fn catalogue_client(config: &Config) -> Client {
     android_client(config)
 }
 
-/// The client the catalogue is searched with. It needs no player script because
-/// a search result carries a plain video id.
 const MUSIC_CLIENT: Client = Client {
     name: "WEB_REMIX",
     version: Cow::Borrowed("1.20250101.01.00"),
@@ -147,20 +125,13 @@ const MUSIC_CLIENT: Client = Client {
     throttled_without_pot: false,
 };
 
-/// Restricts a search to videos. Without it YouTube mixes in channels,
-/// playlists and shorts, which have no length and are dropped anyway.
 const SEARCH_PARAMS: &str = "EgIQAfABAQ==";
-
-/// Restricts a YouTube Music search to songs.
 const MUSIC_SONGS_PARAMS: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA==";
-
-/// Bounds an API response; playlist and search payloads are large.
 const MAX_BODY: u64 = 8 << 20;
-
-/// How many pages of a playlist are read before stopping.
 const MAX_PLAYLIST_PAGES: usize = 6;
+const VISITOR_TTL: Duration = Duration::from_secs(3600);
+const RECENTLY_RESOLVED_WINDOW: Duration = Duration::from_secs(5);
 
-/// One audio stream the player offers.
 #[derive(Debug, Clone, Default)]
 pub struct Format {
     pub url: String,
@@ -242,7 +213,6 @@ struct NextRequest<'a> {
     playlist_id: &'a str,
 }
 
-/// Posts one InnerTube request without cloning or mutating a `serde_json::Value` tree.
 fn call<B: Serialize + ?Sized>(
     agent: &ureq::Agent,
     base: &str,
@@ -271,59 +241,65 @@ fn call<B: Serialize + ?Sized>(
     };
     let url = format!("{}/youtubei/v1/{endpoint}?prettyPrint=false", base.trim_end_matches('/'));
     netguard::validate_url(&url)?;
-    let mut request = agent
+    let mut req = agent
         .post(url)
         .header("Content-Type", "application/json")
         .header("User-Agent", client.user_agent.as_ref())
         .header("Accept-Language", "en-US,en;q=0.9");
     if !visitor.is_empty() {
-        request = request.header("X-Goog-Visitor-Id", visitor);
+        req = req.header("X-Goog-Visitor-Id", visitor);
     }
-    let response = request
+    let resp = req
         .config()
-        .timeout_global(Some(deadline::timeout(std::time::Duration::from_secs(20))?))
+        .timeout_global(Some(deadline::timeout(Duration::from_secs(20))?))
         .http_status_as_error(false)
         .build()
         .send_json(&payload)
-        .map_err(|error| SourceError::Http(format!("youtube could not be reached: {error}")))?;
-    let status = response.status().as_u16();
+        .map_err(|e| SourceError::Http(format!("youtube could not be reached: {e}")))?;
+    let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(SourceError::Media { status });
     }
-    let raw = response
+    let raw = resp
         .into_body()
         .with_config()
         .limit(MAX_BODY)
         .read_to_vec()
-        .map_err(|error| SourceError::Http(error.to_string()))?;
+        .map_err(|e| SourceError::Http(e.to_string()))?;
     serde_json::from_slice(&raw)
-        .map_err(|error| SourceError::Http(format!("youtube sent an unreadable answer: {error}")))
+        .map_err(|e| SourceError::Http(format!("youtube sent an unreadable answer: {e}")))
 }
 
-const VISITOR_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-
 fn is_https(url: &str) -> bool {
-    url.trim().get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    strip_ascii_prefix(url.trim(), "https://").is_some()
+}
+
+fn extract_visitor_str(val: &Value, pointer: &str) -> Option<String> {
+    val.pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 fn fetch_sw_visitor_data(
     agent: &ureq::Agent,
     host_base: &str,
-) -> Result<(String, std::time::Duration), SourceError> {
+) -> Result<(String, Duration), SourceError> {
     let sw_url = format!("{}/sw.js_data", host_base.trim().trim_end_matches('/'));
     netguard::validate_url(&sw_url)?;
-    let timeout = deadline::timeout(std::time::Duration::from_secs(10))?;
     let resp = agent
         .get(&sw_url)
         .header("User-Agent", MUSIC_CLIENT.user_agent.as_ref())
         .config()
-        .timeout_global(Some(timeout))
+        .timeout_global(Some(deadline::timeout(Duration::from_secs(10))?))
         .http_status_as_error(false)
         .build()
         .call()
         .map_err(|e| SourceError::Http(format!("youtube visitor bootstrap failed: {e}")))?;
-    if !(200..300).contains(&resp.status().as_u16()) {
-        return Err(SourceError::Media { status: resp.status().as_u16() });
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(SourceError::Media { status });
     }
     let text = resp
         .into_body()
@@ -331,38 +307,24 @@ fn fetch_sw_visitor_data(
         .limit(512 << 10)
         .read_to_string()
         .map_err(|e| SourceError::Http(e.to_string()))?;
-    let trimmed = text.strip_prefix(")]}'\n").unwrap_or(&text);
-    let val: Value = serde_json::from_str(trimmed)
+    let val: Value = serde_json::from_str(text.strip_prefix(")]}'\n").unwrap_or(&text))
         .map_err(|e| SourceError::Http(format!("unreadable sw.js_data: {e}")))?;
-    let vd = val
-        .pointer("/0/2/0/0/13")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|vd| !vd.is_empty())
-        .ok_or_else(|| SourceError::Http("youtube visitorData missing".into()))?;
-    Ok((vd.to_owned(), VISITOR_TTL))
+    extract_visitor_str(&val, "/0/2/0/0/13")
+        .map(|vd| (vd, VISITOR_TTL))
+        .ok_or_else(|| SourceError::Http("youtube visitorData missing".into()))
 }
 
 fn fetch_visitor_data(
     agent: &ureq::Agent,
     base: &str,
     music_base: &str,
-) -> Result<(String, std::time::Duration), SourceError> {
+) -> Result<(String, Duration), SourceError> {
     let base = base.trim().trim_end_matches('/');
     let visitor_url = format!("{base}/youtubei/v1/visitor_id?prettyPrint=false");
     netguard::validate_url(&visitor_url)?;
-    let timeout = deadline::timeout(std::time::Duration::from_secs(10))?;
-    let body = json!({
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20250101.00.00",
-                "hl": "en",
-                "gl": "US",
-            }
-        }
-    });
-    if let Ok(resp) = agent
+    let timeout = deadline::timeout(Duration::from_secs(10))?;
+    let body = json!({"context": {"client": {"clientName": "WEB", "clientVersion": "2.20250101.00.00", "hl": "en", "gl": "US"}}});
+    if let Some(vd) = agent
         .post(&visitor_url)
         .header("Content-Type", "application/json")
         .header("User-Agent", MUSIC_CLIENT.user_agent.as_ref())
@@ -371,36 +333,25 @@ fn fetch_visitor_data(
         .http_status_as_error(false)
         .build()
         .send_json(&body)
+        .ok()
+        .filter(|resp| (200..300).contains(&resp.status().as_u16()))
+        .and_then(|resp| resp.into_body().with_config().limit(256 << 10).read_to_vec().ok())
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|val| extract_visitor_str(&val, "/responseContext/visitorData"))
     {
-        if (200..300).contains(&resp.status().as_u16()) {
-            if let Ok(raw) = resp.into_body().with_config().limit(256 << 10).read_to_vec() {
-                if let Ok(val) = serde_json::from_slice::<Value>(&raw) {
-                    if let Some(vd) = val
-                        .pointer("/responseContext/visitorData")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|vd| !vd.is_empty())
-                    {
-                        return Ok((vd.to_owned(), VISITOR_TTL));
-                    }
-                }
-            }
-        }
+        return Ok((vd, VISITOR_TTL));
     }
-    match fetch_sw_visitor_data(agent, base) {
-        Ok(found) => Ok(found),
-        Err(err) => {
-            let music_base = music_base.trim().trim_end_matches('/');
-            if !music_base.is_empty()
-                && !music_base.eq_ignore_ascii_case(base)
-                && (!is_https(base) || is_https(music_base))
-            {
-                fetch_sw_visitor_data(agent, music_base)
-            } else {
-                Err(err)
-            }
+    fetch_sw_visitor_data(agent, base).or_else(|err| {
+        let music = music_base.trim().trim_end_matches('/');
+        if !music.is_empty()
+            && !music.eq_ignore_ascii_case(base)
+            && (!is_https(base) || is_https(music))
+        {
+            fetch_sw_visitor_data(agent, music)
+        } else {
+            Err(err)
         }
-    }
+    })
 }
 
 fn probe_tail_byte(
@@ -409,29 +360,22 @@ fn probe_tail_byte(
     headers: &BTreeMap<String, String>,
     content_length: i64,
 ) -> Result<(), SourceError> {
-    use std::io::Read as _;
     let last = content_length.saturating_sub(1).max(0);
-    let _scope = deadline::enter(
-        std::time::Instant::now() + deadline::timeout(std::time::Duration::from_secs(10))?,
-    );
+    let _scope = deadline::enter(Instant::now() + deadline::timeout(Duration::from_secs(10))?);
     let (mut body, _, partial) = crate::media::request(agent, url, headers, Some(last))?;
     if !partial {
         return Err(SourceError::Http("youtube tail probe did not return partial content".into()));
     }
-    let mut byte = [0u8; 1];
-    body.read(&mut byte)
-        .map_err(|e| SourceError::Http(format!("youtube tail probe read failed: {e}")))?;
-    Ok(())
+    body.read(&mut [0u8; 1])
+        .map(|_| ())
+        .map_err(|e| SourceError::Http(format!("youtube tail probe read failed: {e}")))
 }
 
-/// A catalogue request, which carries the configuration a call needs.
 pub struct Catalog<'a> {
     pub agent: &'a ureq::Agent,
     pub config: &'a Config,
     state: Option<&'a CatalogState>,
 }
-
-const RECENTLY_RESOLVED_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl<'a> Catalog<'a> {
     pub fn new(agent: &'a ureq::Agent, config: &'a Config) -> Self {
@@ -442,39 +386,40 @@ impl<'a> Catalog<'a> {
         Self { agent, config, state: Some(state) }
     }
 
-    fn visitor_cache(&self) -> Option<&'a crate::catalog::CredentialCache> {
+    fn visitor_cache(&self) -> Option<&'a CredentialCache> {
         self.state.map(|s| s.youtube_visitor.as_ref())
+    }
+
+    fn https_state(&self) -> Option<&'a CatalogState> {
+        self.state.filter(|_| is_https(&self.config.youtube_endpoint))
     }
 
     fn ordered_clients(&self) -> [Client; 4] {
         let base = clients(self.config);
-        match self.state.filter(|_| is_https(&self.config.youtube_endpoint)) {
-            Some(state) => state.youtube_health.partition_clients(base, |client| client.name),
+        match self.https_state() {
+            Some(s) => s.youtube_health.partition_clients(base, |c| c.name),
             None => base,
         }
     }
 
     fn ordered_catalogue_clients(&self) -> [Client; 2] {
-        let android = catalogue_client(self.config);
-        let visionos = visionos_client();
-        if let Some(state) = self.state.filter(|_| is_https(&self.config.youtube_endpoint)) {
-            if !state.youtube_health.is_healthy(android.name)
-                && state.youtube_health.is_healthy(visionos.name)
-            {
-                return [visionos, android];
-            }
+        let (android, visionos) = (catalogue_client(self.config), visionos_client());
+        if self.https_state().is_some_and(|s| {
+            !s.youtube_health.is_healthy(android.name) && s.youtube_health.is_healthy(visionos.name)
+        }) {
+            [visionos, android]
+        } else {
+            [android, visionos]
         }
-        [android, visionos]
     }
 
     fn record_client_outcome(&self, name: &'static str, ok: bool) {
-        let Some(state) = self.state.filter(|_| is_https(&self.config.youtube_endpoint)) else {
-            return;
-        };
-        if ok {
-            state.youtube_health.record_success(name);
-        } else {
-            state.youtube_health.record_failure(name);
+        if let Some(state) = self.https_state() {
+            if ok {
+                state.youtube_health.record_success(name);
+            } else {
+                state.youtube_health.record_failure(name);
+            }
         }
     }
 
@@ -494,10 +439,7 @@ impl<'a> Catalog<'a> {
         format: Format,
         tail_probed: bool,
     ) {
-        let Some(state) = self.state else {
-            return;
-        };
-        let Some(ttl) = youtube_stream_ttl(&format.url) else {
+        let (Some(state), Some(ttl)) = (self.state, youtube_stream_ttl(&format.url)) else {
             return;
         };
         state.youtube_streams.put(
@@ -520,29 +462,22 @@ impl<'a> Catalog<'a> {
         if !configured.is_empty() {
             return configured.to_owned();
         }
-        if let Some(cached) = self.visitor_cache().and_then(|c| c.peek()) {
+        if let Some(cached) = self.visitor_cache().and_then(CredentialCache::peek) {
             return cached;
         }
         if !bootstrap || !is_https(&self.config.youtube_endpoint) {
             return String::new();
         }
-        match self.visitor_cache() {
-            Some(cache) => cache
-                .get_or_refresh(|| {
-                    fetch_visitor_data(
-                        self.agent,
-                        &self.config.youtube_endpoint,
-                        &self.config.youtube_music_endpoint,
-                    )
-                })
-                .unwrap_or_default(),
-            None => fetch_visitor_data(
+        let fetch = || {
+            fetch_visitor_data(
                 self.agent,
                 &self.config.youtube_endpoint,
                 &self.config.youtube_music_endpoint,
             )
-            .map(|(vd, _)| vd)
-            .unwrap_or_default(),
+        };
+        match self.visitor_cache() {
+            Some(cache) => cache.get_or_refresh(fetch).unwrap_or_default(),
+            None => fetch().map(|(vd, _)| vd).unwrap_or_default(),
         }
     }
 
@@ -550,15 +485,10 @@ impl<'a> Catalog<'a> {
         if !self.config.youtube_visitor_data.trim().is_empty() {
             return;
         }
-        if let Some(cache) = self.visitor_cache() {
-            if let Some(vd) = answer
-                .pointer("/responseContext/visitorData")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|vd| !vd.is_empty())
-            {
-                cache.store_if_empty(vd, VISITOR_TTL);
-            }
+        if let (Some(cache), Some(vd)) =
+            (self.visitor_cache(), extract_visitor_str(answer, "/responseContext/visitorData"))
+        {
+            cache.store_if_empty(&vd, VISITOR_TTL);
         }
     }
 
@@ -572,10 +502,9 @@ impl<'a> Catalog<'a> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            if reason.contains("not a bot")
-                || reason.contains("reloaded")
-                || reason.contains("sign in")
-                || reason.contains("try again later")
+            if ["not a bot", "reloaded", "sign in", "try again later"]
+                .iter()
+                .any(|pat| reason.contains(pat))
             {
                 cache.invalidate_if(used_vd);
             }
@@ -614,8 +543,7 @@ impl<'a> Catalog<'a> {
             if client.needs_visitor_data
                 && !vd.is_empty()
                 && self.config.youtube_visitor_data.trim().is_empty()
-                && self.visitor_cache().is_some()
-                && is_https(&self.config.youtube_endpoint)
+                && self.https_state().is_some()
             {
                 let fresh = self.effective_visitor_data(true);
                 if !fresh.is_empty() && fresh != vd {
@@ -659,7 +587,6 @@ impl<'a> Catalog<'a> {
         Ok(answer)
     }
 
-    /// Searches the catalogue for videos.
     pub fn search(&self, query: &str, want: usize) -> Result<Vec<Track>, SourceError> {
         if query.trim().is_empty() || want == 0 {
             return Ok(Vec::new());
@@ -667,42 +594,30 @@ impl<'a> Catalog<'a> {
         let [primary, fallback] = self.ordered_catalogue_clients();
         let req = SearchRequest { query, params: SEARCH_PARAMS };
         let answer = match self.web_call(&primary, "search", &req) {
-            Ok(answer) => {
+            Ok(ans) => {
                 self.record_client_outcome(primary.name, true);
-                answer
+                ans
             }
             Err(_) if is_https(&self.config.youtube_endpoint) => {
                 self.record_client_outcome(primary.name, false);
-                let answer = self.web_call(&fallback, "search", &req)?;
+                let ans = self.web_call(&fallback, "search", &req)?;
                 self.record_client_outcome(fallback.name, true);
-                answer
+                ans
             }
-            Err(error) => return Err(error),
+            Err(e) => return Err(e),
         };
-        let mut found = Vec::with_capacity(want.min(64));
-        collect_videos_up_to(&answer, &mut found, want);
-        Ok(found.into_iter().filter_map(|media| media.into_track("youtube")).take(want).collect())
+        Ok(tracks_from_answer(&answer, want))
     }
 
-    /// Searches YouTube Music, which finds the official recording where the
-    /// ordinary catalogue finds a reupload.
     pub fn music_search(&self, query: &str, want: usize) -> Result<Vec<Track>, SourceError> {
         if query.trim().is_empty() || want == 0 {
             return Ok(Vec::new());
         }
-        let req = SearchRequest { query, params: MUSIC_SONGS_PARAMS };
-        let answer = self.music_call("search", &req)?;
-        let mut found = Vec::with_capacity(want.min(64));
-        collect_videos_up_to(&answer, &mut found, want);
-        Ok(found.into_iter().filter_map(|media| media.into_track("youtube")).take(want).collect())
+        let answer =
+            self.music_call("search", &SearchRequest { query, params: MUSIC_SONGS_PARAMS })?;
+        Ok(tracks_from_answer(&answer, want))
     }
 
-    /// Reads a playlist, up to the configured number of tracks.
-    ///
-    /// A playlist is paged, and each page names the next one, so the walk stops
-    /// on a page count rather than on the playlist ending: a client asking for a
-    /// thousand track playlist should not hold the load open while the node
-    /// reads all of it.
     pub fn playlist(&self, playlist_id: &str) -> Result<LoadResult, SourceError> {
         let limit = self.config.max_playlist_tracks as usize;
         if limit == 0 {
@@ -710,55 +625,17 @@ impl<'a> Catalog<'a> {
         }
         let [mut client, fallback_client] = self.ordered_catalogue_clients();
         let browse_id = format!("VL{playlist_id}");
-        let mut videos = Vec::new();
-        let mut page_videos = Vec::new();
-        let mut seen_ids = HashSet::new();
-        let mut seen_continuations = HashSet::new();
-        let mut title = String::new();
-        let mut continuation = String::new();
-        let mut pages = 0;
-        let mut last_error: Option<SourceError> = None;
-        let mut saw_ok = false;
-        loop {
-            let req = if continuation.is_empty() {
-                BrowseRequest { browse_id: Some(&browse_id), continuation: None }
-            } else {
-                BrowseRequest { browse_id: None, continuation: Some(&continuation) }
-            };
-            let answer = match self.web_call(&client, "browse", &req) {
-                Ok(answer) => {
-                    self.record_client_outcome(client.name, true);
-                    saw_ok = true;
-                    answer
-                }
-                Err(error) if pages == 0 && playlist_id.starts_with("RD") => {
-                    last_error = Some(error);
-                    break;
-                }
-                Err(error) if pages == 0 && is_https(&self.config.youtube_endpoint) => {
-                    self.record_client_outcome(client.name, false);
-                    last_error = Some(error);
-                    client = fallback_client.clone();
-                    match self.web_call(&client, "browse", &req) {
-                        Ok(answer) => {
-                            self.record_client_outcome(client.name, true);
-                            saw_ok = true;
-                            answer
-                        }
-                        Err(error) if playlist_id.starts_with("RD") => {
-                            last_error = Some(error);
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(error) => return Err(error),
-            };
+        let (mut videos, mut page_videos) = (Vec::new(), Vec::new());
+        let (mut seen_ids, mut seen_conts) = (HashSet::new(), HashSet::new());
+        let (mut title, mut cont) = (String::new(), String::new());
+        let (mut pages, mut last_error, mut saw_ok) = (0usize, None, false);
+
+        let mut ingest = |answer: &Value, title: &mut String, videos: &mut Vec<Media>| {
             if title.is_empty() {
-                title = header_title(&answer).unwrap_or_default();
+                *title = header_title(answer).unwrap_or_default();
             }
             page_videos.clear();
-            collect_videos_up_to(&answer, &mut page_videos, limit);
+            collect_videos_up_to(answer, &mut page_videos, limit);
             for media in page_videos.drain(..) {
                 if seen_ids.insert(media.id.clone()) {
                     videos.push(media);
@@ -767,48 +644,75 @@ impl<'a> Catalog<'a> {
                     }
                 }
             }
+        };
+
+        loop {
+            let req = if cont.is_empty() {
+                BrowseRequest { browse_id: Some(&browse_id), continuation: None }
+            } else {
+                BrowseRequest { browse_id: None, continuation: Some(&cont) }
+            };
+            let answer = match self.web_call(&client, "browse", &req) {
+                Ok(ans) => {
+                    self.record_client_outcome(client.name, true);
+                    saw_ok = true;
+                    ans
+                }
+                Err(e) if pages == 0 && playlist_id.starts_with("RD") => {
+                    last_error = Some(e);
+                    break;
+                }
+                Err(e) if pages == 0 && is_https(&self.config.youtube_endpoint) => {
+                    self.record_client_outcome(client.name, false);
+                    last_error = Some(e);
+                    client = fallback_client.clone();
+                    match self.web_call(&client, "browse", &req) {
+                        Ok(ans) => {
+                            self.record_client_outcome(client.name, true);
+                            saw_ok = true;
+                            ans
+                        }
+                        Err(e) if playlist_id.starts_with("RD") => {
+                            last_error = Some(e);
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            ingest(&answer, &mut title, &mut videos);
             pages += 1;
             if videos.len() >= limit || pages >= MAX_PLAYLIST_PAGES {
                 break;
             }
-            match next_continuation(&answer) {
-                Some(token) if !seen_continuations.contains(token) => {
-                    seen_continuations.insert(token.to_owned());
-                    continuation.clear();
-                    continuation.push_str(token);
+            match next_continuation(&answer).filter(|t| !seen_conts.contains(*t)) {
+                Some(token) => {
+                    seen_conts.insert(token.to_owned());
+                    cont.clear();
+                    cont.push_str(token);
                 }
-                _ => break,
+                None => break,
             }
         }
+
         if videos.is_empty() && playlist_id.starts_with("RD") {
             let next_req = NextRequest {
-                video_id: playlist_id.strip_prefix("RD").filter(|seed| youtube_id(seed)),
+                video_id: playlist_id.strip_prefix("RD").filter(|s| youtube_id(s)),
                 playlist_id,
             };
             let https = is_https(&self.config.youtube_endpoint);
             for attempt in 0..3 {
-                let outcome = match attempt {
+                let res = match attempt {
                     0 => self.web_call(&client, "next", &next_req),
                     1 if https => self.web_call(&visionos_client(), "next", &next_req),
                     2 if https => self.music_call("next", &next_req),
                     _ => break,
                 };
-                match outcome {
-                    Ok(answer) => {
+                match res {
+                    Ok(ans) => {
                         saw_ok = true;
-                        if title.is_empty() {
-                            title = header_title(&answer).unwrap_or_default();
-                        }
-                        page_videos.clear();
-                        collect_videos_up_to(&answer, &mut page_videos, limit);
-                        for media in page_videos.drain(..) {
-                            if seen_ids.insert(media.id.clone()) {
-                                videos.push(media);
-                                if videos.len() >= limit {
-                                    break;
-                                }
-                            }
-                        }
+                        ingest(&ans, &mut title, &mut videos);
                         if !videos.is_empty() {
                             if title.is_empty() {
                                 title = "YouTube Mix".into();
@@ -816,34 +720,18 @@ impl<'a> Catalog<'a> {
                             break;
                         }
                     }
-                    Err(error) => {
-                        last_error = Some(error);
-                    }
+                    Err(e) => last_error = Some(e),
                 }
             }
         }
-        if videos.is_empty() && !saw_ok {
-            if let Some(error) = last_error {
-                return Err(error);
-            }
+        if let Some(e) = last_error.filter(|_| videos.is_empty() && !saw_ok) {
+            return Err(e);
         }
-        let tracks: Vec<Track> = videos
-            .into_iter()
-            .filter_map(|media| media.into_track("youtube"))
-            .take(limit)
-            .collect();
-        if tracks.is_empty() {
-            return Ok(LoadResult::Empty);
-        }
-        Ok(LoadResult::Playlist(Box::new(Playlist::new(title, -1, tracks))))
+        let tracks =
+            videos.into_iter().filter_map(|m| m.into_track("youtube")).take(limit).collect();
+        Ok(finish_playlist(title, tracks))
     }
 
-    /// Resolves a direct audio URL for a video.
-    ///
-    /// Every client is tried, because YouTube answers the ones it trusts with a
-    /// plain URL and the ones it does not with a format that carries none. The
-    /// failure that is reported is the first one, which is the one for the
-    /// client that usually works.
     pub fn media_url(
         &self,
         video_id: &str,
@@ -851,122 +739,109 @@ impl<'a> Catalog<'a> {
         self.with_media_url(video_id, |url, headers| Ok((url, headers)))
     }
 
-    /// Tries a pre-resolved stream from `YoutubeStreamCache` first (populated when
-    /// `video()` fetched metadata, or on an earlier playback/seek), falling back
-    /// to live client iteration when the cache is empty or the CDN rejects the URL.
+    fn prepare_stream(
+        &self,
+        raw_url: String,
+        mut headers: BTreeMap<String, String>,
+        user_agent: &str,
+        probe_len: Option<i64>,
+    ) -> Result<(String, BTreeMap<String, String>), SourceError> {
+        netguard::validate_url(&raw_url)?;
+        headers.retain(|k, _| !k.eq_ignore_ascii_case("user-agent"));
+        headers.insert("User-Agent".into(), user_agent.to_owned());
+        let url = with_po_token(raw_url, &self.config.youtube_po_token);
+        if let Some(len) = probe_len {
+            probe_tail_byte(self.agent, &url, &headers, len)?;
+        }
+        Ok((url, headers))
+    }
+
     pub(crate) fn with_media_url<T>(
         &self,
         video_id: &str,
         mut open: impl FnMut(String, BTreeMap<String, String>) -> Result<T, SourceError>,
     ) -> Result<T, SourceError> {
-        let mut first: Option<SourceError> = None;
-        let mut stream_error = None;
-        let mut skip_recent_client: Option<&'static str> = None;
+        let (mut first, mut stream_error, mut skip_recent) = (None, None, None);
+        let no_pot = self.config.youtube_po_token.trim().is_empty();
 
         if let Some(state) = self.state {
             let key = self.stream_key(video_id);
             if let Some((cached, age)) = state.youtube_streams.get(&key) {
-                netguard::validate_url(&cached.url)?;
-                let mut headers = cached.headers.clone();
-                headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
-                headers.insert("User-Agent".into(), cached.user_agent.to_string());
-                let url = with_po_token(cached.url.clone(), &self.config.youtube_po_token);
-                let mut probe_failed = false;
-                if cached.throttled_without_pot
+                let need_probe = cached.throttled_without_pot
                     && !cached.tail_probed
-                    && self.config.youtube_po_token.trim().is_empty()
-                    && cached.content_length > 1_048_576
-                {
-                    match probe_tail_byte(self.agent, &url, &headers, cached.content_length) {
-                        Ok(()) => state.youtube_streams.mark_tail_probed(&key),
-                        Err(error) if error.retryable() => {
-                            state.youtube_streams.invalidate(&key);
-                            self.record_client_outcome(cached.client_name, false);
-                            stream_error = Some(error);
-                            if age < RECENTLY_RESOLVED_WINDOW {
-                                skip_recent_client = Some(cached.client_name);
-                            }
-                            probe_failed = true;
+                    && no_pot
+                    && cached.content_length > 1_048_576;
+                let res = self
+                    .prepare_stream(
+                        cached.url.clone(),
+                        cached.headers.clone(),
+                        &cached.user_agent,
+                        need_probe.then_some(cached.content_length),
+                    )
+                    .and_then(|(url, headers)| {
+                        if need_probe {
+                            state.youtube_streams.mark_tail_probed(&key);
                         }
-                        Err(error) => return Err(error),
+                        open(url, headers)
+                    });
+                match res {
+                    Ok(stream) => {
+                        self.record_client_outcome(cached.client_name, true);
+                        return Ok(stream);
                     }
-                }
-                if !probe_failed {
-                    match open(url, headers) {
-                        Ok(stream) => {
-                            self.record_client_outcome(cached.client_name, true);
-                            return Ok(stream);
+                    Err(e) if e.retryable() => {
+                        state.youtube_streams.invalidate(&key);
+                        self.record_client_outcome(cached.client_name, false);
+                        stream_error = Some(e);
+                        if age < RECENTLY_RESOLVED_WINDOW {
+                            skip_recent = Some(cached.client_name);
                         }
-                        Err(error) if error.retryable() => {
-                            state.youtube_streams.invalidate(&key);
-                            self.record_client_outcome(cached.client_name, false);
-                            stream_error = Some(error);
-                            if age < RECENTLY_RESOLVED_WINDOW {
-                                skip_recent_client = Some(cached.client_name);
-                            }
-                        }
-                        Err(error) => return Err(error),
                     }
+                    Err(e) => return Err(e),
                 }
             }
         }
 
         for client in self.ordered_clients() {
-            if skip_recent_client == Some(client.name) {
+            if skip_recent == Some(client.name) {
                 continue;
             }
             match self.player(&client, video_id) {
                 Ok(Some(format)) => {
-                    netguard::validate_url(&format.url)?;
-                    let cache_candidate = Format {
+                    let candidate = Format {
                         url: format.url.clone(),
                         mime_type: String::new(),
                         bitrate: format.bitrate,
                         content_length: format.content_length,
                         headers: format.headers.clone(),
                     };
-                    let mut headers = format.headers;
-                    headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
-                    headers.insert("User-Agent".into(), client.user_agent.to_string());
-                    let url = with_po_token(format.url, &self.config.youtube_po_token);
-                    if client.throttled_without_pot
-                        && self.config.youtube_po_token.trim().is_empty()
-                        && format.content_length > 1_048_576
-                    {
-                        if let Err(error) =
-                            probe_tail_byte(self.agent, &url, &headers, format.content_length)
-                        {
-                            if error.retryable() {
-                                self.record_client_outcome(client.name, false);
-                                if stream_error.is_none() {
-                                    stream_error = Some(error);
-                                }
-                                continue;
-                            }
-                            return Err(error);
-                        }
-                    }
-                    match open(url, headers) {
+                    let need_probe =
+                        client.throttled_without_pot && no_pot && format.content_length > 1_048_576;
+                    let res = self
+                        .prepare_stream(
+                            format.url,
+                            format.headers,
+                            &client.user_agent,
+                            need_probe.then_some(format.content_length),
+                        )
+                        .and_then(|(url, headers)| open(url, headers));
+                    match res {
                         Ok(stream) => {
-                            self.store_cached_stream(video_id, &client, cache_candidate, true);
+                            self.store_cached_stream(video_id, &client, candidate, true);
                             self.record_client_outcome(client.name, true);
                             return Ok(stream);
                         }
-                        Err(error) if error.retryable() => {
+                        Err(e) if e.retryable() => {
                             self.record_client_outcome(client.name, false);
-                            if stream_error.is_none() {
-                                stream_error = Some(error);
-                            }
+                            stream_error.get_or_insert(e);
                         }
-                        Err(error) => return Err(error),
+                        Err(e) => return Err(e),
                     }
                 }
                 Ok(None) => {}
-                Err(error) => {
+                Err(e) => {
                     self.record_client_outcome(client.name, false);
-                    if first.is_none() {
-                        first = Some(error);
-                    }
+                    first.get_or_insert(e);
                 }
             }
         }
@@ -980,17 +855,12 @@ impl<'a> Catalog<'a> {
         serde_json::to_value(self.player_request(video_id)).expect("valid player request")
     }
 
-    /// Asks one client for a video's streams.
     pub fn player(&self, client: &Client, video_id: &str) -> Result<Option<Format>, SourceError> {
         let answer = self.player_call(client, video_id)?;
         check_video_id(&answer, video_id)?;
         Ok(pick_format(&answer))
     }
 
-    /// Reads a video's own metadata, which is how a bare video id becomes a
-    /// track without a search. When the player response also carries usable
-    /// `streamingData`, caches the picked stream so `open()` starts with zero
-    /// additional InnerTube `/player` round-trips.
     pub fn video(&self, video_id: &str) -> Result<Track, SourceError> {
         let mut first = None;
         for client in self.ordered_clients() {
@@ -999,11 +869,9 @@ impl<'a> Catalog<'a> {
                     self.record_client_outcome(client.name, true);
                     return Ok(track);
                 }
-                Err(error) => {
+                Err(e) => {
                     self.record_client_outcome(client.name, false);
-                    if first.is_none() {
-                        first = Some(error);
-                    }
+                    first.get_or_insert(e);
                 }
             }
         }
@@ -1019,15 +887,15 @@ impl<'a> Catalog<'a> {
         let seconds = details
             .get("lengthSeconds")
             .and_then(Value::as_str)
-            .and_then(|text| text.parse().ok())
+            .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let live = details.get("isLive").and_then(Value::as_bool).unwrap_or_else(|| {
             details.get("isLiveContent").and_then(Value::as_bool).unwrap_or(false) && seconds <= 0.0
         });
         let media = Media {
-            id: details.get("videoId").and_then(Value::as_str).unwrap_or(video_id).to_string(),
-            title: details.get("title").and_then(Value::as_str).unwrap_or_default().to_string(),
-            author: details.get("author").and_then(Value::as_str).unwrap_or_default().to_string(),
+            id: details.get("videoId").and_then(Value::as_str).unwrap_or(video_id).to_owned(),
+            title: details.get("title").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            author: details.get("author").and_then(Value::as_str).unwrap_or_default().to_owned(),
             seconds,
             live,
             artwork: thumbnails(answer.pointer("/videoDetails/thumbnail")),
@@ -1035,13 +903,17 @@ impl<'a> Catalog<'a> {
         let track = media.into_track("youtube").ok_or_else(|| {
             SourceError::Http("youtube described a video that cannot be encoded".into())
         })?;
-        if !live {
-            if let Some(format) = pick_format(&answer) {
-                self.store_cached_stream(video_id, client, format, false);
-            }
+        if let Some(format) = (!live).then(|| pick_format(&answer)).flatten() {
+            self.store_cached_stream(video_id, client, format, false);
         }
         Ok(track)
     }
+}
+
+fn tracks_from_answer(answer: &Value, want: usize) -> Vec<Track> {
+    let mut found = Vec::with_capacity(want.min(64));
+    collect_videos_up_to(answer, &mut found, want);
+    found.into_iter().filter_map(|m| m.into_track("youtube")).take(want).collect()
 }
 
 fn check_video_id(answer: &Value, requested: &str) -> Result<(), SourceError> {
@@ -1050,14 +922,18 @@ fn check_video_id(answer: &Value, requested: &str) -> Result<(), SourceError> {
         .and_then(Value::as_str)
         .is_some_and(|id| id != requested)
     {
-        return Err(SourceError::Http("youtube returned a different video".into()));
+        Err(SourceError::Http("youtube returned a different video".into()))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn check_playability(answer: &Value) -> Result<(), SourceError> {
-    let status = answer.pointer("/playabilityStatus/status").and_then(Value::as_str);
-    if status.is_some_and(|status| status != "OK") {
+    if answer
+        .pointer("/playabilityStatus/status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != "OK")
+    {
         let reason = answer
             .pointer("/playabilityStatus/reason")
             .and_then(Value::as_str)
@@ -1067,7 +943,6 @@ fn check_playability(answer: &Value) -> Result<(), SourceError> {
     Ok(())
 }
 
-/// One video, as the catalogue describes it.
 #[derive(Debug, Clone, Default)]
 pub struct Media {
     pub id: String,
@@ -1080,25 +955,20 @@ pub struct Media {
 
 impl Media {
     fn into_track(self, source: &str) -> Option<Track> {
-        let author =
-            if self.author.is_empty() { "Unknown artist".to_string() } else { self.author };
-        let length = duration_millis(self.seconds);
         let uri = Some(format!("https://www.youtube.com/watch?v={}", self.id));
-        let info = TrackInfo {
+        encode_track_owned(TrackInfo {
             identifier: self.id,
             title: self.title,
-            author,
-            length,
-            // Search and playlist items often omit their length, so an unknown
-            // length is still a video: only the live flag makes a stream.
+            author: if self.author.is_empty() { "Unknown artist".into() } else { self.author },
+            length: duration_millis(self.seconds),
             is_stream: self.live,
             is_seekable: !self.live,
             uri,
             artwork_url: self.artwork,
-            source_name: source.to_string(),
+            source_name: source.to_owned(),
             ..Default::default()
-        };
-        encode_track_owned(info).ok()
+        })
+        .ok()
     }
 
     #[cfg(test)]
@@ -1107,15 +977,12 @@ impl Media {
     }
 }
 
-/// Adds the configured proof-of-origin token to a Google video URL. Without it
-/// the CDN answers only the first ~768 KiB of audio and then refuses with 403.
-/// Other hosts never receive the token.
 fn with_po_token(url: String, token: &str) -> String {
     let token = token.trim();
-    let Some(mut parsed) = crate::http_url(&url) else { return url };
+    let Some(mut parsed) = http_url(&url) else { return url };
     if token.is_empty()
-        || !parsed.host_str().is_some_and(|host| crate::host_matches(host, "googlevideo.com"))
-        || parsed.query_pairs().any(|(name, _)| name == "pot")
+        || !parsed.host_str().is_some_and(|h| host_matches(h, "googlevideo.com"))
+        || parsed.query_pairs().any(|(k, _)| k == "pot")
     {
         return url;
     }
@@ -1123,25 +990,15 @@ fn with_po_token(url: String, token: &str) -> String {
     parsed.into()
 }
 
-/// Converts an external duration to protocol milliseconds without allowing
-/// non-finite, negative, or unrepresentable values to become metadata. A zero
-/// result means that the source did not provide a usable duration.
 fn duration_millis(seconds: f64) -> i64 {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return 0;
+    let ms = seconds * 1000.0;
+    if seconds.is_finite() && seconds > 0.0 && ms.is_finite() && ms > 0.0 && ms < i64::MAX as f64 {
+        ms as i64
+    } else {
+        0
     }
-    let milliseconds = seconds * 1000.0;
-    if !milliseconds.is_finite() || milliseconds <= 0.0 || milliseconds >= i64::MAX as f64 {
-        return 0;
-    }
-    milliseconds as i64
 }
 
-/// Picks the best audio-only stream out of a player answer.
-///
-/// A progressive format carries audio and video together, which is twice the
-/// bytes for the same sound; an adaptive audio-only format is what a node that
-/// never shows a picture wants.
 fn pick_format(answer: &Value) -> Option<Format> {
     #[derive(Clone, Copy)]
     struct Candidate<'a> {
@@ -1152,8 +1009,8 @@ fn pick_format(answer: &Value) -> Option<Format> {
         rank: (bool, bool, bool, bool, bool, u8, i64),
     }
 
-    fn select<'a>(formats: &'a [Value], audio_only: bool) -> Option<Candidate<'a>> {
-        let mut best: Option<Candidate<'a>> = None;
+    fn select(formats: &[Value], audio_only: bool) -> Option<Candidate<'_>> {
+        let mut best: Option<Candidate<'_>> = None;
         for entry in formats {
             let mime = entry.get("mimeType").and_then(Value::as_str).unwrap_or_default();
             if (audio_only && !mime.starts_with("audio/")) || !has_audio_codec(mime) {
@@ -1189,9 +1046,6 @@ fn pick_format(answer: &Value) -> Option<Format> {
                 .unwrap_or(true);
             let he_aac = mime_contains(mime, b"mp4a.40.5") || mime_contains(mime, b"mp4a.40.29");
             let drc = entry.get("isDrc").and_then(Value::as_bool).unwrap_or(false);
-            // Prefer lossless FLAC first, then native 48 kHz Opus (which passes
-            // straight to Discord without resampling or second-generation lossy
-            // transcoding), over 44.1 kHz AAC/Vorbis.
             let codec_tier = if mime_contains(mime, b"flac") {
                 3
             } else if mime_contains(mime, b"opus") {
@@ -1200,32 +1054,28 @@ fn pick_format(answer: &Value) -> Option<Format> {
                 1
             };
             let rank = (!dubbed, original, default_track, !he_aac, !drc, codec_tier, bitrate);
-            if best.is_some_and(|held| held.rank >= rank) {
-                continue;
+            if best.is_none_or(|held| rank > held.rank) {
+                best = Some(Candidate { entry, url, mime, bitrate, rank });
             }
-            best = Some(Candidate { entry, url, mime, bitrate, rank });
         }
         best
     }
 
-    let best = answer
+    let Candidate { entry, url, mime, bitrate, .. } = answer
         .pointer("/streamingData/adaptiveFormats")
         .and_then(Value::as_array)
-        .and_then(|formats| select(formats, true))
+        .and_then(|f| select(f, true))
         .or_else(|| {
             answer
                 .pointer("/streamingData/formats")
                 .and_then(Value::as_array)
-                .and_then(|formats| select(formats, false))
+                .and_then(|f| select(f, false))
         })?;
-    let Candidate { entry, url, mime, bitrate, .. } = best;
     let mut headers = BTreeMap::new();
     if let Some(extra) = entry.get("httpHeaders").and_then(Value::as_object) {
-        for (name, value) in extra {
-            if let Some(value) = value.as_str() {
-                headers.insert(name.clone(), value.to_owned());
-            }
-        }
+        headers.extend(
+            extra.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned()))),
+        );
     }
     Some(Format {
         url: url.to_owned(),
@@ -1234,94 +1084,66 @@ fn pick_format(answer: &Value) -> Option<Format> {
         content_length: entry
             .get("contentLength")
             .and_then(Value::as_str)
-            .and_then(|text| text.parse().ok())
+            .and_then(|s| s.parse().ok())
             .unwrap_or(0),
         headers,
     })
 }
 
-/// Whether a MIME type names a codec the node can decode.
-///
-/// The player offers some formats in codecs nothing but a browser has, and
-/// handing one to the decoder would fail a track that has a playable format next
-/// to it.
 fn mime_contains(mime: &str, needle: &[u8]) -> bool {
-    mime.as_bytes().windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
+    mime.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 fn has_audio_codec(mime: &str) -> bool {
-    const PLAYABLE: [&[u8]; 5] = [b"opus", b"vorbis", b"mp4a", b"flac", b"aac"];
-    PLAYABLE.iter().any(|codec| mime_contains(mime, codec))
+    [&b"opus"[..], b"vorbis", b"mp4a", b"flac", b"aac"].iter().any(|c| mime_contains(mime, c))
 }
 
 fn thumbnails(value: Option<&Value>) -> Option<String> {
-    let list = value?.get("thumbnails")?.as_array()?;
-    // The last entry is the largest.
-    list.last()?.get("url")?.as_str().map(str::to_string)
+    value?.get("thumbnails")?.as_array()?.last()?.get("url")?.as_str().map(str::to_owned)
 }
 
-/// Reads a written duration such as "3:45" or "1:02:03" into seconds.
 fn length_seconds(text: &str) -> Option<f64> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let mut count = 0usize;
-    let mut total = 0u64;
+    let (mut count, mut total) = (0usize, 0u64);
     for part in trimmed.split(':') {
         count += 1;
-        if count > 3 {
-            return None;
-        }
         let part = part.trim();
-        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        if count > 3 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let value: u64 = part.parse().ok()?;
-        if count > 1 && value >= 60 {
+        let val: u64 = part.parse().ok()?;
+        if count > 1 && val >= 60 {
             return None;
         }
-        total = total.checked_mul(60)?.checked_add(value)?;
+        total = total.checked_mul(60)?.checked_add(val)?;
     }
-    if count < 2 {
-        return None;
-    }
-    Some(total as f64)
+    (count >= 2).then_some(total as f64)
 }
 
-/// Reads the words of a renderer field, borrowing when possible.
 fn runs_cow(value: Option<&Value>) -> Cow<'_, str> {
-    let Some(value) = value else {
-        return Cow::Borrowed("");
-    };
-    if let Some(text) = value.get("simpleText").and_then(Value::as_str) {
-        return Cow::Borrowed(text);
+    let Some(v) = value else { return Cow::Borrowed("") };
+    if let Some(s) = v.get("simpleText").and_then(Value::as_str) {
+        return Cow::Borrowed(s);
     }
-    if let Some(runs) = value.get("runs").and_then(Value::as_array) {
+    if let Some(runs) = v.get("runs").and_then(Value::as_array) {
         return match runs.as_slice() {
             [] => Cow::Borrowed(""),
-            [single] => Cow::Borrowed(single.get("text").and_then(Value::as_str).unwrap_or("")),
+            [one] => Cow::Borrowed(one.get("text").and_then(Value::as_str).unwrap_or("")),
             many => Cow::Owned(
-                many.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect(),
+                many.iter().filter_map(|r| r.get("text").and_then(Value::as_str)).collect(),
             ),
         };
     }
-    if let Some(text) = value.as_str() {
-        return Cow::Borrowed(text);
-    }
-    Cow::Borrowed("")
+    Cow::Borrowed(v.as_str().unwrap_or(""))
 }
 
 fn runs_text(value: Option<&Value>) -> String {
     runs_cow(value).into_owned()
 }
 
-/// Walks an answer and collects every video it names.
-///
-/// The catalogue nests its results differently for every surface, and a search
-/// for a song can come back as any of half a dozen renderer shapes. Looking for
-/// the shapes rather than for the path they sit at is what keeps one parser
-/// working across all of them.
 pub fn collect_videos(value: &Value, out: &mut Vec<Media>) {
     collect_videos_up_to(value, out, usize::MAX);
 }
@@ -1337,8 +1159,6 @@ fn collect_videos_up_to(value: &Value, out: &mut Vec<Media>, limit: usize) {
                     return;
                 }
                 match key.as_str() {
-                    // Promoted results and metadata/entity envelopes are never
-                    // song search results or playlist entries, so skip them.
                     "responseContext"
                     | "frameworkUpdates"
                     | "adSlotRenderer"
@@ -1353,27 +1173,11 @@ fn collect_videos_up_to(value: &Value, out: &mut Vec<Media>, limit: usize) {
                     | "compactVideoRenderer"
                     | "playlistVideoRenderer"
                     | "playlistPanelVideoRenderer"
-                    | "reelItemRenderer" => {
-                        if let Some(media) = video_from_renderer(child) {
-                            out.push(media);
-                        }
-                        continue;
-                    }
-                    "shortsLockupViewModel" => {
-                        if let Some(media) = video_from_shorts_lockup(child) {
-                            out.push(media);
-                        }
-                        continue;
-                    }
-                    "musicResponsiveListItemRenderer" => {
-                        if let Some(media) = video_from_music_item(child) {
-                            out.push(media);
-                        }
-                        continue;
-                    }
-                    _ => {}
+                    | "reelItemRenderer" => out.extend(video_from_renderer(child)),
+                    "shortsLockupViewModel" => out.extend(video_from_shorts_lockup(child)),
+                    "musicResponsiveListItemRenderer" => out.extend(video_from_music_item(child)),
+                    _ => collect_videos_up_to(child, out, limit),
                 }
-                collect_videos_up_to(child, out, limit);
             }
         }
         Value::Array(items) => {
@@ -1389,36 +1193,32 @@ fn collect_videos_up_to(value: &Value, out: &mut Vec<Media>, limit: usize) {
 }
 
 fn video_from_renderer(value: &Value) -> Option<Media> {
-    let id = value.get("videoId").and_then(Value::as_str)?;
-    if !youtube_id(id) {
-        return None;
-    }
+    let id = value.get("videoId").and_then(Value::as_str).filter(|id| youtube_id(id))?;
     let title = runs_text(value.get("title").or_else(|| value.get("headline")));
     if title.is_empty() {
         return None;
     }
     let author = ["ownerText", "longBylineText", "shortBylineText"]
         .into_iter()
-        .map(|field| runs_cow(value.get(field)))
-        .find(|text| !text.is_empty())
+        .map(|f| runs_cow(value.get(f)))
+        .find(|s| !s.is_empty())
         .map_or_else(String::new, Cow::into_owned);
-    let length_raw = runs_cow(value.get("lengthText"));
-    let seconds = length_seconds(&length_raw).unwrap_or(0.0);
+    let seconds = length_seconds(&runs_cow(value.get("lengthText"))).unwrap_or(0.0);
     let live = value.get("isLiveNow").and_then(Value::as_bool).unwrap_or(false)
-        || value.get("badges").and_then(Value::as_array).is_some_and(|badges| {
-            badges.iter().any(|b| {
-                b.pointer("/metadataBadgeRenderer/style").and_then(Value::as_str)
+        || value.get("badges").and_then(Value::as_array).is_some_and(|b| {
+            b.iter().any(|x| {
+                x.pointer("/metadataBadgeRenderer/style").and_then(Value::as_str)
                     == Some("BADGE_STYLE_TYPE_LIVE_NOW")
             })
         })
-        || value.get("thumbnailOverlays").and_then(Value::as_array).is_some_and(|overlays| {
-            overlays.iter().any(|o| {
-                o.pointer("/thumbnailOverlayTimeStatusRenderer/style").and_then(Value::as_str)
+        || value.get("thumbnailOverlays").and_then(Value::as_array).is_some_and(|o| {
+            o.iter().any(|x| {
+                x.pointer("/thumbnailOverlayTimeStatusRenderer/style").and_then(Value::as_str)
                     == Some("LIVE")
             })
         });
     Some(Media {
-        id: id.to_string(),
+        id: id.to_owned(),
         title,
         author,
         seconds,
@@ -1442,22 +1242,10 @@ fn video_from_shorts_lockup(value: &Value) -> Option<Media> {
     let artwork = value
         .pointer("/thumbnailViewModel/thumbnailViewModel/image/sources")
         .or_else(|| value.pointer("/thumbnail/sources"))
-        .and_then(Value::as_array)
-        .and_then(|list| list.last())
-        .and_then(|item| item.get("url"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Some(Media {
-        id: id.to_owned(),
-        title,
-        author: String::new(),
-        seconds: 0.0,
-        live: false,
-        artwork,
-    })
+        .and_then(|v| v.as_array()?.last()?.get("url")?.as_str().map(str::to_owned));
+    Some(Media { id: id.to_owned(), title, artwork, ..Default::default() })
 }
 
-/// Reads a YouTube Music list item, whose fields are in flex columns.
 fn video_from_music_item(value: &Value) -> Option<Media> {
     let columns = value.get("flexColumns").and_then(Value::as_array)?;
     let id = value
@@ -1465,13 +1253,12 @@ fn video_from_music_item(value: &Value) -> Option<Media> {
         .and_then(Value::as_str)
         .filter(|id| youtube_id(id))
         .or_else(|| {
-            columns.iter().find_map(|column| {
-                column
-                    .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")
+            columns.iter().find_map(|c| {
+                c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")
                     .and_then(Value::as_array)?
                     .iter()
-                    .find_map(|run| {
-                        run.pointer("/navigationEndpoint/watchEndpoint/videoId")
+                    .find_map(|r| {
+                        r.pointer("/navigationEndpoint/watchEndpoint/videoId")
                             .and_then(Value::as_str)
                             .filter(|id| youtube_id(id))
                     })
@@ -1485,29 +1272,23 @@ fn video_from_music_item(value: &Value) -> Option<Media> {
         })?;
     let title = columns
         .first()
-        .map(|column| runs_text(column.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
-        .unwrap_or_default();
-    if title.is_empty() {
-        return None;
-    }
-    // The second column lists the artist and then the album (and sometimes
-    // duration), separated by middle dots, so the artist is the part before it.
+        .map(|c| runs_text(c.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
+        .filter(|t| !t.is_empty())?;
     let byline = columns
         .get(1)
-        .map(|column| runs_cow(column.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
+        .map(|c| runs_cow(c.pointer("/musicResponsiveListItemFlexColumnRenderer/text")))
         .unwrap_or_default();
-    let author = byline.split('•').next().unwrap_or_default().trim().to_string();
-    let fixed_len =
+    let author = byline.split('\u{2022}').next().unwrap_or_default().trim().to_owned();
+    let fixed =
         runs_cow(value.pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text"));
-    let seconds = length_seconds(&fixed_len)
-        .or_else(|| byline.rsplit('•').next().and_then(length_seconds))
+    let seconds = length_seconds(&fixed)
+        .or_else(|| byline.rsplit('\u{2022}').next().and_then(length_seconds))
         .unwrap_or(0.0);
     let artwork = thumbnails(value.pointer("/thumbnail/musicThumbnailRenderer/thumbnail"))
         .or_else(|| thumbnails(value.get("thumbnail")));
-    Some(Media { id: id.to_string(), title, author, seconds, live: false, artwork })
+    Some(Media { id: id.to_owned(), title, author, seconds, live: false, artwork })
 }
 
-/// Reads the title of a playlist page.
 fn header_title(value: &Value) -> Option<String> {
     [
         "/header/playlistHeaderRenderer/title",
@@ -1517,32 +1298,26 @@ fn header_title(value: &Value) -> Option<String> {
         "/contents/singleColumnWatchNextResults/playlist/playlist/title",
     ]
     .into_iter()
-    .map(|path| runs_cow(value.pointer(path)))
-    .find(|text| !text.is_empty())
+    .map(|p| runs_cow(value.pointer(p)))
+    .find(|s| !s.is_empty())
     .map(Cow::into_owned)
 }
 
-/// Finds the token that names the next page of a list.
 fn next_continuation(value: &Value) -> Option<&str> {
     match value {
         Value::Object(map) => {
-            if let Some(token) = map
-                .get("nextContinuationData")
-                .and_then(|data| data.get("continuation"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
+            for (parent, field) in
+                [("nextContinuationData", "continuation"), ("continuationCommand", "token")]
             {
-                return Some(token);
-            }
-            if let Some(token) = map
-                .get("continuationCommand")
-                .and_then(|data| data.get("token"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-            {
-                return Some(token);
+                if let Some(tok) = map
+                    .get(parent)
+                    .and_then(|d| d.get(field))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    return Some(tok);
+                }
             }
             map.iter()
                 .filter(|(k, _)| {
@@ -1572,6 +1347,13 @@ fn next_continuation(value: &Value) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http;
+
+    fn yt_cfg(base: String) -> Config {
+        let mut c = Config::default();
+        c.youtube_endpoint = base;
+        c
+    }
 
     #[test]
     fn promoted_video_subtrees_are_not_returned_as_music_results() {
@@ -1602,7 +1384,7 @@ mod tests {
     #[test]
     fn video_metadata_tries_another_client_after_a_refusal() {
         let mut request = 0;
-        let (base, server) = crate::test_http::serve(2, move |_, _, body| {
+        let (base, server) = test_http::serve(2, move |_, _, body| {
             request += 1;
             assert_eq!(body["videoId"], "1CXveaq_vFU");
             if request == 1 {
@@ -1615,12 +1397,9 @@ mod tests {
                 }})
             }
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
-        let result = Catalog::new(&agent, &config).video("1CXveaq_vFU");
+        let (agent, cfg) = (netguard::agent(true), yt_cfg(base));
+        let track = Catalog::new(&agent, &cfg).video("1CXveaq_vFU").unwrap();
         server.join().unwrap();
-        let track = result.unwrap();
         assert_eq!(track.metadata.identifier, "1CXveaq_vFU");
         assert_eq!(track.metadata.title, "Shared video");
         assert_eq!(track.metadata.length, 180_000);
@@ -1629,29 +1408,27 @@ mod tests {
     #[test]
     fn video_metadata_never_returns_an_unrelated_video() {
         let mut request = 0;
-        let (base, server) = crate::test_http::serve(3, move |_, _, _| {
+        let (base, server) = test_http::serve(3, move |_, _, _| {
             request += 1;
             match request {
-                1 => json!({"playabilityStatus":{"status":"OK"},"videoDetails":{
-                    "videoId":"dQw4w9WgXcQ","title":"Wrong video"
-                }}),
+                1 => {
+                    json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"Wrong video"}})
+                }
                 2 => json!({"playabilityStatus":{"status":"OK"}}),
-                _ => json!({"playabilityStatus":{"status":"OK"},"videoDetails":{
-                    "videoId":"1CXveaq_vFU","title":"Requested video"
-                }}),
+                _ => {
+                    json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":"1CXveaq_vFU","title":"Requested video"}})
+                }
             }
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
-        let result = Catalog::new(&agent, &config).video("1CXveaq_vFU");
+        let (agent, cfg) = (netguard::agent(true), yt_cfg(base));
+        let result = Catalog::new(&agent, &cfg).video("1CXveaq_vFU");
         server.join().unwrap();
         assert_eq!(result.unwrap().metadata.title, "Requested video");
     }
 
     #[test]
     fn a_cdn_rejection_tries_the_next_client_and_keeps_its_user_agent() {
-        let (base, server) = crate::test_http::serve(2, |_, _, body| {
+        let (base, server) = test_http::serve(2, |_, _, body| {
             let client = body["context"]["client"]["clientName"].as_str().unwrap();
             json!({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{
                 "mimeType":"audio/webm; codecs=\"opus\"",
@@ -1659,16 +1436,11 @@ mod tests {
                 "httpHeaders":{"user-agent":"wrong agent","X-Media-Fixture":"preserved"}
             }]}})
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
+        let (agent, cfg) = (netguard::agent(true), yt_cfg(base));
         let mut opened = 0;
-        let result = Catalog::new(&agent, &config).with_media_url("1CXveaq_vFU", |url, headers| {
+        let result = Catalog::new(&agent, &cfg).with_media_url("1CXveaq_vFU", |url, headers| {
             opened += 1;
-            assert_eq!(
-                headers.keys().filter(|name| name.eq_ignore_ascii_case("user-agent")).count(),
-                1
-            );
+            assert_eq!(headers.keys().filter(|n| n.eq_ignore_ascii_case("user-agent")).count(), 1);
             assert_eq!(headers["X-Media-Fixture"], "preserved");
             if opened == 1 {
                 assert!(url.ends_with("/VISIONOS"));
@@ -1680,41 +1452,36 @@ mod tests {
             }
         });
         server.join().unwrap();
-        assert!(result.unwrap().ends_with("/IOS_PRODUCER"));
-        assert_eq!(opened, 2);
+        assert!(result.unwrap().ends_with("/IOS_PRODUCER") && opened == 2);
     }
 
     #[test]
     fn a_different_videos_audio_is_never_opened() {
         let mut request = 0;
-        let (base, server) = crate::test_http::serve(2, move |_, _, body| {
+        let (base, server) = test_http::serve(2, move |_, _, body| {
             request += 1;
             assert_eq!(body["videoId"], "1CXveaq_vFU");
             let id = if request == 1 { "dQw4w9WgXcQ" } else { "1CXveaq_vFU" };
             json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":id},
             "streamingData":{"adaptiveFormats":[{
-                "mimeType":"audio/webm; codecs=\"opus\"",
-                "url":format!("https://cdn.example/{id}"),"bitrate":160000
+                "mimeType":"audio/webm; codecs=\"opus\"","url":format!("https://cdn.example/{id}"),"bitrate":160000
             }]}})
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
+        let (agent, cfg) = (netguard::agent(true), yt_cfg(base));
         let mut opened = 0;
-        let result = Catalog::new(&agent, &config).with_media_url("1CXveaq_vFU", |url, _| {
+        let result = Catalog::new(&agent, &cfg).with_media_url("1CXveaq_vFU", |url, _| {
             opened += 1;
             assert!(url.ends_with("/1CXveaq_vFU"));
             Ok(url)
         });
         server.join().unwrap();
-        assert!(result.is_ok());
-        assert_eq!(opened, 1);
+        assert!(result.is_ok() && opened == 1);
     }
 
     #[test]
     fn exhausted_clients_preserve_the_retryable_cdn_error() {
         let mut request = 0;
-        let (base, server) = crate::test_http::serve(4, move |_, _, _| {
+        let (base, server) = test_http::serve(4, move |_, _, _| {
             request += 1;
             if request == 1 {
                 json!({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{
@@ -1724,10 +1491,8 @@ mod tests {
                 json!({"playabilityStatus":{"status":"ERROR","reason":"client refused"}})
             }
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
-        let result = Catalog::new(&agent, &config)
+        let (agent, cfg) = (netguard::agent(true), yt_cfg(base));
+        let result = Catalog::new(&agent, &cfg)
             .with_media_url::<()>("1CXveaq_vFU", |_, _| Err(SourceError::Media { status: 403 }));
         server.join().unwrap();
         assert!(matches!(result, Err(SourceError::Media { status: 403 })));
@@ -1735,15 +1500,13 @@ mod tests {
 
     #[test]
     fn a_nonretryable_stream_error_stops_client_fallback() {
-        let (base, server) = crate::test_http::serve(1, |_, _, _| {
+        let (base, server) = test_http::serve(1, |_, _, _| {
             json!({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{
                 "mimeType":"audio/webm; codecs=\"opus\"","url":"https://cdn.example/audio","bitrate":160000
             }]}})
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
-        let result = Catalog::new(&agent, &config).with_media_url::<()>("1CXveaq_vFU", |_, _| {
+        let (agent, cfg) = (netguard::agent(true), yt_cfg(base));
+        let result = Catalog::new(&agent, &cfg).with_media_url::<()>("1CXveaq_vFU", |_, _| {
             Err(SourceError::Url("invalid media URL".into()))
         });
         server.join().unwrap();
@@ -1753,21 +1516,17 @@ mod tests {
     #[test]
     fn the_po_token_reaches_google_video_urls_only() {
         let audio = "https://rr1---sn-x.googlevideo.com/videoplayback?itag=251&c=ANDROID";
-        assert_eq!(
-            with_po_token(audio.into(), " a+b/c= "),
-            format!("{audio}&pot=a%2Bb%2Fc%3D"),
-            "appended once, trimmed and encoded"
-        );
-        assert_eq!(with_po_token(audio.into(), ""), audio, "no token leaves the URL alone");
+        assert_eq!(with_po_token(audio.into(), " a+b/c= "), format!("{audio}&pot=a%2Bb%2Fc%3D"));
+        assert_eq!(with_po_token(audio.into(), ""), audio);
         let tokened = format!("{audio}&pot=existing");
-        assert_eq!(with_po_token(tokened.clone(), "new"), tokened, "an existing pot is kept");
+        assert_eq!(with_po_token(tokened.clone(), "new"), tokened);
         let other = "https://cdn.example/audio?id=1";
-        assert_eq!(with_po_token(other.into(), "secret"), other, "other hosts never see it");
+        assert_eq!(with_po_token(other.into(), "secret"), other);
     }
 
     #[test]
     fn native_player_sends_configured_token_and_visitor_context() {
-        let (base, server) = crate::test_http::serve(1, |_, headers, body| {
+        let (base, server) = test_http::serve(1, |_, headers, body| {
             assert!(headers.starts_with("POST /youtubei/v1/player?prettyPrint=false "));
             assert!(headers.to_lowercase().contains("x-goog-visitor-id: visitor-fixture"));
             assert_eq!(
@@ -1786,16 +1545,15 @@ mod tests {
                 {"mimeType":"audio/webm; codecs=\"opus\"","url":"https://cdn.example/audio","bitrate":160000}
             ]}})
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
+        let mut config = yt_cfg(base);
         config.youtube_po_token = "player-token-fixture".into();
         config.youtube_visitor_data = "visitor-fixture".into();
         let agent = netguard::agent(true);
         let result = Catalog::new(&agent, &config).player(&clients(&config)[0], "dQw4w9WgXcQ");
         server.join().unwrap();
         assert_eq!(result.unwrap().unwrap().url, "https://cdn.example/audio");
-        let config = Config::default();
-        assert!(Catalog::new(&agent, &config)
+        let default_cfg = Config::default();
+        assert!(Catalog::new(&agent, &default_cfg)
             .player_body("dQw4w9WgXcQ")
             .get("serviceIntegrityDimensions")
             .is_none());
@@ -1806,15 +1564,13 @@ mod tests {
         assert_eq!(length_seconds("3:45"), Some(225.0));
         assert_eq!(length_seconds("1:02:03"), Some(3723.0));
         assert_eq!(length_seconds("0:07"), Some(7.0));
-        assert_eq!(length_seconds("not a length"), None);
-        assert_eq!(length_seconds("-1:00"), None);
-        assert_eq!(length_seconds("NaN"), None);
-        assert_eq!(length_seconds("inf"), None);
+        for bad in ["not a length", "-1:00", "NaN", "inf"] {
+            assert_eq!(length_seconds(bad), None);
+        }
     }
 
     #[test]
     fn missing_or_invalid_media_durations_become_unknown_but_stay_seekable_videos() {
-        // 0.0 is what a search or playlist item without `lengthText` carries.
         for seconds in [0.0, f64::NAN, -1.0, f64::INFINITY, f64::MAX] {
             let track = Media {
                 id: "dQw4w9WgXcQ".into(),
@@ -1824,9 +1580,8 @@ mod tests {
                 ..Default::default()
             }
             .track("youtube");
-            assert_eq!(track.metadata.length, 0, "seconds={seconds:?}");
-            assert!(!track.metadata.is_stream, "seconds={seconds:?}");
-            assert!(track.metadata.is_seekable, "seconds={seconds:?}");
+            assert_eq!(track.metadata.length, 0);
+            assert!(!track.metadata.is_stream && track.metadata.is_seekable);
         }
     }
 
@@ -1841,8 +1596,7 @@ mod tests {
         }
         .track("youtube");
         assert_eq!(track.metadata.length, 180_000);
-        assert!(!track.metadata.is_stream);
-        assert!(track.metadata.is_seekable);
+        assert!(!track.metadata.is_stream && track.metadata.is_seekable);
     }
 
     #[test]
@@ -1859,17 +1613,20 @@ mod tests {
         let mut found = Vec::new();
         collect_videos(&answer, &mut found);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].title, "A Song");
-        assert_eq!(found[0].author, "Someone");
-        assert_eq!(found[0].seconds, 225.0);
+        assert_eq!(
+            (found[0].title.as_str(), found[0].author.as_str(), found[0].seconds),
+            ("A Song", "Someone", 225.0)
+        );
         assert_eq!(found[0].artwork.as_deref(), Some("large"));
     }
 
     #[test]
     fn a_result_that_is_not_a_video_is_skipped() {
-        let answer = json!({"videoRenderer": {"videoId": "short", "title": {"simpleText": "x"}}});
         let mut found = Vec::new();
-        collect_videos(&answer, &mut found);
+        collect_videos(
+            &json!({"videoRenderer": {"videoId": "short", "title": {"simpleText": "x"}}}),
+            &mut found,
+        );
         assert!(found.is_empty());
     }
 
@@ -1882,7 +1639,7 @@ mod tests {
                         {"text": "A Song", "navigationEndpoint": {"watchEndpoint": {"videoId": "dQw4w9WgXcQ"}}}
                     ]}}},
                     {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
-                        {"text": "Someone"}, {"text": " • "}, {"text": "An Album"}
+                        {"text": "Someone"}, {"text": " \u{2022} "}, {"text": "An Album"}
                     ]}}}
                 ],
                 "fixedColumns": [{"musicResponsiveListItemFixedColumnRenderer": {"text": {"runs": [{"text": "3:45"}]}}}]
@@ -1891,9 +1648,10 @@ mod tests {
         let mut found = Vec::new();
         collect_videos(&answer, &mut found);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].title, "A Song");
-        assert_eq!(found[0].author, "Someone");
-        assert_eq!(found[0].seconds, 225.0);
+        assert_eq!(
+            (found[0].title.as_str(), found[0].author.as_str(), found[0].seconds),
+            ("A Song", "Someone", 225.0)
+        );
     }
 
     #[test]
@@ -1904,8 +1662,7 @@ mod tests {
             {"mimeType": "audio/webm; codecs=\"opus\"", "url": "https://c", "bitrate": 129000}
         ]}});
         let picked = pick_format(&answer).unwrap();
-        assert_eq!(picked.url, "https://c");
-        assert_eq!(picked.bitrate, 129_000);
+        assert_eq!((picked.url.as_str(), picked.bitrate), ("https://c", 129_000));
     }
 
     #[test]
@@ -1934,18 +1691,18 @@ mod tests {
 
     #[test]
     fn a_format_with_no_url_is_not_usable() {
-        let answer = json!({"streamingData": {"adaptiveFormats": [
+        assert!(pick_format(&json!({"streamingData": {"adaptiveFormats": [
             {"mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 160000}
-        ]}});
-        assert!(pick_format(&answer).is_none());
+        ]}}))
+        .is_none());
     }
 
     #[test]
     fn a_codec_the_node_cannot_decode_is_not_picked() {
-        let answer = json!({"streamingData": {"adaptiveFormats": [
+        assert!(pick_format(&json!({"streamingData": {"adaptiveFormats": [
             {"mimeType": "audio/mp4; codecs=\"ec-3\"", "url": "https://a", "bitrate": 500000}
-        ]}});
-        assert!(pick_format(&answer).is_none());
+        ]}}))
+        .is_none());
     }
 
     #[test]
@@ -1971,7 +1728,7 @@ mod tests {
     fn the_clients_that_serve_whole_files_are_tried_first() {
         let config = Config::default();
         let clients = clients(&config);
-        let names: Vec<_> = clients.iter().map(|client| client.name).collect();
+        let names: Vec<_> = clients.iter().map(|c| c.name).collect();
         assert_eq!(names, ["VISIONOS", "IOS_PRODUCER", "ANDROID_VR", "ANDROID"]);
         assert_eq!(clients[0].version, "0.1");
         assert!(clients[0].needs_visitor_data);
@@ -1985,7 +1742,7 @@ mod tests {
     fn a_configured_client_version_replaces_the_built_in_android_one() {
         let mut config = Config::default();
         config.youtube_client_version = "99.1.2".into();
-        let android = clients(&config).into_iter().find(|client| client.name == "ANDROID").unwrap();
+        let android = clients(&config).into_iter().find(|c| c.name == "ANDROID").unwrap();
         assert_eq!(android.version, "99.1.2");
         assert!(android.user_agent.contains("youtube/99.1.2 "));
     }
@@ -1993,7 +1750,7 @@ mod tests {
     #[test]
     fn failed_player_does_not_harvest_tainted_visitor_data_and_stale_reasons_invalidate() {
         let mut request = 0;
-        let (base, server) = crate::test_http::serve(2, move |_, headers, body| {
+        let (base, server) = test_http::serve(2, move |_, headers, body| {
             request += 1;
             if request == 1 {
                 assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
@@ -2012,10 +1769,8 @@ mod tests {
                 })
             }
         });
-        let state = crate::catalog::State::default();
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
+        let state = CatalogState::default();
+        let (agent, config) = (netguard::agent(true), yt_cfg(base));
         let catalog = Catalog::with_state(&agent, &config, &state);
         let track = catalog.video("1CXveaq_vFU").unwrap();
         server.join().unwrap();
@@ -2031,42 +1786,11 @@ mod tests {
 
     #[test]
     fn rd_mix_playlist_propagates_network_errors_instead_of_returning_empty() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
-                let mut req = Vec::new();
-                let mut buf = [0u8; 1024];
-                while let Ok(n) = socket.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    req.extend_from_slice(&buf[..n]);
-                    if let Some(split) = req.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&req[..split]).to_ascii_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| {
-                                l.strip_prefix("content-length:")?.trim().parse::<usize>().ok()
-                            })
-                            .unwrap_or(0);
-                        if req.len() >= split + 4 + len {
-                            break;
-                        }
-                    }
-                }
-                let _ = socket.write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                let _ = socket.flush();
-            }
+        let (base, server) = test_http::serve_raw(2, |_, _, _| {
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
         });
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
+        let (agent, config) = (netguard::agent(true), yt_cfg(base));
         let result = Catalog::new(&agent, &config).playlist("RDdQw4w9WgXcQ");
         server.join().unwrap();
         assert!(matches!(result, Err(SourceError::Media { status: 503 })));
@@ -2074,69 +1798,37 @@ mod tests {
 
     #[test]
     fn visitor_bootstrap_falls_back_to_music_sw_js_data_and_tail_probe_follows_redirects() {
-        use std::io::{Read, Write};
-        let api_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let api_base = format!("http://{}", api_listener.local_addr().unwrap());
-        let api_server = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut socket, _) = api_listener.accept().unwrap();
-                socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-                let mut buf = [0u8; 2048];
-                let _ = socket.read(&mut buf);
-                let _ = socket.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-            }
+        let (api_base, api_server) = test_http::serve_raw(2, |_, _, _| {
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         });
-
-        let music_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let music_base = format!("http://{}", music_listener.local_addr().unwrap());
-        let music_server = std::thread::spawn(move || {
-            let (mut socket, _) = music_listener.accept().unwrap();
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-            let mut buf = [0u8; 2048];
-            let read = socket.read(&mut buf).unwrap();
-            let req = std::str::from_utf8(&buf[..read]).unwrap();
-            assert!(req.starts_with("GET /sw.js_data "), "{req}");
+        let (music_base, music_server) = test_http::serve_raw(1, |_, head, _| {
+            assert!(head.starts_with("GET /sw.js_data "), "{head}");
             let mut slot = vec![Value::Null; 14];
             slot[13] = json!("music-sw-visitor");
             let payload = format!(")]}}'\n{}", json!([[null, null, [[slot]]]]));
-            write!(
-                socket,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
             )
-            .unwrap();
+            .into_bytes()
         });
-
         let agent = netguard::agent(true);
         let (vd, _) = fetch_visitor_data(&agent, &api_base, &music_base).unwrap();
         api_server.join().unwrap();
         music_server.join().unwrap();
         assert_eq!(vd, "music-sw-visitor");
 
-        let cdn_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let cdn_base = format!("http://{}", cdn_listener.local_addr().unwrap());
-        let cdn_server = std::thread::spawn(move || {
-            let (mut s1, _) = cdn_listener.accept().unwrap();
-            s1.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-            let mut b1 = [0u8; 2048];
-            let _ = s1.read(&mut b1);
-            let _ = s1.write_all(
-                b"HTTP/1.1 302 Found\r\nLocation: /edge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-
-            let (mut s2, _) = cdn_listener.accept().unwrap();
-            s2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-            let mut b2 = [0u8; 2048];
-            let n = s2.read(&mut b2).unwrap();
-            let head = std::str::from_utf8(&b2[..n]).unwrap().to_ascii_lowercase();
-            assert!(head.starts_with("get /edge "));
-            assert!(head.contains("\r\nrange: bytes=2097151-\r\n"));
-            let _ = s2.write_all(
-                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2097151-2097151/2097152\r\nContent-Length: 1\r\nConnection: close\r\n\r\nZ",
-            );
+        let mut step = 0;
+        let (cdn_base, cdn_server) = test_http::serve_raw(2, move |_, head, _| {
+            step += 1;
+            if step == 1 {
+                b"HTTP/1.1 302 Found\r\nLocation: /edge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            } else {
+                let lower = head.to_ascii_lowercase();
+                assert!(lower.starts_with("get /edge "));
+                assert!(lower.contains("\r\nrange: bytes=2097151-\r\n"));
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2097151-2097151/2097152\r\nContent-Length: 1\r\nConnection: close\r\n\r\nZ".to_vec()
+            }
         });
         probe_tail_byte(&agent, &format!("{cdn_base}/start"), &BTreeMap::new(), 2_097_152).unwrap();
         cdn_server.join().unwrap();
@@ -2144,13 +1836,7 @@ mod tests {
 
     #[test]
     fn collect_videos_stops_at_limit_and_skips_framework_updates() {
-        let video = |id: &str| {
-            json!({"videoRenderer": {
-                "videoId": id,
-                "title": {"simpleText": "Song"},
-                "ownerText": {"simpleText": "Artist"}
-            }})
-        };
+        let video = |id: &str| json!({"videoRenderer": {"videoId": id, "title": {"simpleText": "Song"}, "ownerText": {"simpleText": "Artist"}}});
         let payload = json!({
             "responseContext": video("ignored0001"),
             "frameworkUpdates": video("ignored0002"),
@@ -2158,11 +1844,13 @@ mod tests {
         });
         let mut out = Vec::new();
         collect_videos_up_to(&payload, &mut out, 2);
-        let ids: Vec<_> = out.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["dQw4w9WgXcQ", "1CXveaq_vFU"]);
-        assert!(next_continuation(&json!({
-            "frameworkUpdates": {"continuationCommand": {"token": "wrong"}}
-        }))
+        assert_eq!(
+            out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["dQw4w9WgXcQ", "1CXveaq_vFU"]
+        );
+        assert!(next_continuation(
+            &json!({"frameworkUpdates": {"continuationCommand": {"token": "wrong"}}})
+        )
         .is_none());
     }
 
@@ -2171,16 +1859,11 @@ mod tests {
         let future_expire =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
                 + 7200;
-        let (base, server) = crate::test_http::serve(1, move |_, _, body| {
+        let (base, server) = test_http::serve(1, move |_, _, body| {
             assert_eq!(body["videoId"], "1CXveaq_vFU");
             json!({
                 "playabilityStatus": {"status": "OK"},
-                "videoDetails": {
-                    "videoId": "1CXveaq_vFU",
-                    "title": "Cached Song",
-                    "author": "Artist",
-                    "lengthSeconds": "200"
-                },
+                "videoDetails": {"videoId": "1CXveaq_vFU", "title": "Cached Song", "author": "Artist", "lengthSeconds": "200"},
                 "streamingData": {"adaptiveFormats": [{
                     "mimeType": "audio/webm; codecs=\"opus\"",
                     "bitrate": 160000,
@@ -2191,12 +1874,9 @@ mod tests {
             })
         });
         let state = CatalogState::default();
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
+        let (agent, config) = (netguard::agent(true), yt_cfg(base));
         let catalog = Catalog::with_state(&agent, &config, &state);
-        let track = catalog.video("1CXveaq_vFU").unwrap();
-        assert_eq!(track.metadata.title, "Cached Song");
+        assert_eq!(catalog.video("1CXveaq_vFU").unwrap().metadata.title, "Cached Song");
 
         let mut opens = 0;
         for _ in 0..2 {
@@ -2210,32 +1890,24 @@ mod tests {
             assert!(url.contains("googlevideo.com/videoplayback"));
         }
         server.join().unwrap();
-        assert_eq!(opens, 2, "both initial open and seek used the cached stream");
+        assert_eq!(opens, 2);
         assert!(youtube_stream_ttl("https://rr1.googlevideo.com/videoplayback?expire=1").is_none());
     }
 
     #[test]
     fn rejected_cached_stream_skips_same_client_and_falls_back_cleanly() {
-        let (base, server) = crate::test_http::serve(2, |_, _, body| {
+        let (base, server) = test_http::serve(2, |_, _, body| {
             let client = body["context"]["client"]["clientName"].as_str().unwrap();
             json!({
                 "playabilityStatus": {"status": "OK"},
-                "videoDetails": {
-                    "videoId": "1CXveaq_vFU",
-                    "title": "Fallback Song",
-                    "lengthSeconds": "180"
-                },
+                "videoDetails": {"videoId": "1CXveaq_vFU", "title": "Fallback Song", "lengthSeconds": "180"},
                 "streamingData": {"adaptiveFormats": [{
-                    "mimeType": "audio/webm; codecs=\"opus\"",
-                    "bitrate": 160000,
-                    "url": format!("https://cdn.example/{client}")
+                    "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 160000, "url": format!("https://cdn.example/{client}")
                 }]}
             })
         });
         let state = CatalogState::default();
-        let mut config = Config::default();
-        config.youtube_endpoint = base;
-        let agent = netguard::agent(true);
+        let (agent, config) = (netguard::agent(true), yt_cfg(base));
         let catalog = Catalog::with_state(&agent, &config, &state);
         let _ = catalog.video("1CXveaq_vFU").unwrap();
 
@@ -2260,16 +1932,22 @@ mod tests {
         let state = CatalogState::default();
         let config = Config::default();
         state.youtube_health.record_failure("VISIONOS");
-        let partitioned =
-            state.youtube_health.partition_clients(clients(&config), |client| client.name);
-        let names: Vec<_> = partitioned.iter().map(|c| c.name).collect();
+        let names: Vec<_> = state
+            .youtube_health
+            .partition_clients(clients(&config), |c| c.name)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
         assert_eq!(names, ["IOS_PRODUCER", "ANDROID_VR", "ANDROID", "VISIONOS"]);
 
         state.youtube_health.record_success("VISIONOS");
-        let restored =
-            state.youtube_health.partition_clients(clients(&config), |client| client.name);
-        let restored_names: Vec<_> = restored.iter().map(|c| c.name).collect();
-        assert_eq!(restored_names, ["VISIONOS", "IOS_PRODUCER", "ANDROID_VR", "ANDROID"]);
+        let restored: Vec<_> = state
+            .youtube_health
+            .partition_clients(clients(&config), |c| c.name)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(restored, ["VISIONOS", "IOS_PRODUCER", "ANDROID_VR", "ANDROID"]);
     }
 
     #[test]
@@ -2291,9 +1969,7 @@ mod tests {
         let mut found = Vec::new();
         collect_videos(&payload, &mut found);
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].id, "dQw4w9WgXcQ");
-        assert_eq!(found[0].title, "Short One");
-        assert_eq!(found[1].id, "1CXveaq_vFU");
-        assert_eq!(found[1].title, "Short Two");
+        assert_eq!((found[0].id.as_str(), found[0].title.as_str()), ("dQw4w9WgXcQ", "Short One"));
+        assert_eq!((found[1].id.as_str(), found[1].title.as_str()), ("1CXveaq_vFU", "Short Two"));
     }
 }

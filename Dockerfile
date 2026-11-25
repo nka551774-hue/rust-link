@@ -1,5 +1,3 @@
-# The build stage carries the headers the Opus encoder is linked against and
-# compiles the whole workspace, which the binary crate depends on.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 RUN apt-get update \
@@ -8,7 +6,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY benchmarks ./benchmarks
-RUN cargo build --release --locked --bin rustlink
+RUN cargo build --release --locked -p rustlink --bin rustlink -p rustlink-discord-bot --example music
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -18,10 +16,8 @@ RUN apt-get update \
     && mkdir -p /app/.tools \
     && chown -R rustlink:rustlink /app
 COPY --from=build /src/target/release/rustlink /usr/local/bin/rustlink
+COPY --from=build /src/target/release/examples/music /usr/local/bin/rustlink-bot
 COPY LICENSE NOTICE /usr/share/doc/rustlink/
-# FFmpeg comes from the distribution and is pinned by path, because a bare name
-# only ever means a file inside the tools directory. The container already has
-# its codec helper, so startup does not need any downloads.
 ENV RUSTLINK_ADDRESS="0.0.0.0:2333" \
     RUSTLINK_FFMPEG="/usr/bin/ffmpeg" \
     RUSTLINK_TOOLS_DIRECTORY="/app/.tools" \

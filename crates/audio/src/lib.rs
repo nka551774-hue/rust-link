@@ -1,6 +1,4 @@
-//! The audio pipeline: filters, the in-process decoder and DSP chain, the Opus
-//! encoder, and the FFmpeg engine that covers everything the built-in path does
-//! not.
+//! Audio pipeline: filter model, in-process decode/DSP/Opus engine, and FFmpeg fallback.
 
 pub mod decode;
 pub mod dsp;

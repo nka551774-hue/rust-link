@@ -13,16 +13,13 @@ use std::hint::black_box;
 static ALLOCATOR: measure::CountingAllocator = measure::CountingAllocator;
 
 fn main() {
-    let payload = [0x5a; 336];
-    let key = [42; 32];
-    let header = transport::header(7, 960, 12345);
+    let (payload, key, header) = ([0x5a; 336], [42; 32], transport::header(7, 960, 12345));
     for mode in
         [transport::Mode::AeadAes256GcmRtpSize, transport::Mode::AeadXChaCha20Poly1305RtpSize]
     {
         let old_mode = legacy::Mode::parse(mode.name()).unwrap();
         let cipher = transport::PacketCipher::new(mode, &key);
-        let mut old = Vec::with_capacity(1500);
-        let mut new = Vec::with_capacity(1500);
+        let (mut old, mut new) = (Vec::with_capacity(1500), Vec::with_capacity(1500));
         legacy::seal_into(&mut old, old_mode, &key, &header, 0, &payload).unwrap();
         cipher.seal_into(&mut new, &header, 0, &payload).unwrap();
         assert_eq!(old, new);

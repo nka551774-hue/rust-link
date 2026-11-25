@@ -12,7 +12,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::{validate_snowflake, BotError};
+use crate::{
+    bot_auth_header, http_client, is_loopback_host, read_limited_body, validate_bot_token,
+    validate_snowflake, validate_text, BotError, USER_AGENT_VALUE,
+};
 
 /// Discord gateway intents used by native bot applications.
 pub const GUILDS: u64 = 1 << 0;
@@ -21,11 +24,10 @@ pub const GUILD_MESSAGES: u64 = 1 << 9;
 pub const MESSAGE_CONTENT: u64 = 1 << 15;
 
 const API_BASE: &str = "https://discord.com/api/v10";
-const USER_AGENT_VALUE: &str =
-    concat!("DiscordBot (https://github.com/rustlink, ", env!("CARGO_PKG_VERSION"), ")");
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_GATEWAY_MESSAGE: usize = 16 * 1024 * 1024;
-const MAX_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_GATEWAY_MESSAGE: usize = 16 << 20;
+const MAX_HTTP_RESPONSE_BYTES: usize = 2 << 20;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -39,7 +41,6 @@ pub struct GatewayInfo {
 pub struct Ready {
     pub user_id: String,
     /// The application that owns the bot, needed to register slash commands.
-    /// Empty when Discord omits it.
     pub application_id: String,
     pub session_id: String,
     pub resume_gateway_url: String,
@@ -61,14 +62,13 @@ pub struct Interaction {
 
 impl Interaction {
     pub fn option(&self, name: &str) -> Option<&str> {
-        self.options.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+        self.options.iter().find(|(key, _)| key == name).map(|(_, val)| val.as_str())
     }
 }
 
 impl std::fmt::Debug for Interaction {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Interaction")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Interaction")
             .field("id", &self.id)
             .field("token", &"<redacted>")
             .field("guild_id", &self.guild_id)
@@ -80,25 +80,27 @@ impl std::fmt::Debug for Interaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct VoiceStateUpdate {
+    #[serde(default)]
     pub guild_id: Option<String>,
     pub user_id: String,
+    #[serde(default)]
     pub channel_id: Option<String>,
     pub session_id: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct VoiceServerUpdate {
     pub guild_id: String,
     pub token: String,
+    #[serde(default)]
     pub endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for VoiceServerUpdate {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("VoiceServerUpdate")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceServerUpdate")
             .field("guild_id", &self.guild_id)
             .field("token", &"<redacted>")
             .field("endpoint", &self.endpoint)
@@ -129,10 +131,10 @@ impl BotEvent {
     /// Returns the guild ID associated with this event, if any.
     pub fn guild_id(&self) -> Option<&str> {
         match self {
-            Self::VoiceStateUpdate(update) => update.guild_id.as_deref(),
-            Self::VoiceServerUpdate(update) => Some(update.guild_id.as_str()),
-            Self::MessageCreate(message) => message.guild_id.as_deref(),
-            Self::Interaction(interaction) => interaction.guild_id.as_deref(),
+            Self::VoiceStateUpdate(u) => u.guild_id.as_deref(),
+            Self::VoiceServerUpdate(u) => Some(&u.guild_id),
+            Self::MessageCreate(m) => m.guild_id.as_deref(),
+            Self::Interaction(i) => i.guild_id.as_deref(),
             Self::Other { data, .. } => {
                 data.get("guild_id").or_else(|| data.get("id")).and_then(Value::as_str)
             }
@@ -150,7 +152,6 @@ pub struct Gateway {
     next_heartbeat: Instant,
     heartbeat_acknowledged: bool,
     needs_flush: bool,
-    /// The code Discord closed the connection with, once it has.
     close_code: Option<u16>,
     sequence: Option<u64>,
     session_id: Option<String>,
@@ -167,10 +168,8 @@ fn reconnect_backoff(
 ) -> Duration {
     let base = if close_code == Some(4008) {
         Duration::from_secs(5)
-    } else if attempts > 0 {
-        Duration::from_secs(u64::from(attempts.min(5)))
     } else {
-        Duration::ZERO
+        Duration::from_secs(u64::from(attempts.min(5)))
     };
     if invalid_unresumable {
         base.max(Duration::from_secs(2))
@@ -179,37 +178,36 @@ fn reconnect_backoff(
     }
 }
 
-fn apply_initial_heartbeat_jitter(gateway: &mut Gateway) {
-    let jitter_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let factor = 0.25 + (f64::from((jitter_nanos / 100) % 7_500) / 10_000.0);
-    gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval.mul_f64(factor);
+fn prepare_token(token: impl Into<String>) -> Result<Zeroizing<String>, BotError> {
+    let token = Zeroizing::new(token.into());
+    validate_bot_token(&token)?;
+    Ok(token)
 }
 
 impl Gateway {
+    fn with_jitter(mut self) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let factor = 0.25 + f64::from((nanos / 100) % 7_500) / 10_000.0;
+        self.next_heartbeat = Instant::now() + self.heartbeat_interval.mul_f64(factor);
+        self
+    }
+
     /// Fetch Discord's gateway URL, receive HELLO, and send IDENTIFY.
     pub async fn connect(token: impl Into<String>, intents: u64) -> Result<Self, BotError> {
-        let raw_token = Zeroizing::new(token.into());
-        let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
+        let token = prepare_token(token)?;
         let info = Self::fetch_gateway_info(&token).await?;
-        let mut gateway = Self::connect_url(info.url, token, intents).await?;
-        apply_initial_heartbeat_jitter(&mut gateway);
-        Ok(gateway)
+        Ok(Self::connect_url(&info.url, token, intents).await?.with_jitter())
     }
 
     /// Connects and awaits `READY` with `GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES | MESSAGE_CONTENT`,
-    /// automatically falling back to unprivileged `GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES`
-    /// if Discord closes with `4014` (`Disallowed intent(s)`).
-    ///
-    /// The returned boolean is `true` when full channel message content is enabled,
-    /// and `false` when only slash commands and `@bot` mentions carry message text.
+    /// automatically falling back to unprivileged intents on close code `4014`.
     pub async fn connect_with_messages(
         token: impl Into<String>,
     ) -> Result<(Self, Ready, bool), BotError> {
-        let raw_token = Zeroizing::new(token.into());
-        let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
+        let token = prepare_token(token)?;
         let info = Self::fetch_gateway_info(&token).await?;
         Self::connect_url_with_messages(
             &info.url,
@@ -220,25 +218,14 @@ impl Gateway {
     }
 
     async fn fetch_gateway_info(token: &str) -> Result<GatewayInfo, BotError> {
-        let auth_text = Zeroizing::new(format!("Bot {token}"));
-        let mut auth = reqwest::header::HeaderValue::from_str(&auth_text).map_err(|_| {
-            BotError::Invalid("bot token contains invalid header characters".into())
-        })?;
-        auth.set_sensitive(true);
-        let http = reqwest::Client::builder()
-            .tcp_nodelay(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let response = http
+        let response = http_client(Duration::from_secs(20))?
             .get(format!("{API_BASE}/gateway/bot"))
-            .header(reqwest::header::AUTHORIZATION, auth)
+            .header(reqwest::header::AUTHORIZATION, bot_auth_header(token)?)
             .header(reqwest::header::USER_AGENT, USER_AGENT_VALUE)
             .send()
             .await?;
         let status = response.status();
-        let body = crate::read_limited_body(
+        let body = read_limited_body(
             response,
             status,
             MAX_HTTP_RESPONSE_BYTES,
@@ -248,8 +235,6 @@ impl Gateway {
         if !status.is_success() {
             return Err(BotError::HttpStatus {
                 status: status.as_u16(),
-                // Discord error bodies are not needed to decide whether to
-                // retry, and must not become a token-bearing log message.
                 message: format!("gateway endpoint returned {} bytes", body.len()),
             });
         }
@@ -261,15 +246,14 @@ impl Gateway {
         token: Zeroizing<String>,
         base_intents: u64,
     ) -> Result<(Self, Ready, bool), BotError> {
-        let mut gateway =
-            Self::connect_url(base.to_owned(), token.clone(), base_intents | MESSAGE_CONTENT)
-                .await?;
-        apply_initial_heartbeat_jitter(&mut gateway);
-        match gateway.next_ready().await {
-            Ok(ready) => Ok((gateway, ready, true)),
-            Err(_) if gateway.close_code() == Some(4014) => {
-                let mut fallback = Self::connect_url(base.to_owned(), token, base_intents).await?;
-                apply_initial_heartbeat_jitter(&mut fallback);
+        let mut gw = Self::connect_url(base, token.clone(), base_intents | MESSAGE_CONTENT)
+            .await?
+            .with_jitter();
+        match gw.next_ready().await {
+            Ok(ready) => Ok((gw, ready, true)),
+            Err(_) if gw.close_code() == Some(4014) => {
+                let mut fallback =
+                    Self::connect_url(base, token, base_intents).await?.with_jitter();
                 let ready = fallback.next_ready().await?;
                 Ok((fallback, ready, false))
             }
@@ -285,30 +269,23 @@ impl Gateway {
         sequence: u64,
         intents: u64,
     ) -> Result<Self, BotError> {
-        let raw_token = Zeroizing::new(token.into());
-        let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
-        let session_id = crate::validate_text(session_id.as_ref(), "session ID")?;
-        let mut gateway = Self::open_hello(resume_gateway_url.as_ref(), token, intents).await?;
-        apply_initial_heartbeat_jitter(&mut gateway);
-        gateway.sequence = Some(sequence);
-        gateway.session_id = Some(session_id.to_owned());
-        gateway.resume_gateway_url = Some(resume_gateway_url.as_ref().to_owned());
-        gateway.resuming = true;
-        gateway
-            .send(json!({
-                "op": 6,
-                "d": {
-                    "token": gateway.token.as_str(),
-                    "session_id": session_id,
-                    "seq": sequence
-                }
-            }))
-            .await?;
-        Ok(gateway)
+        let token = prepare_token(token)?;
+        let session_id = validate_text(session_id.as_ref(), "session ID", 512)?;
+        let url = resume_gateway_url.as_ref();
+        let mut gw = Self::open_hello(url, token, intents).await?.with_jitter();
+        gw.sequence = Some(sequence);
+        gw.session_id = Some(session_id.to_owned());
+        gw.resume_gateway_url = Some(url.to_owned());
+        gw.resuming = true;
+        gw.send(json!({
+            "op": 6,
+            "d": { "token": gw.token.as_str(), "session_id": session_id, "seq": sequence }
+        }))
+        .await?;
+        Ok(gw)
     }
 
-    /// Whether a gateway close code indicates a permanent configuration or auth
-    /// error that reconnecting cannot cure.
+    /// Whether a gateway close code indicates a permanent configuration or auth error.
     pub fn is_fatal_close_code(code: u16) -> bool {
         matches!(code, 4004 | 4010..=4014)
     }
@@ -324,38 +301,40 @@ impl Gateway {
         cause: Option<&BotError>,
         identify_url: Option<&str>,
     ) -> Result<(), BotError> {
-        let stripped_message_content =
-            self.close_code == Some(4014) && (self.intents & MESSAGE_CONTENT) != 0;
-        if stripped_message_content {
+        let stripped_mc = self.close_code == Some(4014) && (self.intents & MESSAGE_CONTENT) != 0;
+        if stripped_mc {
             self.intents &= !MESSAGE_CONTENT;
             self.close_code = None;
         }
         if let Some(code) = self.close_code.filter(|&c| Self::is_fatal_close_code(c)) {
             return Err(BotError::Protocol(format!("fatal Discord gateway close code {code}")));
         }
-        let close_code = self.close_code;
-        let was_resuming = self.resuming;
-        let attempts = self.reconnect_attempts;
+        let (close_code, was_resuming, attempts) =
+            (self.close_code, self.resuming, self.reconnect_attempts);
         let next_attempts = attempts.saturating_add(1);
         self.reconnect_attempts = next_attempts;
         let _ = tokio::time::timeout(Duration::from_secs(1), self.socket.close(None)).await;
-        let can_resume = !stripped_message_content
+
+        let can_resume = !stripped_mc
             && !was_resuming
             && match cause {
                 Some(BotError::InvalidSession) => self.invalid_session_resumable,
                 _ => !matches!(close_code, Some(4007 | 4009)),
             };
-        let invalid_unresumable = !can_resume && matches!(cause, Some(BotError::InvalidSession));
-        let delay = reconnect_backoff(attempts, close_code, invalid_unresumable);
+        let delay = reconnect_backoff(
+            attempts,
+            close_code,
+            !can_resume && matches!(cause, Some(BotError::InvalidSession)),
+        );
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
         if can_resume {
-            if let (Some(url), Some(session_id), Some(seq)) =
-                (self.resume_gateway_url.clone(), self.session_id.clone(), self.sequence)
+            if let (Some(url), Some(sid), Some(seq)) =
+                (self.resume_gateway_url.as_deref(), self.session_id.as_deref(), self.sequence)
             {
                 if let Ok(mut resumed) =
-                    Self::resume(&url, self.token.as_str(), &session_id, seq, self.intents).await
+                    Self::resume(url, self.token.as_str(), sid, seq, self.intents).await
                 {
                     resumed.reconnect_attempts = next_attempts;
                     *self = resumed;
@@ -365,10 +344,7 @@ impl Gateway {
         }
         let mut fresh = match identify_url {
             Some(url) => {
-                let mut gateway =
-                    Self::connect_url(url.to_owned(), self.token.clone(), self.intents).await?;
-                apply_initial_heartbeat_jitter(&mut gateway);
-                gateway
+                Self::connect_url(url, self.token.clone(), self.intents).await?.with_jitter()
             }
             None => Self::connect(self.token.as_str(), self.intents).await?,
         };
@@ -378,13 +354,13 @@ impl Gateway {
     }
 
     async fn connect_url(
-        base: String,
+        base: impl AsRef<str>,
         token: Zeroizing<String>,
         intents: u64,
     ) -> Result<Self, BotError> {
-        let mut gateway = Self::open_hello(&base, token, intents).await?;
-        gateway.identify().await?;
-        Ok(gateway)
+        let mut gw = Self::open_hello(base.as_ref(), token, intents).await?;
+        gw.identify().await?;
+        Ok(gw)
     }
 
     async fn open_hello(
@@ -402,41 +378,37 @@ impl Gateway {
         )
         .await
         .map_err(|_| BotError::Protocol("gateway HELLO timed out".into()))??;
+
         let mut needs_flush = false;
         let hello: Value = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             loop {
-                let frame = socket
+                match socket
                     .next()
                     .await
-                    .ok_or_else(|| BotError::Protocol("gateway closed before HELLO".into()))??;
-                match frame {
-                    Message::Ping(_) => {
-                        needs_flush = true;
-                    }
+                    .ok_or_else(|| BotError::Protocol("gateway closed before HELLO".into()))??
+                {
+                    Message::Ping(_) => needs_flush = true,
                     Message::Pong(_) => {}
                     Message::Close(_) => {
                         return Err(BotError::Protocol("gateway closed before HELLO".into()));
                     }
                     Message::Text(text) => return Ok(serde_json::from_str(&text)?),
-                    _ => {
-                        return Err(BotError::Protocol(
-                            "gateway HELLO was not a text payload".into(),
-                        ));
-                    }
+                    _ => return Err(BotError::Protocol("gateway HELLO was not text".into())),
                 }
             }
         })
         .await
         .map_err(|_| BotError::Protocol("gateway HELLO timed out".into()))??;
+
         if hello.get("op").and_then(Value::as_u64) != Some(10) {
             return Err(BotError::Protocol("first gateway payload was not HELLO".into()));
         }
-        let interval_ms = hello["d"]["heartbeat_interval"]
+        let interval = hello["d"]["heartbeat_interval"]
             .as_f64()
-            .filter(|interval| interval.is_finite() && *interval >= 500.0)
+            .filter(|ms| ms.is_finite() && *ms >= 500.0)
+            .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
             .ok_or_else(|| BotError::Protocol("HELLO has invalid heartbeat interval".into()))?;
-        let interval = Duration::try_from_secs_f64(interval_ms / 1000.0)
-            .map_err(|_| BotError::Protocol("HELLO has invalid heartbeat interval".into()))?;
+
         Ok(Self {
             socket,
             token,
@@ -486,11 +458,12 @@ impl Gateway {
     }
 
     async fn send(&mut self, payload: Value) -> Result<(), BotError> {
-        self.send_text(payload.to_string()).await
+        self.feed_text(payload.to_string()).await?;
+        self.flush_socket().await
     }
 
     async fn feed_text(&mut self, text: String) -> Result<(), BotError> {
-        tokio::time::timeout(Duration::from_secs(10), self.socket.feed(Message::Text(text.into())))
+        tokio::time::timeout(WRITE_TIMEOUT, self.socket.feed(Message::Text(text.into())))
             .await
             .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
         self.needs_flush = true;
@@ -498,16 +471,11 @@ impl Gateway {
     }
 
     async fn flush_socket(&mut self) -> Result<(), BotError> {
-        tokio::time::timeout(Duration::from_secs(10), self.socket.flush())
+        tokio::time::timeout(WRITE_TIMEOUT, self.socket.flush())
             .await
             .map_err(|_| BotError::Protocol("gateway write timed out".into()))??;
         self.needs_flush = false;
         Ok(())
-    }
-
-    async fn send_text(&mut self, text: String) -> Result<(), BotError> {
-        self.feed_text(text).await?;
-        self.flush_socket().await
     }
 
     /// Sends OP 4 to join, move, or leave a guild voice channel.
@@ -528,8 +496,7 @@ impl Gateway {
         self_deaf: bool,
     ) -> Result<(), BotError> {
         let guild_id = validate_snowflake(guild_id, "guild ID")?;
-        let channel_id =
-            channel_id.map(|channel| validate_snowflake(channel, "channel ID")).transpose()?;
+        let channel_id = channel_id.map(|ch| validate_snowflake(ch, "channel ID")).transpose()?;
         self.send(json!({
             "op": 4,
             "d": {
@@ -566,19 +533,16 @@ impl Gateway {
                 self.flush_socket().await?;
             }
             tokio::select! {
-                // What has already arrived is read before the heartbeat timer is
-                // looked at. A caller that was busy for a moment leaves both the
-                // acknowledgement of the last beat and the next beat's deadline
-                // ready at once, and picking the timer first would call a beat
-                // unanswered while its answer sits in the socket.
+                // Drain queued socket frames before firing a due heartbeat timer so
+                // an already-received OP 11 ACK is never misread as a missed beat.
                 biased;
                 message = self.socket.next() => {
                     let Some(message) = message else { return Ok(None); };
                     match message? {
                         Message::Text(text) => {
                             let payload: Value = serde_json::from_str(&text)?;
-                            if let Some(sequence) = payload.get("s").and_then(Value::as_u64) {
-                                self.sequence = Some(sequence);
+                            if let Some(seq) = payload.get("s").and_then(Value::as_u64) {
+                                self.sequence = Some(seq);
                             }
                             match payload.get("op").and_then(Value::as_u64) {
                                 Some(0) => {
@@ -600,16 +564,14 @@ impl Gateway {
                                     return Err(BotError::InvalidSession);
                                 }
                                 Some(11) => self.heartbeat_acknowledged = true,
-                                Some(10) => {},
+                                Some(10) => {}
                                 Some(op) => return Err(BotError::Protocol(format!("unsupported gateway opcode {op}"))),
                                 None => return Err(BotError::Protocol("gateway payload has no opcode".into())),
                             }
                         }
-                        Message::Ping(_) => {
-                            self.needs_flush = true;
-                        }
+                        Message::Ping(_) => self.needs_flush = true,
                         Message::Close(frame) => {
-                            self.close_code = frame.map(|frame| u16::from(frame.code));
+                            self.close_code = frame.map(|f| u16::from(f.code));
                             return Ok(None);
                         }
                         Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
@@ -624,47 +586,33 @@ impl Gateway {
         self.sequence
     }
 
-    /// The code Discord closed the connection with, after `next_event` has
-    /// returned `None` for it. 4004 means the token was refused and 4010 to 4014
-    /// mean the bot's own configuration (shards, intents) is wrong: none of
-    /// them can be cured by connecting again. Other codes, and a close with no
-    /// code at all, are worth a retry.
+    /// Close code received from Discord once `next_event` returns `None`.
     pub fn close_code(&self) -> Option<u16> {
         self.close_code
     }
 
-    /// Whether the most recent `OP 9` (`Invalid Session`) payload indicated that
-    /// resuming (`Gateway::resume`) is allowed (`d: true`).
+    /// Whether the latest `OP 9` (`Invalid Session`) permitted `Gateway::resume`.
     pub fn invalid_session_resumable(&self) -> bool {
         self.invalid_session_resumable
     }
 }
 
 fn gateway_url(base: &str) -> Result<String, BotError> {
-    let mut url = Url::parse(base.trim()).map_err(|error| {
-        BotError::Invalid(format!("Discord gateway returned an invalid URL: {error}"))
-    })?;
+    let mut url = Url::parse(base.trim())
+        .map_err(|e| BotError::Invalid(format!("Discord gateway returned an invalid URL: {e}")))?;
     let scheme = url.scheme();
     let host = url
         .host_str()
         .ok_or_else(|| BotError::Invalid("Discord gateway URL has no host".into()))?;
-    if scheme != "wss" && scheme != "ws" {
+    if !matches!(scheme, "wss" | "ws") {
         return Err(BotError::Invalid("Discord gateway URL must use ws or wss".into()));
     }
-    let discord_host = host.eq_ignore_ascii_case("gateway.discord.gg")
-        || (host.len() > ".discord.gg".len()
-            && host
-                .as_bytes()
-                .get(host.len().wrapping_sub(".discord.gg".len())..)
-                .is_some_and(|tail| tail.eq_ignore_ascii_case(b".discord.gg")));
-    let loopback =
-        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1" | "[::1]");
+    let discord_host = host.len() > ".discord.gg".len()
+        && host.as_bytes()[host.len() - ".discord.gg".len()..].eq_ignore_ascii_case(b".discord.gg");
     if scheme == "wss" && !discord_host {
         return Err(BotError::Invalid("remote Discord gateway URL has an untrusted host".into()));
     }
-    // Plaintext WebSockets are only acceptable for the in-process loopback
-    // simulator. A production gateway URL must be encrypted.
-    if scheme == "ws" && !loopback {
+    if scheme == "ws" && !is_loopback_host(host) {
         return Err(BotError::Invalid("remote Discord gateway URL must use wss".into()));
     }
     if !url.username().is_empty()
@@ -677,25 +625,12 @@ fn gateway_url(base: &str) -> Result<String, BotError> {
         ));
     }
     url.set_query(Some("v=10&encoding=json"));
-    Ok(url.to_string())
-}
-
-fn validate_gateway_token(token: &str) -> Result<String, BotError> {
-    if token.is_empty() || token.len() > 512 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(BotError::Invalid(
-            "bot token is empty, too long, or contains whitespace".into(),
-        ));
-    }
-    Ok(token.to_owned())
+    Ok(url.into())
 }
 
 fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
-    let Value::Object(mut map) = payload else {
-        return Ok(None);
-    };
-    let Some(Value::String(name)) = map.remove("t") else {
-        return Ok(None);
-    };
+    let Value::Object(mut map) = payload else { return Ok(None) };
+    let Some(Value::String(name)) = map.remove("t") else { return Ok(None) };
     if name.is_empty() {
         return Ok(None);
     }
@@ -703,56 +638,36 @@ fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
     let event = match name.as_str() {
         "READY" => {
             let ready: RawReady = serde_json::from_value(data)?;
-            let resume_gateway_url = ready
-                .resume_gateway_url
-                .filter(|url| !url.trim().is_empty())
-                .unwrap_or_else(default_resume_url);
             Some(BotEvent::Ready(Ready {
                 user_id: ready.user.id,
-                application_id: ready
-                    .application
-                    .map(|application| application.id)
-                    .unwrap_or_default(),
+                application_id: ready.application.map(|a| a.id).unwrap_or_default(),
                 session_id: ready.session_id,
-                resume_gateway_url,
+                resume_gateway_url: ready
+                    .resume_gateway_url
+                    .filter(|u| !u.trim().is_empty())
+                    .unwrap_or_else(|| "wss://gateway.discord.gg".into()),
             }))
         }
-        "VOICE_STATE_UPDATE" => {
-            let update: RawVoiceState = serde_json::from_value(data)?;
-            Some(BotEvent::VoiceStateUpdate(VoiceStateUpdate {
-                guild_id: update.guild_id,
-                user_id: update.user_id,
-                channel_id: update.channel_id,
-                session_id: update.session_id,
-            }))
-        }
-        "VOICE_SERVER_UPDATE" => {
-            let update: RawVoiceServer = serde_json::from_value(data)?;
-            Some(BotEvent::VoiceServerUpdate(VoiceServerUpdate {
-                guild_id: update.guild_id,
-                token: update.token,
-                endpoint: update.endpoint,
-            }))
-        }
+        "VOICE_STATE_UPDATE" => Some(BotEvent::VoiceStateUpdate(serde_json::from_value(data)?)),
+        "VOICE_SERVER_UPDATE" => Some(BotEvent::VoiceServerUpdate(serde_json::from_value(data)?)),
         "MESSAGE_CREATE" => {
-            let message: RawMessage = serde_json::from_value(data)?;
-            if message.author.bot || message.webhook_id.is_some() {
+            let msg: RawMessage = serde_json::from_value(data)?;
+            if msg.author.bot || msg.webhook_id.is_some() {
                 return Ok(None);
             }
             Some(BotEvent::MessageCreate(MessageCreate {
-                id: message.id,
-                channel_id: message.channel_id,
-                guild_id: message.guild_id,
-                author_id: message.author.id,
-                content: message.content,
+                id: msg.id,
+                channel_id: msg.channel_id,
+                guild_id: msg.guild_id,
+                author_id: msg.author.id,
+                content: msg.content,
             }))
         }
-        // Type 2 is an application (slash) command; buttons and the rest stay `Other`.
         "INTERACTION_CREATE" if data.get("type").and_then(Value::as_u64) == Some(2) => {
             let raw: RawInteraction = serde_json::from_value(data)?;
             let user_id = raw
                 .member
-                .and_then(|member| member.user)
+                .and_then(|m| m.user)
                 .or(raw.user)
                 .ok_or_else(|| BotError::Protocol("interaction has no user".into()))?
                 .id;
@@ -760,8 +675,8 @@ fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
                 .data
                 .options
                 .into_iter()
-                .filter_map(|option| match option.value {
-                    Value::String(value) => Some((option.name, value)),
+                .filter_map(|o| match o.value {
+                    Value::String(v) => Some((o.name, v)),
                     _ => None,
                 })
                 .collect();
@@ -780,7 +695,7 @@ fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
     Ok(event)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RawReady {
     user: RawUser,
     #[serde(default)]
@@ -790,11 +705,7 @@ struct RawReady {
     resume_gateway_url: Option<String>,
 }
 
-fn default_resume_url() -> String {
-    "wss://gateway.discord.gg".into()
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RawUser {
     id: String,
     #[serde(default)]
@@ -836,22 +747,7 @@ struct RawOption {
     value: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawVoiceState {
-    guild_id: Option<String>,
-    user_id: String,
-    channel_id: Option<String>,
-    session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawVoiceServer {
-    guild_id: String,
-    token: String,
-    endpoint: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RawMessage {
     id: String,
     channel_id: String,
@@ -866,30 +762,50 @@ struct RawMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+    type ServerSocket = WebSocketStream<TcpStream>;
+
+    async fn bind_ws() -> (TcpListener, String) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+        (listener, ws_url)
+    }
+
+    async fn accept_ws(listener: &TcpListener) -> ServerSocket {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    }
+
+    async fn send_json(socket: &mut ServerSocket, payload: Value) {
+        socket.send(Message::Text(payload.to_string().into())).await.unwrap();
+    }
+
+    async fn recv_json(socket: &mut ServerSocket) -> Value {
+        match socket.next().await.unwrap().unwrap() {
+            Message::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
 
     #[test]
     fn message_create_ignores_bots_and_webhooks_and_emits_human_messages() {
         let bot_msg = json!({"op": 0, "t": "MESSAGE_CREATE", "d": {
             "id": "1", "channel_id": "10", "guild_id": "20",
-            "author": {"id": "30", "bot": true},
-            "content": "https://youtu.be/dQw4w9WgXcQ"
+            "author": {"id": "30", "bot": true}, "content": "https://youtu.be/dQw4w9WgXcQ"
         }});
         assert_eq!(dispatch(bot_msg).unwrap(), None);
 
         let webhook_msg = json!({"op": 0, "t": "MESSAGE_CREATE", "d": {
             "id": "2", "channel_id": "10", "guild_id": "20",
-            "author": {"id": "31"},
-            "webhook_id": "99",
-            "content": "https://youtu.be/dQw4w9WgXcQ"
+            "author": {"id": "31"}, "webhook_id": "99", "content": "https://youtu.be/dQw4w9WgXcQ"
         }});
         assert_eq!(dispatch(webhook_msg).unwrap(), None);
 
         let user_msg = json!({"op": 0, "t": "MESSAGE_CREATE", "d": {
             "id": "3", "channel_id": "10", "guild_id": "20",
-            "author": {"id": "32"},
-            "content": "https://youtu.be/dQw4w9WgXcQ"
+            "author": {"id": "32"}, "content": "https://youtu.be/dQw4w9WgXcQ"
         }});
         assert_eq!(
             dispatch(user_msg).unwrap(),
@@ -905,66 +821,48 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn connect_url_with_messages_falls_back_when_message_content_is_disallowed() {
-        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, ws_url) = bind_ws().await;
         let base_intents = GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES;
         let server = tokio::spawn(async move {
-            // Connection 1: reject MESSAGE_CONTENT with close code 4014.
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let hello = json!({"op": 10, "d": {"heartbeat_interval": 5000}});
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
-            let Message::Text(first_identify) = socket.next().await.unwrap().unwrap() else {
-                panic!("expected IDENTIFY text")
-            };
-            let first: Value = serde_json::from_str(&first_identify).unwrap();
-            assert_eq!(first["d"]["intents"].as_u64(), Some(base_intents | MESSAGE_CONTENT));
-            let frame =
-                CloseFrame { code: CloseCode::from(4014), reason: "Disallowed intent(s)".into() };
-            socket.close(Some(frame)).await.unwrap();
-
-            // Connection 2: accept unprivileged base_intents and send READY.
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
-            let Message::Text(second_identify) = socket.next().await.unwrap().unwrap() else {
-                panic!("expected fallback IDENTIFY text")
-            };
-            let second: Value = serde_json::from_str(&second_identify).unwrap();
-            assert_eq!(second["d"]["intents"].as_u64(), Some(base_intents));
-            socket
-                .send(Message::Text(
-                    json!({
-                        "op": 0,
-                        "t": "READY",
-                        "s": 1,
-                        "d": {
-                            "session_id": "sess-fallback",
-                            "resume_gateway_url": "wss://gateway.discord.gg",
-                            "user": {"id": "777"},
-                            "application": {"id": "888"}
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
+            let mut s1 = accept_ws(&listener).await;
+            send_json(&mut s1, hello.clone()).await;
+            assert_eq!(
+                recv_json(&mut s1).await["d"]["intents"].as_u64(),
+                Some(base_intents | MESSAGE_CONTENT)
+            );
+            s1.close(Some(CloseFrame { code: CloseCode::from(4014), reason: "Disallowed".into() }))
                 .await
                 .unwrap();
-            socket.close(None).await.unwrap();
+
+            let mut s2 = accept_ws(&listener).await;
+            send_json(&mut s2, hello).await;
+            assert_eq!(recv_json(&mut s2).await["d"]["intents"].as_u64(), Some(base_intents));
+            send_json(
+                &mut s2,
+                json!({
+                    "op": 0, "t": "READY", "s": 1,
+                    "d": {
+                        "session_id": "sess-fallback",
+                        "resume_gateway_url": "wss://gateway.discord.gg",
+                        "user": {"id": "777"},
+                        "application": {"id": "888"}
+                    }
+                }),
+            )
+            .await;
+            s2.close(None).await.unwrap();
         });
 
-        let (gateway, ready, message_content) = Gateway::connect_url_with_messages(
-            &format!("ws://{address}"),
-            Zeroizing::new("bot-token".to_owned()),
+        let (gw, ready, mc) = Gateway::connect_url_with_messages(
+            &ws_url,
+            Zeroizing::new("bot-token".into()),
             base_intents,
         )
         .await
         .unwrap();
-        assert!(!message_content);
-        assert_eq!(ready.user_id, "777");
-        assert_eq!(ready.application_id, "888");
-        assert_eq!(gateway.intents, base_intents);
+        assert!(!mc && ready.user_id == "777" && ready.application_id == "888");
+        assert_eq!(gw.intents, base_intents);
         server.await.unwrap();
     }
 
@@ -985,8 +883,7 @@ mod tests {
             }))
         );
         let debug = format!("{event:?}");
-        assert!(!debug.contains("voice-secret"));
-        assert!(!debug.contains("bot-token"));
+        assert!(!debug.contains("voice-secret") && !debug.contains("bot-token"));
     }
 
     #[test]
@@ -1005,44 +902,28 @@ mod tests {
                 {"name": "volume", "type": 4, "value": 50}
             ]}
         }});
-        let Some(BotEvent::Interaction(interaction)) = dispatch(interaction).unwrap() else {
-            panic!()
-        };
-        assert_eq!(interaction.user_id, "400");
-        assert_eq!(interaction.command, "play");
-        assert_eq!(interaction.option("url"), Some("https://youtu.be/dQw4w9WgXcQ"));
-        assert_eq!(interaction.option("volume"), None, "only string options are kept");
-        assert!(!format!("{interaction:?}").contains("secret-interaction-token"));
+        let Some(BotEvent::Interaction(ix)) = dispatch(interaction).unwrap() else { panic!() };
+        assert_eq!((ix.user_id.as_str(), ix.command.as_str()), ("400", "play"));
+        assert_eq!(ix.option("url"), Some("https://youtu.be/dQw4w9WgXcQ"));
+        assert_eq!(ix.option("volume"), None);
+        assert!(!format!("{ix:?}").contains("secret-interaction-token"));
 
-        // A button click (type 3) is not a slash command.
         let button = json!({"op": 0, "t": "INTERACTION_CREATE", "d": {"type": 3}});
         assert!(matches!(dispatch(button).unwrap(), Some(BotEvent::Other { .. })));
     }
 
     #[test]
     fn malformed_dispatch_is_rejected() {
-        let result = dispatch(json!({"op": 0, "t": "READY", "d": {}}));
-        assert!(result.is_err());
+        assert!(dispatch(json!({"op": 0, "t": "READY", "d": {}})).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_gateway_simulator_covers_hello_identify_ready_and_heartbeat() {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, ws_url) = bind_ws().await;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket
-                .send(Message::Text(
-                    json!({"op":10,"d":{"heartbeat_interval":5000}}).to_string().into(),
-                ))
-                .await
-                .unwrap();
-            let identify = socket.next().await.unwrap().unwrap();
-            let identify: Value = match identify {
-                Message::Text(text) => serde_json::from_str(&text).unwrap(),
-                other => panic!("unexpected identify payload: {other:?}"),
-            };
+            let mut socket = accept_ws(&listener).await;
+            send_json(&mut socket, json!({"op": 10, "d": {"heartbeat_interval": 5000}})).await;
+            let identify = recv_json(&mut socket).await;
             assert_eq!(identify["op"], 2);
             assert_eq!(identify["d"]["token"], "bot-token");
             assert_eq!(identify["d"]["intents"], 128);
@@ -1050,121 +931,81 @@ mod tests {
             assert_eq!(identify["d"]["properties"]["$browser"], "rustlink");
             assert_eq!(identify["d"]["properties"]["$device"], "rustlink");
             assert!(identify["d"]["properties"]["os"].is_null());
-            socket
-                .send(Message::Text(
-                    json!({"op":0,"t":"READY","s":1,"d":{"session_id":"session","resume_gateway_url":"wss://gateway.discord.gg","user":{"id":"123"}}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            socket.send(Message::Text(json!({"op":1,"d":null}).to_string().into())).await.unwrap();
-            let heartbeat = tokio::time::timeout(Duration::from_secs(2), socket.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let heartbeat: Value = match heartbeat {
-                Message::Text(text) => serde_json::from_str(&text).unwrap(),
-                other => panic!("unexpected heartbeat payload: {other:?}"),
-            };
-            assert_eq!(heartbeat["op"], 1);
-            assert_eq!(heartbeat["d"], 1);
-            socket.send(Message::Text(json!({"op":11,"d":null}).to_string().into())).await.unwrap();
+            send_json(
+                &mut socket,
+                json!({"op": 0, "t": "READY", "s": 1, "d": {
+                    "session_id": "session",
+                    "resume_gateway_url": "wss://gateway.discord.gg",
+                    "user": {"id": "123"}
+                }}),
+            )
+            .await;
+            send_json(&mut socket, json!({"op": 1, "d": null})).await;
+            let beat =
+                tokio::time::timeout(Duration::from_secs(2), recv_json(&mut socket)).await.unwrap();
+            assert_eq!((beat["op"].as_u64(), beat["d"].as_u64()), (Some(1), Some(1)));
+            send_json(&mut socket, json!({"op": 11, "d": null})).await;
             socket.close(None).await.unwrap();
         });
 
-        let mut gateway = Gateway::connect_url(
-            format!("ws://{address}"),
-            Zeroizing::new("bot-token".to_owned()),
-            128,
-        )
-        .await
-        .unwrap();
-        let event = gateway.next_event().await.unwrap().unwrap();
+        let mut gw =
+            Gateway::connect_url(&ws_url, Zeroizing::new("bot-token".into()), 128).await.unwrap();
+        let event = gw.next_event().await.unwrap().unwrap();
         assert!(matches!(event, BotEvent::Ready(Ready { user_id, .. }) if user_id == "123"));
-        assert!(gateway.next_event().await.unwrap().is_none());
+        assert!(gw.next_event().await.unwrap().is_none());
         server.await.unwrap();
     }
 
-    /// One connection on which the caller is slow to poll: the first heartbeat
-    /// is acknowledged, then the caller does not read until the next heartbeat
-    /// has also fallen due, so the acknowledgement and the deadline are ready
-    /// together.
     async fn slow_caller() -> Result<Option<BotEvent>, BotError> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, ws_url) = bind_ws().await;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let hello = json!({"op":10,"d":{"heartbeat_interval":500}});
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let mut socket = accept_ws(&listener).await;
+            send_json(&mut socket, json!({"op": 10, "d": {"heartbeat_interval": 500}})).await;
             let _identify = socket.next().await;
             let _first_heartbeat = socket.next().await;
-            // The acknowledgement comes after the caller has stopped reading (at
-            // 650 ms), so it can only be found sitting in the socket.
             tokio::time::sleep(Duration::from_millis(200)).await;
-            socket.send(Message::Text(json!({"op":11,"d":null}).to_string().into())).await.unwrap();
-            // A dispatch for the caller to return on once it reads again.
+            send_json(&mut socket, json!({"op": 11, "d": null})).await;
             tokio::time::sleep(Duration::from_millis(600)).await;
-            let event = json!({"op":0,"t":"SOMETHING","s":2,"d":{"x":1}});
-            socket.send(Message::Text(event.to_string().into())).await.unwrap();
+            send_json(&mut socket, json!({"op": 0, "t": "SOMETHING", "s": 2, "d": {"x": 1}})).await;
             let _ = socket.next().await;
         });
-        let mut gateway = Gateway::connect_url(
-            format!("ws://{address}"),
-            Zeroizing::new("bot-token".to_owned()),
-            128,
-        )
-        .await
-        .unwrap();
-        // The first heartbeat goes out at 500 ms; nothing is dispatched, so this waits out.
-        assert!(tokio::time::timeout(Duration::from_millis(650), gateway.next_event())
-            .await
-            .is_err());
-        // The acknowledgement is now in the socket. Staying away lets the next beat fall due.
+        let mut gw =
+            Gateway::connect_url(&ws_url, Zeroizing::new("bot-token".into()), 128).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(650), gw.next_event()).await.is_err());
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let event = gateway.next_event().await;
+        let event = gw.next_event().await;
         server.abort();
         event
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_acknowledgement_already_received_is_never_missed_for_a_late_heartbeat() {
-        // Each connection used to fail about half the time, so sixteen at once
-        // make a return of the race all but certain to be seen.
-        let outcomes = futures_util::future::join_all((0..16).map(|_| slow_caller())).await;
-        for outcome in outcomes {
-            let event = outcome.expect("a heartbeat that was acknowledged is not unanswered");
+        for outcome in futures_util::future::join_all((0..16).map(|_| slow_caller())).await {
+            let event = outcome.expect("acknowledged heartbeat must not fail");
             assert!(matches!(event, Some(BotEvent::Other { .. })), "{event:?}");
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_close_code_is_kept_so_a_refused_token_can_be_told_from_a_dropped_link() {
-        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, ws_url) = bind_ws().await;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let hello = json!({"op":10,"d":{"heartbeat_interval":5000}});
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let mut socket = accept_ws(&listener).await;
+            send_json(&mut socket, json!({"op": 10, "d": {"heartbeat_interval": 5000}})).await;
             let _identify = socket.next().await;
-            let frame =
-                CloseFrame { code: CloseCode::from(4004), reason: "Authentication failed".into() };
-            socket.close(Some(frame)).await.unwrap();
+            socket
+                .close(Some(CloseFrame {
+                    code: CloseCode::from(4004),
+                    reason: "Auth failed".into(),
+                }))
+                .await
+                .unwrap();
         });
-        let mut gateway = Gateway::connect_url(
-            format!("ws://{address}"),
-            Zeroizing::new("bot-token".to_owned()),
-            128,
-        )
-        .await
-        .unwrap();
-        assert_eq!(gateway.close_code(), None, "nothing has closed yet");
-        assert!(gateway.next_event().await.unwrap().is_none());
-        assert_eq!(gateway.close_code(), Some(4004));
+        let mut gw =
+            Gateway::connect_url(&ws_url, Zeroizing::new("bot-token".into()), 128).await.unwrap();
+        assert_eq!(gw.close_code(), None);
+        assert!(gw.next_event().await.unwrap().is_none());
+        assert_eq!(gw.close_code(), Some(4004));
         server.await.unwrap();
     }
 
@@ -1173,21 +1014,21 @@ mod tests {
         assert!(gateway_url("wss://gateway.discord.gg").is_ok());
         assert!(gateway_url("wss://gateway-us-east1-b.discord.gg/").is_ok());
         assert!(gateway_url("ws://127.0.0.1:1234").is_ok());
-        for value in [
+        for bad in [
             "wss://example.test",
             "ws://example.test",
             "wss://gateway.discord.gg/?token=secret",
             "wss://user:pass@gateway.discord.gg",
         ] {
-            assert!(gateway_url(value).is_err(), "accepted untrusted gateway URL {value}");
+            assert!(gateway_url(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn gateway_token_validation_rejects_header_injection_and_whitespace() {
-        assert!(validate_gateway_token("token-value").is_ok());
-        for value in ["", " token", "token ", "token\nvalue", "token\tvalue"] {
-            assert!(validate_gateway_token(value).is_err(), "accepted token {value:?}");
+        assert!(validate_bot_token("token-value").is_ok());
+        for bad in ["", " token", "token ", "token\nvalue", "token\tvalue"] {
+            assert!(validate_bot_token(bad).is_err(), "{bad:?}");
         }
     }
 
@@ -1206,30 +1047,21 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn open_hello_skips_ping_and_pong_frames_before_hello() {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, ws_url) = bind_ws().await;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut socket = accept_ws(&listener).await;
             socket.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
             socket.send(Message::Pong(Vec::new().into())).await.unwrap();
-            socket
-                .send(Message::Text(
-                    json!({"op": 10, "d": {"heartbeat_interval": 5000}}).to_string().into(),
-                ))
-                .await
-                .unwrap();
-            let mut saw_pong = false;
-            let mut saw_identify = false;
+            send_json(&mut socket, json!({"op": 10, "d": {"heartbeat_interval": 5000}})).await;
+            let (mut saw_pong, mut saw_identify) = (false, false);
             for _ in 0..2 {
                 match socket.next().await.unwrap().unwrap() {
-                    Message::Pong(payload) => {
-                        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+                    Message::Pong(p) => {
+                        assert_eq!(p.as_ref(), &[1, 2, 3]);
                         saw_pong = true;
                     }
-                    Message::Text(text) => {
-                        let parsed: Value = serde_json::from_str(&text).unwrap();
-                        assert_eq!(parsed["op"], 2);
+                    Message::Text(t) => {
+                        assert_eq!(serde_json::from_str::<Value>(&t).unwrap()["op"], 2);
                         saw_identify = true;
                     }
                     other => panic!("unexpected frame: {other:?}"),
@@ -1239,172 +1071,102 @@ mod tests {
             socket.close(None).await.unwrap();
         });
 
-        let mut gateway = Gateway::connect_url(
-            format!("ws://{address}"),
-            Zeroizing::new("bot-token".to_owned()),
-            GUILDS,
-        )
-        .await
-        .unwrap();
-        assert!(!gateway.needs_flush);
-        assert!(gateway.next_event().await.unwrap().is_none());
+        let mut gw = Gateway::connect_url(&ws_url, Zeroizing::new("bot-token".into()), GUILDS)
+            .await
+            .unwrap();
+        assert!(!gw.needs_flush);
+        assert!(gw.next_event().await.unwrap().is_none());
         server.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn unconfirmed_resume_falls_back_to_identify_with_backoff() {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let ws_url = format!("ws://{address}");
+        let (listener, ws_url) = bind_ws().await;
         let server_ws_url = ws_url.clone();
-
         let server = tokio::spawn(async move {
             let hello = json!({"op": 10, "d": {"heartbeat_interval": 5000}});
 
-            // 1. Initial IDENTIFY + READY.
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
-            let Message::Text(first) = socket.next().await.unwrap().unwrap() else { panic!() };
-            let first_json: Value = serde_json::from_str(&first).unwrap();
-            assert_eq!(first_json["op"], 2);
-            socket
-                .send(Message::Text(
-                    json!({
-                        "op": 0,
-                        "t": "READY",
-                        "s": 7,
-                        "d": {
-                            "session_id": "sess-1",
-                            "resume_gateway_url": server_ws_url,
-                            "user": {"id": "123"}
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            socket.close(None).await.unwrap();
+            let mut s1 = accept_ws(&listener).await;
+            send_json(&mut s1, hello.clone()).await;
+            assert_eq!(recv_json(&mut s1).await["op"], 2);
+            send_json(
+                &mut s1,
+                json!({
+                    "op": 0, "t": "READY", "s": 7,
+                    "d": {"session_id": "sess-1", "resume_gateway_url": server_ws_url, "user": {"id": "123"}}
+                }),
+            )
+            .await;
+            s1.close(None).await.unwrap();
 
-            // 2. First reconnect sends RESUME (op: 6), then server closes before op: 0.
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
-            let Message::Text(second) = socket.next().await.unwrap().unwrap() else { panic!() };
-            let second_json: Value = serde_json::from_str(&second).unwrap();
-            assert_eq!(second_json["op"], 6);
-            assert_eq!(second_json["d"]["session_id"], "sess-1");
-            assert_eq!(second_json["d"]["seq"], 7);
-            socket.close(None).await.unwrap();
+            let mut s2 = accept_ws(&listener).await;
+            send_json(&mut s2, hello.clone()).await;
+            let second = recv_json(&mut s2).await;
+            assert_eq!(second["op"], 6);
+            assert_eq!(second["d"]["session_id"], "sess-1");
+            assert_eq!(second["d"]["seq"], 7);
+            s2.close(None).await.unwrap();
 
-            // 3. Second reconnect must NOT loop on RESUME; it falls back to IDENTIFY (op: 2).
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
-            let Message::Text(third) = socket.next().await.unwrap().unwrap() else { panic!() };
-            let third_json: Value = serde_json::from_str(&third).unwrap();
-            assert_eq!(third_json["op"], 2);
-            socket
-                .send(Message::Text(
-                    json!({
-                        "op": 0,
-                        "t": "READY",
-                        "s": 1,
-                        "d": {
-                            "session_id": "sess-2",
-                            "resume_gateway_url": server_ws_url,
-                            "user": {"id": "123"}
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            socket.close(None).await.unwrap();
+            let mut s3 = accept_ws(&listener).await;
+            send_json(&mut s3, hello).await;
+            assert_eq!(recv_json(&mut s3).await["op"], 2);
+            send_json(
+                &mut s3,
+                json!({
+                    "op": 0, "t": "READY", "s": 1,
+                    "d": {"session_id": "sess-2", "resume_gateway_url": server_ws_url, "user": {"id": "123"}}
+                }),
+            )
+            .await;
+            s3.close(None).await.unwrap();
         });
 
-        let mut gateway =
-            Gateway::connect_url(ws_url.clone(), Zeroizing::new("bot-token".to_owned()), GUILDS)
-                .await
-                .unwrap();
-        let ready = gateway.next_ready().await.unwrap();
-        assert_eq!(ready.session_id, "sess-1");
-        assert!(!gateway.resuming);
-        assert_eq!(gateway.reconnect_attempts, 0);
+        let mut gw = Gateway::connect_url(&ws_url, Zeroizing::new("bot-token".into()), GUILDS)
+            .await
+            .unwrap();
+        assert_eq!(gw.next_ready().await.unwrap().session_id, "sess-1");
+        assert!(!gw.resuming && gw.reconnect_attempts == 0);
 
-        // Connection 1 closes cleanly -> reconnect #1 resumes immediately.
-        assert!(gateway.next_event().await.unwrap().is_none());
-        gateway.reconnect_inner(None, Some(&ws_url)).await.unwrap();
-        assert!(gateway.resuming);
-        assert_eq!(gateway.reconnect_attempts, 1);
+        assert!(gw.next_event().await.unwrap().is_none());
+        gw.reconnect_inner(None, Some(&ws_url)).await.unwrap();
+        assert!(gw.resuming && gw.reconnect_attempts == 1);
 
-        // Connection 2 closes before any op: 0 -> reconnect #2 backs off >= 1s and sends IDENTIFY.
-        assert!(gateway.next_event().await.unwrap().is_none());
+        assert!(gw.next_event().await.unwrap().is_none());
         let started = Instant::now();
-        gateway.reconnect_inner(None, Some(&ws_url)).await.unwrap();
+        gw.reconnect_inner(None, Some(&ws_url)).await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(900));
-        assert!(!gateway.resuming);
-        assert_eq!(gateway.reconnect_attempts, 2);
+        assert!(!gw.resuming && gw.reconnect_attempts == 2);
 
-        // Receiving READY (op: 0) resets reconnect_attempts back to 0.
-        let ready2 = gateway.next_ready().await.unwrap();
-        assert_eq!(ready2.session_id, "sess-2");
-        assert_eq!(gateway.reconnect_attempts, 0);
-        assert!(!gateway.resuming);
+        assert_eq!(gw.next_ready().await.unwrap().session_id, "sess-2");
+        assert!(!gw.resuming && gw.reconnect_attempts == 0);
         server.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_next_event_flushes_buffered_heartbeat_without_duplicating_it() {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, ws_url) = bind_ws().await;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket
-                .send(Message::Text(
-                    json!({"op": 10, "d": {"heartbeat_interval": 500}}).to_string().into(),
-                ))
-                .await
-                .unwrap();
-            let _identify = socket.next().await.unwrap().unwrap();
-            let beat = socket.next().await.unwrap().unwrap();
-            let Message::Text(beat_text) = beat else { panic!("expected heartbeat text") };
-            let parsed: Value = serde_json::from_str(&beat_text).unwrap();
-            assert_eq!(parsed["op"], 1);
-            socket
-                .send(Message::Text(json!({"op": 11, "d": null}).to_string().into()))
-                .await
-                .unwrap();
-            socket
-                .send(Message::Text(
-                    json!({"op": 0, "t": "PING_CHECK", "s": 1, "d": {}}).to_string().into(),
-                ))
-                .await
-                .unwrap();
+            let mut socket = accept_ws(&listener).await;
+            send_json(&mut socket, json!({"op": 10, "d": {"heartbeat_interval": 500}})).await;
+            let _identify = recv_json(&mut socket).await;
+            assert_eq!(recv_json(&mut socket).await["op"], 1);
+            send_json(&mut socket, json!({"op": 11, "d": null})).await;
+            send_json(&mut socket, json!({"op": 0, "t": "PING_CHECK", "s": 1, "d": {}})).await;
             socket.close(None).await.unwrap();
         });
 
-        let mut gateway = Gateway::connect_url(
-            format!("ws://{address}"),
-            Zeroizing::new("bot-token".to_owned()),
-            GUILDS,
-        )
-        .await
-        .unwrap();
-        // Simulate feeding a heartbeat right before an outer `tokio::select!` cancels flush.
-        gateway.feed_text(r#"{"op":1,"d":null}"#.to_owned()).await.unwrap();
-        gateway.heartbeat_acknowledged = false;
-        gateway.next_heartbeat = Instant::now() + gateway.heartbeat_interval;
-        assert!(gateway.needs_flush);
+        let mut gw = Gateway::connect_url(&ws_url, Zeroizing::new("bot-token".into()), GUILDS)
+            .await
+            .unwrap();
+        gw.feed_text(r#"{"op":1,"d":null}"#.into()).await.unwrap();
+        gw.heartbeat_acknowledged = false;
+        gw.next_heartbeat = Instant::now() + gw.heartbeat_interval;
+        assert!(gw.needs_flush);
 
-        let event = gateway.next_event().await.unwrap().unwrap();
-        assert!(!gateway.needs_flush);
-        assert!(gateway.heartbeat_acknowledged);
+        let event = gw.next_event().await.unwrap().unwrap();
+        assert!(!gw.needs_flush && gw.heartbeat_acknowledged);
         assert!(matches!(event, BotEvent::Other { name, .. } if name == "PING_CHECK"));
-        assert!(gateway.next_event().await.unwrap().is_none());
+        assert!(gw.next_event().await.unwrap().is_none());
         server.await.unwrap();
     }
 }

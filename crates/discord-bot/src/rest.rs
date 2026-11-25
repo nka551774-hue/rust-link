@@ -4,19 +4,22 @@ use std::fmt;
 use std::time::Duration;
 
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
-use reqwest::redirect::Policy;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::BotError;
+use crate::{
+    bot_auth_header, host_is_or_subdomain, http_client, is_loopback_host, read_limited_body,
+    validate_bot_token, validate_snowflake, BotError, USER_AGENT_VALUE,
+};
 
 const DEFAULT_BASE: &str = "https://discord.com/api/v10/";
-const USER_AGENT_VALUE: &str =
-    concat!("DiscordBot (https://github.com/rustlink, ", env!("CARGO_PKG_VERSION"), ")");
 const MAX_CONTENT_CHARS: usize = 2_000;
 const MAX_RESPONSE_BYTES: usize = 2 << 20;
+const MAX_RATE_LIMIT_RETRIES: usize = 3;
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(10);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The subset of Discord's message object needed after a send.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -47,9 +50,8 @@ pub struct DiscordRest {
 }
 
 impl fmt::Debug for DiscordRest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DiscordRest")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscordRest")
             .field("base", &redact(self.base.as_str(), &self.token))
             .field("token", &"<redacted>")
             .finish_non_exhaustive()
@@ -62,26 +64,13 @@ impl DiscordRest {
         Self::with_base(token, DEFAULT_BASE)
     }
 
-    /// Creates a client against an explicit API base. Production hosts must be
-    /// `discord.com` (or a subdomain); plain HTTP is accepted only on loopback
-    /// for local protocol tests, so a bot token cannot be sent to an arbitrary
-    /// proxy by accident.
+    /// Creates a client against an explicit API base (`discord.com` over HTTPS,
+    /// or loopback HTTP for local protocol tests).
     pub fn with_base(token: impl Into<String>, base: &str) -> Result<Self, BotError> {
         let token = Zeroizing::new(token.into());
-        validate_token(&token)?;
-        let auth_text = Zeroizing::new(format!("Bot {}", token.as_str()));
-        let mut auth = HeaderValue::from_str(&auth_text).map_err(|_| {
-            BotError::Invalid("bot token contains invalid header characters".into())
-        })?;
-        auth.set_sensitive(true);
-        let base = parse_base(base)?;
-        let client = reqwest::Client::builder()
-            .tcp_nodelay(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .redirect(Policy::none())
-            .build()?;
-        Ok(Self { client, base, token, auth })
+        validate_bot_token(&token)?;
+        let auth = bot_auth_header(&token)?;
+        Ok(Self { client: http_client(DEFAULT_TIMEOUT)?, base: parse_base(base)?, token, auth })
     }
 
     /// Sends a plain text message to a channel.
@@ -90,7 +79,7 @@ impl DiscordRest {
         channel_id: &str,
         content: &str,
     ) -> Result<SentMessage, BotError> {
-        let channel_id = crate::validate_snowflake(channel_id, "channel_id")?;
+        let channel_id = validate_snowflake(channel_id, "channel_id")?;
         validate_content(content)?;
         let body = self
             .call(
@@ -99,36 +88,34 @@ impl DiscordRest {
                 &ContentBody { content },
                 true,
                 MAX_RATE_LIMIT_WAIT,
-                Duration::from_secs(30),
+                DEFAULT_TIMEOUT,
             )
             .await?;
         serde_json::from_slice(&body).map_err(BotError::from)
     }
 
-    /// Replaces this application's slash commands in one guild. Guild commands
-    /// appear immediately, unlike global ones.
+    /// Replaces this application's slash commands in one guild.
     pub async fn set_guild_commands(
         &self,
         application_id: &str,
         guild_id: &str,
         commands: &serde_json::Value,
     ) -> Result<(), BotError> {
-        let application_id = crate::validate_snowflake(application_id, "application_id")?;
-        let guild_id = crate::validate_snowflake(guild_id, "guild_id")?;
+        let application_id = validate_snowflake(application_id, "application_id")?;
+        let guild_id = validate_snowflake(guild_id, "guild_id")?;
         let path = format!("applications/{application_id}/guilds/{guild_id}/commands");
-        self.call(Method::PUT, &path, commands, true, MAX_RATE_LIMIT_WAIT, Duration::from_secs(30))
+        self.call(Method::PUT, &path, commands, true, MAX_RATE_LIMIT_WAIT, DEFAULT_TIMEOUT)
             .await
             .map(drop)
     }
 
-    /// Acknowledges a slash command within Discord's 3-second window and shows
-    /// "thinking…" until the response is edited.
+    /// Acknowledges a slash command within Discord's 3-second window.
     pub async fn defer_interaction(
         &self,
         interaction_id: &str,
         interaction_token: &str,
     ) -> Result<(), BotError> {
-        let interaction_id = crate::validate_snowflake(interaction_id, "interaction_id")?;
+        let interaction_id = validate_snowflake(interaction_id, "interaction_id")?;
         validate_interaction_token(interaction_token)?;
         let path = format!("interactions/{interaction_id}/{interaction_token}/callback");
         self.call(
@@ -150,7 +137,7 @@ impl DiscordRest {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), BotError> {
-        let application_id = crate::validate_snowflake(application_id, "application_id")?;
+        let application_id = validate_snowflake(application_id, "application_id")?;
         validate_interaction_token(interaction_token)?;
         validate_content(content)?;
         let path = format!("webhooks/{application_id}/{interaction_token}/messages/@original");
@@ -160,15 +147,12 @@ impl DiscordRest {
             &ContentBody { content },
             false,
             MAX_RATE_LIMIT_WAIT,
-            Duration::from_secs(30),
+            DEFAULT_TIMEOUT,
         )
         .await
         .map(drop)
     }
 
-    /// Sends one JSON request and returns the success body. Interaction
-    /// callback/webhook routes authenticate with `interaction_token` in the
-    /// path, so the bot token is omitted there.
     async fn call<B: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -181,7 +165,7 @@ impl DiscordRest {
         let endpoint = self
             .base
             .join(path)
-            .map_err(|error| BotError::Invalid(format!("invalid Discord endpoint: {error}")))?;
+            .map_err(|e| BotError::Invalid(format!("invalid Discord endpoint: {e}")))?;
         let payload = serde_json::to_vec(body)?;
         let mut remaining_wait = max_retry_wait;
         let deadline = tokio::time::Instant::now() + request_timeout + max_retry_wait;
@@ -208,33 +192,21 @@ impl DiscordRest {
             }
             let response = req.send().await.map_err(BotError::from)?;
             let status = response.status();
-            let retry_header = if status.as_u16() == 429 {
-                response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-            } else {
-                None
-            };
-            let response_body = crate::read_limited_body(
+            let retry_header = (status.as_u16() == 429)
+                .then(|| response.headers().get("retry-after")?.to_str().ok().map(str::to_owned))
+                .flatten();
+            let response_body = read_limited_body(
                 response,
                 status,
                 MAX_RESPONSE_BYTES,
                 "Discord response exceeded the configured limit",
             )
             .await?;
-            // Discord rate-limits per route and says how long to wait. A short
-            // wait is worth taking, because the request is otherwise lost for no
-            // fault of its own; a long one is reported, since a caller cannot
-            // sit on it (an interaction token expires within minutes).
             if status.as_u16() == 429 && limited < MAX_RATE_LIMIT_RETRIES {
                 if let Some(wait) = retry_wait(&response_body, retry_header.as_deref())
-                    .filter(|wait| *wait <= remaining_wait)
+                    .filter(|w| *w <= remaining_wait)
                 {
-                    let post_sleep =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if wait < post_sleep {
+                    if wait < deadline.saturating_duration_since(tokio::time::Instant::now()) {
                         remaining_wait -= wait;
                         limited += 1;
                         tokio::time::sleep(wait).await;
@@ -245,7 +217,7 @@ impl DiscordRest {
             if !status.is_success() {
                 return Err(BotError::HttpStatus {
                     status: status.as_u16(),
-                    message: redact(&discord_error_message(&response_body), self.token.as_str()),
+                    message: redact(&discord_error_message(&response_body), &self.token),
                 });
             }
             return Ok(response_body);
@@ -253,15 +225,6 @@ impl DiscordRest {
     }
 }
 
-/// How many times a request is repeated after Discord answers 429.
-const MAX_RATE_LIMIT_RETRIES: usize = 3;
-
-/// The longest a rate limit is waited out.
-const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(10);
-
-/// How long a 429 asks to wait: the `retry_after` of its JSON body, which has
-/// sub-second precision, or else the `Retry-After` header. `None` when it
-/// names no usable wait or one longer than [`MAX_RATE_LIMIT_WAIT`].
 fn retry_wait(body: &[u8], header: Option<&str>) -> Option<Duration> {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
     let seconds = if let Some(field) = parsed.as_ref().and_then(|v| v.get("retry_after")) {
@@ -278,16 +241,11 @@ fn retry_wait(body: &[u8], header: Option<&str>) -> Option<Duration> {
     (wait <= MAX_RATE_LIMIT_WAIT).then_some(wait.max(Duration::from_millis(50)))
 }
 
-/// Interaction tokens are spliced into URL paths, so only URL-safe characters pass.
-/// Dot-segments (`.` and `..`) are explicitly refused so `Url::join` cannot traverse.
 fn validate_interaction_token(token: &str) -> Result<(), BotError> {
     if token.is_empty()
         || token.len() > 512
-        || token == "."
-        || token == ".."
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || matches!(token, "." | "..")
+        || !token.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
         return Err(BotError::Invalid("interaction token is malformed".into()));
     }
@@ -296,9 +254,11 @@ fn validate_interaction_token(token: &str) -> Result<(), BotError> {
 
 fn parse_base(value: &str) -> Result<Url, BotError> {
     let mut base = Url::parse(value)
-        .map_err(|error| BotError::Invalid(format!("invalid Discord API base: {error}")))?;
+        .map_err(|e| BotError::Invalid(format!("invalid Discord API base: {e}")))?;
+    let Some(host) = base.host_str() else {
+        return Err(BotError::Invalid("Discord API base has no host".into()));
+    };
     if !matches!(base.scheme(), "http" | "https")
-        || base.host_str().is_none()
         || !base.username().is_empty()
         || base.password().is_some()
         || base.query().is_some()
@@ -309,15 +269,8 @@ fn parse_base(value: &str) -> Result<Url, BotError> {
                 .into(),
         ));
     }
-    let host = base.host_str().unwrap_or_default();
-    let loopback =
-        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1" | "[::1]");
-    let discord = host.eq_ignore_ascii_case("discord.com")
-        || host
-            .as_bytes()
-            .get(host.len().wrapping_sub(".discord.com".len())..)
-            .is_some_and(|tail| tail.eq_ignore_ascii_case(b".discord.com"));
-    if !loopback && !discord {
+    let loopback = is_loopback_host(host);
+    if !loopback && !host_is_or_subdomain(host, "discord.com") {
         return Err(BotError::Invalid(
             "Discord API base must use discord.com or a loopback test host".into(),
         ));
@@ -328,20 +281,9 @@ fn parse_base(value: &str) -> Result<Url, BotError> {
         ));
     }
     if !base.path().ends_with('/') {
-        let mut path = base.path().to_owned();
-        path.push('/');
-        base.set_path(&path);
+        base.set_path(&format!("{}/", base.path()));
     }
     Ok(base)
-}
-
-fn validate_token(token: &str) -> Result<(), BotError> {
-    if token.is_empty() || token.len() > 512 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(BotError::Invalid(
-            "bot token is empty, too long, or contains invalid characters".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_content(content: &str) -> Result<(), BotError> {
@@ -365,11 +307,11 @@ struct DiscordErrorBody {
 }
 
 fn discord_error_message(body: &[u8]) -> String {
-    let Ok(error) = serde_json::from_slice::<DiscordErrorBody>(body) else {
+    let Ok(err) = serde_json::from_slice::<DiscordErrorBody>(body) else {
         return "Discord returned an error response".into();
     };
-    let message = error.message.unwrap_or_else(|| "Discord request failed".into());
-    match error.code {
+    let message = err.message.unwrap_or_else(|| "Discord request failed".into());
+    match err.code {
         Some(code) if !code.is_null() => format!("{message} (code {code})"),
         _ => message,
     }
@@ -409,13 +351,15 @@ mod tests {
     #[test]
     fn message_and_channel_limits_are_checked_before_network_io() {
         let rest = DiscordRest::with_base("token", "http://127.0.0.1:1/").unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let error = runtime.block_on(rest.send_text("not-a-snowflake", "hello")).unwrap_err();
-        assert!(matches!(error, BotError::Invalid(_)));
-        let error = runtime
-            .block_on(rest.send_text("123", &"x".repeat(MAX_CONTENT_CHARS + 1)))
-            .unwrap_err();
-        assert!(matches!(error, BotError::Invalid(_)));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(matches!(
+            rt.block_on(rest.send_text("not-a-snowflake", "hello")).unwrap_err(),
+            BotError::Invalid(_)
+        ));
+        assert!(matches!(
+            rt.block_on(rest.send_text("123", &"x".repeat(MAX_CONTENT_CHARS + 1))).unwrap_err(),
+            BotError::Invalid(_)
+        ));
     }
 
     #[test]
@@ -430,24 +374,15 @@ mod tests {
     fn a_rate_limit_wait_comes_from_the_body_then_the_header_and_is_bounded() {
         let body = br#"{"message":"You are being rate limited.","retry_after":1.5,"global":false}"#;
         assert_eq!(retry_wait(body, None), Some(Duration::from_millis(1500)));
-        assert_eq!(retry_wait(body, Some("9")), Some(Duration::from_millis(1500)), "the body wins");
+        assert_eq!(retry_wait(body, Some("9")), Some(Duration::from_millis(1500)));
         assert_eq!(retry_wait(b"", Some("2")), Some(Duration::from_secs(2)));
-        assert_eq!(
-            retry_wait(b"not json", None),
-            Some(Duration::from_secs(1)),
-            "no hint: one second"
-        );
+        assert_eq!(retry_wait(b"not json", None), Some(Duration::from_secs(1)));
         assert_eq!(retry_wait(br#"{"retry_after":0}"#, None), Some(Duration::from_millis(50)));
-        assert_eq!(retry_wait(br#"{"retry_after":60}"#, None), None, "too long to sit on");
+        assert_eq!(retry_wait(br#"{"retry_after":60}"#, None), None);
         assert_eq!(retry_wait(br#"{"retry_after":-1}"#, None), None);
-        assert_eq!(
-            retry_wait(b"", Some("nan")),
-            None,
-            "a wait that is not a number is not trusted"
-        );
+        assert_eq!(retry_wait(b"", Some("nan")), None);
     }
 
-    /// A 429 that asks to wait `retry_after` seconds.
     fn limited(retry_after: &str) -> String {
         let body = format!(r#"{{"message":"limited","retry_after":{retry_after},"global":false}}"#);
         format!(
@@ -457,11 +392,9 @@ mod tests {
     }
 
     fn ok() -> String {
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()
     }
 
-    /// Answers each request with the next of `responses`, and reports how many
-    /// requests were made.
     async fn scripted(responses: Vec<String>) -> (String, tokio::task::JoinHandle<usize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -470,12 +403,11 @@ mod tests {
             let mut served = 0;
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0u8; 4096];
-                let mut request = Vec::new();
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    let count = socket.read(&mut buffer).await.unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&buffer[..count]);
+                let (mut buf, mut req) = ([0u8; 4096], Vec::new());
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    req.extend_from_slice(&buf[..n]);
                 }
                 served += 1;
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -489,8 +421,8 @@ mod tests {
     async fn a_short_rate_limit_is_waited_out_and_the_request_goes_through() {
         let (base, server) = scripted(vec![limited("0.05"), limited("0.05"), ok()]).await;
         let rest = DiscordRest::with_base("token", &base).unwrap();
-        rest.edit_interaction_response("123", "abc", "hello").await.expect("retried to success");
-        assert_eq!(server.await.unwrap(), 3, "two limited answers, then the real one");
+        rest.edit_interaction_response("123", "abc", "hello").await.unwrap();
+        assert_eq!(server.await.unwrap(), 3);
     }
 
     #[tokio::test]
@@ -500,13 +432,12 @@ mod tests {
         let started = std::time::Instant::now();
         let error = rest.edit_interaction_response("123", "abc", "hello").await.unwrap_err();
         assert!(matches!(error, BotError::HttpStatus { status: 429, .. }), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(2), "it waited out ten minutes");
-        assert_eq!(server.await.unwrap(), 1, "and did not ask again");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(server.await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn retries_stop_after_the_limit_when_the_rate_limit_keeps_coming() {
-        // The first request and three retries.
         let (base, server) = scripted(vec![limited("0.05"); 1 + MAX_RATE_LIMIT_RETRIES]).await;
         let rest = DiscordRest::with_base("token", &base).unwrap();
         let error = rest.edit_interaction_response("123", "abc", "hello").await.unwrap_err();

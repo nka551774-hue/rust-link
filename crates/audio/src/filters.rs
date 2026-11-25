@@ -1,13 +1,4 @@
-//! The ten standard filters.
-//!
-//! One parse serves both engines: the FFmpeg engine renders the result as a
-//! filter graph, and the in-process engine applies the same settings to samples.
-//! Because they read one validated request they cannot drift apart, and a
-//! request one accepts is a request the other accepts.
-//!
-//! Nothing a client sends reaches FFmpeg as text. Every value is parsed into a
-//! number and formatted again from that number, so a filter string cannot carry
-//! a graph of its own.
+//! Validation and FFmpeg rendering for the ten standard protocol filters.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -15,8 +6,7 @@ use std::fmt;
 use rustlink_protocol::Object;
 use serde_json::Value;
 
-/// The filter names the protocol defines, in the order the reference
-/// implementation reports them.
+/// Protocol filter names in canonical order.
 pub const FILTER_NAMES: [&str; 10] = [
     "volume",
     "equalizer",
@@ -30,8 +20,7 @@ pub const FILTER_NAMES: [&str; 10] = [
     "lowPass",
 ];
 
-/// The fifteen equalizer bands, lowest first. The protocol names a band by its
-/// index into this list.
+/// Centre frequencies (Hz) of the fifteen protocol equalizer bands.
 pub const EQUALIZER_FREQUENCIES: [u32; 15] =
     [25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000];
 
@@ -41,14 +30,13 @@ pub struct FilterError(pub String);
 
 impl FilterError {
     fn new(message: impl Into<String>) -> Self {
-        FilterError(message.into())
+        Self(message.into())
     }
 }
 
-/// A validated filter request.
+/// Validated filter configuration shared by both audio engines.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterSet {
-    /// The global volume and the volume filter combined.
     pub gain: f64,
     pub bands: Vec<EqBand>,
     pub karaoke: Option<Karaoke>,
@@ -59,13 +47,6 @@ pub struct FilterSet {
     pub distort: Option<Distortion>,
     pub mix: Option<ChannelMix>,
     pub low_pass: Option<LowPass>,
-}
-
-impl FilterSet {
-    /// Returns the active [`Timescale`] only when it alters speed, pitch, or rate.
-    pub fn effective_time(&self) -> Option<Timescale> {
-        self.time.filter(Timescale::changes_anything)
-    }
 }
 
 impl Default for FilterSet {
@@ -85,56 +66,43 @@ impl Default for FilterSet {
     }
 }
 
-/// One peaking band, already converted from the protocol's gain scale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EqBand {
     pub frequency: f64,
     pub decibels: f64,
 }
 
-/// Subtracts the centre channel, scaled by `gain`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Karaoke {
     pub filter_band: f64,
     pub filter_width: f64,
-    /// Negative: the centre channel is taken away from the mix.
     pub gain: f64,
 }
 
-/// Changes the speed and the pitch of a track independently.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Timescale {
-    /// Changes tempo and keeps the pitch.
     pub speed: f64,
-    /// Changes pitch and keeps the tempo.
     pub pitch: f64,
-    /// Changes both.
     pub rate: f64,
 }
 
 impl Timescale {
-    /// Whether the time scaling was asked for at all. A request that leaves all
-    /// three controls at one asks for nothing, and running it would only add the
-    /// delay the stretch introduces.
     pub fn changes_anything(&self) -> bool {
         self.speed != 1.0 || self.pitch != 1.0 || self.rate != 1.0
     }
 }
 
-/// The shared shape of tremolo and vibrato.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Modulation {
     pub frequency: f64,
     pub depth: f64,
 }
 
-/// Pans the two channels against each other.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rotation {
     pub hertz: f64,
 }
 
-/// The waveshaper the protocol exposes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Distortion {
     pub sin_offset: f64,
@@ -147,7 +115,6 @@ pub struct Distortion {
     pub scale: f64,
 }
 
-/// The four-way stereo mixdown matrix.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChannelMix {
     pub left_to_left: f64,
@@ -156,76 +123,50 @@ pub struct ChannelMix {
     pub right_to_right: f64,
 }
 
-/// A one pole low pass, held as the frequency it was derived from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LowPass {
-    /// The protocol value.
     pub smoothing: f64,
-    /// What the filter actually uses.
     pub frequency: f64,
 }
 
 impl FilterSet {
-    /// The rate the track advances at, which the player uses to pace frames.
+    /// Returns the active [`Timescale`] only when it alters speed, pitch, or rate.
+    #[inline]
+    pub fn effective_time(&self) -> Option<Timescale> {
+        self.time.filter(Timescale::changes_anything)
+    }
+
+    /// Source-time advancement rate used by frame pacing.
     #[inline]
     pub fn tempo(&self) -> f64 {
         self.tempo_factor()
     }
 
-    /// The filters a request actually asked for, in the order the graph applies
-    /// them. A filter whose settings amount to doing nothing is left out, so the
-    /// list is what has to be honoured rather than what was mentioned.
+    /// Active filter names in execution order.
     pub fn active(&self) -> Vec<&'static str> {
-        let mut names = Vec::with_capacity(9);
-        if !self.bands.is_empty() {
-            names.push("equalizer");
-        }
-        if self.karaoke.is_some() {
-            names.push("karaoke");
-        }
-        if self.time.is_some_and(|t| t.changes_anything()) {
-            names.push("timescale");
-        }
-        if self.tremolo.is_some() {
-            names.push("tremolo");
-        }
-        if self.vibrato.is_some() {
-            names.push("vibrato");
-        }
-        if self.rotation.is_some() {
-            names.push("rotation");
-        }
-        if self.distort.is_some() {
-            names.push("distortion");
-        }
-        if self.mix.is_some() {
-            names.push("channelMix");
-        }
-        if self.low_pass.is_some() {
-            names.push("lowPass");
-        }
-        names
+        [
+            (!self.bands.is_empty(), "equalizer"),
+            (self.karaoke.is_some(), "karaoke"),
+            (self.effective_time().is_some(), "timescale"),
+            (self.tremolo.is_some(), "tremolo"),
+            (self.vibrato.is_some(), "vibrato"),
+            (self.rotation.is_some(), "rotation"),
+            (self.distort.is_some(), "distortion"),
+            (self.mix.is_some(), "channelMix"),
+            (self.low_pass.is_some(), "lowPass"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
     }
 
-    /// How many seconds of source go into one second of output: above one the
-    /// track plays faster, below one slower. Pitch does not appear because the
-    /// graph undoes its effect on length, so only speed and rate count.
+    /// Source seconds consumed per output second (`speed * rate`; pitch is length-compensated).
     #[inline]
     pub fn tempo_factor(&self) -> f64 {
-        self.time.map_or(1.0, |time| {
-            let factor = time.speed * time.rate;
-            if factor.is_finite() && factor > 0.0 {
-                factor
-            } else {
-                1.0
-            }
-        })
+        self.time.map(|t| t.speed * t.rate).filter(|&f| f.is_finite() && f > 0.0).unwrap_or(1.0)
     }
 
     /// Renders the FFmpeg filter graph in a single allocation.
-    ///
-    /// The node order is fixed, so the same request always produces the same
-    /// graph whatever order the fields arrived in.
     pub fn render_ffmpeg(&self) -> String {
         use fmt::Write;
         let mut out = String::with_capacity(128);
@@ -234,46 +175,48 @@ impl FilterSet {
     }
 }
 
-fn write_tempo_chain(value: f64, mut emit: impl FnMut(fmt::Arguments<'_>)) {
+fn write_tempo_chain(
+    value: f64,
+    mut emit: impl FnMut(fmt::Arguments<'_>) -> fmt::Result,
+) -> fmt::Result {
     if !value.is_finite() || value <= 0.0 {
-        emit(format_args!("atempo=1.00000000"));
-        return;
+        return emit(format_args!("atempo=1.00000000"));
     }
     let mut value = value.clamp(1e-4, 1e4);
     while value < 0.5 {
-        emit(format_args!("atempo=0.5"));
+        emit(format_args!("atempo=0.5"))?;
         value /= 0.5;
     }
     while value > 2.0 {
-        emit(format_args!("atempo=2"));
+        emit(format_args!("atempo=2"))?;
         value /= 2.0;
     }
-    emit(format_args!("atempo={value:.8}"));
+    emit(format_args!("atempo={value:.8}"))
 }
 
 #[cfg(test)]
 fn tempo_chain(value: f64) -> Vec<String> {
     let mut out = Vec::new();
-    write_tempo_chain(value, |args| out.push(args.to_string()));
+    let _ = write_tempo_chain(value, |args| {
+        out.push(args.to_string());
+        Ok(())
+    });
     out
 }
 
-/// Reports disabled filters in the stable order of Rustlink's filter registry.
-///
-/// A filter that is absent from the configuration stays enabled, and unknown
-/// filter names are left to [`parse`], which rejects them.
+/// Reports disabled filters in canonical protocol order.
 pub fn disabled_filters(
     filters: &Object,
     configured: &BTreeMap<String, bool>,
 ) -> Vec<&'static str> {
     FILTER_NAMES
         .iter()
-        .filter(|name| filters.contains_key(**name) && configured.get(**name) == Some(&false))
         .copied()
+        .filter(|&name| filters.contains_key(name) && configured.get(name) == Some(&false))
         .collect()
 }
 
-/// Validates a filter request without building anything.
+/// Validates a filter request and player volume (`0..=1000`).
 pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
     if !(0..=1000).contains(&volume) {
         return Err(FilterError::new("volume must be 0..1000"));
@@ -286,11 +229,11 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
 
     let mut set = FilterSet { gain: volume as f64 / 100.0, ..Default::default() };
     if let Some(raw) = filters.get("volume") {
-        let v = raw.as_f64().filter(|v| (0.0..=5.0).contains(v));
-        match v {
-            Some(v) => set.gain *= v,
-            None => return Err(FilterError::new("filter volume must be 0..5")),
-        }
+        let v = raw
+            .as_f64()
+            .filter(|v| (0.0..=5.0).contains(v))
+            .ok_or_else(|| FilterError::new("filter volume must be 0..5"))?;
+        set.gain *= v;
     }
     if let Some(raw) = filters.get("equalizer") {
         set.bands = parse_equalizer(raw)?;
@@ -305,9 +248,6 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
                 Field::new("filterWidth", 100.0, 1.0, 24_000.0),
             ],
         )?;
-        // Cap the effective centre frequency strictly below the 24 kHz Nyquist
-        // limit so FFmpeg's `bandpass` and the in-process biquad stay valid
-        // when a client sends `filterBand: 24000`.
         set.karaoke = Some(Karaoke {
             filter_band: filter_band.min(23_999.0),
             filter_width,
@@ -315,29 +255,19 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
         });
     }
     if let Some(raw) = filters.get("timescale") {
-        let [speed, pitch, rate] = fields(
-            raw,
-            &[
-                Field::new("speed", 1.0, 0.05, 5.0),
-                Field::new("pitch", 1.0, 0.05, 5.0),
-                Field::new("rate", 1.0, 0.05, 5.0),
-            ],
-        )?;
+        let f = |name| Field::new(name, 1.0, 0.05, 5.0);
+        let [speed, pitch, rate] = fields(raw, &[f("speed"), f("pitch"), f("rate")])?;
         set.time = Some(Timescale { speed, pitch, rate });
     }
-    for name in ["tremolo", "vibrato"] {
-        let Some(raw) = filters.get(name) else { continue };
+    let parse_mod = |raw| -> Result<Modulation, FilterError> {
         let [frequency, depth] = fields(
             raw,
             &[Field::new("frequency", 2.0, 0.1, 20.0), Field::new("depth", 0.5, 0.0, 1.0)],
         )?;
-        let m = Modulation { frequency, depth };
-        if name == "tremolo" {
-            set.tremolo = Some(m);
-        } else {
-            set.vibrato = Some(m);
-        }
-    }
+        Ok(Modulation { frequency, depth })
+    };
+    set.tremolo = filters.get("tremolo").map(parse_mod).transpose()?;
+    set.vibrato = filters.get("vibrato").map(parse_mod).transpose()?;
     if let Some(raw) = filters.get("rotation") {
         let [hertz] = fields(raw, &[Field::new("rotationHz", 0.2, -20.0, 20.0)])?;
         if hertz != 0.0 {
@@ -345,18 +275,19 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
         }
     }
     if let Some(raw) = filters.get("distortion") {
+        let f = |name, default| Field::new(name, default, -10.0, 10.0);
         let [sin_offset, sin_scale, cos_offset, cos_scale, tan_offset, tan_scale, offset, scale] =
             fields(
                 raw,
                 &[
-                    Field::new("sinOffset", 0.0, -10.0, 10.0),
-                    Field::new("sinScale", 1.0, -10.0, 10.0),
-                    Field::new("cosOffset", 0.0, -10.0, 10.0),
-                    Field::new("cosScale", 1.0, -10.0, 10.0),
-                    Field::new("tanOffset", 0.0, -10.0, 10.0),
-                    Field::new("tanScale", 1.0, -10.0, 10.0),
-                    Field::new("offset", 0.0, -10.0, 10.0),
-                    Field::new("scale", 1.0, -10.0, 10.0),
+                    f("sinOffset", 0.0),
+                    f("sinScale", 1.0),
+                    f("cosOffset", 0.0),
+                    f("cosScale", 1.0),
+                    f("tanOffset", 0.0),
+                    f("tanScale", 1.0),
+                    f("offset", 0.0),
+                    f("scale", 1.0),
                 ],
             )?;
         set.distort = Some(Distortion {
@@ -371,41 +302,34 @@ pub fn parse(filters: &Object, volume: i64) -> Result<FilterSet, FilterError> {
         });
     }
     if let Some(raw) = filters.get("channelMix") {
+        let f = |name, default| Field::new(name, default, 0.0, 1.0);
         let [left_to_left, left_to_right, right_to_left, right_to_right] = fields(
             raw,
             &[
-                Field::new("leftToLeft", 1.0, 0.0, 1.0),
-                Field::new("leftToRight", 0.0, 0.0, 1.0),
-                Field::new("rightToLeft", 0.0, 0.0, 1.0),
-                Field::new("rightToRight", 1.0, 0.0, 1.0),
+                f("leftToLeft", 1.0),
+                f("leftToRight", 0.0),
+                f("rightToLeft", 0.0),
+                f("rightToRight", 1.0),
             ],
         )?;
         set.mix = Some(ChannelMix { left_to_left, left_to_right, right_to_left, right_to_right });
     }
     if let Some(raw) = filters.get("lowPass") {
         let [smoothing] = fields(raw, &[Field::new("smoothing", 20.0, 1.0001, 1000.0)])?;
-        set.low_pass = Some(LowPass {
-            smoothing,
-            frequency: 48_000.0 / (2.0 * std::f64::consts::PI * smoothing),
-        });
+        set.low_pass =
+            Some(LowPass { smoothing, frequency: 48_000.0 / (std::f64::consts::TAU * smoothing) });
     }
     Ok(set)
 }
 
-/// The equalizer is an array of bands rather than an object, so it is parsed on
-/// its own.
 fn parse_equalizer(raw: &Value) -> Result<Vec<EqBand>, FilterError> {
     let invalid = || FilterError::new("invalid equalizer");
-    let Some(items) = raw.as_array() else { return Err(invalid()) };
-    if items.len() > 15 {
-        return Err(invalid());
-    }
+    let items = raw.as_array().filter(|a| a.len() <= 15).ok_or_else(invalid)?;
     let mut bands = Vec::with_capacity(items.len());
     let mut seen = [false; 15];
     for item in items {
-        let Value::Object(map) = item else { return Err(invalid()) };
-        let mut band = None;
-        let mut gain = 0.0f64;
+        let map = item.as_object().ok_or_else(invalid)?;
+        let (mut band, mut gain) = (None, 0.0f64);
         for (key, value) in map {
             match key.as_str() {
                 "band" => band = Some(value.as_i64().ok_or_else(invalid)?),
@@ -414,20 +338,18 @@ fn parse_equalizer(raw: &Value) -> Result<Vec<EqBand>, FilterError> {
             }
         }
         let band = band.ok_or_else(invalid)?;
-        // An omitted gain leaves the band flat.
         if !(0..=14).contains(&band) || !(-0.25..=1.0).contains(&gain) || seen[band as usize] {
             return Err(FilterError::new("invalid or duplicate equalizer band"));
         }
         seen[band as usize] = true;
         bands.push(EqBand {
-            frequency: EQUALIZER_FREQUENCIES[band as usize] as f64,
+            frequency: f64::from(EQUALIZER_FREQUENCIES[band as usize]),
             decibels: 20.0 * f64::max(0.0001, 1.0 + 4.0 * gain).log10(),
         });
     }
     Ok(bands)
 }
 
-/// One numeric parameter of a filter object.
 struct Field {
     name: &'static str,
     default: f64,
@@ -437,16 +359,14 @@ struct Field {
 
 impl Field {
     const fn new(name: &'static str, default: f64, min: f64, max: f64) -> Self {
-        Field { name, default, min, max }
+        Self { name, default, min, max }
     }
 }
 
-/// Reads a filter object's numeric parameters into a fixed stack array,
-/// rejecting unknown or non-numeric fields in O(1) extra work.
 fn fields<const N: usize>(raw: &Value, wanted: &[Field; N]) -> Result<[f64; N], FilterError> {
-    let Some(map) = raw.as_object() else {
-        return Err(FilterError::new("filter must be an object with numeric values"));
-    };
+    let map = raw
+        .as_object()
+        .ok_or_else(|| FilterError::new("filter must be an object with numeric values"))?;
     let mut out = [0.0f64; N];
     let mut matched = 0usize;
     for (slot, field) in out.iter_mut().zip(wanted) {
@@ -459,7 +379,7 @@ fn fields<const N: usize>(raw: &Value, wanted: &[Field; N]) -> Result<[f64; N], 
             }
             None => field.default,
         };
-        if !value.is_finite() || value < field.min || value > field.max {
+        if !(field.min..=field.max).contains(&value) {
             return Err(FilterError::new(format!(
                 "{} must be in [{}, {}]",
                 field.name,
@@ -475,7 +395,6 @@ fn fields<const N: usize>(raw: &Value, wanted: &[Field; N]) -> Result<[f64; N], 
     Ok(out)
 }
 
-/// Formats a numeric bound without unnecessary decimal zeroes.
 fn bound(value: f64) -> String {
     if value == value.trunc() && value.abs() < 1e15 {
         format!("{}", value as i64)
@@ -509,13 +428,7 @@ impl fmt::Display for FilterSet {
                 48_000.0
             };
             write!(f, ",asetrate={setrate:.8},aresample=48000")?;
-            let mut status = Ok(());
-            write_tempo_chain(t.speed / t.pitch, |args| {
-                if status.is_ok() {
-                    status = write!(f, ",{args}");
-                }
-            });
-            status?;
+            write_tempo_chain(t.speed / t.pitch, |args| write!(f, ",{args}"))?;
         }
         if let Some(m) = self.tremolo {
             write!(f, ",tremolo=f={:.8}:d={:.8}", m.frequency, m.depth)?;
@@ -565,6 +478,20 @@ impl fmt::Display for FilterSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Object {
+        let Value::Object(m) = value else { panic!("not an object") };
+        m
+    }
+
+    fn set(value: Value) -> FilterSet {
+        parse(&object(value), 100).unwrap()
+    }
+
+    fn error(value: Value) -> String {
+        parse(&object(value), 100).unwrap_err().0
+    }
 
     #[test]
     fn default_filter_set_is_neutral_in_both_engines() {
@@ -573,28 +500,11 @@ mod tests {
         assert!(crate::dsp::DspChain::new(&defaults).is_empty());
         assert!(defaults.render_ffmpeg().contains("volume=1.00000000"));
     }
-    use serde_json::json;
-
-    fn object(value: serde_json::Value) -> Object {
-        match value {
-            serde_json::Value::Object(m) => m,
-            _ => panic!("not an object"),
-        }
-    }
-
-    fn set(value: serde_json::Value) -> FilterSet {
-        parse(&object(value), 100).unwrap()
-    }
-
-    fn error(value: serde_json::Value) -> String {
-        parse(&object(value), 100).unwrap_err().0
-    }
 
     #[test]
     fn an_empty_request_changes_nothing() {
         let filters = set(json!({}));
-        assert_eq!(filters.gain, 1.0);
-        assert_eq!(filters.tempo(), 1.0);
+        assert_eq!((filters.gain, filters.tempo()), (1.0, 1.0));
         assert!(filters.active().is_empty());
         assert_eq!(
             filters.render_ffmpeg(),
@@ -627,8 +537,7 @@ mod tests {
         let filters =
             set(json!({"equalizer": [{"band": 0, "gain": 0.0}, {"band": 14, "gain": 1.0}]}));
         assert_eq!(filters.bands.len(), 2);
-        assert_eq!(filters.bands[0].frequency, 25.0);
-        assert_eq!(filters.bands[0].decibels, 0.0);
+        assert_eq!(filters.bands[0], EqBand { frequency: 25.0, decibels: 0.0 });
         assert_eq!(filters.bands[1].frequency, 16_000.0);
         assert!((filters.bands[1].decibels - 13.979_400).abs() < 1e-4);
         assert!(filters.render_ffmpeg().contains("equalizer=f=25:t=o:w=0.666667:g=0.00000000"));
@@ -636,23 +545,15 @@ mod tests {
 
     #[test]
     fn a_band_may_omit_its_gain_but_not_repeat_itself() {
-        // Unspecified gain is neutral.
-        let filters = set(json!({"equalizer": [{"band": 3}]}));
-        assert_eq!(filters.bands[0].decibels, 0.0);
-        let filters = set(json!({"equalizer": [{"band": 3, "gain": 0.0}]}));
-        assert_eq!(filters.bands[0].decibels, 0.0);
-        assert_eq!(
-            error(json!({"equalizer": [{"band": 3}, {"band": 3}]})),
-            "invalid or duplicate equalizer band"
-        );
-        assert_eq!(
-            error(json!({"equalizer": [{"band": 15}]})),
-            "invalid or duplicate equalizer band"
-        );
-        assert_eq!(
-            error(json!({"equalizer": [{"band": 0, "gain": 2}]})),
-            "invalid or duplicate equalizer band"
-        );
+        assert_eq!(set(json!({"equalizer": [{"band": 3}]})).bands[0].decibels, 0.0);
+        assert_eq!(set(json!({"equalizer": [{"band": 3, "gain": 0.0}]})).bands[0].decibels, 0.0);
+        for dup in [
+            json!({"equalizer": [{"band": 3}, {"band": 3}]}),
+            json!({"equalizer": [{"band": 15}]}),
+            json!({"equalizer": [{"band": 0, "gain": 2}]}),
+        ] {
+            assert_eq!(error(dup), "invalid or duplicate equalizer band");
+        }
         assert_eq!(error(json!({"equalizer": {"band": 0}})), "invalid equalizer");
         assert_eq!(error(json!({"equalizer": [{"gain": 0.5}]})), "invalid equalizer");
     }
@@ -662,13 +563,13 @@ mod tests {
         let filters = set(json!({"timescale": {"speed": 1.5}}));
         assert_eq!(filters.tempo(), 1.5);
         assert_eq!(filters.active(), vec!["timescale"]);
-        assert!(filters.render_ffmpeg().contains("asetrate=48000.00000000"));
-        assert!(filters.render_ffmpeg().contains("atempo=1.50000000"));
+        let graph = filters.render_ffmpeg();
+        assert!(graph.contains("asetrate=48000.00000000") && graph.contains("atempo=1.50000000"));
 
         let filters = set(json!({"timescale": {"speed": 1.5, "pitch": 1.5}}));
         assert_eq!(filters.tempo(), 1.5);
-        assert!(filters.render_ffmpeg().contains("asetrate=72000.00000000"));
-        assert!(filters.render_ffmpeg().contains("atempo=1.00000000"));
+        let graph = filters.render_ffmpeg();
+        assert!(graph.contains("asetrate=72000.00000000") && graph.contains("atempo=1.00000000"));
     }
 
     #[test]
@@ -684,14 +585,17 @@ mod tests {
 
     #[test]
     fn timescale_left_at_one_is_not_a_filter() {
-        let filters = set(json!({"timescale": {"speed": 1.0, "pitch": 1.0, "rate": 1.0}}));
-        assert!(filters.active().is_empty());
+        assert!(set(json!({"timescale": {"speed": 1.0, "pitch": 1.0, "rate": 1.0}}))
+            .active()
+            .is_empty());
     }
 
     #[test]
     fn a_slow_tempo_becomes_several_stages() {
-        let stages = tempo_chain(0.1);
-        assert_eq!(stages, vec!["atempo=0.5", "atempo=0.5", "atempo=0.5", "atempo=0.80000000"]);
+        assert_eq!(
+            tempo_chain(0.1),
+            vec!["atempo=0.5", "atempo=0.5", "atempo=0.5", "atempo=0.80000000"]
+        );
     }
 
     #[test]
@@ -699,28 +603,24 @@ mod tests {
         for bad in [0.0, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert_eq!(tempo_chain(bad), vec!["atempo=1.00000000"]);
         }
-        assert!(tempo_chain(1e-30).len() <= 16);
-        assert!(tempo_chain(1e30).len() <= 16);
+        assert!(tempo_chain(1e-30).len() <= 16 && tempo_chain(1e30).len() <= 16);
 
         let degenerate = FilterSet {
             time: Some(Timescale { speed: 0.0, pitch: -1.0, rate: f64::NAN }),
             ..Default::default()
         };
         let graph = degenerate.render_ffmpeg();
-        assert!(graph.contains("asetrate=48000.00000000"));
-        assert!(graph.contains("atempo=1.00000000"));
+        assert!(graph.contains("asetrate=48000.00000000") && graph.contains("atempo=1.00000000"));
         assert_eq!(degenerate.tempo_factor(), 1.0);
     }
 
     #[test]
     fn karaoke_subtracts_the_centre_channel() {
-        let filters = set(json!({"karaoke": {"level": 0.5, "monoLevel": 1.0}}));
-        let karaoke = filters.karaoke.unwrap();
-        assert_eq!(karaoke.gain, -0.5);
-        assert_eq!(karaoke.filter_band, 220.0);
-        assert_eq!(karaoke.filter_width, 100.0);
-        let nyquist = set(json!({"karaoke": {"filterBand": 24000}})).karaoke.unwrap();
-        assert!(nyquist.filter_band < 24_000.0);
+        let karaoke = set(json!({"karaoke": {"level": 0.5, "monoLevel": 1.0}})).karaoke.unwrap();
+        assert_eq!((karaoke.gain, karaoke.filter_band, karaoke.filter_width), (-0.5, 220.0, 100.0));
+        assert!(
+            set(json!({"karaoke": {"filterBand": 24000}})).karaoke.unwrap().filter_band < 24_000.0
+        );
     }
 
     #[test]

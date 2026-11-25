@@ -9,9 +9,7 @@ description = "Filter model, in-process DSP pipeline and the FFmpeg fallback eng
 [dependencies]
 rustlink-protocol.workspace = true
 rustlink-config.workspace = true
-# Keep the common source codecs in-process.  YouTube and catalogue providers
-# frequently return AAC in ISO-MP4 or MP3; leaving those features at Symphonia's
-# small default set needlessly sends otherwise native streams to FFmpeg.
+# Keep common source codecs in-process so AAC/MP4, MP3, FLAC, Vorbis and WAV avoid FFmpeg.
 symphonia = { version = "0.5.5", default-features = false, features = [
     "aac",
     "adpcm",
@@ -30,8 +28,7 @@ thiserror = "2"
 
 [features]
 default = ["native-opus"]
-# Link the system libopus and encode in process. Without it the node still
-# plays, but every track goes through FFmpeg.
+# Link system libopus for in-process Opus decode/encode; falls back to FFmpeg when disabled.
 native-opus = []
 
 [[bench]]

@@ -1,8 +1,4 @@
-//! Configuration validation.
-//!
-//! Everything a node needs to be self-consistent is checked here, before it
-//! listens, so a mistake is a startup error naming the option rather than a
-//! failure later that only shows up as a request that does not work.
+//! Configuration validation before the node binds or opens network connections.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -17,6 +13,10 @@ fn invalid(message: impl Into<String>) -> Result<(), ConfigError> {
     Err(ConfigError::Invalid(message.into()))
 }
 
+fn is_printable_ascii(s: &str) -> bool {
+    s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
 pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.password.is_empty() {
         return invalid("set RUSTLINK_PASSWORD or password in config");
@@ -24,7 +24,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.password.trim() != config.password {
         return invalid("password must not have leading or trailing whitespace");
     }
-    if !config.password.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+    if !is_printable_ascii(&config.password) {
         return invalid(
             "password must contain only printable ASCII characters (HTTP Authorization header limit)",
         );
@@ -61,14 +61,6 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.webhook.enable && webhook_url.is_empty() {
         return invalid("webhook.url is required while webhook is enabled");
     }
-    if config.webhook.state_latency_seconds > MAX_LIMIT {
-        return invalid("webhook.stateLatencySeconds must be between 0 and 100000");
-    }
-    // Zero is meaningful here: it keeps every daily file rather than a window of
-    // them, which is what a node whose logs are rotated elsewhere asks for.
-    if config.log_retention_days > MAX_LIMIT {
-        return invalid("logRetentionDays must be between 0 and 100000");
-    }
     if let Some(problem) = check_webhook_url(webhook_url, config.allow_private_networks) {
         return invalid(problem);
     }
@@ -76,63 +68,47 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
         return invalid(problem);
     }
     if config.youtube_native {
-        let yt_api = config.youtube_endpoint.trim();
-        let yt_music = config.youtube_music_endpoint.trim();
-        if yt_api.is_empty() || yt_music.is_empty() {
-            return invalid(
-                "youtubeEndpoint and youtubeMusicEndpoint are required while youtubeNative is on",
-            );
-        }
-        if let Some(problem) = check_http_endpoint("youtubeEndpoint", yt_api) {
-            return invalid(problem);
-        }
-        if let Some(problem) = check_http_endpoint("youtubeMusicEndpoint", yt_music) {
-            return invalid(problem);
-        }
+        require_endpoints(
+            &[
+                ("youtubeEndpoint", &config.youtube_endpoint),
+                ("youtubeMusicEndpoint", &config.youtube_music_endpoint),
+            ],
+            "youtubeEndpoint and youtubeMusicEndpoint are required while youtubeNative is on",
+        )?;
     }
     if config.soundcloud_native {
-        let sc_api = config.soundcloud_api_endpoint.trim();
-        let sc_web = config.soundcloud_web_endpoint.trim();
-        if sc_api.is_empty() || sc_web.is_empty() {
-            return invalid(
-                "soundcloudApiEndpoint and soundcloudWebEndpoint are required while soundcloudNative is on",
-            );
-        }
-        if let Some(problem) = check_http_endpoint("soundcloudApiEndpoint", sc_api) {
-            return invalid(problem);
-        }
-        if let Some(problem) = check_http_endpoint("soundcloudWebEndpoint", sc_web) {
-            return invalid(problem);
-        }
+        require_endpoints(
+            &[
+                ("soundcloudApiEndpoint", &config.soundcloud_api_endpoint),
+                ("soundcloudWebEndpoint", &config.soundcloud_web_endpoint),
+            ],
+            "soundcloudApiEndpoint and soundcloudWebEndpoint are required while soundcloudNative is on",
+        )?;
     }
-    let deezer_api = config.deezer_api_endpoint.trim();
-    if deezer_api.is_empty() {
-        return invalid("deezerApiEndpoint is required");
-    }
-    if let Some(problem) = check_http_endpoint("deezerApiEndpoint", deezer_api) {
-        return invalid(problem);
-    }
+    require_endpoints(
+        &[("deezerApiEndpoint", &config.deezer_api_endpoint)],
+        "deezerApiEndpoint is required",
+    )?;
 
-    let limits: [(&str, u32); 11] = [
-        ("maxPlayers", config.max_players),
-        ("maxSessions", config.max_sessions),
-        ("maxConcurrentLoads", config.max_concurrent_loads),
-        ("maxPlaylistTracks", config.max_playlist_tracks),
-        ("searchResults", config.search_results),
-        ("cacheEntries", config.cache_entries),
-        ("cacheTtlSeconds", config.cache_ttl_seconds),
-        ("loadTimeoutSeconds", config.load_timeout_seconds),
-        ("playerUpdateSeconds", config.player_update_seconds),
-        ("statsSeconds", config.stats_seconds),
-        ("soundcloudClientIdTtlSeconds", config.soundcloud_client_id_ttl_seconds),
-    ];
-    for (name, value) in limits {
-        if !(1..=MAX_LIMIT).contains(&value) {
-            return invalid(format!("{name} must be between 1 and 100000"));
+    for (name, value, min, max) in [
+        ("webhook.stateLatencySeconds", config.webhook.state_latency_seconds, 0, MAX_LIMIT),
+        ("logRetentionDays", config.log_retention_days, 0, MAX_LIMIT),
+        ("maxPlayers", config.max_players, 1, MAX_LIMIT),
+        ("maxSessions", config.max_sessions, 1, MAX_LIMIT),
+        ("maxConcurrentLoads", config.max_concurrent_loads, 1, MAX_LIMIT),
+        ("maxPlaylistTracks", config.max_playlist_tracks, 1, MAX_LIMIT),
+        ("searchResults", config.search_results, 1, MAX_LIMIT),
+        ("cacheEntries", config.cache_entries, 1, MAX_LIMIT),
+        ("cacheTtlSeconds", config.cache_ttl_seconds, 1, MAX_LIMIT),
+        ("loadTimeoutSeconds", config.load_timeout_seconds, 1, MAX_LIMIT),
+        ("playerUpdateSeconds", config.player_update_seconds, 1, MAX_LIMIT),
+        ("statsSeconds", config.stats_seconds, 1, MAX_LIMIT),
+        ("soundcloudClientIdTtlSeconds", config.soundcloud_client_id_ttl_seconds, 1, MAX_LIMIT),
+        ("eventBuffer", config.event_buffer, 1, MAX_EVENT_BUFFER),
+    ] {
+        if !(min..=max).contains(&value) {
+            return invalid(format!("{name} must be between {min} and {max}"));
         }
-    }
-    if !(1..=MAX_EVENT_BUFFER).contains(&config.event_buffer) {
-        return invalid("eventBuffer must be between 1 and 16384");
     }
     if !(16_000..=256_000).contains(&config.opus_bitrate) {
         return invalid("opusBitrate must be 16000..256000");
@@ -169,11 +145,25 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
             return invalid("spotifyMarket must be a two-letter ISO country code such as US or TW");
         }
     }
-    if !config.youtube_client_version.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
-        return invalid("youtubeClientVersion must contain only printable ASCII characters");
+    for (name, value) in [
+        ("youtubeClientVersion", config.youtube_client_version.as_str()),
+        ("youtubeVisitorData", config.youtube_visitor_data.as_str()),
+    ] {
+        if !is_printable_ascii(value) {
+            return invalid(format!("{name} must contain only printable ASCII characters"));
+        }
     }
-    if !config.youtube_visitor_data.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
-        return invalid("youtubeVisitorData must contain only printable ASCII characters");
+    Ok(())
+}
+
+fn require_endpoints(endpoints: &[(&str, &str)], missing_msg: &str) -> Result<(), ConfigError> {
+    if endpoints.iter().any(|(_, url)| url.trim().is_empty()) {
+        return invalid(missing_msg);
+    }
+    for &(name, url) in endpoints {
+        if let Some(problem) = check_http_endpoint(name, url.trim()) {
+            return invalid(problem);
+        }
     }
     Ok(())
 }
@@ -196,30 +186,24 @@ fn valid_non_ipv6_host(host: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let mut last_label = "";
+    let mut last = "";
     for label in trimmed.split('.') {
-        if label.is_empty()
-            || label.len() > 63
+        if !(1..=63).contains(&label.len())
             || label.starts_with('-')
             || label.ends_with('-')
             || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
             return false;
         }
-        last_label = label;
+        last = label;
     }
-    // Top-level DNS labels are never all-digits or hex literals; any such host
-    // must be a canonical dotted-quad IPv4 address (no octets > 255, octal, hex, or shorthand).
-    if last_label.bytes().all(|b| b.is_ascii_digit())
-        || last_label.starts_with("0x")
-        || last_label.starts_with("0X")
+    if last.bytes().all(|b| b.is_ascii_digit()) || last.starts_with("0x") || last.starts_with("0X")
     {
         return host == trimmed && host.parse::<Ipv4Addr>().is_ok();
     }
     true
 }
 
-/// Checks the bind address syntax (`host:port` or `[ipv6]:port`) before startup.
 fn check_address(address: &str) -> Option<String> {
     if has_control_bytes(address) {
         return Some("address must not contain control characters".into());
@@ -231,31 +215,29 @@ fn check_address(address: &str) -> Option<String> {
     if trimmed != address || trimmed.chars().any(char::is_whitespace) {
         return Some("address must not contain whitespace".into());
     }
-    if let Some(rest) = trimmed.strip_prefix('[') {
+    let port = if let Some(rest) = trimmed.strip_prefix('[') {
         let Some((host, port)) = rest.rsplit_once("]:") else {
             return Some("IPv6 address must use [host]:port syntax".into());
         };
         if host.contains(['[', ']']) || host.parse::<Ipv6Addr>().is_err() {
             return Some(format!("address has an invalid IPv6 host: [{host}]"));
         }
-        if !valid_port_digits(port, true) {
-            return Some(format!("address has an invalid port: {port}"));
+        port
+    } else {
+        let Some((host, port)) = trimmed.rsplit_once(':') else {
+            return Some("address must be host:port (or [ipv6]:port)".into());
+        };
+        if host.contains(':') {
+            return Some(format!(
+                "IPv6 address must wrap the host in brackets, e.g. [{host}]:{port}"
+            ));
         }
-        return None;
-    }
-    let Some((host, port)) = trimmed.rsplit_once(':') else {
-        return Some("address must be host:port (or [ipv6]:port)".into());
+        if host.contains(['[', ']']) || !valid_non_ipv6_host(host) {
+            return Some("address must have a valid host before :port".into());
+        }
+        port
     };
-    if host.contains(':') {
-        return Some(format!("IPv6 address must wrap the host in brackets, e.g. [{host}]:{port}"));
-    }
-    if host.contains(['[', ']']) || !valid_non_ipv6_host(host) {
-        return Some("address must have a valid host before :port".into());
-    }
-    if !valid_port_digits(port, true) {
-        return Some(format!("address has an invalid port: {port}"));
-    }
-    None
+    (!valid_port_digits(port, true)).then(|| format!("address has an invalid port: {port}"))
 }
 
 fn strip_scheme_ascii_case<'a>(url: &'a str, schemes: &[&str]) -> Option<&'a str> {
@@ -287,20 +269,15 @@ fn is_rfc3986_unreserved_or_subdelim(byte: u8) -> bool {
 }
 
 fn valid_percent_encoding(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-        } else {
-            index += 1;
+    let mut rest = text.as_bytes();
+    while let Some(pos) = rest.iter().position(|&b| b == b'%') {
+        let Some(&[h1, h2, ref tail @ ..]) = rest.get(pos + 1..) else {
+            return false;
+        };
+        if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
+            return false;
         }
+        rest = tail;
     }
     true
 }
@@ -354,8 +331,7 @@ fn parse_rfc3986_url<'a>(url: &'a str, schemes: &[&str]) -> Option<ParsedUrl<'a>
     }
     let rest = strip_scheme_ascii_case(url, schemes)?;
     let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end];
-    let tail = &rest[auth_end..];
+    let (authority, tail) = rest.split_at(auth_end);
     if tail.contains(['[', ']']) {
         return None;
     }
@@ -368,28 +344,24 @@ fn parse_rfc3986_url<'a>(url: &'a str, schemes: &[&str]) -> Option<ParsedUrl<'a>
         }
         None => (false, authority),
     };
-    let host = parse_authority_host(host_port)?;
-    Some(ParsedUrl { has_userinfo, host, tail })
+    Some(ParsedUrl { has_userinfo, host: parse_authority_host(host_port)?, tail })
 }
 
 fn is_public_v4(address: Ipv4Addr) -> bool {
-    if address.is_private()
+    !(address.is_private()
         || address.is_loopback()
         || address.is_link_local()
         || address.is_broadcast()
         || address.is_documentation()
         || address.is_unspecified()
-    {
-        return false;
-    }
-    !matches!(
-        address.octets(),
-        [0 | 224.., ..]
-            | [100, 64..=127, ..]
-            | [198, 18 | 19, ..]
-            | [192, 88, 99, _]
-            | [192, 0, 0, _]
-    )
+        || matches!(
+            address.octets(),
+            [0 | 224.., ..]
+                | [100, 64..=127, ..]
+                | [198, 18 | 19, ..]
+                | [192, 88, 99, _]
+                | [192, 0, 0, _]
+        ))
 }
 
 fn is_public_v6(address: Ipv6Addr) -> bool {
@@ -410,7 +382,7 @@ fn is_disallowed_private_host(host: &str) -> bool {
         || bare
             .as_bytes()
             .get(bare.len().wrapping_sub(10)..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".localhost"))
+            .is_some_and(|s| s.eq_ignore_ascii_case(b".localhost"))
     {
         return true;
     }
@@ -423,7 +395,7 @@ fn is_disallowed_private_host(host: &str) -> bool {
 
 fn check_http_endpoint(name: &str, url: &str) -> Option<String> {
     let valid = parse_rfc3986_url(url, &["https://", "http://"])
-        .is_some_and(|parsed| !parsed.has_userinfo && !parsed.tail.contains(['@', '?', '#']));
+        .is_some_and(|p| !p.has_userinfo && !p.tail.contains(['@', '?', '#']));
     (!valid).then(|| {
         format!("{name} must be an http or https base URL without credentials, query, or fragment")
     })
@@ -439,32 +411,26 @@ fn check_webhook_url(url: &str, allow_private_networks: bool) -> Option<String> 
     if parsed.has_userinfo || parsed.tail.contains('#') {
         return Some("webhook.url must be an http or https URL without credentials".into());
     }
-    if !allow_private_networks && is_disallowed_private_host(parsed.host) {
-        return Some(
-            "webhook.url cannot target localhost or a non-public IP address while allowPrivateNetworks is false"
-                .into(),
-        );
-    }
-    None
+    (!allow_private_networks && is_disallowed_private_host(parsed.host)).then(|| {
+        "webhook.url cannot target localhost or a non-public IP address while allowPrivateNetworks is false"
+            .into()
+    })
 }
 
 fn check_proxy_url(url: &str) -> Option<String> {
     const SCHEMES: [&str; 6] =
         ["http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://"];
-    if url.is_empty()
-        || parse_rfc3986_url(url, &SCHEMES).is_some_and(|parsed| parsed.tail.is_empty())
-    {
-        return None;
-    }
-    Some(
+    let valid =
+        url.is_empty() || parse_rfc3986_url(url, &SCHEMES).is_some_and(|p| p.tail.is_empty());
+    (!valid).then(|| {
         "youtubeProxy must be an http://, https://, socks4://, socks4a://, socks5:// or socks5h:// URL with a host and no path"
-            .into(),
-    )
+            .into()
+    })
 }
 
 fn one_of(value: &str, allowed: &[&str]) -> bool {
-    let value = value.trim();
-    allowed.iter().any(|candidate| candidate.eq_ignore_ascii_case(value))
+    let v = value.trim();
+    allowed.iter().any(|c| c.eq_ignore_ascii_case(v))
 }
 
 #[cfg(test)]
@@ -477,11 +443,15 @@ mod tests {
         config
     }
 
+    fn with(mutate: impl FnOnce(&mut Config)) -> Result<(), ConfigError> {
+        let mut config = valid();
+        mutate(&mut config);
+        validate(&config)
+    }
+
     #[test]
     fn a_password_is_required() {
-        let mut config = valid();
-        config.password = String::new();
-        assert!(validate(&config).is_err());
+        assert!(with(|c| c.password.clear()).is_err());
     }
 
     #[test]
@@ -497,9 +467,7 @@ mod tests {
             "http://user:pass@proxy.example:8080",
             "socks5h://p.example",
         ] {
-            let mut config = valid();
-            config.youtube_proxy = good.into();
-            validate(&config).unwrap_or_else(|error| panic!("{good}: {error:?}"));
+            with(|c| c.youtube_proxy = good.into()).unwrap_or_else(|e| panic!("{good}: {e:?}"));
         }
         for bad in [
             "127.0.0.1:40000",
@@ -513,90 +481,84 @@ mod tests {
             "http://999.0.0.1:8080",
             "http://proxy<bad>.example:8080",
         ] {
-            let mut config = valid();
-            config.youtube_proxy = bad.into();
-            assert!(validate(&config).is_err(), "{bad} was accepted");
+            assert!(with(|c| c.youtube_proxy = bad.into()).is_err(), "{bad} was accepted");
         }
     }
 
     #[test]
     fn limits_are_bounded() {
-        let mut config = valid();
-        config.opus_bitrate = 8_000;
-        assert!(validate(&config).is_err());
-        config.opus_bitrate = 128_000;
-        config.opus_complexity = 11;
-        assert!(validate(&config).is_err());
-        config.opus_complexity = 4;
-        validate(&config).unwrap();
-        config.max_players = 0;
-        assert!(validate(&config).is_err());
+        assert!(with(|c| c.opus_bitrate = 8_000).is_err());
+        assert!(with(|c| c.opus_complexity = 11).is_err());
+        with(|c| {
+            c.opus_bitrate = 128_000;
+            c.opus_complexity = 4;
+        })
+        .unwrap();
+        assert!(with(|c| c.max_players = 0).is_err());
     }
 
     #[test]
     fn a_webhook_needs_a_url_when_it_is_enabled() {
-        let mut config = valid();
-        config.webhook.enable = true;
-        assert!(validate(&config).is_err());
-        config.webhook.url = "not-a-url".into();
-        assert!(validate(&config).is_err());
-        config.webhook.url = "https://discord.com/api/webhooks/1/abc".into();
-        validate(&config).unwrap();
+        assert!(with(|c| c.webhook.enable = true).is_err());
+        assert!(with(|c| {
+            c.webhook.enable = true;
+            c.webhook.url = "not-a-url".into();
+        })
+        .is_err());
+        with(|c| {
+            c.webhook.enable = true;
+            c.webhook.url = "https://discord.com/api/webhooks/1/abc".into();
+        })
+        .unwrap();
     }
 
     #[test]
     fn spotify_credentials_come_in_pairs() {
-        let mut config = valid();
-        config.spotify_client_id = "id".into();
-        assert!(validate(&config).is_err());
-        config.spotify_client_secret = "secret".into();
-        validate(&config).unwrap();
-        config.spotify_refresh_token = "token".into();
-        validate(&config).unwrap();
-        config.spotify_client_id = String::new();
-        config.spotify_client_secret = String::new();
-        assert!(validate(&config).is_err());
+        assert!(with(|c| c.spotify_client_id = "id".into()).is_err());
+        with(|c| {
+            c.spotify_client_id = "id".into();
+            c.spotify_client_secret = "secret".into();
+        })
+        .unwrap();
+        with(|c| {
+            c.spotify_client_id = "id".into();
+            c.spotify_client_secret = "secret".into();
+            c.spotify_refresh_token = "token".into();
+        })
+        .unwrap();
+        assert!(with(|c| c.spotify_refresh_token = "token".into()).is_err());
     }
 
     #[test]
     fn enum_like_options_are_checked_case_insensitively() {
-        let mut config = valid();
-        config.log_level = "DEBUG".into();
-        validate(&config).unwrap();
-        config.log_level = "verbose".into();
-        assert!(validate(&config).is_err());
+        with(|c| c.log_level = "DEBUG".into()).unwrap();
+        assert!(with(|c| c.log_level = "verbose".into()).is_err());
     }
 
     #[test]
     fn a_native_client_needs_its_endpoints() {
-        let mut config = valid();
-        config.youtube_music_endpoint = String::new();
-        assert!(validate(&config).is_err());
-        config.youtube_native = false;
-        validate(&config).unwrap();
+        assert!(with(|c| c.youtube_music_endpoint.clear()).is_err());
+        with(|c| {
+            c.youtube_music_endpoint.clear();
+            c.youtube_native = false;
+        })
+        .unwrap();
     }
 
     #[test]
     fn a_log_retention_of_zero_is_allowed_and_an_absurd_one_is_not() {
-        let mut config = valid();
-        config.log_retention_days = 0;
-        validate(&config).unwrap();
-        config.log_retention_days = MAX_LIMIT + 1;
-        assert!(validate(&config).is_err());
+        with(|c| c.log_retention_days = 0).unwrap();
+        assert!(with(|c| c.log_retention_days = MAX_LIMIT + 1).is_err());
     }
 
     #[test]
     fn passwords_addresses_filters_and_markets_reject_unusable_values() {
         for bad_pw in ["   ", " secret", "secret ", "secret\n", "密碼"] {
-            let mut config = valid();
-            config.password = bad_pw.into();
-            assert!(validate(&config).is_err(), "password {bad_pw:?} should fail");
+            assert!(with(|c| c.password = bad_pw.into()).is_err(), "{bad_pw:?}");
         }
         for good_addr in ["0.0.0.0:2333", "127.0.0.1:0", "[::]:2333", "[::1]:2333", "localhost:80"]
         {
-            let mut config = valid();
-            config.address = good_addr.into();
-            validate(&config).unwrap_or_else(|e| panic!("{good_addr}: {e}"));
+            with(|c| c.address = good_addr.into()).unwrap_or_else(|e| panic!("{good_addr}: {e}"));
         }
         for bad_addr in [
             "::1:2333",
@@ -611,36 +573,33 @@ mod tests {
             "host]bad:2333",
             "host|bad:2333",
         ] {
-            let mut config = valid();
-            config.address = bad_addr.into();
-            assert!(validate(&config).is_err(), "address {bad_addr:?} should fail");
+            assert!(with(|c| c.address = bad_addr.into()).is_err(), "{bad_addr:?}");
         }
-        let mut bad_filter = valid();
-        bad_filter.filters.insert("lowpass".into(), false);
-        assert!(validate(&bad_filter).is_err());
-        bad_filter.filters.clear();
-        bad_filter.filters.insert("lowPass".into(), false);
-        validate(&bad_filter).unwrap();
-
-        let mut no_audio = valid();
-        no_audio.in_process_audio = false;
-        no_audio.ffmpeg = "none".into();
-        assert!(validate(&no_audio).is_err());
-
-        let mut bad_market = valid();
-        bad_market.spotify_client_id = "id".into();
-        bad_market.spotify_client_secret = "secret".into();
-        bad_market.spotify_market = "US&limit=50".into();
-        assert!(validate(&bad_market).is_err());
+        assert!(with(|c| {
+            c.filters.insert("lowpass".into(), false);
+        })
+        .is_err());
+        with(|c| {
+            c.filters.insert("lowPass".into(), false);
+        })
+        .unwrap();
+        assert!(with(|c| {
+            c.in_process_audio = false;
+            c.ffmpeg = "none".into();
+        })
+        .is_err());
+        assert!(with(|c| {
+            c.spotify_client_id = "id".into();
+            c.spotify_client_secret = "secret".into();
+            c.spotify_market = "US&limit=50".into();
+        })
+        .is_err());
     }
 
     #[test]
     fn control_bytes_event_buffer_cap_rfc3986_authorities_and_private_webhooks_are_enforced() {
-        let mut config = valid();
-        config.event_buffer = 16_384;
-        validate(&config).unwrap();
-        config.event_buffer = 16_385;
-        assert!(validate(&config).is_err());
+        with(|c| c.event_buffer = 16_384).unwrap();
+        assert!(with(|c| c.event_buffer = 16_385).is_err());
 
         for mutate in [
             |c: &mut Config| c.youtube_po_token = "tok\x07en".into(),
@@ -660,9 +619,7 @@ mod tests {
                 c.spotify_refresh_token = "ref\r".into();
             },
         ] {
-            let mut bad = valid();
-            mutate(&mut bad);
-            assert!(validate(&bad).is_err());
+            assert!(with(mutate).is_err());
         }
 
         for bad_url in [
@@ -679,16 +636,21 @@ mod tests {
             "http://[::1]:8080/hook",
             "http://[::ffff:127.0.0.1]/hook",
         ] {
-            let mut hook = valid();
-            hook.webhook.enable = true;
-            hook.webhook.url = bad_url.into();
-            assert!(validate(&hook).is_err(), "webhook {bad_url} should be rejected");
+            assert!(
+                with(|c| {
+                    c.webhook.enable = true;
+                    c.webhook.url = bad_url.into();
+                })
+                .is_err(),
+                "{bad_url}"
+            );
         }
 
-        let mut allowed_private = valid();
-        allowed_private.allow_private_networks = true;
-        allowed_private.webhook.enable = true;
-        allowed_private.webhook.url = "http://127.0.0.1:8080/hook".into();
-        validate(&allowed_private).unwrap();
+        with(|c| {
+            c.allow_private_networks = true;
+            c.webhook.enable = true;
+            c.webhook.url = "http://127.0.0.1:8080/hook".into();
+        })
+        .unwrap();
     }
 }

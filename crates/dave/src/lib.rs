@@ -1,5 +1,4 @@
-//! Discord DAVE protocol v1: MLS membership, transitions and Opus encryption.
-//! Protocol reference: <https://daveprotocol.com/>.
+//! Discord DAVE protocol v1 (<https://daveprotocol.com/>): MLS membership, transitions, and Opus AEAD.
 
 mod media;
 mod session;
@@ -17,6 +16,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[inline]
 fn check<T, E>(result: std::result::Result<T, E>, context: &'static str) -> Result<T> {
     result.map_err(|_| Error::Protocol(context))
 }

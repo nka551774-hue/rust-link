@@ -1,15 +1,9 @@
-//! One player: the track it is on, the voice connection it sends to, and the
-//! events it reports.
-//!
-//! A player is a small state machine behind one mutex plus a thread that paces
-//! frames out of the decoder. Everything a client can change goes through the
-//! update path, which is serialized, so two updates never interleave half-way
-//! through a track change.
+//! Per-guild audio player: state machine, voice transport lifecycle, and 20 ms Opus frame pump.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rustlink_audio::{AudioError, FilterSet, Frames};
 use rustlink_protocol::{
@@ -17,25 +11,19 @@ use rustlink_protocol::{
     PlayerUpdate, Track, VoiceState,
 };
 use rustlink_source::LoadResult;
-use rustlink_voice::{Closed, Connection, Factory};
-use serde_json::json;
+use rustlink_voice::{Closed, Connection, Factory, VoiceError};
+use serde_json::{json, Value};
 
 use crate::playback::{Engine, Loader};
-use crate::{Counters, Emit};
+use crate::{now_millis, Counters, Emit};
 
-/// The length of one Opus frame, which is what paces playback.
 const FRAME_MILLIS: f64 = 20.0;
-
-/// How late a frame may be before the deficit counter notices.
 const LATE: Duration = Duration::from_millis(100);
-
-/// Minimum spacing between catch-up frames after a transient scheduler hiccup
-/// (`<= LATE`) so late ticks never flood Discord's UDP jitter buffer in 0 µs.
 const MIN_CATCHUP_GAP: Duration = Duration::from_millis(5);
-
-/// The stall threshold the node reports in a `track.stalled`. The engine
-/// applies the same limit, and a client is told what it was.
 const STUCK_MILLIS: i64 = 10_000;
+const MAX_USER_DATA_BYTES: usize = 16 << 10;
+
+type PendingEvents = Vec<(&'static str, Value)>;
 
 #[cfg(windows)]
 mod high_res_timer {
@@ -54,8 +42,7 @@ mod high_res_timer {
     impl Guard {
         pub(super) fn acquire() -> Self {
             if ACTIVE_PUMPS.fetch_add(1, Ordering::AcqRel) == 0 {
-                // SAFETY: `timeBeginPeriod(1)` is thread-safe and requests 1 ms OS
-                // timer ticks instead of Windows' default 15.625 ms granularity.
+                // SAFETY: `timeBeginPeriod(1)` is thread-safe and requests 1 ms OS timer ticks.
                 unsafe {
                     let _ = timeBeginPeriod(1);
                 }
@@ -107,74 +94,99 @@ fn sleep_until_precise(deadline: Instant) {
     }
 }
 
-/// The connection frames are written to, and whether that connection has been
-/// told the node is speaking.
-///
-/// Discord drops audio that arrives before a speaking announcement, so the flag
-/// has to travel with the connection it belongs to.
 struct VoiceOutput<'a> {
     connection: &'a Arc<dyn Connection>,
     speaking: bool,
 }
 
-/// Why an update could not be applied.
+impl VoiceOutput<'_> {
+    fn park_disconnected(&mut self, state: &mut State) {
+        state.reset_pump();
+        self.speaking = false;
+    }
+
+    fn quiet(&mut self) {
+        if self.speaking {
+            let _ = self.connection.speaking(false);
+            self.speaking = false;
+        }
+    }
+}
+
+enum PumpGate<'a> {
+    Ready(MutexGuard<'a, State>),
+    Paused,
+    Exit,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlayerError {
-    /// The request itself is not something a player can be asked to do.
     #[error("{0}")]
     Invalid(String),
-    /// The identifier could not be resolved.
     #[error("{0}")]
     Source(#[from] rustlink_source::SourceError),
-    /// The player was destroyed while the update was in flight.
     #[error("player is destroyed")]
     Destroyed,
-    /// An identifier resolved to something other than one track.
     #[error("identifier must resolve to one track")]
     NotATrack,
 }
 
-/// The dependencies a player is built with, shared by every player on the node.
 pub struct Deps {
     pub loader: Arc<dyn Loader>,
     pub engine: Arc<dyn Engine>,
     pub voice: Arc<dyn Factory>,
 }
 
-/// Everything the player owns, behind one lock.
 struct State {
-    /// The body a client reads back and a `player.updated` reports.
     body: PlayerBody,
-    /// The position playback stops at, when the client set one.
     end_time: Option<i64>,
-    /// Whether the current track has been announced as started.
     started: bool,
-    /// Whether the player has been destroyed.
     closed: bool,
-    /// Whether a thread is currently pacing frames.
     running: bool,
-    /// Whether the current playback thread is still inside `engine.start()`.
     opening: bool,
-    /// Whether the active `Frames` implementation accepts live DSP updates.
     live_filters: bool,
-    /// Validated DSP configuration matching `body.filters` and `body.volume`.
     filter_set: FilterSet,
-    /// Pending in-place volume/filter update for the active pump thread.
     pending_filters: Option<FilterSet>,
-    /// Bumped whenever playback is stopped, so a thread that is still unwinding
-    /// knows it is no longer the current one.
     generation: u64,
-    /// The voice connection audio is written to.
     connection: Option<Arc<dyn Connection>>,
-    /// Bumped whenever a connection is opened, so a handshake that finishes
-    /// late is discarded rather than adopted.
     voice_generation: u64,
-    /// Whether a join has been announced and no leave has been announced for
-    /// it yet, so a dead connection is reported once.
     voice_up: bool,
-    /// The handshake in flight, aborted when it is superseded or the player
-    /// is destroyed so a stale join does not finish connecting to Discord.
     connecting: Option<tokio::task::AbortHandle>,
+}
+
+impl State {
+    fn reset_pump(&mut self) {
+        self.running = false;
+        self.opening = false;
+        self.live_filters = false;
+        self.pending_filters = None;
+    }
+
+    fn take_track(&mut self) -> Option<Track> {
+        let mut track = self.body.track.take()?;
+        track.metadata.position = self.body.state.position;
+        self.body.state.position = 0;
+        self.end_time = None;
+        self.started = false;
+        Some(track)
+    }
+
+    fn detach_voice(
+        &mut self,
+        channel: Option<&str>,
+        reason: &str,
+        events: &mut PendingEvents,
+    ) -> Option<Arc<dyn Connection>> {
+        let connection = self.connection.take();
+        if let Some(task) = self.connecting.take() {
+            task.abort();
+        }
+        if self.voice_up {
+            self.voice_up = false;
+            events.push(("voice.disconnected", voice_fields(channel, reason)));
+        }
+        connection
+    }
 }
 
 pub struct Player {
@@ -186,16 +198,11 @@ pub struct Player {
     load_timeout: Duration,
     load_gate: Arc<tokio::sync::Semaphore>,
     state: Mutex<State>,
-    /// Wakes the playback thread when the state it waits on changes.
     wake: Condvar,
-    /// Serializes updates, so a slow source lookup cannot be overtaken by the
-    /// next request for the same player.
     updates: tokio::sync::Mutex<()>,
 }
 
 impl Player {
-    /// Builds a player for a guild. It has no track and no voice connection
-    /// until a client asks for one.
     pub fn new(
         user: String,
         guild: String,
@@ -206,7 +213,6 @@ impl Player {
         Self::with_load_timeout(user, guild, deps, emit, counters, Duration::from_secs(30))
     }
 
-    /// Builds a player with an explicit query-resolution timeout.
     pub fn with_load_timeout(
         user: String,
         guild: String,
@@ -264,24 +270,20 @@ impl Player {
         })
     }
 
-    /// The guild the player serves.
     pub fn guild(&self) -> &str {
         &self.guild
     }
 
-    /// What the client is told about the player.
     pub fn snapshot(&self) -> PlayerBody {
         let state = self.state.lock().unwrap();
         self.snapshot_locked(&state)
     }
 
-    /// Reads only the live `PlayerState` without cloning tracks, filters or voice credentials.
     pub fn state_snapshot(&self) -> (&str, PlayerState) {
         let state = self.state.lock().unwrap();
         (&self.guild, Self::live_state(&state))
     }
 
-    /// Reads the currently loaded track, if any, without cloning the rest of the player.
     pub fn track(&self) -> Option<Track> {
         let state = self.state.lock().unwrap();
         let mut track = state.body.track.clone()?;
@@ -289,18 +291,16 @@ impl Player {
         Some(track)
     }
 
-    /// Builds `(playing, state_entry)` for [`Server::player_state_report`] without
-    /// cloning track tokens, filter maps, user data, or voice credentials.
-    pub(crate) fn report_state(&self) -> (bool, serde_json::Value) {
+    pub(crate) fn report_state(&self) -> (bool, Value) {
         let state = self.state.lock().unwrap();
         let live = Self::live_state(&state);
         let playing = state.body.track.is_some() && !state.body.paused && live.connected;
         let (title, author, source, duration_ms) = match state.body.track.as_ref() {
-            Some(track) => (
-                track.metadata.title.as_str(),
-                track.metadata.author.as_str(),
-                track.metadata.source_name.as_str(),
-                track.metadata.length,
+            Some(t) => (
+                t.metadata.title.as_str(),
+                t.metadata.author.as_str(),
+                t.metadata.source_name.as_str(),
+                t.metadata.length,
             ),
             None => ("", "", "", 0),
         };
@@ -322,25 +322,17 @@ impl Player {
         )
     }
 
-    /// Whether the player is playing, which is what the node's counters ask of
-    /// every player it has.
-    ///
-    /// It reads the three fields the answer needs rather than building the body
-    /// a client is sent, because a stats request asks this of every player on
-    /// the node.
     pub fn playing(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.body.track.is_some()
             && !state.body.paused
-            && state.connection.as_ref().is_some_and(|connection| connection.connected())
+            && state.connection.as_ref().is_some_and(|c| c.connected())
     }
 
     fn live_state(state: &State) -> PlayerState {
-        let connected = state.connection.as_ref().is_some_and(|connection| connection.connected());
-        let ping = if connected {
-            state.connection.as_ref().map_or(-1, |connection| connection.ping())
-        } else {
-            -1
+        let (connected, ping) = match state.connection.as_ref().filter(|c| c.connected()) {
+            Some(conn) => (true, conn.ping()),
+            None => (false, -1),
         };
         PlayerState { time: now_millis(), position: state.body.state.position, connected, ping }
     }
@@ -354,32 +346,15 @@ impl Player {
         body
     }
 
-    fn take_track_locked(state: &mut State) -> Option<Track> {
-        let mut track = state.body.track.take()?;
-        track.metadata.position = state.body.state.position;
-        state.body.state.position = 0;
-        state.end_time = None;
-        state.started = false;
-        Some(track)
-    }
-
-    /// Applies a player update.
-    ///
-    /// The update is serialized against every other update for this player, so
-    /// the result a client sees is the result of its own request and nothing
-    /// that arrived in between.
     pub async fn update(
         self: &Arc<Self>,
         update: PlayerUpdate,
         no_replace: bool,
     ) -> Result<PlayerBody, PlayerError> {
         let _serialized = self.updates.lock().await;
-        let prepared = prepare(update)?;
-        self.apply_locked(prepared, no_replace).await
+        self.apply_locked(prepare(update)?, no_replace).await
     }
 
-    /// Applies an already-validated [`PreparedUpdate`] without re-decoding the
-    /// track token or re-parsing filters.
     pub(crate) async fn apply(
         self: &Arc<Self>,
         prepared: PreparedUpdate,
@@ -404,17 +379,13 @@ impl Player {
         } else {
             false
         };
-        let resolved_track = if changes_track && !skip_query {
-            match prepared.query.take() {
-                Some(identifier) => Some(self.resolve(identifier).await?),
-                None => None,
-            }
-        } else {
-            None
+        let resolved_track = match prepared.query.take().filter(|_| changes_track && !skip_query) {
+            Some(identifier) => Some(self.resolve(identifier).await?),
+            None => None,
         };
         let mut connect = None;
         let mut to_close: Option<Arc<dyn Connection>> = None;
-        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let mut events = PendingEvents::new();
         let result = {
             let mut state = self.state.lock().unwrap();
             if state.closed {
@@ -451,7 +422,7 @@ impl Player {
             if changes_track && !ignore {
                 need_stop = true;
                 live_filter_update = None;
-                if let Some(previous) = Self::take_track_locked(&mut state) {
+                if let Some(previous) = state.take_track() {
                     let reason = if track.is_some() { "replaced" } else { "stopped" };
                     events.push(("track.ended", json!({ "track": previous, "reason": reason })));
                 }
@@ -464,25 +435,21 @@ impl Player {
                 state.started = false;
                 state.end_time = None;
             }
-            if let Some(user_data) = prepared.user_data.take() {
-                if !ignore {
-                    if let Some(current) = state.body.track.as_mut() {
-                        current.user_data = user_data;
-                    }
+            if let Some(user_data) = prepared.user_data.take().filter(|_| !ignore) {
+                if let Some(current) = state.body.track.as_mut() {
+                    current.user_data = user_data;
                 }
             }
             if let Some(position) = prepared.position {
-                let body = &mut state.body;
-                if let Some(current) = body.track.as_mut() {
-                    if current.metadata.is_seekable {
-                        let target = clamp_position(position.get(), current.metadata.length);
-                        if target != body.state.position {
-                            need_stop = true;
-                            live_filter_update = None;
-                        }
-                        body.state.position = target;
-                        current.metadata.position = target;
+                let PlayerBody { track, state: player_state, .. } = &mut state.body;
+                if let Some(current) = track.as_mut().filter(|t| t.metadata.is_seekable) {
+                    let target = clamp_position(position.get(), current.metadata.length);
+                    if target != player_state.position {
+                        need_stop = true;
+                        live_filter_update = None;
                     }
+                    player_state.position = target;
+                    current.metadata.position = target;
                 }
             }
             match prepared.end_time {
@@ -494,7 +461,6 @@ impl Player {
                 state.body.volume = volume.get();
             }
             if changes_track && !ignore {
-                // A new track starts unless the same request explicitly pauses it.
                 state.body.paused = prepared.paused.unwrap_or(false);
             } else if let Some(paused) = prepared.paused {
                 state.body.paused = paused;
@@ -503,20 +469,11 @@ impl Player {
                 state.body.filters = filters;
             }
             if let Some(voice) = prepared.voice {
-                // The channel being left is the one the previous voice state
-                // named, which the update has not overwritten yet.
                 let left = state.body.voice.channel_id.take();
                 state.body.voice = voice.clone();
                 need_stop = true;
                 live_filter_update = None;
-                to_close = state.connection.take();
-                if let Some(task) = state.connecting.take() {
-                    task.abort();
-                }
-                if state.voice_up {
-                    state.voice_up = false;
-                    events.push(("voice.disconnected", voice_fields(left.as_deref(), "replaced")));
-                }
+                to_close = state.detach_voice(left.as_deref(), "replaced", &mut events);
                 state.voice_generation += 1;
                 connect = Some((state.voice_generation, voice));
             }
@@ -532,17 +489,13 @@ impl Player {
         if let Some(connection) = to_close {
             connection.close();
         }
-        for (kind, payload) in events {
-            self.event(kind, payload);
-        }
+        self.emit_all(events);
         if let Some((generation, voice)) = connect {
             self.open_voice(generation, voice);
         }
         Ok(result)
     }
 
-    /// Resolves an identifier on a thread of its own, because it is network
-    /// work and the runtime must stay free to answer other clients meanwhile.
     async fn resolve(&self, identifier: String) -> Result<Track, PlayerError> {
         let deadline = tokio::time::Instant::now() + self.load_timeout;
         let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.load_gate).acquire_owned())
@@ -558,7 +511,7 @@ impl Player {
         let result = tokio::time::timeout_at(deadline, work)
             .await
             .map_err(|_| PlayerError::Invalid("the source did not answer in time".into()))?
-            .map_err(|error| PlayerError::Invalid(error.to_string()))??;
+            .map_err(|e| PlayerError::Invalid(e.to_string()))??;
         match result.as_ref() {
             LoadResult::Track(track) => Ok(track.as_ref().clone()),
             LoadResult::Error(error) => Err(PlayerError::Invalid(error.message.clone())),
@@ -566,8 +519,6 @@ impl Player {
         }
     }
 
-    /// Opens a voice connection for a guild, and adopts it if it is still the
-    /// one the player is waiting for.
     fn open_voice(self: &Arc<Self>, generation: u64, voice: VoiceState) {
         let weak: Weak<Player> = Arc::downgrade(self);
         let handler = Box::new(move |closed: Closed| {
@@ -578,8 +529,7 @@ impl Player {
         let future = self.deps.voice.connect(self.user.clone(), self.guild.clone(), voice, handler);
         let player = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let result = future.await;
-            player.connected(generation, result);
+            player.connected(generation, future.await);
         });
         let mut state = self.state.lock().unwrap();
         if state.closed || state.voice_generation != generation {
@@ -592,7 +542,7 @@ impl Player {
     fn connected(
         self: &Arc<Self>,
         generation: u64,
-        result: Result<Arc<dyn Connection>, rustlink_voice::VoiceError>,
+        result: Result<Arc<dyn Connection>, VoiceError>,
     ) {
         let mut state = self.state.lock().unwrap();
         if state.closed || state.voice_generation != generation {
@@ -603,48 +553,34 @@ impl Player {
             return;
         }
         state.connecting = None;
-        let mut extra_events = Vec::new();
-        let pending_event = match result {
+        let mut events = PendingEvents::new();
+        match result {
             Ok(connection) => {
-                // A connection that reports itself ready is the moment the bot
-                // is actually in the channel, which is what a listener wants to
-                // know; one that died while it was being opened never gets
-                // announced.
-                let event = if connection.connected() {
+                if connection.connected() {
                     state.voice_up = true;
                     let channel = state.body.voice.channel_id.clone();
-                    Some(("voice.connected", voice_fields(channel.as_deref(), "")))
-                } else {
-                    None
-                };
+                    events.push(("voice.connected", voice_fields(channel.as_deref(), "")));
+                }
                 state.connection = Some(connection);
-                self.start(&mut state, &mut extra_events);
-                event
+                self.start(&mut state, &mut events);
             }
-            Err(error) => Some((
+            Err(error) => events.push((
                 "voice.closed",
                 json!({ "code": 4000, "reason": error.to_string(), "by_remote": false }),
             )),
-        };
+        }
         drop(state);
-        if let Some((kind, payload)) = pending_event {
-            self.event(kind, payload);
-        }
-        for (kind, payload) in extra_events {
-            self.event(kind, payload);
-        }
+        self.emit_all(events);
     }
-    /// Reports a voice connection that ended, whichever side ended it.
+
     fn connection_closed(&self, generation: u64, closed: Closed) {
-        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let mut events = PendingEvents::new();
         {
             let mut state = self.state.lock().unwrap();
             if state.closed || state.voice_generation != generation {
                 return;
             }
             self.stop(&mut state);
-            // The bot leaving is reported before the protocol event that explains
-            // the close, so a channel reads as a departure followed by its cause.
             if state.voice_up {
                 state.voice_up = false;
                 let channel = state.body.voice.channel_id.clone();
@@ -658,34 +594,19 @@ impl Player {
                 json!({ "code": closed.code, "reason": closed.reason, "by_remote": closed.by_remote }),
             ));
         }
-        for (kind, payload) in events {
-            self.event(kind, payload);
-        }
+        self.emit_all(events);
     }
 
-    /// Stops pacing frames. The thread notices at its next frame, which is at
-    /// most one frame away.
     fn stop(&self, state: &mut State) {
         state.generation += 1;
-        state.running = false;
-        state.opening = false;
-        state.live_filters = false;
-        state.pending_filters = None;
+        state.reset_pump();
         self.wake.notify_all();
-        if let Some(connection) = state.connection.as_ref() {
-            if connection.connected() {
-                let _ = connection.speaking(false);
-            }
+        if let Some(connection) = state.connection.as_ref().filter(|c| c.connected()) {
+            let _ = connection.speaking(false);
         }
     }
 
-    /// Starts pacing frames, if there is a track, a live connection and no
-    /// thread already doing it.
-    fn start(
-        self: &Arc<Self>,
-        state: &mut State,
-        events: &mut Vec<(&'static str, serde_json::Value)>,
-    ) {
+    fn start(self: &Arc<Self>, state: &mut State, events: &mut PendingEvents) {
         if state.closed || state.running || state.body.track.is_none() {
             return;
         }
@@ -711,31 +632,43 @@ impl Player {
                 player.run(generation, track, position, volume, filters, tempo, connection)
             });
         if let Err(error) = spawned {
-            state.running = false;
-            state.opening = false;
-            if let Some(failed_track) = Self::take_track_locked(state) {
-                let track_json =
-                    serde_json::to_value(&failed_track).unwrap_or(serde_json::Value::Null);
-                self.counters.errors.fetch_add(1, Ordering::Relaxed);
-                events.push((
-                    "track.failed",
-                    json!({
-                        "track": track_json.clone(),
-                        "exception": {
-                            "message": error.to_string(),
-                            "severity": "fault",
-                            "cause": "rustlink.audio",
-                        },
-                    }),
-                ));
-                events
-                    .push(("track.ended", json!({ "track": track_json, "reason": "load_failed" })));
+            state.reset_pump();
+            if let Some(failed_track) = state.take_track() {
+                self.push_track_failure(events, &failed_track, false, error.to_string());
             }
         }
     }
 
-    /// Paces frames out of the decoder until the track ends or the player is
-    /// stopped.
+    fn push_track_failure(
+        &self,
+        events: &mut PendingEvents,
+        track: &Track,
+        stalled: bool,
+        message: String,
+    ) {
+        let track_json = serde_json::to_value(track).unwrap_or(Value::Null);
+        self.counters.errors.fetch_add(1, Ordering::Relaxed);
+        if stalled {
+            events.push((
+                "track.stalled",
+                json!({ "track": track_json.clone(), "threshold_ms": STUCK_MILLIS }),
+            ));
+        } else {
+            events.push((
+                "track.failed",
+                json!({
+                    "track": track_json.clone(),
+                    "exception": {
+                        "message": message,
+                        "severity": "fault",
+                        "cause": "rustlink.audio",
+                    },
+                }),
+            ));
+        }
+        events.push(("track.ended", json!({ "track": track_json, "reason": "load_failed" })));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run(
         self: Arc<Self>,
@@ -783,60 +716,80 @@ impl Player {
         }
     }
 
+    fn poll_pump(
+        &self,
+        generation: u64,
+        output: &mut VoiceOutput<'_>,
+        timer_guard: &mut Option<high_res_timer::Guard>,
+        next: &mut Instant,
+        last_send: &mut Option<Instant>,
+    ) -> PumpGate<'_> {
+        let mut state = self.state.lock().unwrap();
+        if state.generation != generation || state.closed {
+            return PumpGate::Exit;
+        }
+        if !output.connection.connected() {
+            output.park_disconnected(&mut state);
+            return PumpGate::Exit;
+        }
+        if state.end_time.is_some_and(|end| state.body.state.position >= end) {
+            drop(state);
+            self.finish(generation, None);
+            return PumpGate::Exit;
+        }
+        if state.body.paused {
+            output.quiet();
+            drop(state);
+            drop(timer_guard.take());
+            self.wait(generation);
+            *timer_guard = Some(high_res_timer::Guard::acquire());
+            *next = Instant::now();
+            *last_send = None;
+            return PumpGate::Paused;
+        }
+        PumpGate::Ready(state)
+    }
+
+    fn handle_voice_err(
+        &self,
+        generation: u64,
+        mut state: MutexGuard<'_, State>,
+        output: &mut VoiceOutput<'_>,
+        error: VoiceError,
+    ) {
+        if matches!(error, VoiceError::NotReady) || !output.connection.connected() {
+            output.park_disconnected(&mut state);
+        } else {
+            drop(state);
+            self.finish(generation, Some(AudioError::Transport(error.to_string())));
+        }
+    }
+
     fn pump(
         &self,
         generation: u64,
         frames: &mut Box<dyn Frames>,
         position: i64,
         tempo: f64,
-        output: &mut VoiceOutput,
+        output: &mut VoiceOutput<'_>,
     ) {
         let mut timer_guard = Some(high_res_timer::Guard::acquire());
         let mut position = position as f64;
         let mut next = Instant::now();
         let mut last_send: Option<Instant> = None;
-        // One packet buffer for the life of the pump: a player runs for hours,
-        // and one frame is written here every twenty milliseconds.
         let mut frame = Vec::with_capacity(1500);
         loop {
-            // Pause consumes neither source data nor playback time.
-            let mut pending_update = None;
-            {
-                let mut state = self.state.lock().unwrap();
-                if state.generation != generation || state.closed {
-                    return;
-                }
-                if !output.connection.connected() {
-                    state.running = false;
-                    state.live_filters = false;
-                    state.pending_filters = None;
-                    output.speaking = false;
-                    return;
-                }
-                if let Some(end) = state.end_time {
-                    if state.body.state.position >= end {
-                        drop(state);
-                        self.finish(generation, None);
-                        return;
-                    }
-                }
-                if state.body.paused {
-                    if output.speaking {
-                        let _ = output.connection.speaking(false);
-                        output.speaking = false;
-                    }
-                    drop(state);
-                    drop(timer_guard.take());
-                    self.wait(generation);
-                    timer_guard = Some(high_res_timer::Guard::acquire());
-                    next = Instant::now();
-                    last_send = None;
-                    continue;
-                }
-                if let Some(set) = state.pending_filters.take() {
-                    pending_update = Some(set);
-                }
-            }
+            let pending_update = match self.poll_pump(
+                generation,
+                output,
+                &mut timer_guard,
+                &mut next,
+                &mut last_send,
+            ) {
+                PumpGate::Ready(mut state) => state.pending_filters.take(),
+                PumpGate::Paused => continue,
+                PumpGate::Exit => return,
+            };
             if let Some(set) = pending_update {
                 let _ = frames.set_filters(&set);
             }
@@ -852,82 +805,42 @@ impl Player {
                 }
             }
             loop {
-                let target = match last_send {
-                    Some(prev) => next.max(prev + MIN_CATCHUP_GAP),
-                    None => next,
-                };
+                let target = last_send.map_or(next, |prev| next.max(prev + MIN_CATCHUP_GAP));
                 sleep_until_precise(target);
                 let started_track = {
-                    let mut state = self.state.lock().unwrap();
-                    if state.generation != generation || state.closed {
-                        return;
-                    }
-                    if !output.connection.connected() {
-                        state.running = false;
-                        state.live_filters = false;
-                        state.pending_filters = None;
-                        output.speaking = false;
-                        return;
-                    }
-                    if state.end_time.is_some_and(|end| state.body.state.position >= end) {
-                        drop(state);
-                        self.finish(generation, None);
-                        return;
-                    }
-                    if state.body.paused {
-                        if output.speaking {
-                            let _ = output.connection.speaking(false);
-                            output.speaking = false;
-                        }
-                        drop(state);
-                        drop(timer_guard.take());
-                        self.wait(generation);
-                        timer_guard = Some(high_res_timer::Guard::acquire());
-                        next = Instant::now();
-                        last_send = None;
-                        continue;
-                    }
+                    let mut state = match self.poll_pump(
+                        generation,
+                        output,
+                        &mut timer_guard,
+                        &mut next,
+                        &mut last_send,
+                    ) {
+                        PumpGate::Ready(state) => state,
+                        PumpGate::Paused => continue,
+                        PumpGate::Exit => return,
+                    };
                     if !output.speaking {
                         if let Err(error) = output.connection.speaking(true) {
-                            if matches!(error, rustlink_voice::VoiceError::NotReady)
-                                || !output.connection.connected()
-                            {
-                                state.running = false;
-                                state.live_filters = false;
-                                state.pending_filters = None;
-                                return;
-                            }
-                            drop(state);
-                            self.finish(generation, Some(AudioError::Transport(error.to_string())));
+                            self.handle_voice_err(generation, state, output, error);
                             return;
                         }
                         output.speaking = true;
                         next = Instant::now();
                     }
                     if let Err(error) = output.connection.write(&frame) {
-                        if matches!(error, rustlink_voice::VoiceError::NotReady)
-                            || !output.connection.connected()
-                        {
-                            state.running = false;
-                            state.live_filters = false;
-                            state.pending_filters = None;
-                            output.speaking = false;
-                            return;
-                        }
-                        drop(state);
-                        self.finish(generation, Some(AudioError::Transport(error.to_string())));
+                        self.handle_voice_err(generation, state, output, error);
                         return;
                     }
                     last_send = Some(Instant::now());
                     self.counters.sent.fetch_add(1, Ordering::Relaxed);
                     position += FRAME_MILLIS * tempo;
                     state.body.state.position = position as i64;
-                    if !state.started {
-                        state.started = true;
-                        state.body.track.clone()
-                    } else {
-                        None
-                    }
+                    (!state.started)
+                        .then(|| {
+                            state.started = true;
+                            state.body.track.clone()
+                        })
+                        .flatten()
                 };
                 if let Some(track) = started_track {
                     self.event("track.started", json!({ "track": track }));
@@ -948,9 +861,6 @@ impl Player {
         }
     }
 
-    /// Check the predicate while holding the same mutex as updates, so an
-    /// update between the pause check and this wait cannot lose its signal.
-    /// Paused players need no periodic wake-up or CPU polling.
     fn wait(&self, generation: u64) {
         let state = self.state.lock().unwrap();
         drop(
@@ -965,54 +875,29 @@ impl Player {
         );
     }
 
-    /// Reports the end of a track, and stops the player from pacing more of it.
     fn finish(&self, generation: u64, error: Option<AudioError>) {
-        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::with_capacity(2);
+        let mut events = PendingEvents::with_capacity(2);
         {
             let mut state = self.state.lock().unwrap();
-            if state.generation != generation || state.closed || state.body.track.is_none() {
+            if state.generation != generation || state.closed {
                 return;
             }
-            let Some(track) = Self::take_track_locked(&mut state) else {
+            let Some(track) = state.take_track() else {
                 return;
             };
             self.stop(&mut state);
             if let Some(error) = error {
-                let track_json = serde_json::to_value(&track).unwrap_or(serde_json::Value::Null);
-                self.counters.errors.fetch_add(1, Ordering::Relaxed);
-                if matches!(error, AudioError::Stuck) {
-                    events.push((
-                        "track.stalled",
-                        json!({ "track": track_json.clone(), "threshold_ms": STUCK_MILLIS }),
-                    ));
-                } else {
-                    events.push((
-                        "track.failed",
-                        json!({
-                            "track": track_json.clone(),
-                            "exception": {
-                                "message": error.to_string(),
-                                "severity": "fault",
-                                "cause": "rustlink.audio",
-                            },
-                        }),
-                    ));
-                }
-                events
-                    .push(("track.ended", json!({ "track": track_json, "reason": "load_failed" })));
+                let stalled = matches!(error, AudioError::Stuck);
+                self.push_track_failure(&mut events, &track, stalled, error.to_string());
             } else {
                 events.push(("track.ended", json!({ "track": track, "reason": "finished" })));
             }
         }
-        for (kind, payload) in events {
-            self.event(kind, payload);
-        }
+        self.emit_all(events);
     }
 
-    /// Tears the player down: the track ends, the connection closes and the
-    /// playback thread stops.
     pub fn destroy(&self) {
-        let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        let mut events = PendingEvents::new();
         let connection = {
             let mut state = self.state.lock().unwrap();
             if state.closed {
@@ -1020,32 +905,27 @@ impl Player {
             }
             state.closed = true;
             self.stop(&mut state);
-            if let Some(track) = Self::take_track_locked(&mut state) {
+            if let Some(track) = state.take_track() {
                 events.push(("track.ended", json!({ "track": track, "reason": "cleanup" })));
             }
-            let connection = state.connection.take();
-            if let Some(task) = state.connecting.take() {
-                task.abort();
-            }
-            if state.voice_up {
-                state.voice_up = false;
-                let channel = state.body.voice.channel_id.clone();
-                events.push(("voice.disconnected", voice_fields(channel.as_deref(), "destroyed")));
-            }
-            connection
+            let channel = state.body.voice.channel_id.clone();
+            state.detach_voice(channel.as_deref(), "destroyed", &mut events)
         };
         if let Some(connection) = connection {
             connection.close();
         }
+        self.emit_all(events);
+    }
+
+    fn emit_all(&self, events: PendingEvents) {
         for (kind, payload) in events {
             self.event(kind, payload);
         }
     }
 
-    /// Sends one event to the session that owns this player.
-    fn event(&self, kind: &str, fields: serde_json::Value) {
+    fn event(&self, kind: &str, fields: Value) {
         let mut event = match fields {
-            serde_json::Value::Object(object) => object,
+            Value::Object(object) => object,
             _ => Object::new(),
         };
         event.insert("timestamp_ms".into(), json!(now_millis()));
@@ -1055,21 +935,17 @@ impl Player {
     }
 }
 
-/// Describes a bot voice event: the channel the connection was on and, when it
-/// ended, why. The voice token, session and endpoint are left out, because an
-/// event is readable by anyone the webhook is shared with.
-fn voice_fields(channel: Option<&str>, reason: &str) -> serde_json::Value {
+fn voice_fields(channel: Option<&str>, reason: &str) -> Value {
     let mut fields = Object::new();
-    if let Some(channel) = channel {
-        if !channel.is_empty() {
-            fields.insert("channel_id".into(), json!(channel));
-        }
+    if let Some(channel) = channel.filter(|c| !c.is_empty()) {
+        fields.insert("channel_id".into(), json!(channel));
     }
     if !reason.is_empty() {
         fields.insert("reason".into(), json!(reason));
     }
-    serde_json::Value::Object(fields)
+    Value::Object(fields)
 }
+
 fn clamp_position(position: i64, length: i64) -> i64 {
     let clamped = position.max(0);
     if length > 0 {
@@ -1079,9 +955,6 @@ fn clamp_position(position: i64, length: i64) -> i64 {
     }
 }
 
-/// Validated, pre-decoded representation of a [`PlayerUpdate`] so route
-/// admission and player application never decode track tokens or parse filters
-/// more than once.
 pub(crate) struct PreparedUpdate {
     changes_track: bool,
     decoded_track: Option<Track>,
@@ -1094,8 +967,6 @@ pub(crate) struct PreparedUpdate {
     pub(crate) filters: Option<Object>,
     voice: Option<VoiceState>,
 }
-
-const MAX_USER_DATA_BYTES: usize = 16 << 10;
 
 struct BoundedCounter {
     bytes: usize,
@@ -1143,23 +1014,42 @@ fn validate_scalar_fields(
         if end_time.get() <= 0 {
             return Err(PlayerError::Invalid("end_ms must be positive or null".into()));
         }
-        if let Some(position) = position {
-            if end_time.get() <= position.get() {
-                return Err(PlayerError::Invalid("end_ms must be greater than position_ms".into()));
-            }
+        if position.is_some_and(|pos| end_time.get() <= pos.get()) {
+            return Err(PlayerError::Invalid("end_ms must be greater than position_ms".into()));
         }
     }
     if let Some(filters) = filters {
         rustlink_audio::parse_filters(filters, 100)
-            .map_err(|error| PlayerError::Invalid(error.to_string()))?;
+            .map_err(|e| PlayerError::Invalid(e.to_string()))?;
     }
     if let Some(voice) = voice {
-        rustlink_voice::validate(voice).map_err(|error| PlayerError::Invalid(error.to_string()))?;
+        rustlink_voice::validate(voice).map_err(|e| PlayerError::Invalid(e.to_string()))?;
     }
     Ok(())
 }
 
-/// Validates and consumes a [`PlayerUpdate`], decoding any track token once.
+fn validate_track_fields(
+    has_token: bool,
+    query: Option<&str>,
+    user_data: Option<&Object>,
+) -> Result<(), PlayerError> {
+    if let Some(data) = user_data {
+        validate_user_data(data)?;
+    }
+    if has_token && query.is_some() {
+        return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
+    }
+    if let Some(identifier) = query {
+        if identifier.trim().is_empty() {
+            return Err(PlayerError::Invalid("query must not be empty".into()));
+        }
+        if identifier.len() > 8192 {
+            return Err(PlayerError::Invalid("query must contain 1..8192 bytes".into()));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare(update: PlayerUpdate) -> Result<PreparedUpdate, PlayerError> {
     validate_scalar_fields(
         update.volume,
@@ -1173,25 +1063,12 @@ pub(crate) fn prepare(update: PlayerUpdate) -> Result<PreparedUpdate, PlayerErro
         Patch::Null => (Patch::Null, None, None),
         Patch::Missing => (Patch::Missing, None, None),
     };
-    if let Some(data) = user_data.as_ref() {
-        validate_user_data(data)?;
-    }
-    if !token.is_missing() && query.is_some() {
-        return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
-    }
-    if let Some(identifier) = &query {
-        if identifier.trim().is_empty() {
-            return Err(PlayerError::Invalid("query must not be empty".into()));
-        }
-        if identifier.len() > 8192 {
-            return Err(PlayerError::Invalid("query must contain 1..8192 bytes".into()));
-        }
-    }
+    validate_track_fields(!token.is_missing(), query.as_deref(), user_data.as_ref())?;
     let changes_track = !token.is_missing() || query.is_some();
     let decoded_track = match token {
-        Patch::Value(encoded) => Some(
-            decode_track_owned(encoded).map_err(|error| PlayerError::Invalid(error.to_string()))?,
-        ),
+        Patch::Value(encoded) => {
+            Some(decode_track_owned(encoded).map_err(|e| PlayerError::Invalid(e.to_string()))?)
+        }
         Patch::Null | Patch::Missing => None,
     };
     Ok(PreparedUpdate {
@@ -1208,8 +1085,6 @@ pub(crate) fn prepare(update: PlayerUpdate) -> Result<PreparedUpdate, PlayerErro
     })
 }
 
-/// Checks a request before any of it is applied, so a request that cannot be
-/// honoured leaves the player exactly as it was.
 pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
     validate_scalar_fields(
         update.volume,
@@ -1223,32 +1098,11 @@ pub fn validate(update: &PlayerUpdate) -> Result<(), PlayerError> {
         Patch::Null => (&Patch::Null, None, None),
         Patch::Missing => (&Patch::Missing, None, None),
     };
-    if let Some(data) = user_data {
-        validate_user_data(data)?;
-    }
-    if !token.is_missing() && query.is_some() {
-        return Err(PlayerError::Invalid("token and query are mutually exclusive".into()));
-    }
-    if let Some(identifier) = query {
-        if identifier.trim().is_empty() {
-            return Err(PlayerError::Invalid("query must not be empty".into()));
-        }
-        if identifier.len() > 8192 {
-            return Err(PlayerError::Invalid("query must contain 1..8192 bytes".into()));
-        }
-    }
+    validate_track_fields(!token.is_missing(), query, user_data)?;
     if let Some(encoded) = token.value() {
-        decode_track(encoded).map_err(|error| PlayerError::Invalid(error.to_string()))?;
+        decode_track(encoded).map_err(|e| PlayerError::Invalid(e.to_string()))?;
     }
     Ok(())
-}
-
-/// The wall clock a client reads out of `player.updated`.
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1258,12 +1112,7 @@ mod tests {
     use std::sync::mpsc::{channel, Receiver, Sender};
 
     use rustlink_protocol::{encode_track, TrackInfo};
-    use rustlink_voice::VoiceError;
-    use serde_json::Value;
 
-    use crate::playback::Engine;
-
-    /// A source that resolves one fixed track and opens an empty stream.
     struct FakeLoader;
 
     impl Loader for FakeLoader {
@@ -1295,7 +1144,6 @@ mod tests {
         }
     }
 
-    /// An engine that produces a fixed number of frames.
     struct FakeEngine {
         frames: usize,
     }
@@ -1312,12 +1160,12 @@ mod tests {
         }
     }
 
-    /// A connection that counts what it was sent.
     #[derive(Default)]
     struct FakeConnection {
         frames: AtomicUsize,
         closed: AtomicUsize,
         speaking: AtomicBool,
+        speaking_off: AtomicUsize,
         pause_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     }
 
@@ -1327,10 +1175,12 @@ mod tests {
             Ok(())
         }
         fn speaking(&self, on: bool) -> Result<(), VoiceError> {
-            let hook = if on { None } else { self.pause_hook.lock().unwrap().take() };
-            if let Some((entered, release)) = hook {
-                entered.send(()).unwrap();
-                release.recv_timeout(Duration::from_secs(3)).unwrap();
+            if !on {
+                self.speaking_off.fetch_add(1, Ordering::SeqCst);
+                if let Some((entered, release)) = self.pause_hook.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
             }
             self.speaking.store(on, Ordering::SeqCst);
             Ok(())
@@ -1346,12 +1196,29 @@ mod tests {
         }
     }
 
-    /// A voice factory that hands back one connection immediately.
-    struct FakeVoice {
-        connection: Arc<FakeConnection>,
+    #[derive(Default)]
+    struct TimedConnection(Mutex<Vec<Instant>>);
+
+    impl Connection for TimedConnection {
+        fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
+            self.0.lock().unwrap().push(Instant::now());
+            Ok(())
+        }
+        fn speaking(&self, _: bool) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+        fn ping(&self) -> i64 {
+            1
+        }
+        fn close(&self) {}
     }
 
-    impl Factory for FakeVoice {
+    struct StaticVoice<C>(Arc<C>);
+
+    impl<C: Connection + 'static> Factory for StaticVoice<C> {
         fn connect(
             &self,
             _user: String,
@@ -1360,21 +1227,21 @@ mod tests {
             _on_close: rustlink_voice::CloseHandler,
         ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
         {
-            let connection = self.connection.clone();
-            Box::pin(async move { Ok(connection as Arc<dyn Connection>) })
+            let conn = Arc::clone(&self.0);
+            Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
         }
     }
 
     fn sample() -> Track {
-        let info = TrackInfo {
+        encode_track(&TrackInfo {
             identifier: "abc".into(),
             title: "A Song".into(),
             length: 200_000,
             is_seekable: true,
             source_name: "test".into(),
             ..Default::default()
-        };
-        encode_track(&info).unwrap()
+        })
+        .unwrap()
     }
 
     fn voice() -> VoiceState {
@@ -1390,23 +1257,37 @@ mod tests {
         serde_json::from_value(body).unwrap()
     }
 
-    fn player(frames: usize) -> (Arc<Player>, Receiver<Value>, Arc<FakeConnection>) {
-        let connection = Arc::new(FakeConnection::default());
-        let (sender, receiver): (Sender<Value>, Receiver<Value>) = channel();
+    fn build_player(
+        loader: Arc<dyn Loader>,
+        engine: Arc<dyn Engine>,
+        voice: Arc<dyn Factory>,
+        counters: Arc<Counters>,
+    ) -> (Arc<Player>, Receiver<Value>) {
+        let (sender, receiver) = channel();
         let emit: Emit = Arc::new(move |event| {
             let _ = sender.send(Value::Object(event));
         });
-        let deps = Arc::new(Deps {
-            loader: Arc::new(FakeLoader),
-            engine: Arc::new(FakeEngine { frames }),
-            voice: Arc::new(FakeVoice { connection: connection.clone() }),
-        });
-        let player =
-            Player::new("1".into(), "10".into(), deps, emit, Arc::new(Counters::default()));
-        (player, receiver, connection)
+        let player = Player::new(
+            "1".into(),
+            "10".into(),
+            Arc::new(Deps { loader, engine, voice }),
+            emit,
+            counters,
+        );
+        (player, receiver)
     }
 
-    /// Waits for the first event of a kind, failing the test if it never comes.
+    fn player(frames: usize) -> (Arc<Player>, Receiver<Value>, Arc<FakeConnection>) {
+        let conn = Arc::new(FakeConnection::default());
+        let (player, rx) = build_player(
+            Arc::new(FakeLoader),
+            Arc::new(FakeEngine { frames }),
+            Arc::new(StaticVoice(Arc::clone(&conn))),
+            Arc::new(Counters::default()),
+        );
+        (player, rx, conn)
+    }
+
     fn wait_for(events: &Receiver<Value>, kind: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -1419,10 +1300,9 @@ mod tests {
         panic!("no {kind} arrived");
     }
 
-    /// Reports whether an event of a kind arrives within a window.
     fn arrives(events: &Receiver<Value>, kind: &str, within: Duration) -> bool {
         let deadline = Instant::now() + within;
-        while let Ok(left) = deadline.checked_duration_since(Instant::now()).ok_or(()) {
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match events.recv_timeout(left) {
                 Ok(event) if event["type"] == json!(kind) => return true,
                 Ok(_) => continue,
@@ -1433,48 +1313,50 @@ mod tests {
     }
 
     #[test]
-    fn a_volume_outside_the_protocol_range_is_refused() {
-        let error = validate(&update(json!({ "volume": 1001 }))).unwrap_err();
-        assert_eq!(error.to_string(), "volume must be 0..1000");
+    fn validation_enforces_volume_end_time_filters_tokens_queries_voice_and_user_data() {
+        assert_eq!(
+            validate(&update(json!({ "volume": 1001 }))).unwrap_err().to_string(),
+            "volume must be 0..1000"
+        );
         assert!(validate(&update(json!({ "volume": 0 }))).is_ok());
-    }
 
-    #[test]
-    fn an_end_time_that_is_not_positive_is_refused() {
         assert!(validate(&update(json!({ "end_ms": 0 }))).is_err());
         assert!(validate(&update(json!({ "end_ms": null }))).is_ok());
         assert!(validate(&update(json!({ "end_ms": 5000 }))).is_ok());
-    }
+        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 5000 }))).is_err());
+        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 4999 }))).is_err());
+        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 5001 }))).is_ok());
 
-    #[test]
-    fn a_filter_the_protocol_does_not_define_is_refused() {
-        let error = validate(&update(json!({ "filters": { "reverb": {} } }))).unwrap_err();
-        assert!(error.to_string().contains("unsupported filter"));
-    }
+        assert!(validate(&update(json!({ "filters": { "reverb": {} } })))
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported filter"));
 
-    #[test]
-    fn an_encoded_track_and_an_identifier_are_mutually_exclusive() {
-        let error = validate(&update(json!({
-            "track": { "token": sample().token, "query": "abc" },
-        })))
-        .unwrap_err();
-        assert_eq!(error.to_string(), "token and query are mutually exclusive");
-    }
-
-    #[test]
-    fn an_identifier_over_the_resolve_limit_is_refused() {
-        let error =
-            validate(&update(json!({ "track": { "query": "x".repeat(8193) } }))).unwrap_err();
-        assert_eq!(error.to_string(), "query must contain 1..8192 bytes");
+        assert_eq!(
+            validate(&update(json!({ "track": { "token": sample().token, "query": "abc" } })))
+                .unwrap_err()
+                .to_string(),
+            "token and query are mutually exclusive"
+        );
+        assert_eq!(
+            validate(&update(json!({ "track": { "query": "x".repeat(8193) } })))
+                .unwrap_err()
+                .to_string(),
+            "query must contain 1..8192 bytes"
+        );
         assert!(validate(&update(json!({ "track": { "query": "x".repeat(8192) } }))).is_ok());
-    }
 
-    #[test]
-    fn a_voice_endpoint_that_is_not_discord_is_refused() {
-        let mut state = voice();
-        state.endpoint = "example.com:443".into();
-        let error = validate(&update(json!({ "voice": state }))).unwrap_err();
-        assert!(error.to_string().contains("must be a Discord voice hostname"));
+        let mut bad_voice = voice();
+        bad_voice.endpoint = "example.com:443".into();
+        assert!(validate(&update(json!({ "voice": bad_voice })))
+            .unwrap_err()
+            .to_string()
+            .contains("must be a Discord voice hostname"));
+
+        let small = update(json!({ "track": { "user_data": { "k": "v" } } }));
+        assert!(validate(&small).is_ok() && prepare(small).is_ok());
+        let huge = update(json!({ "track": { "user_data": { "blob": "x".repeat(20_000) } } }));
+        assert!(validate(&huge).is_err() && prepare(huge).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1491,8 +1373,7 @@ mod tests {
         let start = wait_for(&events, "track.started");
         assert_eq!(start["track"]["metadata"]["title"], "A Song");
         assert_eq!(start["guild_id"], "10");
-        let end = wait_for(&events, "track.ended");
-        assert_eq!(end["reason"], "finished");
+        assert_eq!(wait_for(&events, "track.ended")["reason"], "finished");
         assert!(connection.frames.load(Ordering::Relaxed) >= 1);
     }
 
@@ -1503,12 +1384,11 @@ mod tests {
             .update(update(json!({ "track": { "token": sample().token } })), false)
             .await
             .unwrap();
-        assert!(!player.playing(), "a loaded track has no voice connection yet");
+        assert!(!player.playing());
 
         player.update(update(json!({ "voice": voice() })), false).await.unwrap();
         wait_for(&events, "track.started");
-        assert!(player.snapshot().state.connected);
-        assert!(player.playing(), "active playback must be counted in node stats");
+        assert!(player.snapshot().state.connected && player.playing());
 
         player.update(update(json!({ "paused": true })), false).await.unwrap();
         assert!(!player.playing());
@@ -1516,8 +1396,7 @@ mod tests {
         assert!(player.playing());
 
         connection.close();
-        assert!(!player.snapshot().state.connected);
-        assert!(!player.playing(), "a closed transport must stop counting immediately");
+        assert!(!player.snapshot().state.connected && !player.playing());
         player.destroy();
     }
 
@@ -1537,16 +1416,10 @@ mod tests {
             }
         }
         let (starts, opened) = channel();
-        let connection = Arc::new(FakeConnection::default());
-        let player = Player::new(
-            "1".into(),
-            "10".into(),
-            Arc::new(Deps {
-                loader: Arc::new(FakeLoader),
-                engine: Arc::new(RecordingEngine(starts)),
-                voice: Arc::new(FakeVoice { connection }),
-            }),
-            Arc::new(|_| {}),
+        let (player, _) = build_player(
+            Arc::new(FakeLoader),
+            Arc::new(RecordingEngine(starts)),
+            Arc::new(StaticVoice(Arc::new(FakeConnection::default()))),
             Arc::new(Counters::default()),
         );
         let mut info = sample().metadata;
@@ -1579,8 +1452,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_paused_player_holds_its_position() {
-        let (player, events, _) = player(50);
+    async fn a_paused_player_holds_its_position_resumes_and_releases_its_thread() {
+        let (player, events, connection) = player(1000);
         player
             .update(
                 update(json!({
@@ -1592,12 +1465,23 @@ mod tests {
             )
             .await
             .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for(&events, "voice.connected");
+        assert!(!arrives(&events, "track.started", Duration::from_millis(120)));
         let snapshot = player.snapshot();
-        assert!(snapshot.paused);
-        assert_eq!(snapshot.state.position, 0);
-        assert!(!arrives(&events, "track.started", Duration::from_millis(200)));
+        assert!(snapshot.paused && snapshot.state.position == 0);
+
+        player.update(update(json!({ "paused": false })), false).await.unwrap();
+        wait_for(&events, "track.started");
+        assert!(connection.frames.load(Ordering::Relaxed) > 0);
+        player.update(update(json!({ "paused": true })), false).await.unwrap();
+        let weak = Arc::downgrade(&player);
         player.destroy();
+        drop(player);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.strong_count() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(weak.strong_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -1612,8 +1496,6 @@ mod tests {
             .unwrap();
         wait_for(&events, "track.started");
 
-        // Suspend the old pump as it sends the pause announcement. A new
-        // track must never send its speaking announcement ahead of that one.
         let (entered, paused) = channel();
         let (release, resume) = channel();
         *connection.pause_hook.lock().unwrap() = Some((entered, resume));
@@ -1636,8 +1518,6 @@ mod tests {
             change.await.unwrap();
             wait_for(&events, "track.started");
         }
-        // The old pump must have observed its invalidated generation and
-        // exited before checking the final transport announcement.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Arc::strong_count(&player) > 2 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1645,35 +1525,6 @@ mod tests {
         let speaking = connection.speaking.load(Ordering::SeqCst);
         player.destroy();
         assert!(speaking, "an obsolete pause muted the replacement track");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_paused_player_resumes_and_a_paused_destroy_releases_its_thread() {
-        let (player, events, connection) = player(1000);
-        player
-            .update(
-                update(json!({
-                    "track": { "token": sample().token },
-                    "voice": voice(),
-                    "paused": true,
-                })),
-                false,
-            )
-            .await
-            .unwrap();
-        wait_for(&events, "voice.connected");
-        player.update(update(json!({ "paused": false })), false).await.unwrap();
-        wait_for(&events, "track.started");
-        assert!(connection.frames.load(Ordering::Relaxed) > 0);
-        player.update(update(json!({ "paused": true })), false).await.unwrap();
-        let weak = Arc::downgrade(&player);
-        player.destroy();
-        drop(player);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while weak.strong_count() > 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(weak.strong_count(), 0, "the parked playback thread retained its player");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1688,10 +1539,10 @@ mod tests {
         impl Factory for HangingVoice {
             fn connect(
                 &self,
-                _user: String,
-                _guild: String,
-                _state: VoiceState,
-                _on_close: rustlink_voice::CloseHandler,
+                _: String,
+                _: String,
+                _: VoiceState,
+                _: rustlink_voice::CloseHandler,
             ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
             {
                 let guard = Dropped(self.0.lock().unwrap().take().unwrap());
@@ -1702,15 +1553,10 @@ mod tests {
             }
         }
         let (dropped, aborted) = channel();
-        let player = Player::new(
-            "1".into(),
-            "10".into(),
-            Arc::new(Deps {
-                loader: Arc::new(FakeLoader),
-                engine: Arc::new(FakeEngine { frames: 1 }),
-                voice: Arc::new(HangingVoice(Mutex::new(Some(dropped)))),
-            }),
-            Arc::new(|_| {}),
+        let (player, _) = build_player(
+            Arc::new(FakeLoader),
+            Arc::new(FakeEngine { frames: 1 }),
+            Arc::new(HangingVoice(Mutex::new(Some(dropped)))),
             Arc::new(Counters::default()),
         );
         player.update(update(json!({ "voice": voice() })), false).await.unwrap();
@@ -1726,8 +1572,6 @@ mod tests {
     #[test]
     fn a_resume_or_stop_before_wait_does_not_lose_the_wakeup() {
         let (player, _, _) = player(1);
-        // The predicate is already false. These calls must return without a
-        // timer or a notification that would have happened before the wait.
         player.wait(0);
         {
             let mut state = player.state.lock().unwrap();
@@ -1738,44 +1582,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn replacing_a_track_ends_the_previous_one() {
-        let (player, events, _) = player(1000);
-        player
-            .update(
-                update(json!({ "track": { "token": sample().token }, "voice": voice() })),
-                false,
-            )
-            .await
-            .unwrap();
-        wait_for(&events, "track.started");
-        player
-            .update(update(json!({ "track": { "token": sample().token } })), false)
-            .await
-            .unwrap();
-        assert_eq!(wait_for(&events, "track.ended")["reason"], "replaced");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn no_replace_leaves_the_playing_track_alone() {
-        let (player, events, _) = player(1000);
-        player
-            .update(
-                update(json!({ "track": { "token": sample().token }, "voice": voice() })),
-                false,
-            )
-            .await
-            .unwrap();
-        wait_for(&events, "track.started");
-        let result = player
-            .update(update(json!({ "track": { "token": sample().token } })), true)
-            .await
-            .unwrap();
-        assert_eq!(result.track.unwrap().metadata.title, "A Song");
-        assert!(!arrives(&events, "track.ended", Duration::from_millis(200)));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn destroying_a_player_ends_its_track_and_closes_its_connection() {
+    async fn track_replacement_no_replace_and_destruction_behave_cleanly() {
         let (player, events, connection) = player(1000);
         player
             .update(
@@ -1785,46 +1592,49 @@ mod tests {
             .await
             .unwrap();
         wait_for(&events, "track.started");
+
+        let preserved = player
+            .update(update(json!({ "track": { "token": sample().token } })), true)
+            .await
+            .unwrap();
+        assert_eq!(preserved.track.unwrap().metadata.title, "A Song");
+        assert!(!arrives(&events, "track.ended", Duration::from_millis(120)));
+
+        player
+            .update(update(json!({ "track": { "token": sample().token } })), false)
+            .await
+            .unwrap();
+        assert_eq!(wait_for(&events, "track.ended")["reason"], "replaced");
+        wait_for(&events, "track.started");
+
         player.destroy();
         assert_eq!(connection.closed.load(Ordering::Relaxed), 1);
         assert!(player.snapshot().track.is_none());
         assert_eq!(wait_for(&events, "track.ended")["reason"], "cleanup");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_update_after_destruction_is_refused() {
-        let (player, _events, _) = player(1);
-        player.destroy();
-        let error = player.update(update(json!({ "volume": 50 })), false).await.unwrap_err();
-        assert_eq!(error.to_string(), "player is destroyed");
+        assert_eq!(
+            player.update(update(json!({ "volume": 50 })), false).await.unwrap_err().to_string(),
+            "player is destroyed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_identifier_that_is_not_a_track_is_refused() {
         struct AlbumLoader;
-
         impl Loader for AlbumLoader {
-            fn load(&self, _identifier: &str) -> Result<LoadResult, rustlink_source::SourceError> {
+            fn load(&self, _: &str) -> Result<LoadResult, rustlink_source::SourceError> {
                 Ok(LoadResult::Search(Vec::new()))
             }
             fn open(
                 &self,
-                _track: &Track,
+                _: &Track,
             ) -> Result<Box<dyn std::io::Read + Send>, rustlink_source::SourceError> {
                 Ok(Box::new(std::io::empty()))
             }
         }
-
-        let deps = Arc::new(Deps {
-            loader: Arc::new(AlbumLoader),
-            engine: Arc::new(FakeEngine { frames: 1 }),
-            voice: Arc::new(FakeVoice { connection: Arc::new(FakeConnection::default()) }),
-        });
-        let player = Player::new(
-            "1".into(),
-            "10".into(),
-            deps,
-            Arc::new(|_event| {}),
+        let (player, _) = build_player(
+            Arc::new(AlbumLoader),
+            Arc::new(FakeEngine { frames: 1 }),
+            Arc::new(StaticVoice(Arc::new(FakeConnection::default()))),
             Arc::new(Counters::default()),
         );
         let error = player
@@ -1851,79 +1661,14 @@ mod tests {
         assert!(!arrives(&events, "track.ended", Duration::from_millis(120)));
         assert_eq!(
             player.snapshot().track.as_ref().map(|t| t.metadata.title.as_str()),
-            Some("A Song"),
-            "transient transport loss must keep the track parked for voice failover"
+            Some("A Song")
         );
         player.destroy();
     }
 
-    #[test]
-    fn end_time_at_or_before_position_and_oversized_user_data_are_refused() {
-        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 5000 }))).is_err());
-        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 4999 }))).is_err());
-        assert!(validate(&update(json!({ "position_ms": 5000, "end_ms": 5001 }))).is_ok());
-
-        let small = update(json!({ "track": { "user_data": { "k": "v" } } }));
-        assert!(validate(&small).is_ok());
-        assert!(prepare(small).is_ok());
-
-        let huge = update(json!({ "track": { "user_data": { "blob": "x".repeat(20_000) } } }));
-        assert!(validate(&huge).is_err());
-        assert!(prepare(huge).is_err());
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_volume_and_filter_updates_do_not_bump_generation_or_send_speaking_false() {
-        struct CountingVoice {
-            speaking_off: AtomicUsize,
-        }
-        impl Connection for CountingVoice {
-            fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
-                Ok(())
-            }
-            fn speaking(&self, on: bool) -> Result<(), VoiceError> {
-                if !on {
-                    self.speaking_off.fetch_add(1, Ordering::SeqCst);
-                }
-                Ok(())
-            }
-            fn connected(&self) -> bool {
-                true
-            }
-            fn ping(&self) -> i64 {
-                5
-            }
-            fn close(&self) {}
-        }
-        struct CountingFactory(Arc<CountingVoice>);
-        impl Factory for CountingFactory {
-            fn connect(
-                &self,
-                _: String,
-                _: String,
-                _: VoiceState,
-                _: rustlink_voice::CloseHandler,
-            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
-            {
-                let conn = Arc::clone(&self.0);
-                Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
-            }
-        }
-        let conn = Arc::new(CountingVoice { speaking_off: AtomicUsize::new(0) });
-        let (sender, events) = channel();
-        let player = Player::new(
-            "1".into(),
-            "10".into(),
-            Arc::new(Deps {
-                loader: Arc::new(FakeLoader),
-                engine: Arc::new(FakeEngine { frames: 1 }),
-                voice: Arc::new(CountingFactory(Arc::clone(&conn))),
-            }),
-            Arc::new(move |e| {
-                let _ = sender.send(Value::Object(e));
-            }),
-            Arc::new(Counters::default()),
-        );
+        let (player, events, conn) = player(1);
         player.update(update(json!({ "voice": voice() })), false).await.unwrap();
         wait_for(&events, "voice.connected");
         let gen_before = player.state.lock().unwrap().generation;
@@ -1941,95 +1686,52 @@ mod tests {
         player.destroy();
     }
 
+    struct DelayedFrames {
+        index: usize,
+        total: usize,
+        delay_on_second: Duration,
+    }
+
+    impl Frames for DelayedFrames {
+        fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
+            if self.index >= self.total {
+                return Ok(false);
+            }
+            if self.index == 1 {
+                std::thread::sleep(self.delay_on_second);
+            }
+            self.index += 1;
+            packet.clear();
+            packet.resize(8, self.index as u8);
+            Ok(true)
+        }
+    }
+
+    struct DelayedEngine {
+        total: usize,
+        delay: Duration,
+    }
+
+    impl Engine for DelayedEngine {
+        fn start(
+            &self,
+            _: &Track,
+            _: i64,
+            _: i64,
+            _: &Object,
+        ) -> Result<Box<dyn Frames>, AudioError> {
+            Ok(Box::new(DelayedFrames { index: 0, total: self.total, delay_on_second: self.delay }))
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_stall_pacing_waits_one_frame_interval_before_next_write() {
-        struct StallingFrames {
-            index: usize,
-        }
-        impl Frames for StallingFrames {
-            fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
-                match self.index {
-                    0 => {
-                        self.index += 1;
-                        packet.clear();
-                        packet.resize(8, 1);
-                        Ok(true)
-                    }
-                    1 => {
-                        self.index += 1;
-                        // Stall longer than LATE + 2*FRAME (140 ms) so `late > 100 ms` triggers.
-                        std::thread::sleep(Duration::from_millis(165));
-                        packet.clear();
-                        packet.resize(8, 2);
-                        Ok(true)
-                    }
-                    2 => {
-                        self.index += 1;
-                        packet.clear();
-                        packet.resize(8, 3);
-                        Ok(true)
-                    }
-                    _ => Ok(false),
-                }
-            }
-        }
-        struct StallingEngine;
-        impl Engine for StallingEngine {
-            fn start(
-                &self,
-                _: &Track,
-                _: i64,
-                _: i64,
-                _: &Object,
-            ) -> Result<Box<dyn Frames>, AudioError> {
-                Ok(Box::new(StallingFrames { index: 0 }))
-            }
-        }
-        struct TimedConnection(Mutex<Vec<Instant>>);
-        impl Connection for TimedConnection {
-            fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
-                self.0.lock().unwrap().push(Instant::now());
-                Ok(())
-            }
-            fn speaking(&self, _: bool) -> Result<(), VoiceError> {
-                Ok(())
-            }
-            fn connected(&self) -> bool {
-                true
-            }
-            fn ping(&self) -> i64 {
-                1
-            }
-            fn close(&self) {}
-        }
-        struct TimedFactory(Arc<TimedConnection>);
-        impl Factory for TimedFactory {
-            fn connect(
-                &self,
-                _: String,
-                _: String,
-                _: VoiceState,
-                _: rustlink_voice::CloseHandler,
-            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
-            {
-                let conn = Arc::clone(&self.0);
-                Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
-            }
-        }
-        let writes = Arc::new(TimedConnection(Mutex::new(Vec::new())));
+        let writes = Arc::new(TimedConnection::default());
         let counters = Arc::new(Counters::default());
-        let (sender, events) = channel();
-        let player = Player::new(
-            "1".into(),
-            "10".into(),
-            Arc::new(Deps {
-                loader: Arc::new(FakeLoader),
-                engine: Arc::new(StallingEngine),
-                voice: Arc::new(TimedFactory(Arc::clone(&writes))),
-            }),
-            Arc::new(move |e| {
-                let _ = sender.send(Value::Object(e));
-            }),
+        let (player, events) = build_player(
+            Arc::new(FakeLoader),
+            Arc::new(DelayedEngine { total: 3, delay: Duration::from_millis(165) }),
+            Arc::new(StaticVoice(Arc::clone(&writes))),
             Arc::clone(&counters),
         );
         player
@@ -2043,99 +1745,17 @@ mod tests {
         let stamps = writes.0.lock().unwrap().clone();
         assert_eq!(stamps.len(), 3);
         assert!(counters.deficit.load(Ordering::Relaxed) >= 5);
-        // Frame 1 stalled, triggering the deficit reset; frame 2 must be paced ~20ms later, not 0ms.
         let gap = stamps[2].saturating_duration_since(stamps[1]);
         assert!(gap >= Duration::from_millis(14), "frame after stall burst too early: {gap:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sub_threshold_hiccup_recovers_smoothly_without_zero_microsecond_packet_bursts() {
-        struct HiccupFrames {
-            index: usize,
-        }
-        impl Frames for HiccupFrames {
-            fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
-                match self.index {
-                    0 => {
-                        self.index += 1;
-                        packet.clear();
-                        packet.resize(8, 1);
-                        Ok(true)
-                    }
-                    1 => {
-                        self.index += 1;
-                        // 55 ms decode delay -> 35 ms late (<= LATE = 100 ms), so catch-up runs.
-                        std::thread::sleep(Duration::from_millis(55));
-                        packet.clear();
-                        packet.resize(8, 2);
-                        Ok(true)
-                    }
-                    2 | 3 => {
-                        self.index += 1;
-                        packet.clear();
-                        packet.resize(8, 3);
-                        Ok(true)
-                    }
-                    _ => Ok(false),
-                }
-            }
-        }
-        struct HiccupEngine;
-        impl Engine for HiccupEngine {
-            fn start(
-                &self,
-                _: &Track,
-                _: i64,
-                _: i64,
-                _: &Object,
-            ) -> Result<Box<dyn Frames>, AudioError> {
-                Ok(Box::new(HiccupFrames { index: 0 }))
-            }
-        }
-        struct TimedConnection(Mutex<Vec<Instant>>);
-        impl Connection for TimedConnection {
-            fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
-                self.0.lock().unwrap().push(Instant::now());
-                Ok(())
-            }
-            fn speaking(&self, _: bool) -> Result<(), VoiceError> {
-                Ok(())
-            }
-            fn connected(&self) -> bool {
-                true
-            }
-            fn ping(&self) -> i64 {
-                1
-            }
-            fn close(&self) {}
-        }
-        struct TimedFactory(Arc<TimedConnection>);
-        impl Factory for TimedFactory {
-            fn connect(
-                &self,
-                _: String,
-                _: String,
-                _: VoiceState,
-                _: rustlink_voice::CloseHandler,
-            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
-            {
-                let conn = Arc::clone(&self.0);
-                Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
-            }
-        }
-        let writes = Arc::new(TimedConnection(Mutex::new(Vec::new())));
-        let (sender, events) = channel();
-        let player = Player::new(
-            "1".into(),
-            "10".into(),
-            Arc::new(Deps {
-                loader: Arc::new(FakeLoader),
-                engine: Arc::new(HiccupEngine),
-                voice: Arc::new(TimedFactory(Arc::clone(&writes))),
-            }),
-            Arc::new(move |e| {
-                let _ = sender.send(Value::Object(e));
-            }),
+        let writes = Arc::new(TimedConnection::default());
+        let (player, events) = build_player(
+            Arc::new(FakeLoader),
+            Arc::new(DelayedEngine { total: 4, delay: Duration::from_millis(55) }),
+            Arc::new(StaticVoice(Arc::clone(&writes))),
             Arc::new(Counters::default()),
         );
         player

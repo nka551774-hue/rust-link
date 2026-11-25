@@ -1,24 +1,15 @@
-//! Discord voice state validation.
-//!
-//! A voice update arrives from a client, which means every field in it is
-//! attacker-controlled. The checks here are what keep a client from pointing the
-//! node's voice socket at a host of its choosing.
+//! Strict validation for untrusted client-supplied Discord `VoiceState` updates.
 
 use rustlink_protocol::VoiceState;
 
 use crate::VoiceError;
 
-/// Whether a string is a Discord snowflake that names something.
-///
-/// Zero is not a valid id, and neither is anything that is not a decimal number,
-/// so an empty or invented value is refused rather than turned into a plausible
-/// one.
+/// Whether `raw` is a canonical non-zero 64-bit decimal Discord snowflake.
 pub fn valid_id(raw: &str) -> bool {
-    !raw.is_empty()
-        && raw.len() <= 20
+    (1..=20).contains(&raw.len())
         && !raw.starts_with('0')
-        && raw.bytes().all(|byte| byte.is_ascii_digit())
-        && raw.parse::<u64>().is_ok_and(|value| value != 0)
+        && raw.bytes().all(|b| b.is_ascii_digit())
+        && raw.parse::<u64>().is_ok()
 }
 
 fn has_ascii_suffix(text: &str, suffix: &str) -> bool {
@@ -28,10 +19,10 @@ fn has_ascii_suffix(text: &str, suffix: &str) -> bool {
 }
 
 fn has_ascii_whitespace_or_control(raw: &str) -> bool {
-    raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+    raw.bytes().any(|b| b <= b' ' || b == 0x7f)
 }
 
-/// Checks a voice state before the node acts on it.
+/// Validates a `VoiceState` before opening a Discord voice WebSocket.
 pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
     let channel = state.channel_id.as_deref().unwrap_or_default();
     if state.token.is_empty()
@@ -46,18 +37,14 @@ pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
     if state.token.len() > 512 || state.session_id.len() > 256 || state.endpoint.len() > 512 {
         return Err(VoiceError::Invalid("voice credentials or endpoint are too long".into()));
     }
-    if has_ascii_whitespace_or_control(&state.token)
-        || has_ascii_whitespace_or_control(&state.session_id)
-        || has_ascii_whitespace_or_control(&state.endpoint)
+    if [state.token.as_str(), state.session_id.as_str(), state.endpoint.as_str()]
+        .into_iter()
+        .any(has_ascii_whitespace_or_control)
     {
         return Err(VoiceError::Invalid(
             "voice credentials or endpoint contain whitespace or control characters".into(),
         ));
     }
-    // Discord sends the voice host with an optional port, for example
-    // "c-iad21-1a2b3c.discord.media:443". A port is valid; userinfo, a path, a
-    // query and a fragment are not. The hostname rule below is what keeps
-    // non-Discord hosts out.
     let endpoint = &state.endpoint;
     let Some(host) = voice_host(endpoint) else {
         return Err(VoiceError::Invalid(format!("invalid Discord voice endpoint {endpoint:?}")));
@@ -70,25 +57,20 @@ pub fn validate(state: &VoiceState) -> Result<(), VoiceError> {
     Ok(())
 }
 
-/// Returns the hostname of a voice endpoint, or `None` when the value is not a
-/// bare `host[:port]`.
+/// Extracts `host` from `host[:port]`, rejecting paths, userinfo, IPv6 literals, and malformed ports/labels.
 fn voice_host(endpoint: &str) -> Option<&str> {
-    if endpoint.is_empty() || endpoint.len() > 253 + 6 || has_ascii_whitespace_or_control(endpoint)
+    if endpoint.is_empty()
+        || endpoint.len() > 259
+        || has_ascii_whitespace_or_control(endpoint)
+        || endpoint.contains(['/', '?', '#', '@'])
     {
         return None;
     }
-    if endpoint.contains(['/', '?', '#', '@']) {
-        return None;
-    }
     let host = match endpoint.rsplit_once(':') {
-        // A bare IPv6 literal is not a Discord hostname, and a host with a port
-        // has to keep the port canonical, numeric, and non-zero.
         Some((host, port)) => {
-            if host.is_empty()
-                || port.is_empty()
-                || port.starts_with('0')
-                || !port.bytes().all(|byte| byte.is_ascii_digit())
-                || !port.parse::<u16>().is_ok_and(|value| value != 0)
+            if port.starts_with('0')
+                || !port.bytes().all(|b| b.is_ascii_digit())
+                || port.parse::<u16>().is_err()
             {
                 return None;
             }
@@ -96,21 +78,15 @@ fn voice_host(endpoint: &str) -> Option<&str> {
         }
         None => endpoint,
     };
-    // Validate DNS labels before the suffix check. An endpoint that cannot be
-    // connected must be refused before a player tears down its current voice
-    // connection, including separators and controls interpreted by URI parsers.
-    if host.len() > 253
-        || !host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
-        return None;
-    }
-    Some(host)
+    (!host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|l| {
+            (1..=63).contains(&l.len())
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        }))
+    .then_some(host)
 }
 
 #[cfg(test)]
@@ -129,19 +105,17 @@ mod tests {
     #[test]
     fn a_zero_or_invented_id_is_not_an_id() {
         assert!(valid_id("123456789012345678"));
-        assert!(!valid_id("0"));
-        assert!(!valid_id(""));
-        assert!(!valid_id("not a number"));
-        assert!(!valid_id("12 34"));
+        for bad in ["0", "", "not a number", "12 34"] {
+            assert!(!valid_id(bad), "{bad:?}");
+        }
     }
 
     #[test]
     fn snowflakes_cannot_differ_from_the_identify_payload_by_whitespace() {
-        for id in [" 123", "123 ", "\t123", "123\n", "\u{2003}123"] {
-            assert!(!valid_id(id), "non-decimal ID was accepted: {id:?}");
+        for id in [" 123", "123 ", "\t123", "123\n", "\u{2003}123", "18446744073709551616"] {
+            assert!(!valid_id(id), "{id:?}");
         }
         assert!(valid_id("18446744073709551615"));
-        assert!(!valid_id("18446744073709551616"));
     }
 
     #[test]
@@ -156,13 +130,10 @@ mod tests {
     }
 
     #[test]
-    fn a_discord_host_with_a_path_is_refused() {
-        assert!(validate(&state("c-iad21-1a2b3c.discord.media/../x", Some("123"))).is_err());
-    }
-
-    #[test]
-    fn a_discord_host_with_userinfo_is_refused() {
-        assert!(validate(&state("user@c-iad21-1a2b3c.discord.media", Some("123"))).is_err());
+    fn a_discord_host_with_a_path_or_userinfo_is_refused() {
+        for bad in ["c-iad21-1a2b3c.discord.media/../x", "user@c-iad21-1a2b3c.discord.media"] {
+            assert!(validate(&state(bad, Some("123"))).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -193,44 +164,45 @@ mod tests {
 
     #[test]
     fn oversized_voice_fields_are_refused_before_connecting() {
-        let mut oversized = state("a.discord.media", Some("123"));
-        oversized.token = "t".repeat(513);
-        assert!(validate(&oversized).is_err());
-        oversized = state("a.discord.media", Some("123"));
-        oversized.session_id = "s".repeat(257);
-        assert!(validate(&oversized).is_err());
-        oversized = state("a.discord.media", Some("123"));
-        oversized.endpoint = format!("{}.discord.media", "a".repeat(512));
-        assert!(validate(&oversized).is_err());
+        for mutate in [
+            |s: &mut VoiceState| s.token = "t".repeat(513),
+            |s: &mut VoiceState| s.session_id = "s".repeat(257),
+            |s: &mut VoiceState| s.endpoint = format!("{}.discord.media", "a".repeat(512)),
+        ] {
+            let mut s = state("a.discord.media", Some("123"));
+            mutate(&mut s);
+            assert!(validate(&s).is_err());
+        }
     }
 
     #[test]
     fn a_voice_host_is_recognised_with_or_without_a_port() {
         assert_eq!(voice_host("a.discord.media"), Some("a.discord.media"));
         assert_eq!(voice_host("a.discord.media:443"), Some("a.discord.media"));
-        assert_eq!(voice_host("a.discord.media:not-a-port"), None);
-        assert_eq!(voice_host("a.discord.media:0443"), None);
-        assert_eq!(voice_host("a.discord.media:00"), None);
+        for bad in ["a.discord.media:not-a-port", "a.discord.media:0443", "a.discord.media:00"] {
+            assert_eq!(voice_host(bad), None, "{bad}");
+        }
     }
 
     #[test]
     fn empty_endpoint_whitespace_controls_and_leading_zero_ports_are_refused() {
         let err = validate(&state("", Some("123"))).unwrap_err();
         assert!(err.to_string().contains("requires token, session_id, endpoint and channel_id"));
-
-        assert!(validate(&state("a.discord.media:0443", Some("123"))).is_err());
-        assert!(validate(&state(" a.discord.media:443", Some("123"))).is_err());
-        assert!(validate(&state("a.discord.media:443 ", Some("123"))).is_err());
-        assert!(validate(&state("a.discord.media\x7f", Some("123"))).is_err());
-
+        for ep in [
+            "a.discord.media:0443",
+            " a.discord.media:443",
+            "a.discord.media:443 ",
+            "a.discord.media\x7f",
+        ] {
+            assert!(validate(&state(ep, Some("123"))).is_err(), "{ep:?}");
+        }
         for bad in ["tok en", " token", "token\n", "token\0", "token\x1f", "token\x7f"] {
             let mut s = state("a.discord.media:443", Some("123"));
             s.token = bad.into();
-            assert!(validate(&s).is_err(), "bad token accepted: {bad:?}");
-
+            assert!(validate(&s).is_err(), "bad token: {bad:?}");
             let mut s = state("a.discord.media:443", Some("123"));
             s.session_id = bad.into();
-            assert!(validate(&s).is_err(), "bad session_id accepted: {bad:?}");
+            assert!(validate(&s).is_err(), "bad session_id: {bad:?}");
         }
     }
 }

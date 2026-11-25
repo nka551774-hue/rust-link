@@ -19,6 +19,7 @@ const CHANNEL: u64 = 555555555;
 const SSRC: u32 = 77;
 const KEY: [u8; 32] = [29; 32];
 const OPUS: &[u8] = &[0xf8, 0x11, 0x22, 0x33, 0x44];
+const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn connection_with_queue(capacity: usize) -> (DiscordConnection, mpsc::Receiver<Command>) {
     let (commands, receiver) = mpsc::channel(capacity);
@@ -30,36 +31,34 @@ fn connection_with_queue(capacity: usize) -> (DiscordConnection, mpsc::Receiver<
         audio_buffers: Mutex::new(Vec::with_capacity(COMMAND_CAPACITY)),
         dropped_frames: AtomicU64::new(0),
     });
-    let connection = DiscordConnection { commands, shared };
-    (connection, receiver)
+    (DiscordConnection { commands, shared }, receiver)
 }
 
 #[test]
 fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
     let (connection, mut receiver) = connection_with_queue(COMMAND_CAPACITY);
-    let room = COMMAND_CAPACITY - CONTROL_RESERVE;
-    for _ in 0..room {
+    for _ in 0..COMMAND_CAPACITY - CONTROL_RESERVE {
         connection.write(OPUS).unwrap();
     }
-    // A gateway that is behind costs frames, not the track: the late frame is
-    // dropped before locking or allocating from audio_buffers, and the caller sees no error.
-    connection.write(OPUS).expect("a full queue drops the frame without failing the player");
+    connection.write(OPUS).unwrap();
     assert_eq!(connection.shared.dropped_frames.load(Ordering::Relaxed), 1);
     assert_eq!(connection.shared.audio_buffers.lock().unwrap().len(), 0);
+
     let Command::Audio(packet) = receiver.try_recv().unwrap() else { panic!("expected audio") };
     assert!(packet.capacity() >= 1500);
     assert_eq!(&packet[..transport::HEADER_LEN], &[0u8; transport::HEADER_LEN]);
     assert_eq!(&packet[transport::HEADER_LEN..], OPUS);
     let pointer = packet.as_ptr();
-    connection.recycle(packet);
+    connection.shared.recycle(packet);
     assert_eq!(connection.shared.audio_buffers.lock().unwrap().len(), 1);
-    let reused = connection.packet(b"new");
+
+    let reused = connection.shared.packet(b"new");
     assert_eq!(&reused[..transport::HEADER_LEN], &[0u8; transport::HEADER_LEN]);
     assert_eq!(&reused[transport::HEADER_LEN..], b"new");
-    assert_eq!(reused.as_ptr(), pointer, "the buffer just recycled is the one reused");
-    connection.recycle(reused);
+    assert_eq!(reused.as_ptr(), pointer);
+    connection.shared.recycle(reused);
     for _ in 0..COMMAND_CAPACITY * 2 {
-        connection.recycle(Vec::with_capacity(1500));
+        connection.shared.recycle(Vec::with_capacity(1500));
     }
     assert_eq!(connection.shared.audio_buffers.lock().unwrap().len(), COMMAND_CAPACITY);
     connection.close();
@@ -69,7 +68,6 @@ fn audio_backpressure_is_bounded_and_recycled_buffers_do_not_retain_payloads() {
 #[test]
 fn speaking_and_close_always_fit_however_far_behind_the_gateway_is() {
     let (connection, mut receiver) = connection_with_queue(COMMAND_CAPACITY);
-    // Nothing is draining the queue: the audio fills all it may.
     for _ in 0..COMMAND_CAPACITY * 3 {
         connection.write(OPUS).unwrap();
     }
@@ -77,12 +75,10 @@ fn speaking_and_close_always_fit_however_far_behind_the_gateway_is() {
         connection.shared.dropped_frames.load(Ordering::Relaxed) as usize,
         COMMAND_CAPACITY * 2 + CONTROL_RESERVE
     );
-    // Speaking(false) used to be refused here, leaving the user shown as talking.
-    connection.speaking(false).expect("the reserve is for control commands");
-    connection.speaking(true).expect("and there is room for more than one");
+    connection.speaking(false).unwrap();
+    connection.speaking(true).unwrap();
     connection.close();
-    let mut audio = 0;
-    let mut control = Vec::new();
+    let (mut audio, mut control) = (0, Vec::new());
     while let Ok(command) = receiver.try_recv() {
         match command {
             Command::Audio(_) => audio += 1,
@@ -98,7 +94,7 @@ fn speaking_and_close_always_fit_however_far_behind_the_gateway_is() {
 fn a_gateway_task_that_is_gone_is_still_an_error() {
     let (connection, receiver) = connection_with_queue(COMMAND_CAPACITY);
     drop(receiver);
-    assert!(connection.write(OPUS).is_err(), "a closed queue is not a slow one");
+    assert!(connection.write(OPUS).is_err());
     assert!(connection.speaking(true).is_err());
 }
 
@@ -111,22 +107,67 @@ fn state() -> VoiceState {
     }
 }
 
+async fn listener_with_url() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/?v=8", listener.local_addr().unwrap());
+    (listener, url)
+}
+
+async fn accept_ws(listener: &TcpListener) -> ServerSocket {
+    let (tcp, _) = listener.accept().await.unwrap();
+    tokio_tungstenite::accept_async(tcp).await.unwrap()
+}
+
+async fn connect_test(url: &str) -> (Arc<DiscordConnection>, mpsc::UnboundedReceiver<Closed>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let conn = connect_url(
+        url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(move |reason| {
+            let _ = tx.send(reason);
+        }),
+    )
+    .await
+    .unwrap();
+    (conn, rx)
+}
+
+async fn connect_expect_err(url: &str) -> VoiceError {
+    connect_url(
+        url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(|_| panic!("failed handshake must not invoke on_close")),
+    )
+    .await
+    .err()
+    .expect("expected handshake failure")
+}
+
 async fn send(ws: &mut ServerSocket, value: Value) {
     ws.send(Message::Text(value.to_string().into())).await.unwrap();
 }
+
 async fn binary(ws: &mut ServerSocket, sequence: u16, opcode: u8, data: &[u8]) {
     let mut bytes = sequence.to_be_bytes().to_vec();
     bytes.push(opcode);
-    bytes.extend(data);
+    bytes.extend_from_slice(data);
     ws.send(Message::Binary(bytes.into())).await.unwrap();
 }
+
+async fn reply_discovery(udp: &UdpSocket, discovery: &mut [u8; 74], client: SocketAddr) {
+    discovery[..2].copy_from_slice(&2u16.to_be_bytes());
+    discovery[8..17].copy_from_slice(b"127.0.0.1");
+    discovery[72..].copy_from_slice(&client.port().to_be_bytes());
+    udp.send_to(discovery, client).await.unwrap();
+}
+
 async fn next(ws: &mut ServerSocket) -> Message {
     loop {
-        let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let message = tokio::time::timeout(TIMEOUT, ws.next()).await.unwrap().unwrap().unwrap();
         if let Message::Text(ref text) = message {
             let value: Value = serde_json::from_str(text).unwrap();
             if value["op"] == 3 {
@@ -138,30 +179,52 @@ async fn next(ws: &mut ServerSocket) -> Message {
         return message;
     }
 }
+
 async fn next_json(ws: &mut ServerSocket, opcode: u8) -> Value {
-    let Message::Text(text) = next(ws).await else {
-        panic!("expected JSON opcode {opcode}");
-    };
+    let Message::Text(text) = next(ws).await else { panic!("expected JSON opcode {opcode}") };
     let value: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value["op"], opcode);
     value
 }
 
+fn decrypt_rtp(packet: &[u8]) -> Vec<u8> {
+    let size = packet.len();
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(&packet[size - 4..]);
+    Aes256Gcm::new((&KEY).into())
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload { msg: &packet[12..size - 4], aad: &packet[..12] },
+        )
+        .unwrap()
+}
+
 #[tokio::test]
 async fn v8_handshake_waits_for_dave_and_sends_interoperable_encrypted_audio() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/?v=8", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (prepared, waiting) = oneshot::channel();
     let (execute, can_execute) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let mut ws = accept_ws(&listener).await;
         send(&mut ws, json!({"op":8,"d":{"heartbeat_interval":100}})).await;
         let identify = next_json(&mut ws, 0).await;
         assert_eq!(identify["d"]["max_dave_protocol_version"], 1);
         assert_eq!(identify["d"]["user_id"], USER.to_string());
-        send(&mut ws,json!({"op":2,"seq":1,"d":{"ssrc":SSRC,"ip":"127.0.0.1","port":udp.local_addr().unwrap().port(),"modes":["aead_aes256_gcm_rtpsize"]}})).await;
+        send(
+            &mut ws,
+            json!({
+                "op": 2,
+                "seq": 1,
+                "d": {
+                    "ssrc": SSRC,
+                    "ip": "127.0.0.1",
+                    "port": udp.local_addr().unwrap().port(),
+                    "modes": ["aead_aes256_gcm_rtpsize"]
+                }
+            }),
+        )
+        .await;
         let suite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
         let signer = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
         let external = ExternalSender::new(
@@ -175,7 +238,6 @@ async fn v8_handshake_waits_for_dave_and_sends_interoperable_encrypted_audio() {
         let (size, client) = udp.recv_from(&mut discovery).await.unwrap();
         assert_eq!(size, 74);
         assert_eq!(&discovery[..8], &transport::ip_discovery_request(SSRC)[..8]);
-        // Delay discovery until a heartbeat acknowledges the binary opcode sequence.
         loop {
             let Message::Text(text) = ws.next().await.unwrap().unwrap() else {
                 panic!("expected heartbeat");
@@ -187,21 +249,30 @@ async fn v8_handshake_waits_for_dave_and_sends_interoperable_encrypted_audio() {
                 break;
             }
         }
-        discovery[..2].copy_from_slice(&2u16.to_be_bytes());
-        discovery[8..17].copy_from_slice(b"127.0.0.1");
-        discovery[72..].copy_from_slice(&client.port().to_be_bytes());
-        udp.send_to(&discovery, client).await.unwrap();
+        reply_discovery(&udp, &mut discovery, client).await;
         let selected = next_json(&mut ws, 1).await;
         assert_eq!(selected["d"]["data"]["mode"], "aead_aes256_gcm_rtpsize");
-        send(&mut ws,json!({"op":4,"seq":3,"d":{"mode":"aead_aes256_gcm_rtpsize","secret_key":KEY,"dave_protocol_version":1,"audio_codec":"opus"}})).await;
-        let Message::Binary(bytes) = next(&mut ws).await else {
-            panic!("expected key package");
-        };
+        send(
+            &mut ws,
+            json!({
+                "op": 4,
+                "seq": 3,
+                "d": {
+                    "mode": "aead_aes256_gcm_rtpsize",
+                    "secret_key": KEY,
+                    "dave_protocol_version": 1,
+                    "audio_codec": "opus"
+                }
+            }),
+        )
+        .await;
+        let Message::Binary(bytes) = next(&mut ws).await else { panic!("expected key package") };
         assert_eq!(bytes[0], 26);
-        // Discord takes a bare KeyPackage on op 26, as libdave sends it.
-        let package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
         let provider = OpenMlsRustCrypto::default();
-        let package = package.validate(provider.crypto(), ProtocolVersion::Mls10).unwrap();
+        let package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes[1..])
+            .unwrap()
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
         assert_eq!(package.leaf_node().credential().serialized_content(), &USER.to_be_bytes());
         let mut peer = DaveSession::new(NonZeroU16::new(1).unwrap(), PEER, CHANNEL, None).unwrap();
         peer.set_external_sender(&external).unwrap();
@@ -227,43 +298,26 @@ async fn v8_handshake_waits_for_dave_and_sends_interoperable_encrypted_audio() {
         )
         .await;
         let mut welcome = 8u16.to_be_bytes().to_vec();
-        welcome.extend(commit.welcome.unwrap());
+        welcome.extend_from_slice(&commit.welcome.unwrap());
         binary(&mut ws, 5, 30, &welcome).await;
         assert_eq!(next_json(&mut ws, 23).await["d"]["transition_id"], 8);
         prepared.send(()).unwrap();
         can_execute.await.unwrap();
         send(&mut ws, json!({"op":22,"seq":6,"d":{"transition_id":8}})).await;
         assert_eq!(next_json(&mut ws, 5).await["d"]["speaking"], 1);
+
         let mut packet = [0u8; 2048];
-        let (size, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut packet))
-            .await
-            .unwrap()
-            .unwrap();
+        let (size, _) =
+            tokio::time::timeout(TIMEOUT, udp.recv_from(&mut packet)).await.unwrap().unwrap();
         assert_eq!(&packet[8..12], &SSRC.to_be_bytes());
-        let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&packet[size - 4..size]);
-        let frame = Aes256Gcm::new((&KEY).into())
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload { msg: &packet[12..size - 4], aad: &packet[..12] },
-            )
-            .unwrap();
+        let frame = decrypt_rtp(&packet[..size]);
         assert_ne!(frame, OPUS);
         assert_eq!(peer.decrypt(USER, MediaType::AUDIO, &frame).unwrap(), OPUS);
         assert_eq!(next_json(&mut ws, 5).await["d"]["speaking"], 0);
         for _ in 0..5 {
             let (size, _) =
-                tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut packet))
-                    .await
-                    .unwrap()
-                    .unwrap();
-            nonce[..4].copy_from_slice(&packet[size - 4..size]);
-            let silence = Aes256Gcm::new((&KEY).into())
-                .decrypt(
-                    Nonce::from_slice(&nonce),
-                    Payload { msg: &packet[12..size - 4], aad: &packet[..12] },
-                )
-                .unwrap();
+                tokio::time::timeout(TIMEOUT, udp.recv_from(&mut packet)).await.unwrap().unwrap();
+            let silence = decrypt_rtp(&packet[..size]);
             assert_eq!(peer.decrypt(USER, MediaType::AUDIO, &silence).unwrap(), [0xf8, 0xff, 0xfe]);
         }
         ws.close(None).await.unwrap();
@@ -289,69 +343,46 @@ async fn v8_handshake_waits_for_dave_and_sends_interoperable_encrypted_audio() {
     connection.write(OPUS).unwrap();
     connection.speaking(false).unwrap();
     server.await.unwrap();
-    let reason =
-        tokio::time::timeout(Duration::from_secs(5), closes.recv()).await.unwrap().unwrap();
-    assert!(reason.by_remote);
-    assert!(!connection.connected());
+    let reason = tokio::time::timeout(TIMEOUT, closes.recv()).await.unwrap().unwrap();
+    assert!(reason.by_remote && !connection.connected());
     assert!(connection.write(OPUS).is_err());
     assert!(closes.try_recv().is_err());
 }
 
 #[tokio::test]
 async fn missing_heartbeat_ack_ends_the_handshake() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let mut ws = accept_ws(&listener).await;
         send(&mut ws, json!({"op":8,"d":{"heartbeat_interval":20}})).await;
         while let Some(Ok(_)) = ws.next().await {}
     });
-    let result = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(|_| panic!("failed handshake is not an established connection")),
-    )
-    .await;
-    assert!(matches!(result,Err(VoiceError::Gateway(ref s)) if s.contains("not acknowledged")));
+    assert!(
+        matches!(connect_expect_err(&url).await, VoiceError::Gateway(s) if s.contains("not acknowledged"))
+    );
     server.await.unwrap();
 }
 
 #[tokio::test]
 async fn hello_uses_the_supplied_fractional_interval_before_the_first_heartbeat() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let mut ws = accept_ws(&listener).await;
         send(&mut ws, json!({"op":8,"d":{"heartbeat_interval":250.5}})).await;
         assert_eq!(next_json(&mut ws, 0).await["op"], 0);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), ws.next()).await.is_err(),
-            "the first heartbeat was sent before the Hello interval elapsed"
-        );
-        let message = tokio::time::timeout(Duration::from_millis(300), ws.next())
+        assert!(tokio::time::timeout(Duration::from_millis(100), ws.next()).await.is_err());
+        let msg = tokio::time::timeout(Duration::from_millis(300), ws.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let Message::Text(text) = message else { panic!("expected heartbeat JSON") };
-        let heartbeat: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(heartbeat["op"], 3);
-        // Deliberately omit the ACK. The client must fail at the next exact interval.
+        let Message::Text(text) = msg else { panic!("expected heartbeat JSON") };
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["op"], 3);
         while let Some(Ok(_)) = ws.next().await {}
     });
-    let result = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(|_| panic!("failed handshake is not an established connection")),
-    )
-    .await;
-    assert!(matches!(result,Err(VoiceError::Gateway(ref s)) if s.contains("not acknowledged")));
+    assert!(
+        matches!(connect_expect_err(&url).await, VoiceError::Gateway(s) if s.contains("not acknowledged"))
+    );
     server.await.unwrap();
 }
 
@@ -373,60 +404,75 @@ fn malformed_transport_keys_are_rejected() {
     assert_eq!(*read_key(Some(&json!(KEY))).unwrap(), KEY);
 }
 
+async fn establish_v0(
+    listener: &TcpListener,
+    udp: &UdpSocket,
+    op4_seq: u64,
+    stray_udp: bool,
+) -> ServerSocket {
+    let mut ws = accept_ws(listener).await;
+    send(&mut ws, json!({"op":8,"seq":null,"d":{"heartbeat_interval":200}})).await;
+    let _ = next_json(&mut ws, 0).await;
+    send(
+        &mut ws,
+        json!({
+            "op": 2,
+            "seq": 1,
+            "d": {
+                "ssrc": SSRC,
+                "ip": "127.0.0.1",
+                "port": udp.local_addr().unwrap().port(),
+                "modes": ["aead_aes256_gcm_rtpsize"]
+            }
+        }),
+    )
+    .await;
+    let mut discovery = [0u8; 74];
+    let (_, client) = udp.recv_from(&mut discovery).await.unwrap();
+    if stray_udp {
+        udp.send_to(b"stray rtcp packet", client).await.unwrap();
+    }
+    reply_discovery(udp, &mut discovery, client).await;
+    let _ = next_json(&mut ws, 1).await;
+    send(
+        &mut ws,
+        json!({
+            "op": 4,
+            "seq": op4_seq,
+            "d": {
+                "mode": "aead_aes256_gcm_rtpsize",
+                "secret_key": KEY,
+                "dave_protocol_version": 0,
+                "audio_codec": "opus"
+            }
+        }),
+    )
+    .await;
+    ws
+}
+
+async fn accept_resume(listener: &TcpListener) -> (ServerSocket, Value) {
+    let mut ws = accept_ws(listener).await;
+    send(&mut ws, json!({"op":8,"d":{"heartbeat_interval":200}})).await;
+    let resume = next_json(&mut ws, 7).await;
+    (ws, resume)
+}
+
 #[tokio::test]
 async fn dropping_connection_closes_gateway_task_and_null_seq_or_stray_udp_do_not_fail() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-        send(&mut ws, json!({"op":8,"seq":null,"d":{"heartbeat_interval":250}})).await;
-        let _ = next_json(&mut ws, 0).await;
-        send(
-            &mut ws,
-            json!({"op":2,"seq":1,"d":{"ssrc":SSRC,"ip":"127.0.0.1","port":udp.local_addr().unwrap().port(),"modes":["aead_aes256_gcm_rtpsize"]}}),
-        )
-        .await;
-        let mut discovery = [0u8; 74];
-        let (_, client) = udp.recv_from(&mut discovery).await.unwrap();
-        // Send a stray non-discovery UDP datagram first; discover() must ignore it.
-        udp.send_to(b"stray rtcp packet", client).await.unwrap();
-        discovery[..2].copy_from_slice(&2u16.to_be_bytes());
-        discovery[8..17].copy_from_slice(b"127.0.0.1");
-        discovery[72..].copy_from_slice(&client.port().to_be_bytes());
-        udp.send_to(&discovery, client).await.unwrap();
-        let _ = next_json(&mut ws, 1).await;
-        send(
-            &mut ws,
-            json!({"op":4,"seq":2,"d":{"mode":"aead_aes256_gcm_rtpsize","secret_key":KEY,"dave_protocol_version":0,"audio_codec":"opus"}}),
-        )
-        .await;
-        // Wait for the client gateway task to close automatically when Arc<DiscordConnection> drops.
+        let mut ws = establish_v0(&listener, &udp, 2, true).await;
         while let Some(Ok(msg)) = ws.next().await {
             if matches!(msg, Message::Close(_)) {
                 break;
             }
         }
     });
-    let (closed_tx, mut closed_rx) = mpsc::unbounded_channel();
-    let connection = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(move |reason| {
-            let _ = closed_tx.send(reason);
-        }),
-    )
-    .await
-    .unwrap();
-    // Drop without calling connection.close(): Drop must break the cycle and stop the task.
+    let (connection, mut closed_rx) = connect_test(&url).await;
     drop(connection);
-    let reason = tokio::time::timeout(Duration::from_secs(5), closed_rx.recv())
-        .await
-        .expect("gateway task leaked after dropping DiscordConnection")
-        .unwrap();
+    let reason = tokio::time::timeout(TIMEOUT, closed_rx.recv()).await.unwrap().unwrap();
     assert!(!reason.by_remote);
     server.await.unwrap();
 }
@@ -434,10 +480,10 @@ async fn dropping_connection_closes_gateway_task_and_null_seq_or_stray_udp_do_no
 #[test]
 fn resumable_close_codes_exclude_fatal_4xxx_codes() {
     for resumable in [1000, 1001, 1006, 1012, 3999, 4015] {
-        assert!(is_resumable_close_code(resumable), "{resumable} should be resumable");
+        assert!(is_resumable_close_code(resumable), "{resumable}");
     }
     for fatal in [4000, 4001, 4003, 4004, 4006, 4009, 4014, 4016, 4020, 4021, 4022] {
-        assert!(!is_resumable_close_code(fatal), "{fatal} must not resume");
+        assert!(!is_resumable_close_code(fatal), "{fatal}");
     }
 }
 
@@ -450,11 +496,9 @@ async fn udp_connreset_helper_succeeds_on_bound_socket() {
 #[tokio::test]
 async fn pre_hello_opcodes_are_rejected_before_authentication() {
     for binary_first in [false, true] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (listener, url) = listener_with_url().await;
         let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut ws = accept_ws(&listener).await;
             if binary_first {
                 binary(&mut ws, 1, 25, &[0; 8]).await;
             } else {
@@ -462,16 +506,8 @@ async fn pre_hello_opcodes_are_rejected_before_authentication() {
             }
             while let Some(Ok(_)) = ws.next().await {}
         });
-        let result = connect_url(
-            &url,
-            &USER.to_string(),
-            "1111",
-            &state(),
-            Box::new(|_| panic!("failed handshake must not invoke on_close")),
-        )
-        .await;
         assert!(
-            matches!(result, Err(VoiceError::Gateway(ref msg)) if msg.contains("expected voice hello"))
+            matches!(connect_expect_err(&url).await, VoiceError::Gateway(msg) if msg.contains("expected voice hello"))
         );
         server.await.unwrap();
     }
@@ -479,95 +515,51 @@ async fn pre_hello_opcodes_are_rejected_before_authentication() {
 
 #[tokio::test]
 async fn resume_holds_commands_until_op9_resets_attempts_and_propagates_fatal_close() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (pause_resume_tx, pause_resume_rx) = oneshot::channel();
     let (queued_cmds_tx, queued_cmds_rx) = oneshot::channel();
     let (resumed_tx, resumed_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
-        // Initial connection (attempt 0).
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-        send(&mut ws, json!({"op":8,"d":{"heartbeat_interval":200}})).await;
-        let _ = next_json(&mut ws, 0).await;
-        send(
-            &mut ws,
-            json!({"op":2,"seq":1,"d":{"ssrc":SSRC,"ip":"127.0.0.1","port":udp.local_addr().unwrap().port(),"modes":["aead_aes256_gcm_rtpsize"]}}),
-        )
-        .await;
-        let mut discovery = [0u8; 74];
-        let (_, client) = udp.recv_from(&mut discovery).await.unwrap();
-        discovery[..2].copy_from_slice(&2u16.to_be_bytes());
-        discovery[8..17].copy_from_slice(b"127.0.0.1");
-        discovery[72..].copy_from_slice(&client.port().to_be_bytes());
-        udp.send_to(&discovery, client).await.unwrap();
-        let _ = next_json(&mut ws, 1).await;
-        send(
-            &mut ws,
-            json!({"op":4,"seq":4,"d":{"mode":"aead_aes256_gcm_rtpsize","secret_key":KEY,"dave_protocol_version":0,"audio_codec":"opus"}}),
-        )
-        .await;
-
-        // 1st disconnect: remote 4015 crash.
+        let mut ws = establish_v0(&listener, &udp, 4, false).await;
         ws.close(Some(CloseFrame { code: CloseCode::from(4015), reason: "crashed".into() }))
             .await
             .unwrap();
 
-        // Accept 1st RESUME: hold op 9 while caller queues Speaking(true) + Audio!
-        let (tcp2, _) = listener.accept().await.unwrap();
-        let mut ws2 = tokio_tungstenite::accept_async(tcp2).await.unwrap();
-        send(&mut ws2, json!({"op":8,"d":{"heartbeat_interval":200}})).await;
-        let resume1 = next_json(&mut ws2, 7).await;
+        let (mut ws2, resume1) = accept_resume(&listener).await;
         assert_eq!(resume1["d"]["seq_ack"], 4);
         assert_eq!(resume1["d"]["token"], "test-voice-token");
         pause_resume_tx.send(()).unwrap();
         queued_cmds_rx.await.unwrap();
-        // Verify no Speaking (op 5) or UDP packet arrived before op 9!
+
         let mut premature_udp = [0u8; 128];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), udp.recv_from(&mut premature_udp))
-                .await
-                .is_err(),
-            "audio must not transmit while resuming"
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(40), udp.recv_from(&mut premature_udp))
+            .await
+            .is_err());
         send(&mut ws2, json!({"op":9,"seq":5,"d":null})).await;
-        // Immediately after op 9, held Speaking(true) and Audio flush cleanly!
         assert_eq!(next_json(&mut ws2, 5).await["d"]["speaking"], 1);
-        let (size, _) =
-            tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut premature_udp))
-                .await
-                .unwrap()
-                .unwrap();
+        let (size, _) = tokio::time::timeout(TIMEOUT, udp.recv_from(&mut premature_udp))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(size > transport::HEADER_LEN);
 
-        // 2nd disconnect: abrupt TCP drop (no close frame).
         drop(ws2);
-        let (tcp3, _) = listener.accept().await.unwrap();
-        let mut ws3 = tokio_tungstenite::accept_async(tcp3).await.unwrap();
-        send(&mut ws3, json!({"op":8,"d":{"heartbeat_interval":200}})).await;
-        let resume2 = next_json(&mut ws3, 7).await;
+        let (mut ws3, resume2) = accept_resume(&listener).await;
         assert_eq!(resume2["d"]["seq_ack"], 5);
         send(&mut ws3, json!({"op":9,"seq":6,"d":null})).await;
-        // Wait for one heartbeat step so resume_attempts resets to 0 cleanly.
         let Message::Text(hb_text) = ws3.next().await.unwrap().unwrap() else {
             panic!("expected heartbeat");
         };
         let hb: Value = serde_json::from_str(&hb_text).unwrap();
-        assert_eq!(hb["op"], 3);
-        assert_eq!(hb["d"]["seq_ack"], 6);
+        assert_eq!((hb["op"].as_u64(), hb["d"]["seq_ack"].as_i64()), (Some(3), Some(6)));
         send(&mut ws3, json!({"op":6,"d":{"t":hb["d"]["t"]}})).await;
 
-        // 3rd disconnect: close code 1012 (succeeds only if resume_attempts reset to 0!),
-        // then reject resume with fatal 4006 to verify fatal close code propagation.
         ws3.close(Some(CloseFrame { code: CloseCode::from(1012), reason: "restart".into() }))
             .await
             .unwrap();
-        let (tcp4, _) = listener.accept().await.unwrap();
-        let mut ws4 = tokio_tungstenite::accept_async(tcp4).await.unwrap();
-        send(&mut ws4, json!({"op":8,"d":{"heartbeat_interval":200}})).await;
-        let _ = next_json(&mut ws4, 7).await;
+        let (mut ws4, _) = accept_resume(&listener).await;
         resumed_tx.send(()).unwrap();
         ws4.close(Some(CloseFrame {
             code: CloseCode::from(4006),
@@ -577,27 +569,14 @@ async fn resume_holds_commands_until_op9_resets_attempts_and_propagates_fatal_cl
         .unwrap();
     });
 
-    let (closed_tx, mut closed_rx) = mpsc::unbounded_channel();
-    let connection = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(move |reason| {
-            let _ = closed_tx.send(reason);
-        }),
-    )
-    .await
-    .unwrap();
-
+    let (connection, mut closed_rx) = connect_test(&url).await;
     pause_resume_rx.await.unwrap();
     connection.speaking(true).unwrap();
     connection.write(OPUS).unwrap();
     queued_cmds_tx.send(()).unwrap();
 
     resumed_rx.await.unwrap();
-    let final_close =
-        tokio::time::timeout(Duration::from_secs(5), closed_rx.recv()).await.unwrap().unwrap();
+    let final_close = tokio::time::timeout(TIMEOUT, closed_rx.recv()).await.unwrap().unwrap();
     assert_eq!(final_close.code, 4006);
     assert_eq!(final_close.reason, "Session no longer valid");
     assert!(final_close.by_remote);

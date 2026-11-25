@@ -1,4 +1,4 @@
-//! Compare the 0.4.0 sender with the current gateway's reusable-buffer path.
+//! Compare the 0.4.0 sender with the reusable-buffer in-place path.
 #![allow(dead_code, unused_imports)]
 #[path = "support/legacy_media.rs"]
 mod legacy;
@@ -13,9 +13,9 @@ use std::hint::black_box;
 static ALLOCATOR: measure::CountingAllocator = measure::CountingAllocator;
 
 fn main() {
-    let opus = [0x5a; 320]; // 20 ms at 128 kbit/s
-    let mut legacy = legacy::MediaSender::new(vec![42; 16]);
-    let mut current = media::MediaSender::new(vec![42; 16]);
+    let opus = [0x5a; 320];
+    let (mut legacy, mut current) =
+        (legacy::MediaSender::new(vec![42; 16]), media::MediaSender::new(vec![42; 16]));
     assert_eq!(legacy.encrypt(&opus).unwrap(), current.encrypt(&opus).unwrap());
     let mut frame = Vec::with_capacity(1500);
     measure::measure("DAVE 0.4.0", 200_000, || {

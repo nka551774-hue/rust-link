@@ -1,6 +1,5 @@
-//! Frozen Rustlink 0.4.0 Ogg reader, retained only as a reproducible benchmark
-//! baseline. This is the pre-optimization implementation (tests omitted), not
-//! a production parser: its original allocation and EOF behavior are preserved.
+//! Frozen Rustlink 0.4.0 Ogg reader retained as a reproducible benchmark baseline
+//! (original allocation and EOF behavior preserved).
 
 use std::io::{self, Read};
 
@@ -29,7 +28,7 @@ pub struct OggOpusReader<R: Read> {
 
 impl<R: Read> OggOpusReader<R> {
     pub fn new(inner: R) -> Self {
-        OggOpusReader {
+        Self {
             inner,
             buffer: Vec::new(),
             consumed: 0,
@@ -68,13 +67,13 @@ impl<R: Read> OggOpusReader<R> {
         loop {
             if self.page.is_none() {
                 if !self.have_page()? {
-                    return Ok(if packet.is_empty() { None } else { Some(packet) });
+                    return Ok((!packet.is_empty()).then_some(packet));
                 }
                 self.page = Some(self.read_page_header()?);
             }
             let page = self.page.as_mut().expect("a page was just read");
             while page.next_segment < page.count {
-                let size = self.buffer[page.table + page.next_segment] as usize;
+                let size = usize::from(self.buffer[page.table + page.next_segment]);
                 page.next_segment += 1;
                 let end = page.offset + size;
                 if end > self.buffer.len() {
@@ -109,13 +108,12 @@ impl<R: Read> OggOpusReader<R> {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ogg page"));
             }
             if available >= PAGE_HEADER {
-                let segments = self.buffer[self.consumed + 26] as usize;
-                let total = PAGE_HEADER + segments;
+                let total = PAGE_HEADER + usize::from(self.buffer[self.consumed + 26]);
                 if available >= total {
                     let payload: usize = self.buffer
                         [self.consumed + PAGE_HEADER..self.consumed + total]
                         .iter()
-                        .map(|n| *n as usize)
+                        .map(|&n| usize::from(n))
                         .sum();
                     if available >= total + payload {
                         return Ok(true);
@@ -130,22 +128,15 @@ impl<R: Read> OggOpusReader<R> {
     }
 
     fn read_page_header(&self) -> io::Result<PageState> {
-        let available = self.buffer.len() - self.consumed;
-        if available < PAGE_HEADER {
+        if self.buffer.len() - self.consumed < PAGE_HEADER {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated ogg page"));
         }
-        let segments = self.buffer[self.consumed + 26] as usize;
+        let segments = usize::from(self.buffer[self.consumed + 26]);
         if segments > MAX_SEGMENTS {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ogg segment table too long"));
         }
-        let table_start = self.consumed + PAGE_HEADER;
-        let payload_start = table_start + segments;
-        Ok(PageState {
-            table: table_start,
-            count: segments,
-            next_segment: 0,
-            offset: payload_start,
-        })
+        let table = self.consumed + PAGE_HEADER;
+        Ok(PageState { table, count: segments, next_segment: 0, offset: table + segments })
     }
 
     fn compact(&mut self) {
@@ -177,8 +168,9 @@ impl<R: Read> OggOpusReader<R> {
 }
 
 fn read_pre_skip(packet: &[u8]) -> u32 {
-    if packet.len() < 12 || &packet[0..8] != b"OpusHead" {
-        return 0;
+    if packet.len() < 12 || !packet.starts_with(b"OpusHead") {
+        0
+    } else {
+        u32::from(u16::from_le_bytes([packet[10], packet[11]]))
     }
-    u16::from_le_bytes([packet[10], packet[11]]) as u32
 }

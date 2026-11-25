@@ -1,10 +1,6 @@
-//! Locates libopus for the in-process encoder.
-//!
-//! The library is deliberately not built from source: a machine that has libopus
-//! installed, which is what a distribution packages, should link against it
-//! rather than compile a second copy. `OPUS_LIB_DIR` overrides the search for a
-//! tree that is not on the usual paths.
+//! Locates system `libopus` for the in-process encoder (`OPUS_LIB_DIR` overrides discovery).
 
+use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -20,10 +16,10 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
-    if std::env::var_os("CARGO_FEATURE_NATIVE_OPUS").is_none() {
+    if env::var_os("CARGO_FEATURE_NATIVE_OPUS").is_none() {
         return;
     }
-    if let Some(dir) = std::env::var_os("OPUS_LIB_DIR") {
+    if let Some(dir) = env::var_os("OPUS_LIB_DIR") {
         println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
         println!("cargo:rustc-link-lib=opus");
         return;
@@ -40,30 +36,26 @@ fn main() {
         println!("cargo:rustc-link-lib={lib_name}");
         return;
     }
-    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        let msys_root = std::env::var_os("RUSTLINK_MSYS2_ROOT")
+    if env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        let msys_root = env::var_os("RUSTLINK_MSYS2_ROOT")
             .map_or_else(|| PathBuf::from(r"C:\msys64"), PathBuf::from);
         let ucrt_lib = msys_root.join("ucrt64").join("lib");
-        let is_gnu = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
+        let is_gnu = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
         if ucrt_lib.join("libopus.dll.a").is_file()
             || (is_gnu && ucrt_lib.join("libopus.a").is_file())
         {
             println!("cargo:rustc-link-search=native={}", ucrt_lib.display());
         }
     }
-    // Nothing to ask, so let the linker find it the way it would for any other
-    // system library.
     println!("cargo:rustc-link-lib=opus");
 }
 
-/// Asks pkg-config where libopus is, which is how a Unix system normally answers
-/// and how MSYS2 answers on Windows.
 fn pkg_config() -> Option<String> {
-    let cross = std::env::var_os("HOST") != std::env::var_os("TARGET");
+    let cross = env::var_os("HOST") != env::var_os("TARGET");
     if cross
-        && std::env::var_os("PKG_CONFIG_ALLOW_CROSS").as_deref() != Some("1".as_ref())
-        && std::env::var_os("PKG_CONFIG_SYSROOT_DIR").is_none()
-        && std::env::var_os("PKG_CONFIG_LIBDIR").is_none()
+        && env::var_os("PKG_CONFIG_ALLOW_CROSS").as_deref() != Some("1".as_ref())
+        && env::var_os("PKG_CONFIG_SYSROOT_DIR").is_none()
+        && env::var_os("PKG_CONFIG_LIBDIR").is_none()
     {
         return None;
     }

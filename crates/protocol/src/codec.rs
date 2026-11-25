@@ -1,6 +1,4 @@
-//! Rustlink tokens: `rlt1.` followed by URL-safe, unpadded UTF-8 JSON.
-//! Tokens carry metadata, not credentials or cached media URLs. Sources still
-//! validate and resolve that metadata before opening a stream.
+//! Rustlink tokens: `rlt1.` followed by URL-safe, unpadded UTF-8 JSON metadata.
 
 use std::cell::RefCell;
 
@@ -22,11 +20,11 @@ fn with_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
     CODEC_SCRATCH.with(|cell| match cell.try_borrow_mut() {
         Ok(mut buf) => {
             buf.clear();
-            let result = f(&mut buf);
+            let out = f(&mut buf);
             if buf.capacity() > MAX_SCRATCH_CAP {
                 *buf = Vec::new();
             }
-            result
+            out
         }
         Err(_) => f(&mut Vec::new()),
     })
@@ -49,9 +47,10 @@ fn validate(info: &TrackInfo) -> Result<(), CodecError> {
         || info.length < 0
         || info.position < 0
     {
-        return Err(CodecError::Invalid);
+        Err(CodecError::Invalid)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 struct BoundedVec<'a>(&'a mut Vec<u8>);
@@ -73,8 +72,8 @@ impl std::io::Write for BoundedVec<'_> {
 fn encode_token(info: &TrackInfo) -> Result<String, CodecError> {
     validate(info)?;
     with_scratch(|json| {
-        serde_json::to_writer(BoundedVec(json), info).map_err(|err| {
-            if err.is_io() {
+        serde_json::to_writer(BoundedVec(json), info).map_err(|e| {
+            if e.is_io() {
                 CodecError::TextTooLong
             } else {
                 CodecError::Invalid
@@ -88,13 +87,11 @@ fn encode_token(info: &TrackInfo) -> Result<String, CodecError> {
 }
 
 pub fn encode_track(info: &TrackInfo) -> Result<Track, CodecError> {
-    let token = encode_token(info)?;
-    Ok(Track::new(token, info.clone()))
+    Ok(Track::new(encode_token(info)?, info.clone()))
 }
 
 pub fn encode_track_owned(info: TrackInfo) -> Result<Track, CodecError> {
-    let token = encode_token(&info)?;
-    Ok(Track::new(token, info))
+    Ok(Track::new(encode_token(&info)?, info))
 }
 
 fn decode_info(token: &str) -> Result<TrackInfo, CodecError> {
@@ -102,11 +99,11 @@ fn decode_info(token: &str) -> Result<TrackInfo, CodecError> {
         return Err(CodecError::TextTooLong);
     }
     let Some(payload) = token.strip_prefix(PREFIX) else {
-        return if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace()) {
-            Err(CodecError::Invalid)
+        return Err(if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace()) {
+            CodecError::Invalid
         } else {
-            Err(CodecError::UnsupportedVersion)
-        };
+            CodecError::UnsupportedVersion
+        });
     };
     with_scratch(|json| {
         URL_SAFE_NO_PAD.decode_vec(payload, json).map_err(|_| CodecError::Invalid)?;
@@ -117,8 +114,7 @@ fn decode_info(token: &str) -> Result<TrackInfo, CodecError> {
 }
 
 pub fn decode_track(token: &str) -> Result<Track, CodecError> {
-    let info = decode_info(token)?;
-    Ok(Track::new(token.to_owned(), info))
+    Ok(Track::new(token.to_owned(), decode_info(token)?))
 }
 
 pub fn decode_track_owned(token: String) -> Result<Track, CodecError> {
@@ -129,6 +125,7 @@ pub fn decode_track_owned(token: String) -> Result<Track, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn sample() -> TrackInfo {
         TrackInfo {
             identifier: "track-123".into(),
@@ -142,18 +139,20 @@ mod tests {
             ..Default::default()
         }
     }
+
     #[test]
     fn unicode_metadata_roundtrips() {
         let info = sample();
         let track = encode_track(&info).unwrap();
-        let owned = encode_track_owned(info.clone()).unwrap();
-        assert_eq!(track, owned);
+        assert_eq!(track, encode_track_owned(info.clone()).unwrap());
         assert!(track.token.starts_with(PREFIX));
         assert_eq!(decode_track(&track.token).unwrap(), track);
         assert_eq!(track.metadata, info);
-        assert_eq!(decode_track(&format!(" {}", track.token)), Err(CodecError::Invalid));
-        assert_eq!(decode_track(&format!("{}\n", track.token)), Err(CodecError::Invalid));
+        for padded in [format!(" {}", track.token), format!("{}\n", track.token)] {
+            assert_eq!(decode_track(&padded), Err(CodecError::Invalid));
+        }
     }
+
     #[test]
     fn rejects_legacy_unknown_malformed_and_oversized_tokens() {
         for token in ["QAAAgwMABHNvbmc=", "rlt2.e30", "rlt1.!", "rlt1.e30"] {
@@ -164,6 +163,7 @@ mod tests {
         info.title = "a".repeat(MAX_ENCODED_TRACK);
         assert_eq!(encode_track(&info), Err(CodecError::TextTooLong));
     }
+
     #[test]
     fn rejects_invalid_metadata_on_both_paths() {
         let mut info = sample();

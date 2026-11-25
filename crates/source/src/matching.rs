@@ -18,7 +18,7 @@ const VERSIONS: [&str; 12] = [
 ];
 
 fn split_words(lower: &str) -> impl Iterator<Item = &str> {
-    lower.split(|character: char| !character.is_alphanumeric()).filter(|word| !word.is_empty())
+    lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty())
 }
 
 fn words(lower: &str) -> Vec<&str> {
@@ -28,22 +28,15 @@ fn words(lower: &str) -> Vec<&str> {
     out
 }
 
-fn tokens_from_words<'a>(all: &[&'a str]) -> Vec<&'a str> {
-    // Articles and initials add noise to long titles, but a recording or
-    // artist can legitimately be named "X", "愛", or "A B".
-    if all.iter().any(|word| word.chars().nth(1).is_some()) {
-        all.iter().copied().filter(|word| word.chars().nth(1).is_some()).collect()
-    } else {
-        all.to_vec()
+fn filter_short(mut all: Vec<&str>) -> Vec<&str> {
+    if all.iter().any(|w| w.chars().nth(1).is_some()) {
+        all.retain(|w| w.chars().nth(1).is_some());
     }
+    all
 }
 
 fn tokens(lower: &str) -> Vec<&str> {
-    let mut all = words(lower);
-    if all.iter().any(|word| word.chars().nth(1).is_some()) {
-        all.retain(|word| word.chars().nth(1).is_some());
-    }
-    all
+    filter_short(words(lower))
 }
 
 #[inline]
@@ -53,19 +46,18 @@ fn has_word(sorted: &[&str], word: &str) -> bool {
 
 fn overlap(want: &[&str], got: &[&str]) -> f64 {
     if want.is_empty() {
-        return 0.0;
+        0.0
+    } else {
+        want.iter().filter(|&&w| has_word(got, w)).count() as f64 / want.len() as f64
     }
-    want.iter().filter(|&&word| has_word(got, word)).count() as f64 / want.len() as f64
 }
 
 pub fn is_unknown_artist(author: &str) -> bool {
-    let trimmed = author.trim();
-    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown artist")
+    let s = author.trim();
+    s.is_empty() || s.eq_ignore_ascii_case("unknown artist")
 }
 
-/// Require title, artist and duration agreement before accepting a recording.
-/// Desired metadata is normalized once per search, and candidate tokens borrow
-/// from one lowercased string per field without per-word heap allocations.
+/// Requires title, artist, and duration agreement before accepting a recording.
 pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Track> {
     let want_title_lower = want.metadata.title.to_lowercase();
     let want_title = tokens(&want_title_lower);
@@ -73,31 +65,28 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
         return None;
     }
     let has_artist = !is_unknown_artist(&want.metadata.author);
-    let want_author_lower =
-        if has_artist { want.metadata.author.to_lowercase() } else { String::new() };
-    let artist_name = if has_artist { words(&want_author_lower) } else { Vec::new() };
-    let want_artist = if has_artist { tokens_from_words(&artist_name) } else { Vec::new() };
-    let short_artist = has_artist && want_artist.iter().all(|word| word.chars().nth(1).is_none());
-    let mut best = None;
-    let mut best_score = f64::NEG_INFINITY;
+    let want_author_lower = has_artist.then(|| want.metadata.author.to_lowercase());
+    let artist_name = want_author_lower.as_deref().map_or_else(Vec::new, words);
+    let want_artist = filter_short(artist_name.clone());
+    let short_artist = has_artist && want_artist.iter().all(|w| w.chars().nth(1).is_none());
+    let max_delta = 15_000f64.max(want.metadata.length as f64 * 0.12);
+
+    let (mut best, mut best_score) = (None, f64::NEG_INFINITY);
     for candidate in candidates {
         if candidate.metadata.is_stream {
             continue;
         }
         let delta = candidate.metadata.length.abs_diff(want.metadata.length) as f64;
-        let max_delta = 15_000f64.max(want.metadata.length as f64 * 0.12);
         if want.metadata.length > 0 && (candidate.metadata.length <= 0 || delta > max_delta) {
             continue;
         }
         let title_lower = candidate.metadata.title.to_lowercase();
         let candidate_tokens = words(&title_lower);
-        // A named artist prefix is metadata, not a version label: the band
-        // Live must not be mistaken for a live performance of every song.
-        let named_title = [" - ", " – ", " — ", " | ", ": "].iter().find_map(|separator| {
-            let (artist, title) = title_lower.split_once(*separator)?;
+        let named_title = [" - ", " \u{2013} ", " \u{2014} ", " | ", ": "].iter().find_map(|sep| {
+            let (artist, title) = title_lower.split_once(*sep)?;
             (!artist_name.is_empty() && words(artist) == artist_name).then_some(title)
         });
-        let unrequested_version = match named_title {
+        let unrequested = match named_title {
             Some(rest) => {
                 split_words(rest).any(|w| VERSIONS.contains(&w) && !has_word(&want_title, w))
             }
@@ -105,24 +94,20 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
                 .iter()
                 .any(|&v| has_word(&candidate_tokens, v) && !has_word(&want_title, v)),
         };
-        if unrequested_version {
+        if unrequested {
             continue;
         }
         let title = overlap(&want_title, &candidate_tokens);
         if title < if has_artist { 0.6 } else { 0.8 } {
             continue;
         }
-        let artist = if !has_artist {
+        let artist = if !has_artist || want_artist.is_empty() {
             0.0
         } else {
             let author_lower = candidate.metadata.author.to_lowercase();
             let author_tokens = words(&author_lower);
             if short_artist && named_title.is_none() {
-                // A short artist such as "A" cannot be proven by an article in
-                // "A Song". Require the author field or an explicit artist prefix.
                 overlap(&want_artist, &author_tokens)
-            } else if want_artist.is_empty() {
-                0.0
             } else {
                 want_artist
                     .iter()
@@ -134,10 +119,8 @@ pub fn match_track<'a>(want: &Track, candidates: &'a [Track]) -> Option<&'a Trac
         if has_artist && artist < 0.4 {
             continue;
         }
-        let mut score = title + artist;
-        if want.metadata.length > 0 {
-            score += 1.0 - delta / max_delta;
-        }
+        let score =
+            title + artist + if want.metadata.length > 0 { 1.0 - delta / max_delta } else { 0.0 };
         if score > best_score {
             best_score = score;
             best = Some(candidate);
@@ -161,8 +144,9 @@ mod tests {
     #[test]
     fn title_artist_and_duration_must_all_agree() {
         let want = track("A Song", "Someone", 200_000);
-        let candidates = [track("A Song (Official Audio)", "Someone", 201_000)];
-        assert!(match_track(&want, &candidates).is_some());
+        assert!(
+            match_track(&want, &[track("A Song (Official Audio)", "Someone", 201_000)]).is_some()
+        );
         assert!(match_track(&want, &[track("A Song", "Someone", 400_000)]).is_none());
         assert!(match_track(&want, &[track("A Song", "A Cover Band", 200_000)]).is_none());
         assert!(match_track(&want, &[track("Another Tune", "Someone", 200_000)]).is_none());
@@ -171,8 +155,8 @@ mod tests {
     #[test]
     fn artist_can_appear_in_title_and_unicode_normalization_is_preserved() {
         let want = track("夜空之歌", "歌手名稱", 200_000);
-        let candidates = [track("歌手名稱 夜空之歌", "Official channel", 200_001)];
-        assert!(match_track(&want, &candidates).is_some());
+        assert!(match_track(&want, &[track("歌手名稱 夜空之歌", "Official channel", 200_001)])
+            .is_some());
         assert_eq!(
             overlap(&tokens(&"A Song".to_lowercase()), &tokens(&"a SONG".to_lowercase())),
             1.0
@@ -200,12 +184,9 @@ mod tests {
     fn single_character_titles_and_artist_names_remain_matchable() {
         for (title, artist) in [("X", "A"), ("愛", "林"), ("A B", "C D")] {
             let want = track(title, artist, 200_000);
-            let candidates = [track(
-                &format!("{title} (Official Audio)"),
-                &format!("{artist} - Topic"),
-                200_001,
-            )];
-            assert!(match_track(&want, &candidates).is_some(), "{title} by {artist}");
+            let got =
+                track(&format!("{title} (Official Audio)"), &format!("{artist} - Topic"), 200_001);
+            assert!(match_track(&want, &[got]).is_some(), "{title} by {artist}");
         }
     }
 
@@ -243,9 +224,11 @@ mod tests {
     #[test]
     fn a_band_name_is_not_a_version_but_an_extra_live_label_still_is() {
         let want = track("Lightning Crashes", "Live", 200_000);
-        let candidates =
-            [track("Live - Lightning Crashes (Official Music Video)", "Live", 200_000)];
-        assert!(match_track(&want, &candidates).is_some());
+        assert!(match_track(
+            &want,
+            &[track("Live - Lightning Crashes (Official Music Video)", "Live", 200_000)]
+        )
+        .is_some());
         assert!(match_track(&want, &[track("Live - Lightning Crashes (Live)", "Live", 200_000)])
             .is_none());
     }

@@ -13,24 +13,19 @@ env:
 
 jobs:
   version:
-    name: read the version
+    name: read version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - id: read
-        # The binary reports the version it was built with, so a tag that
-        # disagrees with the workspace would publish a mislabelled release.
         run: |
           set -euo pipefail
           declared=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tagged="${GITHUB_REF_NAME#v}"
-            if [ "$tagged" != "$declared" ]; then
-              echo "tag ${GITHUB_REF_NAME} does not match the workspace version ${declared}"
-              exit 1
-            fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$declared" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match workspace version ${declared}"
+            exit 1
           fi
           echo "version=${declared}" >> "$GITHUB_OUTPUT"
 
@@ -42,55 +37,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-            ext: ""
-            archive: tar.gz
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            ext: ""
-            archive: tar.gz
-          - name: macos-aarch64
-            os: macos-15
-            ext: ""
-            archive: tar.gz
-          - name: macos-x86_64
-            os: macos-15-intel
-            ext: ""
-            archive: tar.gz
-          - name: windows-x86_64
-            os: windows-latest
-            ext: ".exe"
-            archive: zip
+          - { name: linux-x86_64, os: ubuntu-latest, ext: "", archive: tar.gz }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, ext: "", archive: tar.gz }
+          - { name: macos-aarch64, os: macos-15, ext: "", archive: tar.gz }
+          - { name: macos-x86_64, os: macos-15-intel, ext: "", archive: tar.gz }
+          - { name: windows-x86_64, os: windows-latest, ext: ".exe", archive: zip }
     steps:
       - uses: actions/checkout@v4
-
       - name: install libopus (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
-
       - name: install libopus (macOS)
         if: runner.os == 'macOS'
         run: brew install opus pkgconf
-
       - uses: dtolnay/rust-toolchain@stable
         if: runner.os != 'Windows'
       - uses: Swatinem/rust-cache@v2
         if: runner.os != 'Windows'
-
       - uses: msys2/setup-msys2@v2
         if: runner.os == 'Windows'
         with:
           msystem: UCRT64
           update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-rust
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-opus
-            mingw-w64-ucrt-x86_64-pkgconf
-            zip
+          install: mingw-w64-ucrt-x86_64-rust mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-pkgconf zip
 
       - name: build and package (Unix)
         if: runner.os != 'Windows'
@@ -105,16 +76,12 @@ jobs:
           cargo build --release --locked --bin rustlink
           name="rustlink_${VERSION}_${PLATFORM}"
           mkdir -p "dist/${name}"
-          cp "target/release/rustlink${EXT}" "dist/${name}/"
-          "dist/${name}/rustlink${EXT}" --version
-          cp LICENSE NOTICE README.md config.example.yaml start.sh "dist/${name}/"
+          cp "target/release/rustlink${EXT}" LICENSE NOTICE README.md config.example.yaml start.sh "dist/${name}/"
           cp -R docs "dist/${name}/"
           chmod +x "dist/${name}/start.sh"
-          if [ "${ARCHIVE}" = "zip" ]; then
-            (cd dist && zip -qr "${name}.zip" "${name}")
-          else
-            tar -czf "dist/${name}.tar.gz" -C dist "${name}"
-          fi
+          "dist/${name}/rustlink${EXT}" --version
+          if [ "${ARCHIVE}" = "zip" ]; then (cd dist && zip -qr "${name}.zip" "${name}")
+          else tar -czf "dist/${name}.tar.gz" -C dist "${name}"; fi
           rm -rf "dist/${name}"
 
       - name: build and package (Windows)
@@ -127,20 +94,15 @@ jobs:
           set -euo pipefail
           cargo build --release --locked --bin rustlink
           name="rustlink_${VERSION}_${PLATFORM}"
-          mkdir -p "dist/${name}"
-          cp "target/release/rustlink.exe" "dist/${name}/"
-          cp LICENSE NOTICE README.md config.example.yaml start.bat start.ps1 "dist/${name}/"
+          mkdir -p "dist/${name}/licenses"
+          cp target/release/rustlink.exe LICENSE NOTICE README.md config.example.yaml start.bat start.ps1 "dist/${name}/"
           cp -R docs "dist/${name}/"
-          # The GNU build uses the system Opus DLL; include its runtime dependencies.
           for dll in libopus-0.dll libgcc_s_seh-1.dll libwinpthread-1.dll libstdc++-6.dll; do
-            if [ -f "/ucrt64/bin/${dll}" ]; then cp "/ucrt64/bin/${dll}" "dist/${name}/"; fi
+            [ -f "/ucrt64/bin/${dll}" ] && cp "/ucrt64/bin/${dll}" "dist/${name}/"
           done
           "dist/${name}/rustlink.exe" --version
-          mkdir -p "dist/${name}/licenses"
-          for package in opus gcc-libs libwinpthread winpthreads; do
-            if [ -d "/ucrt64/share/licenses/${package}" ]; then
-              cp -R "/ucrt64/share/licenses/${package}" "dist/${name}/licenses/"
-            fi
+          for pkg in opus gcc-libs libwinpthread winpthreads; do
+            [ -d "/ucrt64/share/licenses/${pkg}" ] && cp -R "/ucrt64/share/licenses/${pkg}" "dist/${name}/licenses/"
           done
           (cd dist && zip -qr "${name}.zip" "${name}")
           rm -rf "dist/${name}"
@@ -163,8 +125,7 @@ jobs:
         with:
           merge-multiple: true
           path: dist
-      - name: generate checksums
-        run: (cd dist && sha256sum * > checksums.sha256)
+      - run: (cd dist && sha256sum * > checksums.sha256)
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

@@ -1,11 +1,11 @@
-//! Rustlink API v1: REST resources and a per-session event stream.
+//! Rustlink API v1: REST resources, Prometheus metrics, and per-session WebSocket event streams.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -13,14 +13,14 @@ use axum::extract::{FromRequestParts, OriginalUri, Path, Request, State};
 use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use rustlink_config::{Config, ConfigError};
 use rustlink_lyrics::{LyricsError, Manager};
-use rustlink_protocol::{decode_track_owned, LoadResult, PlayerUpdate};
+use rustlink_protocol::{decode_track_owned, LoadResult, PlayerUpdate, Track};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
@@ -31,33 +31,23 @@ use crate::player::{Deps, Player};
 use crate::ratelimit::Keyed;
 use crate::session::Session;
 use crate::webhook::{self, Client};
-use crate::{Counters, APIVERSION, VERSION};
+use crate::{now_millis, Counters, APIVERSION, VERSION};
 
-/// How long a client may go quiet before its socket is closed. The client is
-/// sent a ping well inside this, so silence means the connection is gone.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How often a ping is sent to a client.
 const PING_INTERVAL: Duration = Duration::from_secs(25);
-
-/// How long the node waits for a lyrics provider before giving up on it.
 const LYRICS_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The number of tracks one `tracks/inspect-batch` request may carry.
 const MAX_DECODE_TRACKS: usize = 1000;
-
 const SMALL_BODY_LIMIT: usize = 16 << 10;
 const SINGLE_TOKEN_BODY_LIMIT: usize = 512 << 10;
 const LARGE_BODY_LIMIT: usize = 1 << 20;
+const MAX_KEYS: usize = 10_000;
+const FAILED_LOGINS: (f64, usize) = (2.0, 10);
 
-/// The response header identifying this service and its software version.
 static SERVER_HEADER: LazyLock<HeaderValue> = LazyLock::new(|| {
     HeaderValue::from_str(&format!("Rustlink/{VERSION}"))
         .unwrap_or(HeaderValue::from_static("Rustlink"))
 });
 
-/// What the node needs to run. A node with no lyrics provider or no webhook is
-/// still a node: those routes answer with no content and no event is posted.
 pub struct Dependencies {
     pub loader: Arc<dyn crate::playback::Loader>,
     pub engine: Arc<dyn crate::playback::Engine>,
@@ -66,15 +56,6 @@ pub struct Dependencies {
     pub webhook: Option<Client>,
 }
 
-/// How many distinct sessions or addresses each limiter tracks. The keys can be
-/// invented by a caller, so the table is bounded.
-const MAX_KEYS: usize = 10_000;
-
-/// Budgets for authenticated requests as `(route, requests per second, burst)`.
-/// Each session spends its own bucket for each route, so one busy bot cannot
-/// starve another and an outsider cannot spend either. The player routes are the
-/// ones a bot in many servers calls constantly, so their budgets are generous;
-/// the limit is there to stop a runaway client, not to ration a healthy one.
 #[repr(usize)]
 #[derive(Clone, Copy)]
 enum Route {
@@ -134,14 +115,6 @@ impl PublicRoute {
     const BUDGETS: [(f64, usize); Self::COUNT] = [(2.0, 5), (5.0, 10)];
 }
 
-/// Failed password checks per remote address. A wrong password is the only thing
-/// an outsider can send that reaches the limiter, so this is what slows a guess
-/// without touching anyone's real allowance.
-const FAILED_LOGINS: (f64, usize) = (2.0, 10);
-
-/// The request limits. Authentication comes first: a request is only counted
-/// against a session's budget once it has proved it may be, so nobody without
-/// the password can use up what a legitimate bot depends on.
 struct Limits {
     authenticated: [Keyed; Route::COUNT],
     public: [Keyed; PublicRoute::COUNT],
@@ -163,30 +136,23 @@ impl Limits {
         }
     }
 
-    /// Spends a token of `session`'s budget for a route that needs the password.
     fn allow_authenticated(&self, route: Route, session: &str) -> bool {
         self.authenticated[route as usize].allow(session)
     }
 
-    /// Spends a token of the caller's address for a route open to everyone.
     fn allow_public(&self, route: PublicRoute, remote: &str) -> bool {
         self.public[route as usize].allow(remote)
     }
 
-    /// Records a wrong password from `remote`, and reports whether it may try again.
     fn allow_failed_login(&self, remote: &str) -> bool {
         self.failed_logins.allow(remote)
     }
 }
 
 tokio::task_local! {
-    /// The address the request being handled arrived from, set around every
-    /// request so the guards can key a limit on it without every handler
-    /// passing it along.
     static REMOTE: Option<std::net::IpAddr>;
 }
 
-/// Stack-resident rate-limit key for remote IPv4 or IPv6 `/64` prefixes (at most 24 ASCII bytes).
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct RemoteKey {
     buf: [u8; 24],
@@ -223,21 +189,15 @@ impl std::fmt::Write for RemoteKey {
     }
 }
 
-/// The limit key for the caller: its address, with IPv4-mapped IPv6 addresses
-/// canonicalized to IPv4 and native IPv6 addresses reduced to their /64.
 fn remote_key() -> RemoteKey {
     let mut key = RemoteKey { buf: [0u8; 24], len: 0 };
     match REMOTE.try_with(|remote| remote.map(|ip| ip.to_canonical())).ok().flatten() {
-        Some(std::net::IpAddr::V4(address)) => {
-            let _ = write!(key, "{address}");
+        Some(std::net::IpAddr::V4(addr)) => {
+            let _ = write!(key, "{addr}");
         }
-        Some(std::net::IpAddr::V6(address)) => {
-            let segments = address.segments();
-            let _ = write!(
-                key,
-                "{:x}:{:x}:{:x}:{:x}::/64",
-                segments[0], segments[1], segments[2], segments[3]
-            );
+        Some(std::net::IpAddr::V6(addr)) => {
+            let s = addr.segments();
+            let _ = write!(key, "{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]);
         }
         None => {
             let _ = key.write_str("unknown");
@@ -246,20 +206,17 @@ fn remote_key() -> RemoteKey {
     key
 }
 
-/// The key a session's budget is kept under: the session ID in the path (with
-/// ASCII percent-encoding normalized so `%61` and `a` share one bucket), or
-/// `node` for a route that is not about one session.
-fn session_key(path: &str) -> std::borrow::Cow<'_, str> {
+fn session_key(path: &str) -> Cow<'_, str> {
     let Some(raw) = path
         .split_once("/sessions/")
         .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
         .filter(|id| !id.is_empty())
     else {
-        return std::borrow::Cow::Borrowed("node");
+        return Cow::Borrowed("node");
     };
     if !raw.contains('%') {
         let trimmed = raw.char_indices().nth(64).map_or(raw, |(end, _)| &raw[..end]);
-        return std::borrow::Cow::Borrowed(trimmed);
+        return Cow::Borrowed(trimmed);
     }
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len().min(256));
@@ -278,27 +235,28 @@ fn session_key(path: &str) -> std::borrow::Cow<'_, str> {
         index += 1;
     }
     if decoded.is_empty() {
-        return std::borrow::Cow::Borrowed("node");
+        return Cow::Borrowed("node");
     }
     match String::from_utf8(decoded) {
         Ok(mut text) => {
             if let Some((end, _)) = text.char_indices().nth(64) {
                 text.truncate(end);
             }
-            std::borrow::Cow::Owned(text)
+            Cow::Owned(text)
         }
-        Err(err) => {
-            let lossy = String::from_utf8_lossy(err.as_bytes());
-            std::borrow::Cow::Owned(lossy.chars().take(64).collect())
-        }
+        Err(err) => Cow::Owned(String::from_utf8_lossy(err.as_bytes()).chars().take(64).collect()),
     }
+}
+
+fn skip_interval(period: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
 }
 
 pub struct Server {
     config: Config,
     deps: Dependencies,
-    /// The runtime the node runs on, kept so a thread that is not a task can
-    /// still start one.
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     closed: AtomicBool,
@@ -306,27 +264,19 @@ pub struct Server {
     players: AtomicU64,
     requests: AtomicU64,
     counters: Arc<Counters>,
-    /// What every player on the node is built with.
     player_deps: Arc<Deps>,
     load_gate: Arc<tokio::sync::Semaphore>,
     lyrics_gate: Arc<tokio::sync::Semaphore>,
     cpu: Arc<Cpu>,
     limits: Limits,
-    /// Carries one pending request for a node-wide player report. A burst of
-    /// activity asks for the same one report.
     reports: mpsc::Sender<()>,
     last_report: Mutex<Option<Instant>>,
-    /// Active WebSocket event streams, tracked so graceful shutdown lets them
-    /// flush `track.ended` (`"cleanup"`) and `Close` before the runtime drops.
     ws_active: AtomicUsize,
     ws_drained: tokio::sync::Notify,
-    /// Wakes the background tasks when the node is shutting down.
     shutdown: tokio::sync::Notify,
 }
 
 impl Server {
-    /// Builds the node. It has to be called from inside a Tokio runtime,
-    /// because the node keeps the handle to start tasks from other threads.
     pub fn new(config: Config, deps: Dependencies) -> Result<Arc<Server>, ConfigError> {
         rustlink_config::validate(&config)?;
         let handle = tokio::runtime::Handle::current();
@@ -362,7 +312,6 @@ impl Server {
         Ok(server)
     }
 
-    /// The router a caller serves.
     pub fn router(self: &Arc<Self>) -> Router {
         let server = Arc::clone(self);
         Router::new()
@@ -373,15 +322,15 @@ impl Server {
             .route("/api/v1/metrics", get(metrics))
             .route("/metrics", get(metrics))
             .route("/api/v1/sessions/{session_id}/events", get(websocket))
-            .route("/api/v1/tracks/resolve", axum::routing::post(load_tracks))
-            .route("/api/v1/tracks/inspect", axum::routing::post(decode_track_route))
-            .route("/api/v1/tracks/inspect-batch", axum::routing::post(decode_tracks))
-            .route("/api/v1/lyrics", axum::routing::post(lyrics_for_track))
+            .route("/api/v1/tracks/resolve", post(load_tracks))
+            .route("/api/v1/tracks/inspect", post(decode_track_route))
+            .route("/api/v1/tracks/inspect-batch", post(decode_tracks))
+            .route("/api/v1/lyrics", post(lyrics_for_track))
             .route(
                 "/api/v1/sessions/{session_id}/players/{guild_id}/lyrics",
                 get(lyrics_for_player),
             )
-            .route("/api/v1/sessions", axum::routing::post(create_session))
+            .route("/api/v1/sessions", post(create_session))
             .route(
                 "/api/v1/sessions/{session_id}",
                 get(get_session).patch(update_session).delete(delete_session),
@@ -392,29 +341,18 @@ impl Server {
                 get(get_player).patch(update_player).delete(delete_player),
             )
             .fallback(not_found)
-            .layer(axum::extract::DefaultBodyLimit::max(1 << 20))
+            .layer(axum::extract::DefaultBodyLimit::max(LARGE_BODY_LIMIT))
             .layer(axum::middleware::from_fn_with_state(Arc::clone(self), log_request))
             .layer(axum::middleware::map_response(stamp))
             .with_state(server)
     }
 
-    /// Serves the node's routes on `address` until `shutdown` resolves.
-    ///
-    /// Binding is the last step that fails for a reason an operator has to fix,
-    /// so the error is handed back rather than logged: a node that cannot
-    /// listen did not start.
     pub async fn listen(
         self: Arc<Self>,
         address: &str,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(address).await?;
-        // A node that is not on the loopback address is reachable from
-        // wherever the machine is, and the password is all that stands between
-        // it and a stranger, so an operator who has not thought about the
-        // firewall is told once, at startup. The bound address is used rather
-        // than the configured one, so a name that resolves to several
-        // addresses reports the one that is actually being served.
         if let Ok(bound) = listener.local_addr() {
             if !bound.ip().is_loopback() {
                 log::warn!(
@@ -422,13 +360,8 @@ impl Server {
                 );
             }
         }
-        // Every connection that arrives is a client that is watching this
-        // node, so each one is set up for a conversation rather than for bulk
-        // throughput.
-        let listener = listener.tap_io(|stream| configure_connection(stream));
+        let listener = listener.tap_io(configure_connection);
         log::info!("Rustlink listening address={address} version={VERSION}");
-        // The request log names the client, so the peer address has to travel
-        // with the request.
         let closer = Arc::clone(&self);
         let signal_closer = Arc::clone(&self);
         let routes = self.router().into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -456,24 +389,17 @@ impl Server {
         .await;
     }
 
-    /// Stops every session and ends every track. The node does not come back
-    /// from this: it is what a shutdown signal calls.
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
         self.shutdown.notify_waiters();
-        let sessions = {
-            let mut sessions = self.sessions.lock().unwrap();
-            std::mem::take(&mut *sessions)
-        };
+        let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
         for (_, session) in sessions {
             session.destroy();
         }
     }
 
-    /// Register before checking the persistent state so closing before a task
-    /// starts, or between iterations, cannot lose the shutdown notification.
     async fn shutdown_requested(&self) {
         let notified = self.shutdown.notified();
         tokio::pin!(notified);
@@ -483,8 +409,6 @@ impl Server {
         }
     }
 
-    /// Starts the tasks that sample the machine, expire sessions and post the
-    /// node-wide reports.
     fn start_background(self: &Arc<Self>, reports: mpsc::Receiver<()>) {
         let reaper = Arc::clone(self);
         self.handle.spawn(async move { reaper.reap().await });
@@ -496,7 +420,6 @@ impl Server {
         }
     }
 
-    /// Runs a future on the node's runtime, from a thread that is not a task.
     pub fn spawn<F>(&self, future: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -504,12 +427,10 @@ impl Server {
         self.handle.spawn(future);
     }
 
-    /// The configuration the node was built with.
     pub fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Sends an event to the webhook and asks for a fresh node-wide report.
     pub fn publish(&self, event: &Value) {
         if let Some(client) = &self.deps.webhook {
             client.send_ref(event);
@@ -517,36 +438,33 @@ impl Server {
         self.request_report();
     }
 
-    /// Asks for a report of every player. It never blocks and never queues up:
-    /// a burst of activity asks for the same one report, and the configured
-    /// latency decides whether that report is sent.
     pub fn request_report(&self) {
-        if self.deps.webhook.is_none() {
-            return;
+        if self.deps.webhook.is_some() {
+            let _ = self.reports.try_send(());
         }
-        let _ = self.reports.try_send(());
     }
 }
 
-/// Sets up one accepted connection.
-///
-/// Nagle is off because both halves of this surface are latency-sensitive: the
-/// REST call that starts a track and the event that says it did should not wait
-/// for a delayed acknowledgement. Keepalive is on because a client that was
-/// killed without closing its socket is otherwise a connection the kernel holds
-/// for two hours; the probes give up on it after a minute and a half of
-/// silence, which is when its session is worth releasing.
-fn configure_connection(stream: &tokio::net::TcpStream) {
+fn cas_update(slot: &AtomicU64, mut f: impl FnMut(u64) -> Option<u64>) -> bool {
+    let mut cur = slot.load(Ordering::SeqCst);
+    while let Some(next) = f(cur) {
+        match slot.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+    false
+}
+
+fn configure_connection(stream: &mut tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(60))
         .with_interval(Duration::from_secs(10))
         .with_retries(3);
-    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+    let _ = socket2::SockRef::from(&*stream).set_tcp_keepalive(&keepalive);
 }
 
-/// Stamps every response with the headers a client reads to tell one node from
-/// another.
 async fn stamp(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert("Rustlink-Api-Version", HeaderValue::from_static(APIVERSION));
@@ -554,20 +472,13 @@ async fn stamp(mut response: Response) -> Response {
     response
 }
 
-/// Accounts for every request: successful ones at debug, rejected ones at warn
-/// and server faults at error, so an operator sees failures without turning on
-/// debug logging.
 async fn log_request(
     State(server): State<Arc<Server>>,
-    request: axum::extract::Request,
+    request: Request,
     next: axum::middleware::Next,
 ) -> Response {
     server.requests.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
-    // The pieces the line is made of are kept in the form that costs nothing
-    // until a level that is on asks for them: the URI as a handle and the
-    // address as the value itself, rather than their text. Every request
-    // passes through here, so a request that is not logged allocates nothing.
     let uri = request.uri().clone();
     let remote = request
         .extensions()
@@ -589,7 +500,7 @@ async fn log_request(
         })
         .await;
     if (response.status().is_client_error() || response.status().is_server_error())
-        && response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok())
+        && response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok())
             != Some("application/json")
     {
         let status = response.status();
@@ -614,34 +525,26 @@ async fn log_request(
     response
 }
 
-/// The address a request came from, printed the way the log line wants it: the
-/// address, or nothing when the connection does not carry one. Holding the
-/// address rather than its text is what lets a level that is off skip the
-/// formatting along with the line.
 struct Remote(Option<std::net::IpAddr>);
 
 impl std::fmt::Display for Remote {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            Some(address) => write!(formatter, "{address}"),
+            Some(addr) => write!(f, "{addr}"),
             None => Ok(()),
         }
     }
 }
 
 impl Server {
-    /// Checks the bearer password before Axum extracts bodies, paths or methods,
-    /// so an unauthenticated caller cannot buffer 1 MiB bodies or probe routes
-    /// via 405/400 responses without spending its failed-login budget.
     #[allow(clippy::result_large_err)]
     fn verify_auth(&self, headers: &HeaderMap, path: &str) -> Result<(), Response> {
         let given = headers
             .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split_once(' '))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split_once(' '))
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-            .map(|(_, token)| token)
-            .unwrap_or("");
+            .map_or("", |(_, token)| token);
         if !same(given.as_bytes(), self.config.password.as_bytes()) {
             if self.config.ratelimits.enable
                 && !self.limits.allow_failed_login(remote_key().as_str())
@@ -661,20 +564,13 @@ impl Server {
         if key == "node" {
             return Cow::Borrowed("node");
         }
-        let active = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(key.as_ref())
-            .is_some_and(|session| session.is_usable());
-        if active {
+        if self.sessions.lock().unwrap().get(key.as_ref()).is_some_and(|s| s.is_usable()) {
             key
         } else {
             Cow::Borrowed("unknown_session")
         }
     }
 
-    /// Spends one token from the authenticated session's per-route bucket.
     #[allow(clippy::result_large_err)]
     fn rate_limit(&self, route: Route, path: &str) -> Result<(), Response> {
         if self.config.ratelimits.enable
@@ -685,8 +581,6 @@ impl Server {
         Ok(())
     }
 
-    /// The rate limit alone, for the routes a monitoring system reads without
-    /// the password.
     #[allow(clippy::result_large_err)]
     fn guard_public(&self, route: PublicRoute, path: &str) -> Result<(), Response> {
         if self.config.ratelimits.enable && !self.limits.allow_public(route, remote_key().as_str())
@@ -730,18 +624,20 @@ impl Server {
                     .replace(' ', "_"),
             ),
         };
-        let body = ErrorEnvelope {
-            error: ErrorFields { code: &code, message, path },
-            timestamp_ms: now_millis(),
-        };
-        (status, Json(body)).into_response()
+        (
+            status,
+            Json(ErrorEnvelope {
+                error: ErrorFields { code: &code, message, path },
+                timestamp_ms: now_millis(),
+            }),
+        )
+            .into_response()
     }
 
     fn json(&self, status: StatusCode, body: impl Serialize) -> Response {
         (status, Json(body)).into_response()
     }
 
-    /// REST remains available during the event socket's reconnect grace period.
     #[allow(clippy::result_large_err)]
     fn session(&self, id: &str, path: &str) -> Result<Arc<Session>, Response> {
         let found = self.sessions.lock().unwrap().get(id).cloned();
@@ -765,19 +661,32 @@ impl Server {
         Ok(session)
     }
 
+    #[allow(clippy::result_large_err)]
+    fn require_player(
+        &self,
+        route: Route,
+        session_id: &str,
+        guild_id: &str,
+        path: &str,
+    ) -> Result<Arc<Player>, Response> {
+        self.rate_limit(route, path)?;
+        let session = self.session_and_guild(session_id, guild_id, path)?;
+        session
+            .player(guild_id)
+            .ok_or_else(|| self.fail(StatusCode::NOT_FOUND, "player not found", path))
+    }
+
     fn active_sessions(&self) -> Vec<Arc<Session>> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
-        sessions.into_iter().filter(|session| session.is_usable()).collect()
+        sessions.into_iter().filter(|s| s.is_usable()).collect()
     }
 
-    /// Active usable sessions currently held by the node, without allocating.
     pub fn active_session_count(&self) -> usize {
-        self.sessions.lock().unwrap().values().filter(|session| session.is_usable()).count()
+        self.sessions.lock().unwrap().values().filter(|s| s.is_usable()).count()
     }
 
-    /// Actively playing players across all usable sessions, without allocating.
     pub fn playing_count(&self) -> usize {
-        self.sessions.lock().unwrap().values().map(|session| session.playing_player_count()).sum()
+        self.sessions.lock().unwrap().values().map(|s| s.playing_player_count()).sum()
     }
 
     fn session_and_playing_counts(&self) -> (usize, usize) {
@@ -792,9 +701,6 @@ impl Server {
         (sessions, playing)
     }
 
-    /// Resolves an identifier into a load result, on a thread of its own so a
-    /// slow source cannot stall the runtime, and inside the configured timeout
-    /// so a client is answered either way.
     async fn load(&self, identifier: &str) -> Arc<LoadResult> {
         let deadline = tokio::time::Instant::now() + self.config.load_timeout();
         let permit =
@@ -821,17 +727,10 @@ impl Server {
         }
     }
 
-    /// Answers with the lyrics of a track, or with no content when there are
-    /// none to send. A provider that failed is a bad gateway rather than no
-    /// content, because the difference matters to a client deciding whether to
-    /// ask again.
-    async fn answer_lyrics(&self, track: rustlink_protocol::Track, path: &str) -> Response {
-        let Some(manager) = self.deps.lyrics.clone() else {
+    async fn answer_lyrics(&self, track: Track, path: &str) -> Response {
+        let Some(manager) = self.deps.lyrics.as_ref().filter(|m| m.enabled()).cloned() else {
             return StatusCode::NO_CONTENT.into_response();
         };
-        if !manager.enabled() {
-            return StatusCode::NO_CONTENT.into_response();
-        }
         let deadline = tokio::time::Instant::now() + LYRICS_TIMEOUT;
         let permit =
             match tokio::time::timeout_at(deadline, Arc::clone(&self.lyrics_gate).acquire_owned())
@@ -872,7 +771,6 @@ impl Server {
         }
     }
 
-    /// The enabled native sources reported by `GET /api/v1/info`.
     fn sources(&self) -> Vec<&'static str> {
         let mut sources = vec!["http"];
         if self.config.youtube_native {
@@ -889,23 +787,13 @@ impl Server {
     }
 }
 
-/// Compares two secrets without letting the time taken say how much of one
-/// matched or whether the candidate length matched `expected`.
 fn same(given: &[u8], expected: &[u8]) -> bool {
     let len_eq = (given.len() as u64).ct_eq(&(expected.len() as u64));
     let mut diff = 0u8;
     for (index, &exp) in expected.iter().enumerate() {
-        let got = given.get(index).copied().unwrap_or(0);
-        diff |= got ^ exp;
+        diff |= given.get(index).copied().unwrap_or(0) ^ exp;
     }
     bool::from(len_eq & diff.ct_eq(&0))
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 type RouteResult = Result<Response, Response>;
@@ -937,20 +825,38 @@ async fn not_found(
 async fn info(State(server): State<Arc<Server>>) -> RouteResult {
     server.rate_limit(Route::Info, "/api/v1/info")?;
     let (_, _, cpu_available) = server.cpu.values();
-    Ok(server.json(StatusCode::OK, json!({
-        "name": "Rustlink", "version": VERSION, "api_version": APIVERSION,
-        "sources": server.sources(), "filters": rustlink_audio::FILTER_NAMES,
-        "capabilities": { "track_tokens": "rlt1", "session_resume": true,
-            "lyrics": server.deps.lyrics.as_ref().is_some_and(|manager| manager.enabled()),
-            "cpu_stats": cpu_available, "discord_dave": true },
-        "voice": { "gateway_version": rustlink_voice::GATEWAY_VERSION,
-            "max_dave_protocol_version": rustlink_voice::MAX_DAVE_PROTOCOL_VERSION,
-            "media_codecs": ["opus"],
-            "transport_modes": [rustlink_voice::Mode::AeadAes256GcmRtpSize.name(),
-                rustlink_voice::Mode::AeadXChaCha20Poly1305RtpSize.name()] },
-        "limits": { "max_players": server.config.max_players, "max_sessions": server.config.max_sessions,
-            "max_body_bytes": 1 << 20, "max_inspect_tokens": MAX_DECODE_TRACKS },
-    })))
+    Ok(server.json(
+        StatusCode::OK,
+        json!({
+            "name": "Rustlink",
+            "version": VERSION,
+            "api_version": APIVERSION,
+            "sources": server.sources(),
+            "filters": rustlink_audio::FILTER_NAMES,
+            "capabilities": {
+                "track_tokens": "rlt1",
+                "session_resume": true,
+                "lyrics": server.deps.lyrics.as_ref().is_some_and(|m| m.enabled()),
+                "cpu_stats": cpu_available,
+                "discord_dave": true,
+            },
+            "voice": {
+                "gateway_version": rustlink_voice::GATEWAY_VERSION,
+                "max_dave_protocol_version": rustlink_voice::MAX_DAVE_PROTOCOL_VERSION,
+                "media_codecs": ["opus"],
+                "transport_modes": [
+                    rustlink_voice::Mode::AeadAes256GcmRtpSize.name(),
+                    rustlink_voice::Mode::AeadXChaCha20Poly1305RtpSize.name(),
+                ],
+            },
+            "limits": {
+                "max_players": server.config.max_players,
+                "max_sessions": server.config.max_sessions,
+                "max_body_bytes": LARGE_BODY_LIMIT,
+                "max_inspect_tokens": MAX_DECODE_TRACKS,
+            },
+        }),
+    ))
 }
 
 #[allow(clippy::result_large_err)]
@@ -965,6 +871,7 @@ async fn metrics(State(server): State<Arc<Server>>, OriginalUri(uri): OriginalUr
     Ok(([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], server.metrics_body())
         .into_response())
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResolveRequest {
@@ -985,7 +892,7 @@ struct TokensRequest {
 
 #[derive(Serialize)]
 struct TracksResponse {
-    tracks: Vec<rustlink_protocol::Track>,
+    tracks: Vec<Track>,
 }
 
 #[derive(Serialize)]
@@ -1021,17 +928,6 @@ async fn read_body(
 }
 
 #[allow(clippy::result_large_err)]
-fn read_json<T: serde::de::DeserializeOwned>(
-    server: &Server,
-    body: &[u8],
-    path: &str,
-) -> Result<T, Response> {
-    serde_json::from_slice(body).map_err(|error| {
-        server.fail(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {error}"), path)
-    })
-}
-
-#[allow(clippy::result_large_err)]
 async fn read_body_json<T: serde::de::DeserializeOwned>(
     server: &Server,
     body: Body,
@@ -1039,16 +935,14 @@ async fn read_body_json<T: serde::de::DeserializeOwned>(
     path: &str,
 ) -> Result<T, Response> {
     let bytes = read_body(server, body, limit, path).await?;
-    read_json(server, &bytes, path)
+    serde_json::from_slice(&bytes).map_err(|error| {
+        server.fail(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {error}"), path)
+    })
 }
 
 #[allow(clippy::result_large_err)]
-fn read_track_token(
-    server: &Server,
-    body: &[u8],
-    path: &str,
-) -> Result<rustlink_protocol::Track, Response> {
-    let request: TokenRequest = read_json(server, body, path)?;
+async fn read_track_body(server: &Server, body: Body, path: &str) -> Result<Track, Response> {
+    let request: TokenRequest = read_body_json(server, body, SINGLE_TOKEN_BODY_LIMIT, path).await?;
     decode_track_owned(request.token)
         .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))
 }
@@ -1072,9 +966,7 @@ async fn load_tracks(State(server): State<Arc<Server>>, body: Body) -> RouteResu
 async fn decode_track_route(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/tracks/inspect";
     server.rate_limit(Route::InspectTrack, path)?;
-    let bytes = read_body(&server, body, SINGLE_TOKEN_BODY_LIMIT, path).await?;
-    let track = read_track_token(&server, &bytes, path)?;
-    Ok(server.json(StatusCode::OK, track))
+    Ok(server.json(StatusCode::OK, read_track_body(&server, body, path).await?))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1085,15 +977,12 @@ async fn decode_tracks(State(server): State<Arc<Server>>, body: Body) -> RouteRe
     if request.tokens.len() > MAX_DECODE_TRACKS {
         return Err(server.fail(StatusCode::BAD_REQUEST, "at most 1000 tokens per request", path));
     }
-    let mut tracks = Vec::with_capacity(request.tokens.len());
-    for token in request.tokens {
-        match decode_track_owned(token) {
-            Ok(track) => tracks.push(track),
-            Err(error) => {
-                return Err(server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))
-            }
-        }
-    }
+    let tracks = request
+        .tokens
+        .into_iter()
+        .map(decode_track_owned)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))?;
     Ok(server.json(StatusCode::OK, TracksResponse { tracks }))
 }
 
@@ -1101,8 +990,7 @@ async fn decode_tracks(State(server): State<Arc<Server>>, body: Body) -> RouteRe
 async fn lyrics_for_track(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/lyrics";
     server.rate_limit(Route::Lyrics, path)?;
-    let bytes = read_body(&server, body, SINGLE_TOKEN_BODY_LIMIT, path).await?;
-    let track = read_track_token(&server, &bytes, path)?;
+    let track = read_track_body(&server, body, path).await?;
     Ok(server.answer_lyrics(track, path).await)
 }
 
@@ -1112,17 +1000,11 @@ async fn lyrics_for_player(
     OriginalUri(uri): OriginalUri,
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> RouteResult {
-    // Keep the error path tied to this request, while excluding a query
-    // string that could carry credentials or other sensitive values.
     let path = uri.path();
-    server.rate_limit(Route::PlayerLyrics, path)?;
-    let session = server.session_and_guild(&session_id, &guild_id, path)?;
-    let Some(player) = session.player(&guild_id) else {
-        return Err(server.fail(StatusCode::NOT_FOUND, "player not found", path));
-    };
-    let Some(track) = player.track() else {
-        return Err(server.fail(StatusCode::NOT_FOUND, "no track is playing", path));
-    };
+    let player = server.require_player(Route::PlayerLyrics, &session_id, &guild_id, path)?;
+    let track = player
+        .track()
+        .ok_or_else(|| server.fail(StatusCode::NOT_FOUND, "no track is playing", path))?;
     Ok(server.answer_lyrics(track, path).await)
 }
 
@@ -1145,16 +1027,10 @@ async fn get_player(
     Path((session_id, guild_id)): Path<(String, String)>,
 ) -> RouteResult {
     let path = uri.path();
-    server.rate_limit(Route::GetPlayer, path)?;
-    let session = server.session_and_guild(&session_id, &guild_id, path)?;
-    let Some(player) = session.player(&guild_id) else {
-        return Err(server.fail(StatusCode::NOT_FOUND, "player not found", path));
-    };
+    let player = server.require_player(Route::GetPlayer, &session_id, &guild_id, path)?;
     Ok(server.json(StatusCode::OK, player.snapshot()))
 }
 
-/// Roll back a first update on both error and future cancellation. This guard
-/// must be dropped before the request releases its per-guild update gate.
 struct PlayerCreation<'a> {
     session: &'a Session,
     server: &'a Server,
@@ -1175,18 +1051,10 @@ impl Drop for PlayerCreation<'_> {
 }
 
 #[allow(clippy::result_large_err)]
-async fn update_player(
-    State(server): State<Arc<Server>>,
-    OriginalUri(uri): OriginalUri,
-    Path((session_id, guild_id)): Path<(String, String)>,
-    body: Body,
-) -> RouteResult {
-    let path = uri.path();
-    server.rate_limit(Route::UpdatePlayer, path)?;
-    let session = server.session_and_guild(&session_id, &guild_id, path)?;
+fn parse_no_replace(server: &Server, query: Option<&str>, path: &str) -> Result<bool, Response> {
     let mut replace_param = None;
     let mut has_unknown_param = false;
-    if let Some(raw_query) = uri.query() {
+    if let Some(raw_query) = query {
         for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
             if key == "replace" {
                 replace_param = Some(value);
@@ -1196,16 +1064,11 @@ async fn update_player(
         }
     }
     let no_replace = match replace_param.as_deref() {
-        Some(raw) => match parse_bool(raw) {
-            Some(value) => !value,
-            None => {
-                return Err(server.fail(
-                    StatusCode::BAD_REQUEST,
-                    "replace must be true or false",
-                    path,
-                ))
-            }
-        },
+        Some("true") => false,
+        Some("false") => true,
+        Some(_) => {
+            return Err(server.fail(StatusCode::BAD_REQUEST, "replace must be true or false", path))
+        }
         None => false,
     };
     if has_unknown_param {
@@ -1215,11 +1078,24 @@ async fn update_player(
             path,
         ));
     }
+    Ok(no_replace)
+}
+
+#[allow(clippy::result_large_err)]
+async fn update_player(
+    State(server): State<Arc<Server>>,
+    OriginalUri(uri): OriginalUri,
+    Path((session_id, guild_id)): Path<(String, String)>,
+    body: Body,
+) -> RouteResult {
+    let path = uri.path();
+    server.rate_limit(Route::UpdatePlayer, path)?;
+    let session = server.session_and_guild(&session_id, &guild_id, path)?;
+    let no_replace = parse_no_replace(&server, uri.query(), path)?;
     let update: PlayerUpdate = read_body_json(&server, body, LARGE_BODY_LIMIT, path).await?;
     let prepared = crate::player::prepare(update)
         .map_err(|error| server.fail(StatusCode::BAD_REQUEST, &error.to_string(), path))?;
     if let Some(filters) = &prepared.filters {
-        // Validate operator policy before mutating the player.
         let disabled = rustlink_audio::disabled_filters(filters, &server.config.filters);
         if !disabled.is_empty() {
             let message =
@@ -1328,6 +1204,10 @@ struct UpdateSession {
     resume_timeout_secs: Option<u32>,
 }
 
+fn valid_resume_timeout(secs: Option<u32>) -> bool {
+    secs.is_none_or(|timeout| (1..=86_400).contains(&timeout))
+}
+
 fn hex_encode_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1338,13 +1218,26 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn take_expired(sessions: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<Session>> {
+    let mut expired = Vec::new();
+    sessions.retain(|_, session| {
+        if session.expired() {
+            expired.push(Arc::clone(session));
+            false
+        } else {
+            true
+        }
+    });
+    expired
+}
+
 #[allow(clippy::result_large_err)]
 async fn create_session(State(server): State<Arc<Server>>, body: Body) -> RouteResult {
     let path = "/api/v1/sessions";
     server.rate_limit(Route::CreateSession, path)?;
     let request: CreateSession = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
     if !rustlink_voice::valid_id(&request.bot_id)
-        || request.resume_timeout_secs.is_some_and(|timeout| timeout == 0 || timeout > 86_400)
+        || !valid_resume_timeout(request.resume_timeout_secs)
     {
         return Err(server.fail(
             StatusCode::BAD_REQUEST,
@@ -1365,14 +1258,7 @@ async fn create_session(State(server): State<Arc<Server>>, body: Body) -> RouteR
     let response_body = {
         let mut sessions = server.sessions.lock().unwrap();
         if sessions.len() >= server.config.max_sessions as usize {
-            sessions.retain(|_, session| {
-                if session.expired() {
-                    expired_sessions.push(Arc::clone(session));
-                    false
-                } else {
-                    true
-                }
-            });
+            expired_sessions = take_expired(&mut sessions);
         }
         if server.closed.load(Ordering::SeqCst)
             || sessions.len() >= server.config.max_sessions as usize
@@ -1443,7 +1329,7 @@ async fn update_session(
     server.rate_limit(Route::UpdateSession, path)?;
     let session = server.session(&id, path)?;
     let update: UpdateSession = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
-    if update.resume_timeout_secs.is_some_and(|timeout| timeout == 0 || timeout > 86_400) {
+    if !valid_resume_timeout(update.resume_timeout_secs) {
         return Err(server.fail(
             StatusCode::BAD_REQUEST,
             "resume_timeout_secs must be 1..86400",
@@ -1458,22 +1344,12 @@ async fn update_session(
     Ok(server.json(StatusCode::OK, snapshot))
 }
 
-fn parse_bool(raw: &str) -> Option<bool> {
-    match raw {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
 async fn websocket(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
     request: Request,
 ) -> Response {
     let (mut parts, _) = request.into_parts();
-    // Use only the path component so query parameters (which may contain
-    // credentials) are never copied into an error response.
     let path = parts.uri.path().to_owned();
     if let Err(response) = server.rate_limit(Route::Websocket, &path) {
         return response;
@@ -1493,7 +1369,6 @@ async fn websocket(
         }
     };
     let (inbox, resumed) = {
-        // Coordinate with expiry and deletion while claiming the only subscriber.
         let sessions = server.sessions.lock().unwrap();
         if !sessions.contains_key(&id) {
             return server.fail(StatusCode::NOT_FOUND, "session not found", &path);
@@ -1519,12 +1394,6 @@ async fn websocket(
         };
         (inbox, had_connected)
     };
-    // The upgrade future runs in a background task.  Keep the receiver in a
-    // one-shot cell shared by both outcomes so a failed handshake can return
-    // it to the session instead of dropping the queue (and the players with
-    // it).  `on_upgrade` and `on_failed_upgrade` are mutually exclusive; the
-    // cell makes that ownership explicit and also protects us if an adapter
-    // invokes either callback later than expected.
     let pending = Arc::new(Mutex::new(Some(inbox)));
     let failed_pending = Arc::clone(&pending);
     let failed_session = Arc::clone(&session);
@@ -1532,45 +1401,30 @@ async fn websocket(
         .max_message_size(64 << 10)
         .max_frame_size(64 << 10)
         .on_failed_upgrade(move |_| {
-            // A failed upgrade is not a failed session.  Return the queued
-            // events and let the normal resume/expiry policy decide whether
-            // it should remain in the map.  In particular, removing it here
-            // would destroy a resumable player merely because a proxy dropped
-            // the HTTP upgrade before the WebSocket task started.
             restore_failed_upgrade(&failed_session, &failed_pending, resumed);
         })
         .on_upgrade(move |socket| async move {
-            let inbox = { pending.lock().unwrap().take() };
-            let Some(inbox) = inbox else {
-                // The failure callback won the one-shot cell.  Axum does not
-                // call both callbacks, so this is only a defensive guard for
-                // a custom upgrade adapter.
-                return;
-            };
-            server.serve(session, inbox, socket, resumed).await;
+            let inbox = pending.lock().unwrap().take();
+            if let Some(inbox) = inbox {
+                server.serve(session, inbox, socket, resumed).await;
+            }
         })
         .into_response()
 }
 
-/// Returns a claimed event receiver to a session when the HTTP upgrade failed
-/// before [`Server::serve`] could take ownership of it.  The session is marked
-/// disconnected first, so `resume: false` becomes immediately expired while a
-/// resumable session keeps its configured grace period.
 fn restore_failed_upgrade(
     session: &Arc<Session>,
     pending: &Mutex<Option<mpsc::Receiver<Value>>>,
     had_connected: bool,
 ) {
-    let Some(inbox) = pending.lock().unwrap().take() else {
-        return;
-    };
-    session.rollback_connect(had_connected);
-    session.restore_inbox(inbox);
+    let inbox = pending.lock().unwrap().take();
+    if let Some(inbox) = inbox {
+        session.rollback_connect(had_connected);
+        session.restore_inbox(inbox);
+    }
 }
 
 impl Server {
-    /// Serves one socket: the ready message, the events and the ticks that go
-    /// out, and the messages that come in.
     async fn serve(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -1588,8 +1442,14 @@ impl Server {
         }
         self.ws_active.fetch_add(1, Ordering::Relaxed);
         let _active_stream = ActiveStream(&self);
-        let ready = json!({ "type": "session.ready", "timestamp_ms": now_millis(), "api_version": APIVERSION,
-            "resumed": resumed, "session_id": session.id, "players": session.snapshots() });
+        let ready = json!({
+            "type": "session.ready",
+            "timestamp_ms": now_millis(),
+            "api_version": APIVERSION,
+            "resumed": resumed,
+            "session_id": session.id,
+            "players": session.snapshots(),
+        });
         if !matches!(
             tokio::time::timeout(
                 Duration::from_secs(10),
@@ -1604,8 +1464,6 @@ impl Server {
         }
         let (sink, mut stream) = socket.split();
         let (control, commands) = mpsc::channel(8);
-        // A client arriving is one more moment worth reporting, and it goes
-        // through the same latency as every other one.
         self.request_report();
         let mut writer = tokio::spawn(write_loop(
             Arc::clone(&self),
@@ -1621,11 +1479,20 @@ impl Server {
                     Ok(Some(Ok(Message::Ping(payload)))) => {
                         if control.send(Message::Pong(payload)).await.is_err() { break None; }
                     }
-                    Ok(Some(Ok(Message::Pong(_)))) => {},
-                    Ok(Some(Ok(Message::Text(_)))) | Ok(Some(Ok(Message::Binary(_)))) => {
-                        let error = json!({"type":"request.rejected", "session_id":session.id, "timestamp_ms":now_millis(),
-                            "error":{"code":"rest_required", "message":"use REST to change a player or session"}});
-                        if control.send(Message::Text(error.to_string().into())).await.is_err() { break None; }
+                    Ok(Some(Ok(Message::Pong(_)))) => {}
+                    Ok(Some(Ok(Message::Text(_) | Message::Binary(_)))) => {
+                        let error = json!({
+                            "type": "request.rejected",
+                            "session_id": session.id,
+                            "timestamp_ms": now_millis(),
+                            "error": {
+                                "code": "rest_required",
+                                "message": "use REST to change a player or session",
+                            },
+                        });
+                        if control.send(Message::Text(error.to_string().into())).await.is_err() {
+                            break None;
+                        }
                     }
                     Ok(Some(Ok(Message::Close(_)))) => {
                         let _ = control.send(Message::Close(None)).await;
@@ -1646,8 +1513,6 @@ impl Server {
         self.detach(&session);
     }
 
-    /// Detaches a socket from its session. A session that asked to be resumed
-    /// is kept for its timeout; every other one is closed now.
     fn detach(&self, session: &Arc<Session>) {
         let (closed, player_count, resuming, timeout) = session.detach_info();
         if closed {
@@ -1664,7 +1529,6 @@ impl Server {
         self.remove_session(&session.id);
     }
 
-    /// Drops a session and everything it owns.
     pub fn remove_session(&self, id: &str) {
         let session = self.sessions.lock().unwrap().remove(id);
         if let Some(session) = session {
@@ -1672,59 +1536,22 @@ impl Server {
         }
     }
 
-    /// Counts a player as gone, which is what the capacity check reads.
     pub fn player_destroyed(&self) {
-        let mut count = self.players.load(Ordering::SeqCst);
-        while count > 0 {
-            match self.players.compare_exchange_weak(
-                count,
-                count - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(actual) => count = actual,
-            }
-        }
+        let _ = cas_update(&self.players, |n| n.checked_sub(1));
     }
 
     fn try_increment_player(&self) -> bool {
         let limit = u64::from(self.config.max_players);
-        let mut count = self.players.load(Ordering::SeqCst);
-        while count < limit {
-            match self.players.compare_exchange_weak(
-                count,
-                count + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => count = actual,
-            }
-        }
-        false
+        cas_update(&self.players, |n| (n < limit).then_some(n + 1))
     }
 
     fn reserve_player(&self) -> bool {
-        if self.try_increment_player() {
-            return true;
-        }
-        if self.reap_expired_sessions() > 0 {
-            return self.try_increment_player();
-        }
-        false
+        self.try_increment_player()
+            || (self.reap_expired_sessions() > 0 && self.try_increment_player())
     }
 
     fn reap_expired_sessions(&self) -> usize {
-        let mut expired = Vec::new();
-        self.sessions.lock().unwrap().retain(|_, session| {
-            if session.expired() {
-                expired.push(Arc::clone(session));
-                false
-            } else {
-                true
-            }
-        });
+        let expired = take_expired(&mut self.sessions.lock().unwrap());
         let count = expired.len();
         for session in expired {
             log::info!(
@@ -1740,7 +1567,6 @@ impl Server {
         count
     }
 
-    /// What `GET /api/v1/stats` reports.
     fn stats_body(&self) -> Value {
         let (session_count, playing) = self.session_and_playing_counts();
         let (system_load, process_load, _) = self.cpu.values();
@@ -1759,85 +1585,72 @@ impl Server {
         })
     }
 
-    /// What `GET /metrics` reports, in the text exposition format Prometheus
-    /// reads.
     fn metrics_body(&self) -> String {
         let (sessions, playing) = self.session_and_playing_counts();
         let (system_load, process_load, _) = self.cpu.values();
         let uptime = self.started.elapsed().as_secs_f64();
         let mut out = String::with_capacity(1664);
-        let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
+        for (name, kind, help, value) in [
+            ("rustlink_players", "gauge", "Current players", self.players.load(Ordering::SeqCst)),
+            ("rustlink_playing_players", "gauge", "Currently playing players", playing as u64),
+            ("rustlink_sessions", "gauge", "Current sessions", sessions as u64),
+            ("rustlink_cpu_cores", "gauge", "Logical CPU cores", self.cpu.cores() as u64),
+            (
+                "rustlink_http_requests_total",
+                "counter",
+                "HTTP requests",
+                self.requests.load(Ordering::Relaxed),
+            ),
+            (
+                "rustlink_audio_frames_total",
+                "counter",
+                "Opus frames sent",
+                self.counters.sent.load(Ordering::Relaxed),
+            ),
+            (
+                "rustlink_audio_deficit_total",
+                "counter",
+                "Missed frame deadlines",
+                self.counters.deficit.load(Ordering::Relaxed),
+            ),
+            (
+                "rustlink_audio_errors_total",
+                "counter",
+                "Playback failures",
+                self.counters.errors.load(Ordering::Relaxed),
+            ),
+            (
+                "rustlink_webhook_dropped_total",
+                "counter",
+                "Webhook events dropped",
+                self.deps.webhook.as_ref().map_or(0, Client::dropped),
+            ),
+            (
+                "rustlink_heap_bytes",
+                "gauge",
+                "Bytes this process holds; excludes media subprocesses",
+                self.cpu.memory().0,
+            ),
+            (
+                "rustlink_tasks",
+                "gauge",
+                "Background tasks",
+                self.handle.metrics().num_alive_tasks() as u64,
+            ),
+        ] {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
-        };
-        metric("rustlink_players", "gauge", "Current players", self.players.load(Ordering::SeqCst));
-        metric("rustlink_playing_players", "gauge", "Currently playing players", playing as u64);
-        metric("rustlink_sessions", "gauge", "Current sessions", sessions as u64);
-        metric("rustlink_cpu_cores", "gauge", "Logical CPU cores", self.cpu.cores() as u64);
-        metric(
-            "rustlink_http_requests_total",
-            "counter",
-            "HTTP requests",
-            self.requests.load(Ordering::Relaxed),
-        );
-        metric(
-            "rustlink_audio_frames_total",
-            "counter",
-            "Opus frames sent",
-            self.counters.sent.load(Ordering::Relaxed),
-        );
-        metric(
-            "rustlink_audio_deficit_total",
-            "counter",
-            "Missed frame deadlines",
-            self.counters.deficit.load(Ordering::Relaxed),
-        );
-        metric(
-            "rustlink_audio_errors_total",
-            "counter",
-            "Playback failures",
-            self.counters.errors.load(Ordering::Relaxed),
-        );
-        metric(
-            "rustlink_webhook_dropped_total",
-            "counter",
-            "Webhook events dropped",
-            self.deps.webhook.as_ref().map_or(0, Client::dropped),
-        );
-        metric(
-            "rustlink_heap_bytes",
-            "gauge",
-            "Bytes this process holds; excludes media subprocesses",
-            self.cpu.memory().0,
-        );
-        metric(
-            "rustlink_tasks",
-            "gauge",
-            "Background tasks",
-            self.handle.metrics().num_alive_tasks() as u64,
-        );
+        }
         let _ = writeln!(
             out,
-            "# HELP rustlink_cpu_system_load System CPU load fraction\n# TYPE rustlink_cpu_system_load gauge\nrustlink_cpu_system_load {system_load:.6}"
-        );
-        let _ = writeln!(
-            out,
-            "# HELP rustlink_cpu_process_load Process CPU load fraction\n# TYPE rustlink_cpu_process_load gauge\nrustlink_cpu_process_load {process_load:.6}"
-        );
-        let _ = writeln!(
-            out,
-            "# HELP rustlink_uptime_seconds Uptime in seconds\n# TYPE rustlink_uptime_seconds gauge\nrustlink_uptime_seconds {uptime:.3}"
+            "# HELP rustlink_cpu_system_load System CPU load fraction\n# TYPE rustlink_cpu_system_load gauge\nrustlink_cpu_system_load {system_load:.6}\n\
+             # HELP rustlink_cpu_process_load Process CPU load fraction\n# TYPE rustlink_cpu_process_load gauge\nrustlink_cpu_process_load {process_load:.6}\n\
+             # HELP rustlink_uptime_seconds Uptime in seconds\n# TYPE rustlink_uptime_seconds gauge\nrustlink_uptime_seconds {uptime:.3}"
         );
         out
     }
 
-    /// Expires sessions that have waited past their resume window on a steady
-    /// 1-second cadence, decoupled from blocking OS CPU sampling.
     async fn reap(self: Arc<Self>) {
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            Duration::from_secs(1),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = skip_interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = self.shutdown_requested() => return,
@@ -1848,17 +1661,11 @@ impl Server {
         }
     }
 
-    /// Samples machine and process CPU/memory independently so slow OS table
-    /// refreshes never delay session expiry.
     async fn cpu_loop(self: Arc<Self>) {
         if !self.sample_cpu().await {
             return;
         }
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(2),
-            Duration::from_secs(2),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = skip_interval(Duration::from_secs(2));
         loop {
             tokio::select! {
                 _ = self.shutdown_requested() => return,
@@ -1871,9 +1678,6 @@ impl Server {
         }
     }
 
-    /// Sampling reads the process table, which is blocking system work (the
-    /// first sample takes seconds on Windows) that must not stall a runtime
-    /// worker. Returns false when the node shut down meanwhile.
     async fn sample_cpu(&self) -> bool {
         if self.closed.load(Ordering::SeqCst) {
             return false;
@@ -1885,9 +1689,6 @@ impl Server {
         }
     }
 
-    /// Posts the reports the node asks for. The node announces itself as soon
-    /// as it is up, which is how a restart shows in a channel before anything
-    /// is playing.
     async fn report_loop(self: Arc<Self>, mut reports: mpsc::Receiver<()>) {
         self.request_report();
         loop {
@@ -1902,7 +1703,6 @@ impl Server {
                             _ = self.shutdown_requested() => return,
                             _ = tokio::time::sleep(wait) => {}
                         }
-                        // Drain any coalesced signal arrived during the wait.
                         let _ = reports.try_recv();
                     }
                     self.report_player_state();
@@ -1921,9 +1721,6 @@ impl Server {
         last.and_then(|at| window.checked_sub(at.elapsed())).filter(|wait| !wait.is_zero())
     }
 
-    /// Posts the state of every player on the node. Clients keep receiving
-    /// their own `player.updated` per session; this is the node-wide summary an
-    /// operator watches. Reports are spaced by the configured latency.
     fn report_player_state(&self) {
         let latency = self.config.webhook.state_latency_seconds;
         if self.deps.webhook.is_none() || latency < 1 {
@@ -1931,10 +1728,8 @@ impl Server {
         }
         {
             let mut last = self.last_report.lock().unwrap();
-            if let Some(at) = *last {
-                if at.elapsed() < Duration::from_secs(latency as u64) {
-                    return;
-                }
+            if last.is_some_and(|at| at.elapsed() < Duration::from_secs(latency as u64)) {
+                return;
             }
             *last = Some(Instant::now());
         }
@@ -1944,10 +1739,6 @@ impl Server {
         }
     }
 
-    /// Summarises every player on the node. It is meant for a channel other
-    /// people may read, so it carries only what describes playback: the session
-    /// and user that own a player are left out, along with the encoded track
-    /// and every other field a reader has no business seeing.
     fn player_state_report(&self) -> Value {
         let sessions = self.active_sessions();
         let mut states = Vec::new();
@@ -1966,10 +1757,6 @@ impl Server {
     }
 }
 
-/// Writes everything that goes to a client: its events, its periodic player
-/// updates and stats, and the pings that keep the connection alive. The
-/// receiver is handed back so a session that is resumed can keep reading the
-/// events that arrive while nobody is listening.
 async fn write_loop(
     server: Arc<Server>,
     session: Arc<Session>,
@@ -1977,21 +1764,10 @@ async fn write_loop(
     mut inbox: mpsc::Receiver<Value>,
     mut control: mpsc::Receiver<Message>,
 ) -> mpsc::Receiver<Value> {
-    let update_seconds = server.config.player_update_seconds.max(1) as u64;
-    let stats_seconds = server.config.stats_seconds.max(1) as u64;
-    let mut updates = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(update_seconds),
-        Duration::from_secs(update_seconds),
-    );
-    updates.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut stats = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(stats_seconds),
-        Duration::from_secs(stats_seconds),
-    );
-    stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut ping =
-        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut updates =
+        skip_interval(Duration::from_secs(server.config.player_update_seconds.max(1) as u64));
+    let mut stats = skip_interval(Duration::from_secs(server.config.stats_seconds.max(1) as u64));
+    let mut ping = skip_interval(PING_INTERVAL);
     let mut previous_sent = server.counters.sent.load(Ordering::Relaxed);
     let mut previous_deficit = server.counters.deficit.load(Ordering::Relaxed);
     if let Some(unsent) = session.take_unsent() {
@@ -2123,29 +1899,26 @@ mod tests {
         assert_eq!(session_key("/api/v1/sessions/abc123/players/42"), "abc123");
         assert_eq!(session_key("/api/v1/sessions/%61bc123/players/42"), "abc123");
         assert_eq!(session_key("/api/v1/sessions/abc123"), "abc123");
-        assert_eq!(session_key("/api/v1/sessions"), "node", "creating a session has none yet");
+        assert_eq!(session_key("/api/v1/sessions"), "node");
         assert_eq!(session_key("/api/v1/stats"), "node");
         assert_eq!(session_key("/api/v1/sessions/"), "node");
         let long = format!("/api/v1/sessions/{}/players/1", "x".repeat(500));
-        assert_eq!(session_key(&long).len(), 64, "an invented key stays short");
+        assert_eq!(session_key(&long).len(), 64);
         let wide = format!("/api/v1/sessions/{}é/players/1", "a".repeat(63));
-        assert_eq!(session_key(&wide), format!("{}é", "a".repeat(63)), "cut by characters");
+        assert_eq!(session_key(&wide), format!("{}é", "a".repeat(63)));
     }
 
     #[test]
     fn the_caller_is_keyed_by_its_address_with_ipv6_reduced_to_its_prefix() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let key = |address: &str| {
             let address: std::net::IpAddr = address.parse().unwrap();
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(REMOTE.scope(Some(address), async { remote_key() }))
+            rt.block_on(REMOTE.scope(Some(address), async { remote_key() }))
         };
         assert_eq!(key("203.0.113.9"), "203.0.113.9");
         assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
         assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), key("2001:db8:1:2::1"));
         assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
-        // Outside a request there is no address to key on.
         assert_eq!(remote_key(), "unknown");
     }
 
@@ -2156,13 +1929,9 @@ mod tests {
         for _ in 0..burst {
             assert!(limits.allow_authenticated(Route::Stats, "session-a"));
         }
-        assert!(!limits.allow_authenticated(Route::Stats, "session-a"), "session-a is spent");
-        assert!(limits.allow_authenticated(Route::Stats, "session-b"), "session-b is not");
-        assert!(
-            limits.allow_authenticated(Route::UpdatePlayer, "session-a"),
-            "another route is not"
-        );
-        // Wrong passwords draw on a separate table, so they never touched the above.
+        assert!(!limits.allow_authenticated(Route::Stats, "session-a"));
+        assert!(limits.allow_authenticated(Route::Stats, "session-b"));
+        assert!(limits.allow_authenticated(Route::UpdatePlayer, "session-a"));
         for _ in 0..FAILED_LOGINS.1 {
             assert!(limits.allow_failed_login("198.51.100.1"));
         }
@@ -2176,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_upgrade_restores_a_resumable_session_and_its_inbox() {
+    fn failed_upgrade_restores_inbox_and_honours_resume_policy() {
         let session = Session::new("session-id".into(), "123".into(), std::sync::Weak::new(), 4);
         session.update(Some(true), Some(60));
         session.connect();
@@ -2184,45 +1953,32 @@ mod tests {
         session.emit(Object::new());
 
         restore_failed_upgrade(&session, &pending, true);
-
-        assert!(!session.is_connected());
-        assert!(session.has_connected());
-        assert!(!session.expired());
+        assert!(!session.is_connected() && session.has_connected() && !session.expired());
         let mut inbox = session.take_inbox().expect("failed upgrade restored the inbox");
-        assert!(inbox.try_recv().is_ok(), "events queued during the upgrade were lost");
-        // The one-shot ownership cell is empty after the restoration.
+        assert!(inbox.try_recv().is_ok());
         restore_failed_upgrade(&session, &pending, false);
         assert!(session.take_inbox().is_none());
-    }
 
-    #[test]
-    fn failed_upgrade_keeps_resume_false_expired_for_normal_reaping() {
-        let session = Session::new("session-id".into(), "123".into(), std::sync::Weak::new(), 4);
-        session.update(Some(false), Some(60));
-        session.connect();
-        let pending = pending_for(&session);
-
-        restore_failed_upgrade(&session, &pending, false);
-
-        assert!(!session.is_connected());
-        assert!(!session.has_connected());
-        assert!(session.expired());
-        assert!(session.take_inbox().is_some());
+        let non_resumable =
+            Session::new("session-id".into(), "123".into(), std::sync::Weak::new(), 4);
+        non_resumable.update(Some(false), Some(60));
+        non_resumable.connect();
+        let pending = pending_for(&non_resumable);
+        restore_failed_upgrade(&non_resumable, &pending, false);
+        assert!(!non_resumable.is_connected() && !non_resumable.has_connected());
+        assert!(non_resumable.expired() && non_resumable.take_inbox().is_some());
     }
 
     #[tokio::test]
     async fn fake_session_ids_and_not_found_routes_do_not_create_per_session_rate_keys() {
         struct StubMedia;
         impl crate::playback::Loader for StubMedia {
-            fn load(
-                &self,
-                _: &str,
-            ) -> Result<rustlink_protocol::LoadResult, rustlink_source::SourceError> {
-                Ok(rustlink_protocol::LoadResult::Empty)
+            fn load(&self, _: &str) -> Result<LoadResult, rustlink_source::SourceError> {
+                Ok(LoadResult::Empty)
             }
             fn open(
                 &self,
-                _: &rustlink_protocol::Track,
+                _: &Track,
             ) -> Result<Box<dyn std::io::Read + Send>, rustlink_source::SourceError> {
                 Ok(Box::new(std::io::empty()))
             }
@@ -2230,10 +1986,10 @@ mod tests {
         impl crate::playback::Engine for StubMedia {
             fn start(
                 &self,
-                _: &rustlink_protocol::Track,
+                _: &Track,
                 _: i64,
                 _: i64,
-                _: &rustlink_protocol::Object,
+                _: &Object,
             ) -> Result<Box<dyn rustlink_audio::Frames>, rustlink_audio::AudioError> {
                 Err(rustlink_audio::AudioError::FfmpegMissing)
             }

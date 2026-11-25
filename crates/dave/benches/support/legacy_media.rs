@@ -1,4 +1,4 @@
-//! DAVE v1 Opus sender: RFC 9420 sender ratchet and an eight-byte GCM tag.
+//! 0.4.0 baseline DAVE v1 Opus sender (allocating per-frame baseline for benchmarks).
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes128Gcm, Nonce,
@@ -27,16 +27,15 @@ impl MediaSender {
     }
 
     pub(crate) fn encrypt(&mut self, opus: &[u8]) -> Result<Vec<u8>> {
-        // Increment before use, and never reuse a nonce even if sending fails.
         self.frame = self.frame.checked_add(1).ok_or(Error::Protocol("media counter exhausted"))?;
         let generation = self.frame >> 24;
         if generation > u32::MAX as u64 {
             return Err(Error::Protocol("media ratchet exhausted"));
         }
         while self.next_generation <= generation {
-            let generation = self.next_generation as u32;
-            self.key.copy_from_slice(&expand(&self.next_secret, b"key", generation, 16));
-            self.next_secret = expand(&self.next_secret, b"secret", generation, 32);
+            let g = self.next_generation as u32;
+            self.key.copy_from_slice(&expand(&self.next_secret, b"key", g, 16));
+            self.next_secret = expand(&self.next_secret, b"secret", g, 32);
             self.next_generation += 1;
         }
         let truncated = self.frame as u32;
@@ -49,27 +48,22 @@ impl MediaSender {
             .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], &mut frame)
             .map_err(|_| Error::Protocol("media encryption failed"))?;
         frame.extend_from_slice(&tag[..8]);
-        let mut value = truncated;
-        let mut nonce_len = 0;
+        let (mut v, start) = (truncated, frame.len());
         loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            frame.push(byte);
-            nonce_len += 1;
-            if value == 0 {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                frame.push(byte);
                 break;
             }
+            frame.push(byte | 0x80);
         }
-        frame.extend_from_slice(&[8 + nonce_len + 1 + 2, 0xfa, 0xfa]);
+        let footer_len = (frame.len() - start) as u8 + 11;
+        frame.extend_from_slice(&[footer_len, 0xfa, 0xfa]);
         Ok(frame)
     }
 }
 
-// RFC 9420 ExpandWithLabel, using one HKDF-Expand block (all outputs <= 32).
-// MLS variable-length vectors shorter than 64 bytes use a single length byte.
 fn expand(secret: &[u8], label: &[u8], generation: u32, length: u16) -> Zeroizing<Vec<u8>> {
     let mut info = Vec::with_capacity(32);
     info.extend_from_slice(&length.to_be_bytes());
@@ -78,9 +72,8 @@ fn expand(secret: &[u8], label: &[u8], generation: u32, length: u16) -> Zeroizin
     info.extend_from_slice(label);
     info.push(4);
     info.extend_from_slice(&generation.to_be_bytes());
-    info.push(1); // first HKDF block
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    info.push(1);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).unwrap();
     mac.update(&info);
     let block = Zeroizing::new(mac.finalize().into_bytes().to_vec());
     Zeroizing::new(block[..length as usize].to_vec())

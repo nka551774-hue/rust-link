@@ -1,26 +1,18 @@
-//! The in-process engine.
-//!
-//! Decode, filter, encode, all inside the node. The pipeline is
-//! decoder → 48 kHz → pre-filters → timescale → post-filters → Opus, which is
-//! the order the FFmpeg graph applies the same settings in.
+//! In-process audio pipeline: decode -> 48 kHz -> pre-DSP -> timescale -> post-DSP -> Opus.
 
 use rustlink_protocol::Track;
 
-use crate::decode::{Decoder, PassthroughStep};
+use crate::decode::{Decoder, PassthroughIo, PassthroughStep};
 use crate::dsp::DspChain;
 use crate::engine::{Body, Frames};
 use crate::error::AudioError;
-use crate::filters::FilterSet;
+use crate::filters::{FilterSet, Timescale};
 use crate::opus::{Encoder, FRAME_SAMPLES_STEREO};
 use crate::resample::{ratio_for, SincResampler, TimeStretcher};
 
-/// How many output frames one resample call may produce. The buffer is drained
-/// after every call, so this only bounds a single step.
 const PRODUCE_LIMIT: usize = 1 << 16;
 
-/// Minimum configured output bitrate at which 48 kHz Opus sources (`itag 251`,
-/// Ogg Opus) stream directly without re-encoding; lower operator caps transcode
-/// to honour explicit bandwidth limits.
+/// Minimum bitrate at which neutral 48 kHz Opus streams pass through without re-encoding.
 const MIN_PASSTHROUGH_BITRATE: i32 = 96_000;
 
 pub struct PureFrames {
@@ -29,22 +21,13 @@ pub struct PureFrames {
     resampler: Option<SincResampler>,
     stretcher: Option<TimeStretcher>,
     stretch_factor: f64,
-    time: Option<crate::filters::Timescale>,
+    time: Option<Timescale>,
     dsp: DspChain,
     encoder: Encoder,
-    /// Interleaved stereo at 48 kHz, ready to be cut into frames.
     staging: Vec<f32>,
-    /// How much of `staging` has already been cut into frames. Frames are taken
-    /// from behind this cursor and the buffer is moved down only when what is
-    /// left no longer pays for the move, which is what keeps the steady state
-    /// from shuffling the whole buffer on every frame.
     staging_at: usize,
-    /// Shared temporary PCM buffer for resampling/stretching stages.
     scratch: Vec<f32>,
-    /// Source frames to discard before playback starts, which is how a seek is
-    /// performed on a stream that cannot be seeked.
     skip: u64,
-    /// True while 48 kHz Opus packets are forwarded directly without decode+encode.
     passthrough: bool,
     passthrough_count: u64,
     passthrough_ring: [Vec<u8>; 2],
@@ -58,8 +41,7 @@ pub struct PureFrames {
 #[inline]
 fn skip_frames(skip: &mut u64, buf: &mut Vec<f32>, start: usize) {
     if *skip > 0 {
-        let frames = (buf.len() - start) / 2;
-        let drop = (*skip).min(frames as u64) as usize;
+        let drop = (*skip).min(((buf.len() - start) / 2) as u64) as usize;
         buf.drain(start..start + drop * 2);
         *skip -= drop as u64;
     }
@@ -78,40 +60,30 @@ impl PureFrames {
         bitrate: i32,
         complexity: i32,
     ) -> Result<Self, AudioError> {
-        let decoder = Decoder::new(body).map_err(|e| AudioError::NeedsFfmpeg(e.to_string()))?;
-        let rate = decoder.rate();
-        let active_time = set.effective_time();
-        let time =
-            active_time.unwrap_or(crate::filters::Timescale { speed: 1.0, pitch: 1.0, rate: 1.0 });
-        let ratio = ratio_for(48_000, time.pitch, time.rate);
-        let stretch_factor = time.speed / time.pitch;
-        // Each API control is bounded, but their quotient can reach 100.
-        // Keep the native stretcher's documented work bound and request the
-        // FFmpeg path instead of silently clamping and playing the wrong tempo.
         if !Self::supports_timescale(set) {
             return Err(AudioError::NeedsFfmpeg(
                 "combined speed/pitch is outside the native stretching range 0.05..5".into(),
             ));
         }
-        let stretcher =
-            if (stretch_factor - 1.0).abs() > 1e-9 { Some(TimeStretcher::new()) } else { None };
+        let decoder = Decoder::new(body).map_err(|e| AudioError::NeedsFfmpeg(e.to_string()))?;
+        let rate = decoder.rate();
+        let active_time = set.effective_time();
+        let time = active_time.unwrap_or(Timescale { speed: 1.0, pitch: 1.0, rate: 1.0 });
+        let ratio = ratio_for(48_000, time.pitch, time.rate);
+        let stretch_factor = time.speed / time.pitch;
+        let stretcher = ((stretch_factor - 1.0).abs() > 1e-9).then(TimeStretcher::new);
         let encoder = Encoder::new(bitrate, complexity)?;
-        let skip = if position_ms > 0 {
-            (position_ms as u128 * rate as u128 / 1000).min(u64::MAX as u128) as u64
-        } else {
-            0
-        };
+        let skip =
+            u64::try_from(position_ms.max(0) as u128 * rate as u128 / 1000).unwrap_or(u64::MAX);
         let dsp = DspChain::new(set);
         let passthrough = bitrate >= MIN_PASSTHROUGH_BITRATE
             && skip == 0
             && active_time.is_none()
             && dsp.is_empty()
             && decoder.supports_opus_passthrough();
-        Ok(PureFrames {
+        Ok(Self {
             decoder,
             source_resampler: (rate != 48_000).then(|| SincResampler::new(rate as f64 / 48_000.0)),
-            // A unity conversion needs neither a history window nor another
-            // PCM buffer. This also preserves the first and last samples.
             resampler: (ratio != 1.0).then(|| SincResampler::new(ratio)),
             stretcher,
             stretch_factor,
@@ -137,19 +109,15 @@ impl PureFrames {
         match count {
             0 => (None, None),
             1 => (None, Some(ring[0].as_slice())),
-            n => {
-                let older = ring[(n % 2) as usize].as_slice();
-                let latest = ring[((n - 1) % 2) as usize].as_slice();
-                (Some(older), Some(latest))
-            }
+            n => (
+                Some(ring[(n & 1) as usize].as_slice()),
+                Some(ring[((n - 1) & 1) as usize].as_slice()),
+            ),
         }
     }
 
-    /// Primes `self.encoder`'s lookahead and MDCT overlap state from the final
-    /// samples of packet `K` (`k_tail`) and the leading `lookahead` samples of
-    /// packet `K+1` (`next_pcm`) using a discarded 10 ms (480-sample) encode so
-    /// live filter changes or final-packet trimming transition with zero sample
-    /// offset and zero discontinuity.
+    /// Primes `self.encoder`'s lookahead and MDCT overlap state via a discarded 10 ms (480-sample)
+    /// encode across `k_tail` and `next_pcm` so passthrough transitions with zero discontinuity.
     fn finish_passthrough_handoff(
         &mut self,
         k_tail: &mut [f32],
@@ -194,10 +162,8 @@ impl PureFrames {
         Ok(())
     }
 
-    /// Reads one step of the pipeline, reporting whether anything moved.
     fn pump(&mut self) -> Result<bool, AudioError> {
-        // Zero-copy fast path for 48 kHz sources without timescale (>95% of tracks):
-        // decode straight onto the tail of `self.staging` and run pre-DSP in place.
+        // Zero-copy fast path for 48 kHz sources without timescale.
         if self.source_resampler.is_none() && self.resampler.is_none() && self.stretcher.is_none() {
             if self.drained {
                 return Ok(false);
@@ -215,17 +181,11 @@ impl PureFrames {
         }
 
         let mut progressed = false;
-        // Drain the furthest downstream converter before fetching more input.
-        // Slow combined pitch/rate can expand one chunk hundreds of times;
-        // decoding another chunk on every pump would retain an entire song.
         let time_ready = self.resampler.as_ref().is_some_and(|r| r.available() > 0);
         let source_ready = self.source_resampler.as_ref().is_some_and(|r| r.available() > 0);
         self.scratch.clear();
         if !self.drained && !source_ready && !time_ready {
             if self.decoder.decode_with_skip(&mut self.skip, &mut self.scratch)? {
-                // A chunk that falls entirely inside the seek is still progress:
-                // the rest of the track is still to come, so the caller has to
-                // keep pumping rather than read this as the end of the stream.
                 progressed = true;
                 skip_frames(&mut self.skip, &mut self.scratch, 0);
             } else {
@@ -264,46 +224,28 @@ impl PureFrames {
             }
         }
 
-        match &mut self.stretcher {
-            Some(stretcher) => {
-                if let Some(resampler) = &mut self.resampler {
-                    self.scratch.clear();
-                    if resampler.produce(PRODUCE_LIMIT, &mut self.scratch) > 0 {
-                        progressed = true;
-                        stretcher.push(&self.scratch);
-                        self.scratch.clear();
-                    }
-                }
-                stretcher.produce(self.stretch_factor);
-                // The stretcher's output goes straight into the staging buffer,
-                // which is what keeps a pump from allocating.
-                let before = self.staging.len();
-                stretcher.take_output_into(&mut self.staging);
-                if self.staging.len() > before {
+        if let Some(stretcher) = &mut self.stretcher {
+            if let Some(resampler) = &mut self.resampler {
+                self.scratch.clear();
+                if resampler.produce(PRODUCE_LIMIT, &mut self.scratch) > 0 {
                     progressed = true;
-                }
-                if source_finished
-                    && self.resampler.as_ref().is_none_or(SincResampler::is_drained)
-                    && !self.flushed
-                {
-                    let before = self.staging.len();
-                    stretcher.finish(self.stretch_factor, &mut self.staging);
-                    if self.staging.len() > before {
-                        progressed = true;
-                    }
-                    self.flushed = true;
+                    stretcher.push(&self.scratch);
+                    self.scratch.clear();
                 }
             }
-            None => {
-                // With no stretcher in the chain the resampler writes straight
-                // into the buffer the frames are cut from, which saves copying
-                // the whole stream one more time.
-                if let Some(resampler) = &mut self.resampler {
-                    if resampler.produce(PRODUCE_LIMIT, &mut self.staging) > 0 {
-                        progressed = true;
-                    }
-                }
+            stretcher.produce(self.stretch_factor);
+            let before = self.staging.len();
+            stretcher.take_output_into(&mut self.staging);
+            if source_finished
+                && self.resampler.as_ref().is_none_or(SincResampler::is_drained)
+                && !self.flushed
+            {
+                stretcher.finish(self.stretch_factor, &mut self.staging);
+                self.flushed = true;
             }
+            progressed |= self.staging.len() > before;
+        } else if let Some(resampler) = &mut self.resampler {
+            progressed |= resampler.produce(PRODUCE_LIMIT, &mut self.staging) > 0;
         }
         Ok(progressed)
     }
@@ -312,23 +254,22 @@ impl PureFrames {
 impl Frames for PureFrames {
     fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
         if self.passthrough {
-            let mut k_tail = Vec::new();
-            let mut next_pcm = Vec::new();
+            let (mut k_tail, mut next_pcm) = (Vec::new(), Vec::new());
             let step = {
                 let (older, latest) =
                     Self::passthrough_history(self.passthrough_count, &self.passthrough_ring);
-                self.decoder.try_passthrough_next(
-                    self.passthrough_count,
-                    packet,
+                self.decoder.try_passthrough_next(PassthroughIo {
+                    packet_index: self.passthrough_count,
+                    out_packet: packet,
                     older,
                     latest,
-                    &mut k_tail,
-                    &mut next_pcm,
-                )?
+                    k_tail: &mut k_tail,
+                    next_pcm: &mut next_pcm,
+                })?
             };
             match step {
                 PassthroughStep::Packet => {
-                    let slot = &mut self.passthrough_ring[(self.passthrough_count % 2) as usize];
+                    let slot = &mut self.passthrough_ring[(self.passthrough_count & 1) as usize];
                     slot.clear();
                     slot.extend_from_slice(packet);
                     self.passthrough_count += 1;
@@ -348,13 +289,10 @@ impl Frames for PureFrames {
             }
         } else if self.handoff_pending {
             self.handoff_pending = false;
-            let mut k_tail = Vec::new();
-            {
-                let (older, latest) =
-                    Self::passthrough_history(self.passthrough_count, &self.passthrough_ring);
-                self.decoder.warm_from_passthrough(older, latest, &mut k_tail)?;
-            }
-            let mut next_pcm = Vec::new();
+            let (mut k_tail, mut next_pcm) = (Vec::new(), Vec::new());
+            let (older, latest) =
+                Self::passthrough_history(self.passthrough_count, &self.passthrough_ring);
+            self.decoder.warm_from_passthrough(older, latest, &mut k_tail)?;
             if !self.decoder.decode(&mut next_pcm)? {
                 self.drained = true;
             }
@@ -363,9 +301,6 @@ impl Frames for PureFrames {
 
         while self.staging.len() - self.staging_at < FRAME_SAMPLES_STEREO {
             if !self.pump()? {
-                // RTP has no Ogg pre-skip/granule metadata. Send the encoder's
-                // delayed tail as well; otherwise a frame-aligned song loses
-                // its final 312 samples instead of merely carrying codec delay.
                 if !self.encoder_flushed {
                     if self.encoded_any || self.staging.len() > self.staging_at {
                         self.staging.resize(
@@ -382,11 +317,7 @@ impl Frames for PureFrames {
         if take == 0 {
             return Ok(false);
         }
-        // Process post-DSP in place on `staging` and feed 32-bit float samples
-        // straight into `opus_encode_float` (preserving full 24-bit dynamic range
-        // and stateful soft-clipping without 16-bit quantisation loss).
-        let from = self.staging_at;
-        let slice = &mut self.staging[from..from + take];
+        let slice = &mut self.staging[self.staging_at..self.staging_at + take];
         self.dsp.process_post(slice);
         if take == FRAME_SAMPLES_STEREO {
             self.encoder.encode_float_into(slice, packet)?;
@@ -396,8 +327,6 @@ impl Frames for PureFrames {
             self.encoder.encode_float_into(&mut tail, packet)?;
         }
         self.staging_at += take;
-        // Walk the cursor back once what has been used outweighs what is left,
-        // so the move happens every many frames rather than on every frame.
         if self.staging_at >= FRAME_SAMPLES_STEREO && self.staging_at * 2 >= self.staging.len() {
             self.staging.drain(..self.staging_at);
             self.staging_at = 0;
@@ -417,9 +346,7 @@ impl Frames for PureFrames {
         self.dsp.reconfigure(set);
         if self.passthrough && !self.dsp.is_empty() {
             self.passthrough = false;
-            if self.passthrough_count > 0 {
-                self.handoff_pending = true;
-            }
+            self.handoff_pending = self.passthrough_count > 0;
         }
         true
     }

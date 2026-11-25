@@ -21,9 +21,7 @@ rust-version = "1.88"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
-# Byte-range playback must inspect the wire Content-Encoding and Content-Length.
-# ureq's gzip feature removes both before returning a response, so every crate
-# inherits this policy to prevent Cargo feature unification from re-enabling it.
+# Disable ureq gzip so byte-range streams preserve wire Content-Encoding and Content-Length.
 ureq = { version = "3", default-features = false, features = ["rustls", "json", "socks-proxy"] }
 rustlink-protocol = { path = "crates/protocol" }
 rustlink-config = { path = "crates/config" }

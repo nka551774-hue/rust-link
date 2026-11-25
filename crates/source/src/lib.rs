@@ -1,12 +1,4 @@
-//! Track sources.
-//!
-//! A client names a track, and the node turns that name into something it can
-//! play. The name may be a search query, a video id, a catalogue link or a plain
-//! URL, and each of those is a different conversation with a different service.
-//! What they have in common is the shape they answer in: a Rustlink resolution result.
-//!
-//! Everything here blocks. The caller runs resolution on its own worker so
-//! DNS, TLS and catalogue requests cannot stall the audio transport.
+//! Native Rust track and stream resolution for YouTube, SoundCloud, Spotify, Deezer, and HTTP.
 
 mod cache;
 pub mod catalog;
@@ -22,13 +14,14 @@ mod test_http;
 
 use cache::Cache;
 use flight::{Flight, Leader};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
-use rustlink_protocol::{Track, TrackInfo};
+use rustlink_protocol::{Playlist, Track, TrackInfo};
 use url::Url;
 
 pub use media::MediaBody;
@@ -38,46 +31,42 @@ pub use rustlink_protocol::LoadResult;
 /// What went wrong while resolving a track.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SourceError {
-    /// The identifier is not something any source can be asked about.
     #[error("{0}")]
     Url(String),
-    /// A source the configuration switched off was asked for.
     #[error("{0}")]
     Disabled(String),
-    /// A request could not be made or answered.
     #[error("{0}")]
     Http(String),
-    /// A media server refused the request, which carries the status so the
-    /// caller can tell a stale URL from a permanent failure.
     #[error("media server returned HTTP {status}")]
     Media { status: u16 },
-    /// The URL is a page or a container the node cannot play.
     #[error("the URL contains no supported audio stream")]
     NoAudio,
 }
 
 impl SourceError {
-    /// Whether resolving the track again may yield a usable URL.
-    ///
-    /// A video host rejects a share of otherwise valid URLs, and an expired URL
-    /// surfaces as 404 or 410; both are cured by resolving a fresh one, which is
-    /// what the caller does when this says yes.
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Media { status: 403 | 404 | 410 | 429 | 500.. })
     }
 }
 
-/// The largest identifier the node will look at.
 const MAX_IDENTIFIER: usize = 8192;
+pub(crate) const MAX_CACHED_RESULT: usize = 2 << 20;
+pub(crate) const MAX_CACHE_BYTES: usize = 32 << 20;
+const MEDIA_ATTEMPTS: usize = 3;
+const MEDIA_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-/// The largest load result worth keeping, in bytes.
-const MAX_CACHED_RESULT: usize = 2 << 20;
+#[inline]
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
-/// The largest number of bytes the cache may hold.
-const MAX_CACHE_BYTES: usize = 32 << 20;
+#[inline]
+pub(crate) fn strip_ascii_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len()).filter(|p| p.eq_ignore_ascii_case(prefix)).map(|_| &s[prefix.len()..])
+}
 
 fn is_id_chars(text: &str) -> bool {
-    text.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    text.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Whether an identifier is a bare YouTube video id.
@@ -85,32 +74,44 @@ pub fn youtube_id(id: &str) -> bool {
     id.len() == 11 && is_id_chars(id)
 }
 
-/// Discord can wrap a literal link in angle brackets to suppress its preview.
-/// Only unwrap one complete HTTP(S) link, never arbitrary message/Markdown text.
-fn identifier_text(identifier: &str) -> &str {
-    let identifier = identifier.trim();
-    if let Some(inner) = identifier.strip_prefix('<').and_then(|text| text.strip_suffix('>')) {
-        let is_http = inner.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-            || inner.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
-        if is_http && !inner.contains(['<', '>']) {
-            return inner;
-        }
-    }
-    identifier
+/// Unwraps a Discord `<http(s)://...>` preview-suppressing link wrapper.
+pub(crate) fn identifier_text(identifier: &str) -> &str {
+    let id = identifier.trim();
+    id.strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .filter(|s| {
+            (strip_ascii_prefix(s, "http://").is_some()
+                || strip_ascii_prefix(s, "https://").is_some())
+                && !s.contains(['<', '>'])
+        })
+        .unwrap_or(id)
 }
 
-fn http_url(identifier: &str) -> Option<Url> {
+pub(crate) fn http_url(identifier: &str) -> Option<Url> {
     netguard::parse_http_url(identifier_text(identifier)).ok()
 }
 
-fn host_matches(host: &str, domain: &str) -> bool {
-    host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.'))
+pub(crate) fn host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.strip_suffix(domain).is_some_and(|p| p.ends_with('.'))
+}
+
+pub(crate) fn finish_search(tracks: Vec<Track>) -> LoadResult {
+    if tracks.is_empty() {
+        LoadResult::Empty
+    } else {
+        LoadResult::Search(tracks)
+    }
+}
+
+pub(crate) fn finish_playlist(name: String, tracks: Vec<Track>) -> LoadResult {
+    if tracks.is_empty() {
+        LoadResult::Empty
+    } else {
+        LoadResult::Playlist(Box::new(Playlist::new(name, -1, tracks)))
+    }
 }
 
 /// Which source an identifier belongs to.
-///
-/// A prefix is the node's own shorthand and is checked first, because a search
-/// query can contain anything, including something that looks like a URL.
 pub fn source_kind(id: &str) -> &'static str {
     let id = identifier_text(id);
     if id.starts_with("spsearch:") || id.starts_with("spotify:") {
@@ -129,9 +130,7 @@ pub fn source_kind(id: &str) -> &'static str {
     if id.starts_with("scsearch:") || id.starts_with("soundcloud:") {
         return "soundcloud";
     }
-    let Some(url) = http_url(id) else {
-        return "";
-    };
+    let Some(url) = http_url(id) else { return "" };
     let host = url.host_str().expect("http_url requires a host");
     [
         ("youtube.com", "youtube"),
@@ -146,11 +145,6 @@ pub fn source_kind(id: &str) -> &'static str {
     .unwrap_or("http")
 }
 
-/// A counter that lets a bounded number of loads run at once.
-///
-/// Resolution is the part of the node that costs someone else money, so the
-/// number of loads in flight is a limit the operator sets rather than a function
-/// of how many clients are connected.
 struct Gate {
     free: Mutex<usize>,
     ready: Condvar,
@@ -158,11 +152,11 @@ struct Gate {
 
 impl Gate {
     fn new(permits: usize) -> Self {
-        Gate { free: Mutex::new(permits.max(1)), ready: Condvar::new() }
+        Self { free: Mutex::new(permits.max(1)), ready: Condvar::new() }
     }
 
     fn enter(&self, deadline: Instant) -> Result<Permit<'_>, SourceError> {
-        let mut free = self.free.lock().unwrap_or_else(|error| error.into_inner());
+        let mut free = lock(&self.free);
         if deadline <= Instant::now() {
             return Err(SourceError::Http("source resolution deadline exceeded".into()));
         }
@@ -174,7 +168,7 @@ impl Gate {
                 ));
             }
             let (held, timeout) =
-                self.ready.wait_timeout(free, left).unwrap_or_else(|error| error.into_inner());
+                self.ready.wait_timeout(free, left).unwrap_or_else(|e| e.into_inner());
             free = held;
             if timeout.timed_out() && *free == 0 {
                 return Err(SourceError::Http(
@@ -187,45 +181,32 @@ impl Gate {
     }
 }
 
-/// A load that holds one of the gate's permits until it is dropped.
 struct Permit<'a> {
     gate: &'a Gate,
 }
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        {
-            let mut free = self.gate.free.lock().unwrap_or_else(|error| error.into_inner());
-            *free += 1;
-        }
+        *lock(&self.gate.free) += 1;
         self.gate.ready.notify_one();
     }
 }
+
 /// Resolves identifiers into tracks, and tracks into streams.
 pub struct Service {
     config: Config,
     agent: ureq::Agent,
-    /// What YouTube is reached with: the proxy when one is configured. A proxy
-    /// that cannot be used fails YouTube loads rather than going direct.
     youtube_agent: Result<ureq::Agent, SourceError>,
     cache: Mutex<Cache>,
-    /// One lock per identifier being resolved, so a burst of clients asking for
-    /// the same playlist turns into one conversation with the source and not
-    /// one per client.
     inflight: Mutex<HashMap<String, Arc<Flight>>>,
     catalog_state: catalog::State,
     gate: Gate,
-    hits: std::sync::atomic::AtomicU64,
-    loads: std::sync::atomic::AtomicU64,
+    hits: AtomicU64,
+    loads: AtomicU64,
 }
 
-/// Shared closure reading the node's cached anonymous YouTube `visitorData`.
 pub type VisitorReader = Arc<dyn Fn() -> Option<String> + Send + Sync>;
-
-/// Shared closure publishing a newly harvested YouTube `visitorData`.
 pub type VisitorWriter = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Paired reader and writer closures for sharing YouTube `visitorData`.
 pub type VisitorBridge = (VisitorReader, VisitorWriter);
 
 impl Service {
@@ -237,7 +218,7 @@ impl Service {
             netguard::proxied_agent(config.allow_private_networks, &config.youtube_proxy)
         };
         let gate = Gate::new(config.max_concurrent_loads as usize);
-        Service {
+        Self {
             config,
             agent,
             youtube_agent,
@@ -245,8 +226,8 @@ impl Service {
             inflight: Mutex::new(HashMap::new()),
             catalog_state: catalog::State::default(),
             gate,
-            hits: std::sync::atomic::AtomicU64::new(0),
-            loads: std::sync::atomic::AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            loads: AtomicU64::new(0),
         }
     }
 
@@ -254,49 +235,35 @@ impl Service {
         &self.config
     }
 
-    /// The client every outbound request goes through.
     pub fn agent(&self) -> &ureq::Agent {
         &self.agent
     }
 
-    /// The client configured for YouTube/YouTube Music requests (honouring
-    /// `youtubeProxy`), or `None` when `youtubeProxy` could not be constructed.
     pub fn youtube_agent(&self) -> Option<&ureq::Agent> {
         self.youtube_agent.as_ref().ok()
     }
 
-    /// Returns a shared handle that reads and populates the anonymous YouTube
-    /// `visitorData` cache so sibling subsystems (such as YouTube Music lyrics)
-    /// can reuse the warmed session token without an extra round-trip.
     pub fn youtube_visitor_bridge(&self) -> VisitorBridge {
-        let reader_cache = Arc::clone(&self.catalog_state.youtube_visitor);
-        let writer_cache = Arc::clone(&self.catalog_state.youtube_visitor);
+        let r = Arc::clone(&self.catalog_state.youtube_visitor);
+        let w = Arc::clone(&r);
         (
-            Arc::new(move || reader_cache.peek()),
-            Arc::new(move |fresh: &str| {
-                writer_cache.store_if_empty(fresh, Duration::from_secs(3600))
-            }),
+            Arc::new(move || r.peek()),
+            Arc::new(move |s| w.store_if_empty(s, Duration::from_secs(3600))),
         )
     }
 
-    /// How many loads were answered from the cache.
     pub fn cache_hits(&self) -> u64 {
-        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+        self.hits.load(Ordering::Relaxed)
     }
 
-    /// How many loads went out to a source.
     pub fn load_count(&self) -> u64 {
-        self.loads.load(std::sync::atomic::Ordering::Relaxed)
+        self.loads.load(Ordering::Relaxed)
     }
 
-    /// Resolves an identifier into an owned result. Call `load_shared` when
-    /// the result only needs to be read or serialized, to avoid a deep clone.
     pub fn load(&self, identifier: &str) -> Result<LoadResult, SourceError> {
-        self.load_shared(identifier)
-            .map(|result| Arc::try_unwrap(result).unwrap_or_else(|shared| shared.as_ref().clone()))
+        self.load_shared(identifier).map(Arc::unwrap_or_clone)
     }
 
-    /// Resolves an identifier, sharing cached and concurrently loaded results.
     pub fn load_shared(&self, identifier: &str) -> Result<Arc<LoadResult>, SourceError> {
         let identifier = identifier_text(identifier);
         self.load_with(identifier, || self.resolve(identifier))
@@ -316,15 +283,11 @@ impl Service {
             return Ok(result);
         }
         let flight = {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(flight) = inflight.get(identifier) {
-                let flight = Arc::clone(flight);
+            let mut inflight = lock(&self.inflight);
+            if let Some(flight) = inflight.get(identifier).cloned() {
                 drop(inflight);
                 return flight.wait(deadline);
             }
-            // A leader may have published and removed its flight between our
-            // first cache lookup and locking this map. Recheck atomically with
-            // registration so that gap cannot create a second resolver.
             if let Some(result) = self.cached(identifier) {
                 return Ok(result);
             }
@@ -336,12 +299,10 @@ impl Service {
         let outcome = (|| {
             let _permit = self.gate.enter(deadline)?;
             let _scope = deadline::enter(deadline);
-            self.loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.loads.fetch_add(1, Ordering::Relaxed);
             let result = Arc::new(resolve()?);
-            // Publish to the cache before releasing the flight. Failures and
-            // oversized answers still reach existing waiters through Flight.
             if let Some(bytes) = cache::result_size(&result) {
-                self.cache.lock().unwrap_or_else(|error| error.into_inner()).put(
+                lock(&self.cache).put(
                     identifier,
                     Arc::clone(&result),
                     bytes,
@@ -355,14 +316,13 @@ impl Service {
     }
 
     fn cached(&self, identifier: &str) -> Option<Arc<LoadResult>> {
-        let result = self.cache.lock().unwrap_or_else(|error| error.into_inner()).get(identifier);
+        let result = lock(&self.cache).get(identifier);
         if result.is_some() {
-            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.hits.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
 
-    /// Sends an identifier to the source that owns it.
     fn resolve(&self, identifier: &str) -> Result<LoadResult, SourceError> {
         match source_kind(identifier) {
             "spotify" => {
@@ -375,14 +335,10 @@ impl Service {
             "youtube" => self.load_youtube(identifier),
             "soundcloud" => self.load_soundcloud(identifier),
             "http" => self.load_http(identifier),
-            // An identifier no source recognises is not a failure: the client
-            // asked a question the node has no answer to, which is what empty
-            // means.
             _ => Ok(LoadResult::Empty),
         }
     }
 
-    /// Loads YouTube directly through the native catalogue API.
     fn load_youtube(&self, identifier: &str) -> Result<LoadResult, SourceError> {
         if !self.config.youtube_native {
             return Err(SourceError::Disabled("YouTube is disabled (youtubeNative: false)".into()));
@@ -409,8 +365,6 @@ impl Service {
         if youtube_id(identifier) {
             return Ok(LoadResult::Track(Box::new(catalog.video(identifier)?)));
         }
-        // A shared watch URL often carries its surrounding playlist. A bot
-        // playing that link should enqueue the selected video, not the list.
         if let Some(video) = youtube_video_from_url(identifier) {
             return Ok(LoadResult::Track(Box::new(catalog.video(&video)?)));
         }
@@ -420,7 +374,6 @@ impl Service {
         Err(SourceError::Url(format!("{identifier} names no YouTube video or playlist")))
     }
 
-    /// Loads SoundCloud directly through the native catalogue API.
     fn load_soundcloud(&self, identifier: &str) -> Result<LoadResult, SourceError> {
         if !self.config.soundcloud_native {
             return Err(SourceError::Disabled(
@@ -431,29 +384,17 @@ impl Service {
             .load(identifier)
     }
 
-    /// Loads a plain URL by reading what its own header says about it.
     fn load_http(&self, identifier: &str) -> Result<LoadResult, SourceError> {
-        let (mut body, size) = self.fetch(identifier, &Default::default())?;
+        let (mut body, size, _) = request(&self.agent, identifier, &BTreeMap::new(), None)?;
         let mut head = Vec::with_capacity(probe::FIRST_PROBE);
         let mut chunk = [0u8; 8192];
-        // Only a file with a declared length can be read on for its index: a
-        // live stream has none and never ends, so the first window is all it
-        // gets. A file can keep its index at the end (an M4A written without
-        // "fast start") or give the length of an Ogg only on its last page, and
-        // both are found by reading on, up to MAX_PROBE.
-        // shortcut: a file whose index lies past MAX_PROBE is still not found;
-        // upgrade by asking for its tail with a Range request.
         let sized = size > 0;
-        // The buffer is probed again only once it has doubled, so a long read
-        // does not parse the same leading bytes thousands of times.
-        let mut next_probe = probe::FIRST_PROBE;
-        let mut probed_len = 0usize;
+        let (mut next_probe, mut probed_len) = (probe::FIRST_PROBE, 0usize);
         let mut found = probe::Probe::default();
         while head.len() < probe::MAX_PROBE {
             let cap = (probe::MAX_PROBE - head.len()).min(chunk.len());
-            let read = body
-                .read(&mut chunk[..cap])
-                .map_err(|error| SourceError::Http(error.to_string()))?;
+            let read =
+                body.read(&mut chunk[..cap]).map_err(|e| SourceError::Http(e.to_string()))?;
             let ended = read == 0;
             head.extend_from_slice(&chunk[..read]);
             if !ended && head.len() < next_probe {
@@ -462,14 +403,12 @@ impl Service {
             found = probe::probe(&head, size);
             probed_len = head.len();
             next_probe = head.len().saturating_mul(2).min(probe::MAX_PROBE);
-            if found.audio && found.duration_ms > 0 && !found.title.is_empty() {
+            if (found.audio && found.duration_ms > 0 && !found.title.is_empty()) || ended {
                 break;
             }
-            if ended {
-                break;
-            }
-            let may_have_more = sized && probe::can_gain_from_more(&head, size);
-            if head.len() >= probe::FIRST_PROBE && !may_have_more {
+            if head.len() >= probe::FIRST_PROBE
+                && !(sized && probe::can_gain_from_more(&head, size))
+            {
                 break;
             }
         }
@@ -479,10 +418,9 @@ impl Service {
         if !found.audio {
             return Err(SourceError::NoAudio);
         }
-        let title = if found.title.is_empty() { path_name(identifier) } else { found.title };
         let info = TrackInfo {
             identifier: identifier.to_string(),
-            title,
+            title: if found.title.is_empty() { path_name(identifier) } else { found.title },
             author: if found.artist.is_empty() { "Unknown artist".into() } else { found.artist },
             length: found.duration_ms,
             is_stream: found.duration_ms <= 0,
@@ -493,107 +431,10 @@ impl Service {
             ..Default::default()
         };
         let track = rustlink_protocol::encode_track_owned(info)
-            .map_err(|error| SourceError::Url(error.to_string()))?;
+            .map_err(|e| SourceError::Url(e.to_string()))?;
         Ok(LoadResult::Track(Box::new(track)))
     }
-}
 
-/// An empty search is a question with no answer, which the protocol calls empty
-/// rather than a search that found nothing.
-fn finish_search(tracks: Vec<Track>) -> LoadResult {
-    if tracks.is_empty() {
-        LoadResult::Empty
-    } else {
-        LoadResult::Search(tracks)
-    }
-}
-
-/// The last part of a URL's path, which is the closest thing a bare file has to
-/// a name.
-fn path_name(identifier: &str) -> String {
-    let name = http_url(identifier)
-        .and_then(|url| url.path().rsplit('/').next().map(str::trim).map(str::to_owned))
-        .unwrap_or_else(|| {
-            let path = identifier.split(['?', '#']).next().unwrap_or(identifier);
-            path.rsplit('/').next().unwrap_or(path).trim().to_owned()
-        });
-    if name.is_empty() {
-        "Unknown title".to_string()
-    } else {
-        name
-    }
-}
-
-/// Reads the video id out of a YouTube URL of any of the shapes they come in.
-fn youtube_video_from_url(identifier: &str) -> Option<String> {
-    youtube_video_from_url_inner(identifier, true)
-}
-
-fn youtube_video_from_url_inner(identifier: &str, allow_attribution: bool) -> Option<String> {
-    let url = http_url(identifier)?;
-    let host = url.host_str()?;
-    let mut parts = url.path_segments()?;
-    if host_matches(host, "youtu.be") {
-        let id = parts.next()?;
-        return (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned());
-    }
-    if host_matches(host, "youtube-nocookie.com") {
-        return match parts.next() {
-            Some("embed") | Some("v") | Some("e") => {
-                let id = parts.next()?;
-                (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned())
-            }
-            _ => None,
-        };
-    }
-    if !host_matches(host, "youtube.com") {
-        return None;
-    }
-    match parts.next() {
-        Some("watch") if parts.all(str::is_empty) => {
-            let (_, id) = url.query_pairs().find(|(key, _)| key == "v")?;
-            youtube_id(&id).then(|| id.into_owned())
-        }
-        Some("attribution_link") if allow_attribution && parts.all(str::is_empty) => {
-            let (_, inner) = url.query_pairs().find(|(key, _)| key == "u")?;
-            if !inner.starts_with('/') || inner.starts_with("//") {
-                return None;
-            }
-            let resolved = format!("https://www.youtube.com{inner}");
-            youtube_video_from_url_inner(&resolved, false)
-        }
-        Some("shorts") | Some("embed") | Some("live") | Some("v") | Some("e") => {
-            let id = parts.next()?;
-            (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned())
-        }
-        _ => None,
-    }
-}
-
-/// Reads the playlist id out of a YouTube URL or a `youtube:playlist:` prefix.
-fn youtube_playlist_id(identifier: &str) -> Option<String> {
-    let identifier = identifier_text(identifier);
-    let valid = |id: &str| !id.is_empty() && is_id_chars(id);
-    if let Some(rest) = identifier.strip_prefix("youtube:playlist:") {
-        let id = rest.trim();
-        return valid(id).then(|| id.to_owned());
-    }
-    let url = http_url(identifier)?;
-    if !host_matches(url.host_str()?, "youtube.com") {
-        return None;
-    }
-    match url.path().trim_end_matches('/') {
-        "/playlist" => {}
-        // A watch link naming only a list is valid. A broken video id must not
-        // unexpectedly enqueue the entire list that happened to accompany it.
-        "/watch" if !url.query_pairs().any(|(key, _)| key == "v") => {}
-        _ => return None,
-    }
-    let (_, id) = url.query_pairs().find(|(key, _)| key == "list")?;
-    valid(&id).then(|| id.into_owned())
-}
-
-impl Service {
     fn with_budget<T>(
         &self,
         work: impl FnOnce() -> Result<T, SourceError>,
@@ -604,12 +445,6 @@ impl Service {
         work()
     }
 
-    /// Opens the audio of a track that has already been loaded.
-    ///
-    /// A direct stream URL is never stored in a track encoding, because the ones
-    /// the sources hand out expire within hours and a queue may hold a track for
-    /// days. Opening is therefore where a URL is resolved, and a track loaded a
-    /// week ago plays because of it.
     pub fn open(&self, track: &Track) -> Result<Box<dyn Read + Send>, SourceError> {
         match track.metadata.source_name.as_str() {
             "http" => {
@@ -621,17 +456,9 @@ impl Service {
                 if source_kind(uri) != "http" {
                     return Err(SourceError::Url("track URI does not match its source".into()));
                 }
-                self.with_budget(|| {
-                    let range = MediaRange::for_url(uri);
-                    let body = MediaBody::open(self.agent.clone(), uri, Default::default(), range)?;
-                    Ok(PrefetchReader::boxed(body))
-                })
+                self.with_budget(|| open_stream(&self.agent, uri, BTreeMap::new()))
             }
             "spotify" | "deezer" => {
-                // A catalogue supplies metadata only; the audio is mirrored from
-                // a YouTube search for the same name. Hold the deadline scope
-                // without occupying an outer Gate permit while `load_shared` and
-                // `open(best)` acquire their own single permits.
                 let name =
                     if track.metadata.source_name == "deezer" { "Deezer" } else { "Spotify" };
                 if track.metadata.title.trim().is_empty() {
@@ -657,10 +484,13 @@ impl Service {
                 self.open(best)
             }
             "youtube" | "soundcloud" => {
-                if let Some(uri) = track.metadata.uri.as_deref() {
-                    if source_kind(uri) != track.metadata.source_name {
-                        return Err(SourceError::Url("track URI does not match its source".into()));
-                    }
+                if track
+                    .metadata
+                    .uri
+                    .as_deref()
+                    .is_some_and(|u| source_kind(u) != track.metadata.source_name)
+                {
+                    return Err(SourceError::Url("track URI does not match its source".into()));
                 }
                 self.with_budget(|| self.open_media(track))
             }
@@ -668,12 +498,8 @@ impl Service {
         }
     }
 
-    /// Resolves a media URL and opens it, resolving again when the source
-    /// rejects the URL it handed out.
-    ///
-    /// Resolution runs again only after a rejected URL, using the same deadline.
     fn open_media(&self, track: &Track) -> Result<Box<dyn Read + Send>, SourceError> {
-        let mut last: Option<SourceError> = None;
+        let mut last = None;
         for attempt in 0..MEDIA_ATTEMPTS {
             deadline::timeout(Duration::from_secs(20))?;
             if attempt > 0 {
@@ -687,40 +513,29 @@ impl Service {
                     let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
                     innertube::Catalog::with_state(agent, &self.config, &self.catalog_state)
                         .with_media_url(&track.metadata.identifier, |url, headers| {
-                            let range = MediaRange::for_url(&url);
-                            let body = MediaBody::open(agent.clone(), url, headers, range)?;
-                            Ok(PrefetchReader::boxed(body))
+                            open_stream(agent, url, headers)
                         })
                 }
                 "soundcloud" if self.config.soundcloud_native => {
                     catalog::SoundCloud::with_state(&self.agent, &self.config, &self.catalog_state)
                         .media_url(&track.metadata.identifier)
-                        .and_then(|(url, headers)| {
-                            let range = MediaRange::for_url(&url);
-                            let body = MediaBody::open(self.agent.clone(), url, headers, range)?;
-                            Ok(PrefetchReader::boxed(body))
-                        })
+                        .and_then(|(url, headers)| open_stream(&self.agent, url, headers))
                 }
                 source => Err(SourceError::Disabled(format!("{source} native source is disabled"))),
             };
             match opened {
                 Ok(body) => return Ok(body),
-                Err(error) => {
-                    if !error.retryable() {
-                        return Err(error);
-                    }
-                    last = Some(error);
-                }
+                Err(e) if e.retryable() => last = Some(e),
+                Err(e) => return Err(e),
             }
         }
         Err(last.unwrap_or_else(|| SourceError::Http("the media URL could not be opened".into())))
     }
 
-    /// Opens a playback body wrapped so that it can be read out of order.
     pub fn open_seekable(
         &self,
         url: &str,
-        headers: &std::collections::BTreeMap<String, String>,
+        headers: &BTreeMap<String, String>,
     ) -> Result<Box<dyn Read + Send>, SourceError> {
         Ok(Box::new(self.media_body(url, headers, MediaRange::for_url(url))?))
     }
@@ -728,49 +543,103 @@ impl Service {
     fn media_body(
         &self,
         url: &str,
-        headers: &std::collections::BTreeMap<String, String>,
+        headers: &BTreeMap<String, String>,
         range: MediaRange,
     ) -> Result<MediaBody, SourceError> {
         MediaBody::open(self.agent.clone(), url, headers.clone(), range)
     }
+}
 
-    /// Fetches a URL for reading, without asking for a range.
-    fn fetch(
-        &self,
-        url: &str,
-        headers: &std::collections::BTreeMap<String, String>,
-    ) -> Result<(Box<dyn Read + Send>, i64), SourceError> {
-        let (body, size, _) = request(&self.agent, url, headers, None)?;
-        Ok((body, size))
+fn open_stream(
+    agent: &ureq::Agent,
+    url: impl Into<String>,
+    headers: BTreeMap<String, String>,
+) -> Result<Box<dyn Read + Send>, SourceError> {
+    let url = url.into();
+    let range = MediaRange::for_url(&url);
+    Ok(PrefetchReader::boxed(MediaBody::open(agent.clone(), url, headers, range)?))
+}
+
+fn path_name(identifier: &str) -> String {
+    let name = http_url(identifier)
+        .and_then(|url| url.path().rsplit('/').next().map(|s| s.trim().to_owned()))
+        .unwrap_or_else(|| {
+            let path = identifier.split(['?', '#']).next().unwrap_or(identifier);
+            path.rsplit('/').next().unwrap_or(path).trim().to_owned()
+        });
+    if name.is_empty() {
+        "Unknown title".into()
+    } else {
+        name
     }
 }
 
-/// How often a rejected media URL is replaced by a fresh one.
-const MEDIA_ATTEMPTS: usize = 3;
+fn youtube_video_from_url(identifier: &str) -> Option<String> {
+    youtube_video_from_url_inner(identifier, true)
+}
 
-/// The pause before resolving a media URL again.
-const MEDIA_RETRY_DELAY: Duration = Duration::from_millis(200);
+fn youtube_video_from_url_inner(identifier: &str, allow_attribution: bool) -> Option<String> {
+    let url = http_url(identifier)?;
+    let host = url.host_str()?;
+    let mut parts = url.path_segments()?;
+    let tail_id = |parts: &mut std::str::Split<'_, char>| {
+        let id = parts.next()?;
+        (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned())
+    };
+    if host_matches(host, "youtu.be") {
+        return tail_id(&mut parts);
+    }
+    if host_matches(host, "youtube-nocookie.com") {
+        return matches!(parts.next(), Some("embed" | "v" | "e")).then(|| tail_id(&mut parts))?;
+    }
+    if !host_matches(host, "youtube.com") {
+        return None;
+    }
+    match parts.next() {
+        Some("watch") if parts.all(str::is_empty) => {
+            let (_, id) = url.query_pairs().find(|(k, _)| k == "v")?;
+            youtube_id(&id).then(|| id.into_owned())
+        }
+        Some("attribution_link") if allow_attribution && parts.all(str::is_empty) => {
+            let (_, inner) = url.query_pairs().find(|(k, _)| k == "u")?;
+            (inner.starts_with('/') && !inner.starts_with("//")).then(|| {
+                youtube_video_from_url_inner(&format!("https://www.youtube.com{inner}"), false)
+            })?
+        }
+        Some("shorts" | "embed" | "live" | "v" | "e") => tail_id(&mut parts),
+        _ => None,
+    }
+}
+
+fn youtube_playlist_id(identifier: &str) -> Option<String> {
+    let identifier = identifier_text(identifier);
+    let valid = |id: &str| !id.is_empty() && is_id_chars(id);
+    if let Some(rest) = identifier.strip_prefix("youtube:playlist:") {
+        let id = rest.trim();
+        return valid(id).then(|| id.to_owned());
+    }
+    let url = http_url(identifier)?;
+    if !host_matches(url.host_str()?, "youtube.com") {
+        return None;
+    }
+    match url.path().trim_end_matches('/') {
+        "/playlist" => {}
+        "/watch" if !url.query_pairs().any(|(k, _)| k == "v") => {}
+        _ => return None,
+    }
+    let (_, id) = url.query_pairs().find(|(k, _)| k == "list")?;
+    valid(&id).then(|| id.into_owned())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
 
-    fn await_waiters(service: &Service, key: &str, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let joined = service
-                .inflight
-                .lock()
-                .unwrap()
-                .get(key)
-                .is_some_and(|flight| Arc::strong_count(flight) >= count + 2);
-            if joined {
-                return;
-            }
-            assert!(Instant::now() < deadline, "waiters did not join the active resolution");
-            std::thread::yield_now();
-        }
+    fn local_service(base: String) -> Service {
+        let mut cfg = Config::default();
+        cfg.youtube_endpoint = base;
+        cfg.allow_private_networks = true;
+        Service::new(cfg)
     }
 
     fn concurrent_result(outcome: Result<LoadResult, SourceError>) -> Service {
@@ -794,15 +663,23 @@ mod tests {
                     })
                 })
                 .collect();
-            await_waiters(service, "same query", waiters.len());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !service
+                .inflight
+                .lock()
+                .unwrap()
+                .get("same query")
+                .is_some_and(|f| Arc::strong_count(f) >= waiters.len() + 2)
+            {
+                assert!(Instant::now() < deadline, "waiters did not join");
+                std::thread::yield_now();
+            }
             release_tx.send(()).unwrap();
             let expected = leader.join().unwrap();
             for waiter in waiters {
                 match (&expected, waiter.join().unwrap()) {
-                    (Ok(expected), Ok(result)) => assert!(Arc::ptr_eq(expected, &result)),
-                    (Err(expected), Err(error)) => {
-                        assert_eq!(expected.to_string(), error.to_string())
-                    }
+                    (Ok(exp), Ok(res)) => assert!(Arc::ptr_eq(exp, &res)),
+                    (Err(exp), Err(err)) => assert_eq!(exp.to_string(), err.to_string()),
                     _ => panic!("waiters saw different outcomes"),
                 }
             }
@@ -844,8 +721,7 @@ mod tests {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = service.load_with("panic", || panic!("resolver interrupted"));
         }));
-        assert!(panic.is_err());
-        assert!(service.inflight.lock().unwrap().is_empty());
+        assert!(panic.is_err() && service.inflight.lock().unwrap().is_empty());
         assert!(service.load_with("panic", || Ok(LoadResult::Empty)).is_ok());
     }
 
@@ -877,11 +753,15 @@ mod tests {
 
     #[test]
     fn a_search_prefix_names_the_source_it_belongs_to() {
-        assert_eq!(source_kind("ytsearch:a song"), "youtube");
-        assert_eq!(source_kind("ytmsearch:a song"), "youtube");
-        assert_eq!(source_kind("scsearch:a song"), "soundcloud");
-        assert_eq!(source_kind("spsearch:a song"), "spotify");
-        assert_eq!(source_kind("dzsearch:a song"), "deezer");
+        for (q, kind) in [
+            ("ytsearch:a song", "youtube"),
+            ("ytmsearch:a song", "youtube"),
+            ("scsearch:a song", "soundcloud"),
+            ("spsearch:a song", "spotify"),
+            ("dzsearch:a song", "deezer"),
+        ] {
+            assert_eq!(source_kind(q), kind);
+        }
     }
 
     #[test]
@@ -892,12 +772,16 @@ mod tests {
 
     #[test]
     fn a_link_is_named_by_its_host() {
-        assert_eq!(source_kind("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "youtube");
-        assert_eq!(source_kind("https://youtu.be/dQw4w9WgXcQ"), "youtube");
-        assert_eq!(source_kind("https://soundcloud.com/someone/a-song"), "soundcloud");
-        assert_eq!(source_kind("https://open.spotify.com/track/abc"), "spotify");
-        assert_eq!(source_kind("https://www.deezer.com/track/1"), "deezer");
-        assert_eq!(source_kind("https://example.com/a.mp3"), "http");
+        for (url, kind) in [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"),
+            ("https://youtu.be/dQw4w9WgXcQ", "youtube"),
+            ("https://soundcloud.com/someone/a-song", "soundcloud"),
+            ("https://open.spotify.com/track/abc", "spotify"),
+            ("https://www.deezer.com/track/1", "deezer"),
+            ("https://example.com/a.mp3", "http"),
+        ] {
+            assert_eq!(source_kind(url), kind);
+        }
     }
 
     #[test]
@@ -925,7 +809,6 @@ mod tests {
             assert_eq!(source_kind(url), "youtube", "{url}");
             assert_eq!(youtube_video_from_url(url).as_deref(), Some("dQw4w9WgXcQ"), "{url}");
         }
-        // For a short/live/embed URL the path names the selected video.
         assert_eq!(
             youtube_video_from_url("https://youtube.com/shorts/dQw4w9WgXcQ?v=abcdefghijk")
                 .as_deref(),
@@ -951,8 +834,14 @@ mod tests {
             assert!(youtube_playlist_id(url).is_none(), "{url}");
             assert_ne!(source_kind(url), "youtube", "{url}");
         }
-        assert!(youtube_video_from_url("https://youtube.com/shorts/dQw4w9WgXcQ/extra").is_none());
-        assert!(youtube_video_from_url("https://youtube.com/watch?v=dQw4w9WgXcQ%23extra").is_none());
+        for bad in [
+            "https://youtube.com/shorts/dQw4w9WgXcQ/extra",
+            "https://youtube.com/watch?v=dQw4w9WgXcQ%23extra",
+            "https://www.youtube.com/attribution_link?u=%2F%2Fyoutu.be%2FdQw4w9WgXcQ",
+            "https://www.youtube.com/attribution_link?u=%2Fattribution_link%3Fu%3D%252Fwatch%253Fv%253DdQw4w9WgXcQ",
+        ] {
+            assert!(youtube_video_from_url(bad).is_none(), "{bad}");
+        }
         assert_eq!(
             youtube_video_from_url(
                 "https://www.youtube.com/attribution_link?u=%2Fwatch%3Fv%3DdQw4w9WgXcQ"
@@ -960,14 +849,6 @@ mod tests {
             .as_deref(),
             Some("dQw4w9WgXcQ")
         );
-        assert!(youtube_video_from_url(
-            "https://www.youtube.com/attribution_link?u=%2F%2Fyoutu.be%2FdQw4w9WgXcQ"
-        )
-        .is_none());
-        assert!(youtube_video_from_url(
-            "https://www.youtube.com/attribution_link?u=%2Fattribution_link%3Fu%3D%252Fwatch%253Fv%253DdQw4w9WgXcQ"
-        )
-        .is_none());
     }
 
     #[test]
@@ -1008,19 +889,14 @@ mod tests {
                 "videoId":"dQw4w9WgXcQ","title":"Fixture song","author":"Fixture artist","lengthSeconds":"120"
             }})
         });
-        let mut cfg = Config::default();
-        cfg.youtube_endpoint = base;
-        cfg.allow_private_networks = true;
-        let service = Service::new(cfg);
+        let service = local_service(base);
         for url in urls {
-            let result = service.load(url).unwrap();
-            let LoadResult::Track(track) = result else {
+            let LoadResult::Track(track) = service.load(url).unwrap() else {
                 panic!("single video became a playlist: {url}")
             };
             assert_eq!(track.metadata.identifier, "dQw4w9WgXcQ");
-            assert_eq!(track.metadata.position, 0, "URL timestamps are not implicit seek requests");
+            assert_eq!(track.metadata.position, 0);
         }
-        // The preview-suppressing wrapper must share the exact same cache key.
         assert!(service.load(&format!("<{}>", urls[0])).is_ok());
         assert_eq!(service.cache_hits(), 1);
         server.join().unwrap();
@@ -1035,10 +911,7 @@ mod tests {
                 "playlistVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Fixture song"},"lengthText":{"simpleText":"2:00"}}
             }})
         });
-        let mut cfg = Config::default();
-        cfg.youtube_endpoint = base;
-        cfg.allow_private_networks = true;
-        let service = Service::new(cfg);
+        let service = local_service(base);
         for url in [
             "https://www.youtube.com/playlist?list=PL123&si=share#fragment",
             "https://music.youtube.com/watch?list=PL123#fragment",
@@ -1060,12 +933,11 @@ mod tests {
     fn media_request_sends_only_one_provider_user_agent() {
         let (base, server) = test_http::serve(1, |_, headers, _| {
             let lower = headers.to_ascii_lowercase();
-            let agents: Vec<_> =
-                lower.lines().filter(|line| line.starts_with("user-agent:")).collect();
+            let agents: Vec<_> = lower.lines().filter(|l| l.starts_with("user-agent:")).collect();
             assert_eq!(agents, ["user-agent: provider-client/1.0"]);
             serde_json::Value::Null
         });
-        let headers = std::collections::BTreeMap::from([
+        let headers = BTreeMap::from([
             ("User-Agent".into(), "provider-client/1.0".into()),
             ("user-agent".into(), "duplicate-client/2.0".into()),
         ]);
@@ -1112,10 +984,7 @@ mod tests {
                 }
             }
         });
-        let mut cfg = Config::default();
-        cfg.youtube_endpoint = base;
-        cfg.allow_private_networks = true;
-        let service = Service::new(cfg);
+        let service = local_service(base);
         let track = rustlink_protocol::encode_track(&TrackInfo {
             identifier: "4cOdK2wGLETKBW3PvgPWqT".into(),
             title: "A Song".into(),
@@ -1134,44 +1003,29 @@ mod tests {
 
     #[test]
     fn a_pasted_video_link_opens_the_next_client_when_the_first_cdn_returns_403() {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let cdn = format!("http://{}", listener.local_addr().unwrap());
-        let media_server = std::thread::spawn(move || {
-            for (path, expected_agent, response) in [
-                ("/blocked", "applewebkit/605.1.15", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                ("/allowed", "com.google.ios.youtubeproducer/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
-            ] {
-                let until = Instant::now() + Duration::from_secs(5);
-                let (mut socket, _) = loop {
-                    match listener.accept() {
-                        Ok(connection) => break connection,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < until, "next native client never opened its media");
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("accept: {error}"),
-                    }
-                };
-                socket.set_nonblocking(false).unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0; 4096];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let read = socket.read(&mut buffer).unwrap();
-                    assert!(read > 0 && request.len() < 65_536);
-                    request.extend_from_slice(&buffer[..read]);
-                }
-                let request = std::str::from_utf8(&request).unwrap();
-                assert!(request.starts_with(&format!("GET {path} ")));
-                let lower = request.to_ascii_lowercase();
-                let agents: Vec<_> = lower.lines().filter(|line| line.starts_with("user-agent:")).collect();
-                assert_eq!(agents.len(), 1);
-                assert!(agents[0].contains(expected_agent), "{}", agents[0]);
-                assert!(lower.contains("\r\naccept-encoding: identity\r\n"));
-                socket.write_all(response.as_bytes()).unwrap();
-            }
+        let mut step = 0;
+        let (cdn, media_server) = test_http::serve_raw(2, move |_, request, _| {
+            let (path, expected_agent, resp) = if step == 0 {
+                (
+                    "/blocked",
+                    "applewebkit/605.1.15",
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+            } else {
+                (
+                    "/allowed",
+                    "com.google.ios.youtubeproducer/",
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc",
+                )
+            };
+            step += 1;
+            assert!(request.starts_with(&format!("GET {path} ")));
+            let lower = request.to_ascii_lowercase();
+            let agents: Vec<_> = lower.lines().filter(|l| l.starts_with("user-agent:")).collect();
+            assert_eq!(agents.len(), 1);
+            assert!(agents[0].contains(expected_agent), "{}", agents[0]);
+            assert!(lower.contains("\r\naccept-encoding: identity\r\n"));
+            resp.as_bytes().to_vec()
         });
         let mut call = 0;
         let (base, api_server) = test_http::serve(3, move |_, headers, body| {
@@ -1193,19 +1047,15 @@ mod tests {
                 {"mimeType":"audio/webm; codecs=\"opus\"","bitrate":160000,"url":format!("{cdn}{path}")}
             ]}})
         });
-        let mut cfg = Config::default();
-        cfg.youtube_endpoint = base;
-        cfg.allow_private_networks = true;
-        let service = Service::new(cfg);
+        let service = local_service(base);
         let LoadResult::Track(track) = service
             .load("<https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&si=paste>")
             .unwrap()
         else {
             panic!("pasted single-video link did not resolve to a track");
         };
-        let mut audio = service.open(&track).unwrap();
         let mut bytes = Vec::new();
-        audio.read_to_end(&mut bytes).unwrap();
+        service.open(&track).unwrap().read_to_end(&mut bytes).unwrap();
         api_server.join().unwrap();
         media_server.join().unwrap();
         assert_eq!(bytes, b"abc");
@@ -1213,23 +1063,14 @@ mod tests {
 
     #[test]
     fn a_video_id_is_read_from_every_shape_of_youtube_link() {
-        assert_eq!(
-            youtube_video_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").as_deref(),
-            Some("dQw4w9WgXcQ")
-        );
-        assert_eq!(
-            youtube_video_from_url("https://youtu.be/dQw4w9WgXcQ").as_deref(),
-            Some("dQw4w9WgXcQ")
-        );
-        assert_eq!(
-            youtube_video_from_url("https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ")
-                .as_deref(),
-            Some("dQw4w9WgXcQ")
-        );
-        assert_eq!(
-            youtube_video_from_url("https://www.youtube.com/shorts/dQw4w9WgXcQ").as_deref(),
-            Some("dQw4w9WgXcQ")
-        );
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(youtube_video_from_url(url).as_deref(), Some("dQw4w9WgXcQ"));
+        }
         assert!(youtube_video_from_url("https://example.com/watch?v=dQw4w9WgXcQ").is_none());
     }
 
@@ -1258,20 +1099,16 @@ mod tests {
     #[test]
     fn an_identifier_longer_than_the_limit_is_refused() {
         let service = Service::new(Config::default());
-        let long = "a".repeat(MAX_IDENTIFIER + 1);
-        assert!(service.load(&long).is_err());
+        assert!(service.load(&"a".repeat(MAX_IDENTIFIER + 1)).is_err());
         assert!(service.load("   ").is_err());
     }
 
     #[test]
     fn an_answer_is_reused_rather_than_resolved_twice() {
         let service = Service::new(Config::default());
-        // An empty answer is cached like any other, which is what keeps a client
-        // asking the same unanswerable question from reaching a source.
         assert!(matches!(service.load("just some words").unwrap(), LoadResult::Empty));
         assert!(matches!(service.load("just some words").unwrap(), LoadResult::Empty));
-        assert_eq!(service.load_count(), 1);
-        assert_eq!(service.cache_hits(), 1);
+        assert_eq!((service.load_count(), service.cache_hits()), (1, 1));
     }
 
     #[test]
@@ -1279,7 +1116,6 @@ mod tests {
         let gate = Gate::new(1);
         let deadline = Instant::now() + Duration::from_secs(5);
         let first = gate.enter(deadline).unwrap();
-        // A second load cannot start while the first holds the only permit.
         assert!(gate.enter(Instant::now()).is_err());
         drop(first);
         assert!(gate.enter(deadline).is_ok());

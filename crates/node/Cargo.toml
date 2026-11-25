@@ -27,7 +27,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 ureq.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# The glibc allocator the node is deployed on is tuned at startup, which is a
-# Linux-and-glibc-only thing; see src/linux.rs.
+# Startup glibc malloc arena tuning on Linux; see src/linux.rs.
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"

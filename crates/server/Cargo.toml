@@ -23,7 +23,7 @@ socket2 = "0.6"
 subtle = "2"
 sysinfo = "0.37"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 ureq.workspace = true
 url = "2"
 

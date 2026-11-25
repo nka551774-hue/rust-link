@@ -1,17 +1,17 @@
-//! Request throttling.
-//!
-//! Each route gets its own bucket, so a client that hammers one route does not
-//! spend the allowance of another. A bucket is a token bucket: tokens arrive at
-//! a fixed rate up to a ceiling, one is spent per request, and a request that
-//! finds none is refused rather than queued. Queueing a burst would turn abuse
-//! into latency, which hides it instead of reporting it.
+//! Bounded per-route and per-key token-bucket rate limiters.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// A token bucket, with the rate in tokens per second and the ceiling in
-/// tokens.
+fn sanitize_rate(rate: f64) -> f64 {
+    if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        0.0
+    }
+}
+
 pub struct Limiter {
     rate: f64,
     burst: f64,
@@ -24,10 +24,6 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn new(burst: f64, now: Instant) -> Self {
-        Self { tokens: burst, at: now }
-    }
-
     fn allow(&mut self, rate: f64, burst: f64, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
         self.at = now;
@@ -41,37 +37,30 @@ impl Bucket {
     }
 
     fn idle(&self, rate: f64, burst: f64, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
-        self.tokens + elapsed * rate >= burst
+        self.tokens + now.saturating_duration_since(self.at).as_secs_f64() * rate >= burst
     }
 }
 
 impl Limiter {
-    /// Builds a bucket that starts full, so a client that has been quiet is not
-    /// made to wait before its first request.
     pub fn new(rate: f64, burst: usize) -> Limiter {
         let burst = burst.max(1) as f64;
         Limiter {
-            rate: if rate.is_finite() && rate > 0.0 { rate } else { 0.0 },
+            rate: sanitize_rate(rate),
             burst,
-            inner: Mutex::new(Bucket::new(burst, Instant::now())),
+            inner: Mutex::new(Bucket { tokens: burst, at: Instant::now() }),
         }
     }
 
-    /// Spends one token and reports whether there was one.
     pub fn allow(&self) -> bool {
-        let mut bucket = self.inner.lock().unwrap();
-        bucket.allow(self.rate, self.burst, Instant::now())
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).allow(
+            self.rate,
+            self.burst,
+            Instant::now(),
+        )
     }
 }
 
-/// One token bucket per key, such as a session or a remote address, so a client
-/// can only spend its own allowance.
-///
-/// The number of keys is bounded, because the keys can come from someone who
-/// pays nothing to invent them: at the bound the buckets that have refilled are
-/// forgotten, and when none can be, the rest of the keys share one bucket
-/// instead of growing the table.
+/// Bounded per-key token buckets with idle eviction and shared overflow fallback.
 pub struct Keyed {
     rate: f64,
     burst: f64,
@@ -82,30 +71,25 @@ pub struct Keyed {
 
 struct Table {
     buckets: HashMap<String, Bucket>,
-    /// When refilled buckets were last forgotten, so a table that stays full
-    /// of busy keys is not swept on every request.
     swept: Option<Instant>,
 }
 
 impl Keyed {
     pub fn new(rate: f64, burst: usize, max_keys: usize) -> Keyed {
-        let sanitized_rate = if rate.is_finite() && rate > 0.0 { rate } else { 0.0 };
-        let sanitized_burst = burst.max(1) as f64;
+        let sanitized_rate = sanitize_rate(rate);
         Keyed {
             rate: sanitized_rate,
-            burst: sanitized_burst,
+            burst: burst.max(1) as f64,
             max_keys: max_keys.max(1),
             table: Mutex::new(Table { buckets: HashMap::new(), swept: None }),
             overflow: Limiter::new(sanitized_rate, burst),
         }
     }
 
-    /// Spends a token from `key`'s bucket, creating it full on first use.
     pub fn allow(&self, key: &str) -> bool {
-        let mut table = self.table.lock().unwrap();
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let rate = self.rate;
-        let burst = self.burst;
+        let (rate, burst) = (self.rate, self.burst);
         if let Some(bucket) = table.buckets.get_mut(key) {
             return bucket.allow(rate, burst, now);
         }
@@ -121,8 +105,6 @@ impl Keyed {
             drop(table);
             return self.overflow.allow();
         }
-        // Burst is clamped to >= 1.0 in `new`, so a brand-new bucket always
-        // starts full and immediately spends one token.
         table.buckets.insert(key.to_owned(), Bucket { tokens: burst - 1.0, at: now });
         true
     }
@@ -141,25 +123,21 @@ mod tests {
     #[test]
     fn each_key_spends_only_its_own_bucket() {
         let keyed = Keyed::new(0.0, 2, 10);
-        assert!(keyed.allow("a") && keyed.allow("a"));
-        assert!(!keyed.allow("a"), "a is spent");
-        assert!(keyed.allow("b") && keyed.allow("b"), "b has its own");
+        assert!(keyed.allow("a") && keyed.allow("a") && !keyed.allow("a"));
+        assert!(keyed.allow("b") && keyed.allow("b"));
         assert_eq!(keyed.keys(), 2);
     }
 
     #[test]
     fn inventing_keys_cannot_grow_the_table_or_buy_more_requests() {
         let keyed = Keyed::new(0.0, 1, 3);
-        for key in ["a", "b", "c"] {
+        for key in ["a", "b", "c", "d"] {
             assert!(keyed.allow(key));
         }
-        // The table is full of spent buckets, so new keys share one overflow
-        // bucket: the first of them passes, the rest are refused.
-        assert!(keyed.allow("d"));
         for key in ["e", "f", "g", "h"] {
-            assert!(!keyed.allow(key), "{key} must not get a bucket of its own");
+            assert!(!keyed.allow(key));
         }
-        assert_eq!(keyed.keys(), 3, "the table never passes its bound");
+        assert_eq!(keyed.keys(), 3);
     }
 
     #[test]
@@ -167,43 +145,26 @@ mod tests {
         let keyed = Keyed::new(1000.0, 1, 2);
         assert!(keyed.allow("a") && keyed.allow("b"));
         std::thread::sleep(Duration::from_millis(20));
-        // Both buckets have refilled, so they are swept even within the first second of uptime.
         assert!(keyed.allow("c"));
         assert_eq!(keyed.keys(), 1);
     }
 
     #[test]
-    fn a_bucket_starts_full_and_then_refuses() {
+    fn limiter_handles_burst_refill_zero_rate_and_zero_burst() {
         let limiter = Limiter::new(1.0, 3);
-        for _ in 0..3 {
-            assert!(limiter.allow());
-        }
-        assert!(!limiter.allow());
-    }
+        assert!(limiter.allow() && limiter.allow() && limiter.allow() && !limiter.allow());
 
-    #[test]
-    fn tokens_come_back_over_time() {
-        let limiter = Limiter::new(20.0, 1);
-        assert!(limiter.allow());
-        assert!(!limiter.allow());
+        let refilling = Limiter::new(20.0, 1);
+        assert!(refilling.allow() && !refilling.allow());
         std::thread::sleep(Duration::from_millis(120));
-        assert!(limiter.allow());
-    }
+        assert!(refilling.allow());
 
-    #[test]
-    fn a_bucket_with_no_rate_never_refills() {
-        let limiter = Limiter::new(0.0, 2);
-        assert!(limiter.allow());
-        assert!(limiter.allow());
-        assert!(!limiter.allow());
+        let fixed = Limiter::new(0.0, 2);
+        assert!(fixed.allow() && fixed.allow() && !fixed.allow());
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!limiter.allow());
-    }
+        assert!(!fixed.allow());
 
-    #[test]
-    fn a_burst_of_zero_still_lets_one_through() {
-        let limiter = Limiter::new(1.0, 0);
-        assert!(limiter.allow());
-        assert!(!limiter.allow());
+        let clamped = Limiter::new(1.0, 0);
+        assert!(clamped.allow() && !clamped.allow());
     }
 }

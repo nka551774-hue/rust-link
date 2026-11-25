@@ -1,4 +1,4 @@
-//! A bounded, typed LRU. Hits only clone an Arc and unlink/relink two indices.
+//! Bounded typed O(1) index-slab LRU cache.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ struct Entry {
     data: Arc<LoadResult>,
     expires: Instant,
     bytes: usize,
-    previous: Option<usize>,
+    prev: Option<usize>,
     next: Option<usize>,
 }
 
@@ -30,7 +30,7 @@ pub(super) struct Cache {
 impl Cache {
     pub(super) fn get(&mut self, key: &str) -> Option<Arc<LoadResult>> {
         let index = *self.entries.get(key)?;
-        let entry = self.slots[index].as_ref().expect("indexed entry");
+        let entry = self.slots[index].as_ref()?;
         if entry.expires <= Instant::now() {
             self.remove(index);
             return None;
@@ -51,64 +51,54 @@ impl Cache {
         ttl: Duration,
         limit: usize,
     ) {
-        let reused_key = self.entries.remove(key).map(|index| self.take_slot(index).key);
+        let reused = self.entries.remove(key).map(|idx| self.take_slot(idx).key);
         if limit == 0 || ttl.is_zero() || bytes > MAX_CACHED_RESULT {
             return;
         }
-        // Include the key and list/map bookkeeping in the retained byte budget.
         let bytes = bytes + key.len() + size_of::<Entry>() + 4 * size_of::<usize>();
         while self.entries.len() >= limit || self.bytes + bytes > MAX_CACHE_BYTES {
-            let Some(index) = self.first else { return };
-            self.remove(index);
+            let Some(oldest) = self.first else { return };
+            self.remove(oldest);
         }
         let index = self.vacant.pop().unwrap_or_else(|| {
             self.slots.push(None);
             self.slots.len() - 1
         });
-        let key: Arc<str> = reused_key.unwrap_or_else(|| Arc::from(key));
+        let key = reused.unwrap_or_else(|| Arc::from(key));
         self.entries.insert(Arc::clone(&key), index);
-        self.slots[index] = Some(Entry {
-            key,
-            data,
-            bytes,
-            expires: Instant::now() + ttl,
-            previous: None,
-            next: None,
-        });
+        self.slots[index] =
+            Some(Entry { key, data, bytes, expires: Instant::now() + ttl, prev: None, next: None });
         self.bytes += bytes;
         self.append(index);
     }
 
     fn detach(&mut self, index: usize) {
-        let entry = self.slots[index].as_ref().expect("indexed entry");
-        let (previous, next) = (entry.previous, entry.next);
-        if let Some(previous) = previous {
-            self.slots[previous].as_mut().expect("linked entry").next = next;
-        } else {
-            self.first = next;
+        let e = self.slots[index].as_ref().unwrap();
+        let (prev, next) = (e.prev, e.next);
+        match prev {
+            Some(p) => self.slots[p].as_mut().unwrap().next = next,
+            None => self.first = next,
         }
-        if let Some(next) = next {
-            self.slots[next].as_mut().expect("linked entry").previous = previous;
-        } else {
-            self.last = previous;
+        match next {
+            Some(n) => self.slots[n].as_mut().unwrap().prev = prev,
+            None => self.last = prev,
         }
     }
 
     fn append(&mut self, index: usize) {
-        let entry = self.slots[index].as_mut().expect("indexed entry");
-        entry.previous = self.last;
-        entry.next = None;
-        if let Some(last) = self.last {
-            self.slots[last].as_mut().expect("linked entry").next = Some(index);
-        } else {
-            self.first = Some(index);
+        let prev = self.last.replace(index);
+        let e = self.slots[index].as_mut().unwrap();
+        e.prev = prev;
+        e.next = None;
+        match prev {
+            Some(p) => self.slots[p].as_mut().unwrap().next = Some(index),
+            None => self.first = Some(index),
         }
-        self.last = Some(index);
     }
 
     fn take_slot(&mut self, index: usize) -> Entry {
         self.detach(index);
-        let entry = self.slots[index].take().expect("indexed entry");
+        let entry = self.slots[index].take().unwrap();
         self.bytes -= entry.bytes;
         self.vacant.push(index);
         entry
@@ -120,23 +110,14 @@ impl Cache {
     }
 }
 
-/// Charge the typed representation's containers, capacities, and strings so
-/// cached results remain strictly bounded by `MAX_CACHED_RESULT` and
-/// `MAX_CACHE_BYTES` without serializing the payload to JSON on every insert.
 pub(super) fn result_size(result: &LoadResult) -> Option<usize> {
     let heap = match result {
-        LoadResult::Track(track) => size_of::<Track>().saturating_add(track_heap(track)),
-        LoadResult::Playlist(playlist) => size_of_val(playlist.as_ref())
-            .saturating_add(playlist.metadata.name.capacity())
-            .saturating_add(playlist.tracks.capacity().saturating_mul(size_of::<Track>()))
-            .saturating_add(
-                playlist.tracks.iter().fold(0usize, |acc, t| acc.saturating_add(track_heap(t))),
-            )
-            .saturating_add(object_heap(&playlist.extra)),
-        LoadResult::Search(tracks) => tracks
-            .capacity()
-            .saturating_mul(size_of::<Track>())
-            .saturating_add(tracks.iter().fold(0usize, |acc, t| acc.saturating_add(track_heap(t)))),
+        LoadResult::Track(t) => size_of::<Track>().saturating_add(track_heap(t)),
+        LoadResult::Playlist(p) => size_of_val(p.as_ref())
+            .saturating_add(p.metadata.name.capacity())
+            .saturating_add(tracks_heap(&p.tracks, p.tracks.capacity()))
+            .saturating_add(object_heap(&p.extra)),
+        LoadResult::Search(t) => tracks_heap(t, t.capacity()),
         LoadResult::Empty => 0,
         LoadResult::Error(_) => return None,
     };
@@ -144,42 +125,46 @@ pub(super) fn result_size(result: &LoadResult) -> Option<usize> {
     (bytes <= MAX_CACHED_RESULT).then_some(bytes)
 }
 
+fn tracks_heap(tracks: &[Track], cap: usize) -> usize {
+    cap.saturating_mul(size_of::<Track>())
+        .saturating_add(tracks.iter().map(track_heap).fold(0usize, usize::saturating_add))
+}
+
 fn track_heap(track: &Track) -> usize {
-    let metadata = &track.metadata;
-    track
-        .token
-        .capacity()
-        .saturating_add(metadata.identifier.capacity())
-        .saturating_add(metadata.title.capacity())
-        .saturating_add(metadata.author.capacity())
-        .saturating_add(metadata.source_name.capacity())
-        .saturating_add(metadata.uri.as_ref().map_or(0, String::capacity))
-        .saturating_add(metadata.artwork_url.as_ref().map_or(0, String::capacity))
-        .saturating_add(metadata.isrc.as_ref().map_or(0, String::capacity))
-        .saturating_add(object_heap(&track.extra))
-        .saturating_add(object_heap(&track.user_data))
+    let m = &track.metadata;
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::capacity);
+    [
+        track.token.capacity(),
+        m.identifier.capacity(),
+        m.title.capacity(),
+        m.author.capacity(),
+        m.source_name.capacity(),
+        opt(&m.uri),
+        opt(&m.artwork_url),
+        opt(&m.isrc),
+        object_heap(&track.extra),
+        object_heap(&track.user_data),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
 }
 
 fn object_heap(object: &rustlink_protocol::Object) -> usize {
-    // A conservative per-entry allowance covers BTreeMap node occupancy and
-    // pointers as well as the inline key/value. No JSON object is cached free.
-    const NODE_OVERHEAD: usize =
+    const NODE: usize =
         size_of::<String>() + size_of::<serde_json::Value>() + size_of::<[usize; 8]>();
-    object.iter().fold(0usize, |acc, (key, value)| {
-        acc.saturating_add(key.capacity())
-            .saturating_add(NODE_OVERHEAD)
-            .saturating_add(value_heap(value))
+    object.iter().fold(0usize, |acc, (k, v)| {
+        acc.saturating_add(k.capacity()).saturating_add(NODE).saturating_add(value_heap(v))
     })
 }
 
 fn value_heap(value: &serde_json::Value) -> usize {
     match value {
-        serde_json::Value::String(text) => text.capacity(),
+        serde_json::Value::String(s) => s.capacity(),
         serde_json::Value::Array(items) => items
             .capacity()
             .saturating_mul(size_of::<serde_json::Value>())
             .saturating_add(items.iter().map(value_heap).fold(0usize, usize::saturating_add)),
-        serde_json::Value::Object(object) => object_heap(object),
+        serde_json::Value::Object(obj) => object_heap(obj),
         _ => 0,
     }
 }
@@ -205,26 +190,23 @@ mod tests {
         assert!(cache.get("c").is_none());
         assert!(cache.get("a").is_some());
         assert!(cache.get("d").is_some());
-        assert_eq!(cache.entries.len(), 2);
-        assert_eq!(cache.slots.len(), 2);
+        assert_eq!((cache.entries.len(), cache.slots.len()), (2, 2));
     }
 
     #[test]
     fn expiration_byte_budget_and_oversized_results_are_bounded() {
         let mut cache = Cache::default();
-        for index in 0..100 {
-            put(&mut cache, &index.to_string(), MAX_CACHED_RESULT, 100);
+        for idx in 0..100 {
+            put(&mut cache, &idx.to_string(), MAX_CACHED_RESULT, 100);
         }
-        assert!(cache.bytes <= MAX_CACHE_BYTES);
-        assert!(cache.entries.len() < 16);
+        assert!(cache.bytes <= MAX_CACHE_BYTES && cache.entries.len() < 16);
         put(&mut cache, "huge", MAX_CACHED_RESULT + 1, 100);
         assert!(cache.get("huge").is_none());
         cache.put("expired", Arc::new(LoadResult::Empty), 8, Duration::ZERO, 100);
         assert!(cache.get("expired").is_none());
-        let index = *cache.entries.get("99").unwrap();
-        cache.slots[index].as_mut().unwrap().expires = Instant::now();
-        assert!(cache.get("99").is_none());
-        assert!(cache.get("98").is_some());
+        let idx = cache.entries["99"];
+        cache.slots[idx].as_mut().unwrap().expires = Instant::now();
+        assert!(cache.get("99").is_none() && cache.get("98").is_some());
     }
 
     #[test]
@@ -233,14 +215,11 @@ mod tests {
         let result = Arc::new(LoadResult::Empty);
         cache.put("a", result.clone(), result_size(&result).unwrap(), Duration::from_secs(60), 2);
         assert!(Arc::ptr_eq(&result, &cache.get("a").unwrap()));
-        let result =
+        let over =
             LoadResult::Search(Vec::with_capacity(MAX_CACHED_RESULT / size_of::<Track>() + 1));
-        assert!(result_size(&result).is_none());
+        assert!(result_size(&over).is_none());
     }
 
-    /// Reproduce the previous byte-cache + VecDeque::retain + JSON decode path
-    /// in the same optimized process. No network, timing threshold or claim
-    /// about end-to-end playback performance is hidden in this microbenchmark.
     #[test]
     #[ignore = "release microbenchmark; run with --release --ignored --nocapture"]
     fn benchmark_resolution_cache() {
@@ -255,39 +234,36 @@ mod tests {
         }
         impl Legacy {
             fn get(&mut self, key: &str) -> Option<Vec<u8>> {
-                let entry = self.entries.get(key)?;
-                if entry.1 <= Instant::now() {
-                    return None;
-                }
-                let data = entry.0.clone();
-                self.order.retain(|held| held != key);
-                self.order.push_back(key.to_owned());
-                Some(data)
+                let (bytes, exp) = self.entries.get(key)?;
+                (*exp > Instant::now()).then(|| {
+                    let out = bytes.clone();
+                    self.order.retain(|k| k != key);
+                    self.order.push_back(key.to_owned());
+                    out
+                })
             }
         }
-
-        fn measure(iterations: usize, mut run: impl FnMut(usize)) -> f64 {
-            for index in 0..100 {
-                run(index);
+        fn measure(iters: usize, mut run: impl FnMut(usize)) -> f64 {
+            for i in 0..100 {
+                run(i);
             }
             let start = Instant::now();
-            for index in 0..iterations {
-                run(index);
+            for i in 0..iters {
+                run(i);
             }
-            start.elapsed().as_nanos() as f64 / iterations as f64
+            start.elapsed().as_nanos() as f64 / iters as f64
         }
-
-        for (entries, tracks, iterations) in [(1024, 1, 50_000), (32, 100, 10_000)] {
+        for (entries, tracks, iters) in [(1024, 1, 50_000), (32, 100, 10_000)] {
             let result = Arc::new(LoadResult::Search(
                 (0..tracks)
-                    .map(|index| {
+                    .map(|i| {
                         rustlink_protocol::encode_track(&TrackInfo {
-                            identifier: format!("video{index:06}"),
-                            title: format!("Fixture song {index}"),
+                            identifier: format!("video{i:06}"),
+                            title: format!("Fixture song {i}"),
                             author: "Fixture artist".into(),
                             length: 180_000,
                             source_name: "youtube".into(),
-                            uri: Some(format!("https://example.com/watch?v={index}")),
+                            uri: Some(format!("https://example.com/watch?v={i}")),
                             ..Default::default()
                         })
                         .unwrap()
@@ -296,42 +272,28 @@ mod tests {
             ));
             let data = serde_json::to_vec(result.as_ref()).unwrap();
             let bytes = result_size(&result).unwrap();
-            let keys: Vec<_> = (0..entries).map(|index| format!("fixture-{index}")).collect();
+            let keys: Vec<_> = (0..entries).map(|i| format!("fixture-{i}")).collect();
             let mut legacy = Legacy { entries: HashMap::new(), order: VecDeque::new() };
             let mut modern = Cache::default();
+            let ttl = Duration::from_secs(300);
             for key in &keys {
-                legacy
-                    .entries
-                    .insert(key.clone(), (data.clone(), Instant::now() + Duration::from_secs(300)));
+                legacy.entries.insert(key.clone(), (data.clone(), Instant::now() + ttl));
                 legacy.order.push_back(key.clone());
-                modern.put(key, result.clone(), bytes, Duration::from_secs(300), entries);
+                modern.put(key, result.clone(), bytes, ttl, entries);
             }
             assert_eq!(modern.entries.len(), entries);
-            let legacy = Mutex::new(legacy);
-            let modern = Mutex::new(modern);
-            let mut timings = Vec::new();
-            for _ in 0..3 {
-                let old = measure(iterations, |index| {
-                    let bytes = legacy.lock().unwrap().get(&keys[index % entries]).unwrap();
-                    black_box(serde_json::from_slice::<LoadResult>(&bytes).unwrap());
-                });
-                let owned = measure(iterations, |index| {
-                    let result = modern.lock().unwrap().get(&keys[index % entries]).unwrap();
-                    black_box(result.as_ref().clone());
-                });
-                let shared = measure(iterations, |index| {
-                    black_box(modern.lock().unwrap().get(&keys[index % entries]).unwrap());
-                });
-                timings.push([old, owned, shared]);
-            }
-            let mut medians = [0.0; 3];
-            for column in 0..3 {
-                let mut samples = timings.iter().map(|row| row[column]).collect::<Vec<_>>();
-                samples.sort_by(f64::total_cmp);
-                medians[column] = samples[1];
-            }
-            println!("cache entries={entries} tracks={tracks} json_bytes={} iterations={iterations} median_ns/op: legacy={:.1} typed_owned={:.1} typed_shared={:.1}",
-                data.len(), medians[0], medians[1], medians[2]);
+            let (legacy, modern) = (Mutex::new(legacy), Mutex::new(modern));
+            let old = measure(iters, |i| {
+                let raw = legacy.lock().unwrap().get(&keys[i % entries]).unwrap();
+                black_box(serde_json::from_slice::<LoadResult>(&raw).unwrap());
+            });
+            let shared = measure(iters, |i| {
+                black_box(modern.lock().unwrap().get(&keys[i % entries]).unwrap());
+            });
+            println!(
+                "cache entries={entries} tracks={tracks} json_bytes={} ns/op: legacy={old:.1} shared={shared:.1}",
+                data.len()
+            );
         }
     }
 }

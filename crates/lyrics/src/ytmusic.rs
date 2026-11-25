@@ -1,9 +1,4 @@
-//! The YouTube Music provider.
-//!
-//! The catalogue answers the same page in two shapes: the web app is given the
-//! words as one run inside a description shelf, and the mobile app as timed
-//! lines inside the elements framework. The mobile answer is asked for first
-//! because a client can follow timed lines and cannot follow a wall of text.
+//! YouTube Music synced and plain lyrics provider.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,77 +6,37 @@ use std::time::Duration;
 use rustlink_protocol::{Object, Track};
 use serde_json::{json, Value};
 
-use crate::{Line, Lyrics, LyricsError, Provider};
+use crate::{trim_owned, Line, Lyrics, LyricsError, Provider};
 
-/// The catalogue host both clients post to.
 pub const YTMUSIC_ENDPOINT: &str = "https://music.youtube.com";
-
-/// The web client version, the same one the source package searches the
-/// catalogue with. Such versions age quickly, so the configuration overrides it.
 const WEB_VERSION: &str = "1.20250101.01.00";
-
-/// The Android app version that is still answered with timed lines.
-///
-/// The current app build is not required for this: the catalogue keeps answering
-/// the version the library clients send.
 const MOBILE_VERSION: &str = "7.21.50";
-
 const WEB_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const MOBILE_AGENT: &str =
     "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 11) gzip";
-
-/// Bounds one request. The mobile answer is a few hundred kilobytes, and a
-/// client waiting for lyrics would rather have no answer than a slow one.
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Bounds a response, so a hostile or broken answer cannot fill memory.
 const BODY_LIMIT: u64 = 8 << 20;
-
-/// Caps upfront `Vec<Line>` capacity reservation before iterating timed lines.
 const MAX_TIMED_LINES: usize = 10_000;
-
-/// Marks the tab that holds the words. The title of the tab is localised, so the
-/// page type is what identifies it.
 const LYRICS_PAGE: &str = "MUSIC_PAGE_TYPE_TRACK_LYRICS";
 
-/// Shared closure reading an already-warmed YouTube `visitorData` session token.
 pub type VisitorReader = Arc<dyn Fn() -> Option<String> + Send + Sync>;
-
-/// Shared closure publishing a newly harvested YouTube `visitorData` session token.
 pub type VisitorWriter = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Paired reader and writer closures for sharing YouTube `visitorData`.
 pub type VisitorBridge = (VisitorReader, VisitorWriter);
 
-/// Fetches lyrics from YouTube Music's own catalogue.
-///
-/// It only answers for YouTube tracks, because a video id is the only handle the
-/// catalogue has.
 pub struct YTMusic {
     pub agent: ureq::Agent,
-    /// The catalogue host, so a test can point it at its own server.
     pub endpoint: String,
-    /// Overrides the web client version.
     pub version: String,
-    /// Attached when the node has one, the same way the source package attaches
-    /// it.
     pub visitor_data: String,
-    /// Optional shared reader for an already-warmed session `visitorData`.
     pub visitor_reader: Option<VisitorReader>,
-    /// Optional shared sink to publish harvested `visitorData`.
     pub visitor_writer: Option<VisitorWriter>,
 }
 
-/// One of the two identities the lyrics page is asked with. They are the same
-/// endpoint and the same page; only the answer differs.
 struct Client {
     name: &'static str,
     version: &'static str,
     agent: &'static str,
-    /// The numeric client id YouTube expects in `X-YouTube-Client-Name`.
     id: &'static str,
-    /// Adds the Android fields the app sends, which is what selects the answer
-    /// that carries the timings.
     mobile: bool,
 }
 
@@ -100,70 +55,44 @@ impl Provider for YTMusic {
         "ytmusic"
     }
 
-    /// Returns the lyrics the catalogue has for a track, or
-    /// [`LyricsError::NotFound`] when it has none.
-    ///
-    /// The timed answer is tried first and the plain one is the fallback, so a
-    /// track whose timings the catalogue withholds still gets its words.
     fn fetch(&self, track: &Track) -> Result<Lyrics, LyricsError> {
-        let Some(video_id) = video_id(track) else {
-            return Err(LyricsError::NotFound);
-        };
-        let Some((page, visitor_data)) = self.page(video_id)? else {
-            return Err(LyricsError::NotFound);
-        };
-        // A shape that failed is not a reason to stop: the other one is a
-        // separate request and may still answer. Only when neither has anything
-        // is the failure raised, and the first one is the one worth reporting.
-        let mut last: Option<LyricsError> = None;
-        match self.ask(&MOBILE, &page, &visitor_data) {
-            Ok(answer) => {
-                if let Some(lyrics) = from_mobile(track, &answer) {
-                    return Ok(lyrics);
+        let video_id = video_id(track).ok_or(LyricsError::NotFound)?;
+        let (page, visitor_data) = self.page(video_id)?.ok_or(LyricsError::NotFound)?;
+        let mut last = None;
+        for (client, parse) in
+            [(&MOBILE, from_mobile as fn(&Track, &Value) -> Option<Lyrics>), (&WEB, from_web)]
+        {
+            match self.ask(client, &page, &visitor_data) {
+                Ok(answer) => {
+                    if let Some(lyrics) = parse(track, &answer) {
+                        return Ok(lyrics);
+                    }
                 }
-            }
-            Err(LyricsError::NotFound) => {}
-            Err(error) => last = Some(error),
-        }
-        match self.ask(&WEB, &page, &visitor_data) {
-            Ok(answer) => {
-                if let Some(lyrics) = from_web(track, &answer) {
-                    return Ok(lyrics);
-                }
-            }
-            Err(LyricsError::NotFound) => {}
-            Err(error) => {
-                if last.is_none() {
-                    last = Some(error);
+                Err(LyricsError::NotFound) => {}
+                Err(e) => {
+                    last.get_or_insert(e);
                 }
             }
         }
-        match last {
-            Some(error) => Err(error),
-            None => Err(LyricsError::NotFound),
-        }
+        Err(last.unwrap_or(LyricsError::NotFound))
     }
 }
 
 impl YTMusic {
-    /// Returns the lyrics page a track has (and the visitor session token to
-    /// accompany it), or `None` when it has none.
-    ///
-    /// The words are not in this answer, so a missing browse id is the catalogue
-    /// saying the track has no lyrics rather than a failure.
     fn page(&self, video_id: &str) -> Result<Option<(String, String)>, LyricsError> {
-        let configured_vd = self.visitor_data.trim();
-        let shared_vd = if configured_vd.is_empty() {
-            self.visitor_reader
-                .as_ref()
-                .and_then(|read| read())
-                .filter(|vd| crate::valid_header_value(vd))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let initial_vd = if !configured_vd.is_empty() { configured_vd } else { shared_vd.as_str() };
-        let answer: Value = self.call(&WEB, "next", initial_vd, &json!({ "videoId": video_id }))?;
+        let configured = self.visitor_data.trim();
+        let shared = configured
+            .is_empty()
+            .then(|| {
+                self.visitor_reader
+                    .as_ref()
+                    .and_then(|r| r())
+                    .filter(|v| crate::valid_header_value(v))
+            })
+            .flatten()
+            .unwrap_or_default();
+        let initial_vd = if !configured.is_empty() { configured } else { shared.as_str() };
+        let answer = self.call(&WEB, "next", initial_vd, &json!({ "videoId": video_id }))?;
         let harvested = answer
             .pointer("/responseContext/visitorData")
             .and_then(Value::as_str)
@@ -174,27 +103,28 @@ impl YTMusic {
                     && vd.bytes().all(|b| (0x21..=0x7e).contains(&b))
                     && crate::valid_header_value(vd)
             });
-        if configured_vd.is_empty() {
-            if let (Some(vd), Some(write)) = (harvested, self.visitor_writer.as_ref()) {
-                write(vd);
-            }
+        if let (true, Some(vd), Some(write)) =
+            (configured.is_empty(), harvested, self.visitor_writer.as_ref())
+        {
+            write(vd);
         }
-        let effective_vd = if !configured_vd.is_empty() {
-            configured_vd.to_owned()
+        let effective_vd = if !configured.is_empty() {
+            configured.to_owned()
         } else if let Some(vd) = harvested {
             vd.to_owned()
         } else {
-            shared_vd
+            shared
         };
         let tabs = answer
             .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
             .and_then(Value::as_array);
         for tab in tabs.into_iter().flatten() {
             let endpoint = &tab["tabRenderer"]["endpoint"]["browseEndpoint"];
-            let page_type = endpoint
+            if endpoint
                 .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
-                .and_then(Value::as_str);
-            if page_type == Some(LYRICS_PAGE) {
+                .and_then(Value::as_str)
+                == Some(LYRICS_PAGE)
+            {
                 return Ok(endpoint
                     .get("browseId")
                     .and_then(Value::as_str)
@@ -205,12 +135,10 @@ impl YTMusic {
         Ok(None)
     }
 
-    /// Posts one browse request for the lyrics page.
     fn ask(&self, client: &Client, page: &str, visitor_data: &str) -> Result<Value, LyricsError> {
         self.call(client, "browse", visitor_data, &json!({ "browseId": page }))
     }
 
-    /// Posts one InnerTube request and decodes the answer.
     fn call(
         &self,
         client: &Client,
@@ -240,89 +168,60 @@ impl YTMusic {
             context: json!({ "client": client_context(client, version, visitor) }),
             body,
         };
-        let url = format!("{base}/youtubei/v1/{endpoint}?prettyPrint=false");
-        let mut request = self
+        let mut req = self
             .agent
-            .post(url)
+            .post(format!("{base}/youtubei/v1/{endpoint}?prettyPrint=false"))
             .header("Content-Type", "application/json")
             .header("User-Agent", client.agent)
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("X-YouTube-Client-Name", client.id)
             .header("X-YouTube-Client-Version", version);
         if !visitor.is_empty() {
-            request = request.header("X-Goog-Visitor-Id", visitor);
+            req = req.header("X-Goog-Visitor-Id", visitor);
         }
-        let response = request
+        let resp = req
             .config()
             .timeout_global(Some(TIMEOUT))
             .http_status_as_error(false)
             .build()
             .send_json(&payload)
-            .map_err(|error| {
-                LyricsError::Failed(format!("lyrics: youtube music could not be reached: {error}"))
+            .map_err(|e| {
+                LyricsError::Failed(format!("lyrics: youtube music could not be reached: {e}"))
             })?;
-        match response.status().as_u16() {
+        match resp.status().as_u16() {
             404 => return Err(LyricsError::NotFound),
-            status if (200..300).contains(&status) => {}
-            status => {
-                return Err(LyricsError::Failed(format!(
-                    "lyrics: youtube music answered {status}"
-                )));
-            }
+            s if (200..300).contains(&s) => {}
+            s => return Err(LyricsError::Failed(format!("lyrics: youtube music answered {s}"))),
         }
-        let raw = response.into_body().with_config().limit(BODY_LIMIT).read_to_vec().map_err(
-            |error| {
-                LyricsError::Failed(format!(
-                    "lyrics: youtube music sent an unreadable answer: {error}"
-                ))
-            },
-        )?;
-        serde_json::from_slice(&raw).map_err(|error| {
-            LyricsError::Failed(format!("lyrics: youtube music sent an unreadable answer: {error}"))
+        let raw = resp.into_body().with_config().limit(BODY_LIMIT).read_to_vec().map_err(|e| {
+            LyricsError::Failed(format!("lyrics: youtube music sent an unreadable answer: {e}"))
+        })?;
+        serde_json::from_slice(&raw).map_err(|e| {
+            LyricsError::Failed(format!("lyrics: youtube music sent an unreadable answer: {e}"))
         })
     }
 }
 
-/// Builds the client identity. Only the body carries it, the same as the source
-/// package: the endpoint needs no API key.
 fn client_context(client: &Client, version: &str, visitor_data: &str) -> Value {
-    let mut context =
+    let mut ctx =
         json!({ "clientName": client.name, "clientVersion": version, "hl": "en", "gl": "US" });
     if client.mobile {
-        context["androidSdkVersion"] = json!(30);
-        context["osName"] = json!("Android");
-        context["osVersion"] = json!("11");
+        ctx["androidSdkVersion"] = json!(30);
+        ctx["osName"] = json!("Android");
+        ctx["osVersion"] = json!("11");
     }
     if !visitor_data.is_empty() {
-        context["visitorData"] = json!(visitor_data);
+        ctx["visitorData"] = json!(visitor_data);
     }
-    context
+    ctx
 }
 
-/// The id a track can be asked about, or `None` when the track is not one the
-/// catalogue knows.
 fn video_id(track: &Track) -> Option<&str> {
-    if track.metadata.source_name != "youtube" {
-        return None;
-    }
     let id = track.metadata.identifier.trim();
-    let valid =
-        id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
-    valid.then_some(id)
-}
-
-fn trim_owned(mut text: String) -> String {
-    let trimmed = text.trim();
-    if trimmed.len() == text.len() {
-        return text;
-    }
-    let leading = text.len() - text.trim_start().len();
-    let len = trimmed.len();
-    if leading > 0 {
-        text.drain(..leading);
-    }
-    text.truncate(len);
-    text
+    (track.metadata.source_name == "youtube"
+        && id.len() == 11
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+    .then_some(id)
 }
 
 fn find_key<'a>(value: &'a Value, target: &str, depth: usize) -> Option<&'a Value> {
@@ -331,50 +230,34 @@ fn find_key<'a>(value: &'a Value, target: &str, depth: usize) -> Option<&'a Valu
     }
     match value {
         Value::Object(map) => {
-            if let Some(found) = map.get(target) {
-                return Some(found);
-            }
-            map.values().find_map(|child| find_key(child, target, depth - 1))
+            map.get(target).or_else(|| map.values().find_map(|c| find_key(c, target, depth - 1)))
         }
-        Value::Array(items) => items.iter().find_map(|child| find_key(child, target, depth - 1)),
+        Value::Array(items) => items.iter().find_map(|c| find_key(c, target, depth - 1)),
         _ => None,
     }
 }
 
-/// Builds the payload from the mobile answer.
-///
-/// Timed lines are returned when every line carries a cue; an answer that has
-/// the words without the timings is still worth returning as text, because a
-/// wall of text beats nothing.
 fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
     let data = answer
-        .pointer(
-            "/contents/elementRenderer/newElement/type/componentType/model/timedLyricsModel/lyricsData",
-        )
+        .pointer("/contents/elementRenderer/newElement/type/componentType/model/timedLyricsModel/lyricsData")
         .or_else(|| {
             answer
                 .get("contents")
                 .and_then(|c| find_key(c, "timedLyricsModel", 12))
                 .and_then(|m| m.get("lyricsData"))
         })?;
-    let lines = data.get("timedLyricsData").and_then(Value::as_array)?;
-    if lines.is_empty() {
-        return None;
-    }
-    let source = data.get("sourceMessage").and_then(Value::as_str).unwrap_or_default();
-    let mut out = base(track, source);
-    // Every line has to carry a cue for the answer to be the timed one. One line
-    // without a cue means the catalogue has the words but not when they are
-    // sung, which is still worth returning, as text.
-    let timed = lines.iter().all(|line| line.get("cueRange").is_some_and(|cue| !cue.is_null()))
-        && lines.iter().any(|line| {
-            millis(line.pointer("/cueRange/startTimeMilliseconds")) > 0
-                || millis(line.pointer("/cueRange/endTimeMilliseconds")) > 0
+    let lines = data.get("timedLyricsData").and_then(Value::as_array).filter(|l| !l.is_empty())?;
+    let mut out =
+        base(track, data.get("sourceMessage").and_then(Value::as_str).unwrap_or_default());
+    let timed = lines.iter().all(|l| l.get("cueRange").is_some_and(|c| !c.is_null()))
+        && lines.iter().any(|l| {
+            millis(l.pointer("/cueRange/startTimeMilliseconds")) > 0
+                || millis(l.pointer("/cueRange/endTimeMilliseconds")) > 0
         });
     if !timed {
         let mut joined = String::new();
-        for (idx, line) in lines.iter().enumerate() {
-            if idx > 0 {
+        for (i, line) in lines.iter().take(MAX_TIMED_LINES).enumerate() {
+            if i > 0 {
                 joined.push('\n');
             }
             joined.push_str(line.get("lyricLine").and_then(Value::as_str).unwrap_or_default());
@@ -387,14 +270,13 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
         return Some(out);
     }
     let mut timed_lines = Vec::with_capacity(lines.len().min(MAX_TIMED_LINES));
-    for line in lines {
+    for line in lines.iter().take(MAX_TIMED_LINES) {
         let start = millis(line.pointer("/cueRange/startTimeMilliseconds"));
         let end = millis(line.pointer("/cueRange/endTimeMilliseconds"));
-        let duration = end.checked_sub(start).filter(|duration| *duration > 0);
         timed_lines.push(Line {
             timestamp: start,
-            duration,
-            line: line.get("lyricLine").and_then(Value::as_str).unwrap_or_default().to_string(),
+            duration: end.checked_sub(start).filter(|&d| d > 0),
+            line: line.get("lyricLine").and_then(Value::as_str).unwrap_or_default().to_owned(),
             plugin: Object::new(),
         });
     }
@@ -402,68 +284,45 @@ fn from_mobile(track: &Track, answer: &Value) -> Option<Lyrics> {
     Some(out)
 }
 
-/// Builds the payload from all the text runs in the web description.
-///
-/// An answer with no run is the catalogue saying it has nothing, such as the
-/// message it sends for a track whose lyrics are not licensed.
 fn from_web(track: &Track, answer: &Value) -> Option<Lyrics> {
     let shelf = answer
         .pointer("/contents/sectionListRenderer/contents")
         .and_then(Value::as_array)
-        .and_then(|contents| {
-            contents.iter().find_map(|item| item.get("musicDescriptionShelfRenderer"))
-        })
+        .and_then(|c| c.iter().find_map(|i| i.get("musicDescriptionShelfRenderer")))
         .or_else(|| {
             answer.get("contents").and_then(|c| find_key(c, "musicDescriptionShelfRenderer", 10))
         })?;
     let runs = shelf.pointer("/description/runs").and_then(Value::as_array)?;
-    let text = trim_owned(
-        runs.iter().filter_map(|run| run.get("text").and_then(Value::as_str)).collect::<String>(),
-    );
+    let text =
+        trim_owned(runs.iter().filter_map(|r| r.get("text").and_then(Value::as_str)).collect());
     if text.is_empty() {
         return None;
     }
-    let footer = shelf.pointer("/footer/runs").and_then(Value::as_array);
-    let source: String = footer
+    let source: String = shelf
+        .pointer("/footer/runs")
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|run| run.get("text").and_then(Value::as_str))
+        .filter_map(|r| r.get("text").and_then(Value::as_str))
         .collect();
     let mut out = base(track, &source);
     out.text = Some(text);
     Some(out)
 }
 
-/// The payload both shapes share.
 fn base(track: &Track, source: &str) -> Lyrics {
     let mut out = Lyrics::new(track.metadata.source_name.clone(), "ytmusic");
-    out.plugin = source_object(source);
+    let msg = source.trim().trim_start_matches("Source:").trim();
+    if !msg.is_empty() {
+        out.plugin.insert("source".into(), Value::String(msg.to_owned()));
+    }
     out
 }
 
-/// Reports who supplied the words.
-///
-/// The catalogue credits the licensor, and a client showing lyrics should be
-/// able to pass that on, so it travels in the plugin object rather than being
-/// dropped.
-fn source_object(message: &str) -> Object {
-    let message = message.trim().trim_start_matches("Source:").trim();
-    let mut object = Object::new();
-    if !message.is_empty() {
-        object.insert("source".into(), Value::String(message.to_string()));
-    }
-    object
-}
-
-/// Reads a millisecond count the catalogue sends as a string, and reads one sent
-/// as a number just as well.
-///
-/// A negative or unreadable value is zero rather than an error, because one
-/// unreadable timestamp should not cost the whole track its lyrics.
 fn millis(value: Option<&Value>) -> i64 {
     match value {
-        Some(Value::String(text)) => text.trim().parse().unwrap_or(0),
-        Some(Value::Number(number)) => number.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
         _ => 0,
     }
     .max(0)
@@ -485,6 +344,14 @@ mod tests {
         )
     }
 
+    fn mobile_fixture(lyrics_data: Value) -> Value {
+        json!({
+            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
+                "timedLyricsModel": {"lyricsData": lyrics_data}
+            }}}}}}
+        })
+    }
+
     #[test]
     fn only_a_youtube_video_id_is_worth_asking_about() {
         assert_eq!(video_id(&track("youtube", "dQw4w9WgXcQ")), Some("dQw4w9WgXcQ"));
@@ -501,63 +368,49 @@ mod tests {
                 ]}}
             }]}}
         });
-        let lyrics = from_web(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap();
-        assert_eq!(lyrics.text.as_deref(), Some("first line\nsecond line"));
+        assert_eq!(
+            from_web(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap().text.as_deref(),
+            Some("first line\nsecond line")
+        );
     }
 
     #[test]
     fn a_timed_mobile_answer_becomes_timed_lines() {
-        let answer = json!({
-            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
-                "timedLyricsModel": {"lyricsData": {
-                    "sourceMessage": "Source: Someone",
-                    "timedLyricsData": [
-                        {"lyricLine": "one", "cueRange": {"startTimeMilliseconds": "1000", "endTimeMilliseconds": "2000"}},
-                        {"lyricLine": "two", "cueRange": {"startTimeMilliseconds": 2000, "endTimeMilliseconds": 3000}}
-                    ]
-                }}
-            }}}}}}
-        });
+        let answer = mobile_fixture(json!({
+            "sourceMessage": "Source: Someone",
+            "timedLyricsData": [
+                {"lyricLine": "one", "cueRange": {"startTimeMilliseconds": "1000", "endTimeMilliseconds": "2000"}},
+                {"lyricLine": "two", "cueRange": {"startTimeMilliseconds": 2000, "endTimeMilliseconds": 3000}}
+            ]
+        }));
         let lyrics = from_mobile(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap();
         let lines = lyrics.lines.unwrap();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].timestamp, 1000);
-        assert_eq!(lines[0].duration, Some(1000));
-        assert_eq!(lines[1].timestamp, 2000);
+        assert_eq!(
+            (lines.len(), lines[0].timestamp, lines[0].duration, lines[1].timestamp),
+            (2, 1000, Some(1000), 2000)
+        );
         assert_eq!(lyrics.plugin.get("source").and_then(Value::as_str), Some("Someone"));
     }
 
     #[test]
     fn malformed_mobile_cues_do_not_overflow_or_produce_negative_timestamps() {
-        let answer = json!({
-            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
-                "timedLyricsModel": {"lyricsData": {
-                    "timedLyricsData": [
-                        {"lyricLine": "one", "cueRange": {
-                            "startTimeMilliseconds": i64::MIN.to_string(), "endTimeMilliseconds": i64::MAX}},
-                        {"lyricLine": "two", "cueRange": {
-                            "startTimeMilliseconds": i64::MAX, "endTimeMilliseconds": -1}}
-                    ]
-                }}
-            }}}}}}
-        });
+        let answer = mobile_fixture(json!({
+            "timedLyricsData": [
+                {"lyricLine": "one", "cueRange": {"startTimeMilliseconds": i64::MIN.to_string(), "endTimeMilliseconds": i64::MAX}},
+                {"lyricLine": "two", "cueRange": {"startTimeMilliseconds": i64::MAX, "endTimeMilliseconds": -1}}
+            ]
+        }));
         let lines = from_mobile(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap().lines.unwrap();
-        assert_eq!(lines[0].timestamp, 0);
-        assert_eq!(lines[0].duration, Some(i64::MAX));
-        assert_eq!(lines[1].timestamp, i64::MAX);
-        assert_eq!(lines[1].duration, None);
+        assert_eq!((lines[0].timestamp, lines[0].duration), (0, Some(i64::MAX)));
+        assert_eq!((lines[1].timestamp, lines[1].duration), (i64::MAX, None));
     }
 
     #[test]
     fn a_mobile_answer_without_cues_is_still_text() {
-        let answer = json!({
-            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
-                "timedLyricsModel": {"lyricsData": {
-                    "sourceMessage": "",
-                    "timedLyricsData": [{"lyricLine": "one"}, {"lyricLine": "two"}]
-                }}
-            }}}}}}
-        });
+        let answer = mobile_fixture(json!({
+            "sourceMessage": "",
+            "timedLyricsData": [{"lyricLine": "one"}, {"lyricLine": "two"}]
+        }));
         let lyrics = from_mobile(&track("youtube", "dQw4w9WgXcQ"), &answer).unwrap();
         assert_eq!(lyrics.text.as_deref(), Some("one\ntwo"));
         assert!(lyrics.lines.is_none());
@@ -565,12 +418,11 @@ mod tests {
 
     #[test]
     fn an_empty_mobile_answer_is_not_lyrics() {
-        let answer = json!({
-            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
-                "timedLyricsModel": {"lyricsData": {"timedLyricsData": []}}
-            }}}}}}
-        });
-        assert!(from_mobile(&track("youtube", "dQw4w9WgXcQ"), &answer).is_none());
+        assert!(from_mobile(
+            &track("youtube", "dQw4w9WgXcQ"),
+            &mobile_fixture(json!({"timedLyricsData": []}))
+        )
+        .is_none());
     }
 
     #[test]
@@ -588,103 +440,72 @@ mod tests {
 
     #[test]
     fn a_web_answer_with_no_words_is_not_lyrics() {
-        let answer = json!({"contents": {"sectionListRenderer": {"contents": []}}});
-        assert!(from_web(&track("youtube", "dQw4w9WgXcQ"), &answer).is_none());
+        assert!(from_web(
+            &track("youtube", "dQw4w9WgXcQ"),
+            &json!({"contents": {"sectionListRenderer": {"contents": []}}})
+        )
+        .is_none());
     }
 
     #[test]
     fn the_mobile_client_names_itself_as_the_android_app() {
-        let context = client_context(&MOBILE, MOBILE_VERSION, "visitor-token");
-        assert_eq!(context["clientName"], "ANDROID_MUSIC");
-        assert_eq!(context["osName"], "Android");
-        assert_eq!(context["visitorData"], "visitor-token");
+        let ctx = client_context(&MOBILE, MOBILE_VERSION, "visitor-token");
+        assert_eq!(ctx["clientName"], "ANDROID_MUSIC");
+        assert_eq!(ctx["osName"], "Android");
+        assert_eq!(ctx["visitorData"], "visitor-token");
         let web = client_context(&WEB, WEB_VERSION, "");
-        assert!(web.get("osName").is_none());
-        assert!(web.get("visitorData").is_none());
+        assert!(web.get("osName").is_none() && web.get("visitorData").is_none());
     }
 
     #[test]
     fn single_line_zero_cue_becomes_plain_text_and_next_visitor_data_is_forwarded() {
-        use std::io::{Read, Write};
-        let zero_cue = json!({
-            "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
-                "timedLyricsModel": {"lyricsData": {
-                    "timedLyricsData": [{
-                        "lyricLine": "untimed single line",
-                        "cueRange": {"startTimeMilliseconds": "0", "endTimeMilliseconds": "0"}
-                    }]
-                }}
-            }}}}}}
-        });
+        let zero_cue = mobile_fixture(json!({
+            "timedLyricsData": [{
+                "lyricLine": "untimed single line",
+                "cueRange": {"startTimeMilliseconds": "0", "endTimeMilliseconds": "0"}
+            }]
+        }));
         let parsed = from_mobile(&track("youtube", "dQw4w9WgXcQ"), &zero_cue).unwrap();
         assert_eq!(parsed.text.as_deref(), Some("untimed single line"));
         assert!(parsed.lines.is_none());
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            for step in 0..2 {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut req = Vec::new();
-                let mut buf = [0u8; 4096];
-                let (hdr_end, content_len) = loop {
-                    let n = socket.read(&mut buf).unwrap();
-                    req.extend_from_slice(&buf[..n]);
-                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = std::str::from_utf8(&req[..pos]).unwrap();
-                        let len = head
-                            .lines()
-                            .filter_map(|l| l.split_once(':'))
-                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                            .map_or(0, |(_, v)| v.trim().parse::<usize>().unwrap());
-                        break (pos + 4, len);
-                    }
-                };
-                while req.len() < hdr_end + content_len {
-                    let n = socket.read(&mut buf).unwrap();
-                    req.extend_from_slice(&buf[..n]);
-                }
-                let head = std::str::from_utf8(&req[..hdr_end]).unwrap().to_ascii_lowercase();
-                let body: Value =
-                    serde_json::from_slice(&req[hdr_end..hdr_end + content_len]).unwrap();
-                let resp_json = if step == 0 {
-                    assert!(head.starts_with("post /youtubei/v1/next?"));
-                    json!({
-                        "responseContext": {"visitorData": "harvested-vd"},
-                        "contents": {"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer": {
-                            "watchNextTabbedResultsRenderer": {"tabs": [{"tabRenderer": {"endpoint": {
-                                "browseEndpoint": {
-                                    "browseId": "MPLYt_1",
-                                    "browseEndpointContextSupportedConfigs": {
-                                        "browseEndpointContextMusicConfig": {"pageType": LYRICS_PAGE}
-                                    }
+        let (endpoint, server) = crate::serve_http(2, |step, head, raw| {
+            let lower = head.to_ascii_lowercase();
+            let body: Value = serde_json::from_slice(raw).unwrap();
+            let resp_json = if step == 0 {
+                assert!(lower.starts_with("post /youtubei/v1/next?"));
+                json!({
+                    "responseContext": {"visitorData": "harvested-vd"},
+                    "contents": {"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer": {
+                        "watchNextTabbedResultsRenderer": {"tabs": [{"tabRenderer": {"endpoint": {
+                            "browseEndpoint": {
+                                "browseId": "MPLYt_1",
+                                "browseEndpointContextSupportedConfigs": {
+                                    "browseEndpointContextMusicConfig": {"pageType": LYRICS_PAGE}
                                 }
-                            }}}]}
-                        }}}
-                    })
-                } else {
-                    assert!(head.starts_with("post /youtubei/v1/browse?"));
-                    assert!(head.contains("\r\nx-goog-visitor-id: harvested-vd\r\n"));
-                    assert_eq!(body["context"]["client"]["visitorData"], "harvested-vd");
-                    json!({
-                        "contents": {"elementRenderer": {"newElement": {"type": {"componentType": {"model": {
-                            "timedLyricsModel": {"lyricsData": {"timedLyricsData": [{
-                                "lyricLine": "synced line",
-                                "cueRange": {"startTimeMilliseconds": "0", "endTimeMilliseconds": "2500"}
-                            }]}}
-                        }}}}}}
-                    })
-                };
-                let encoded = serde_json::to_vec(&resp_json).unwrap();
-                write!(
-                    socket,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    encoded.len()
-                )
-                .unwrap();
-                socket.write_all(&encoded).unwrap();
-            }
+                            }
+                        }}}]}
+                    }}}
+                })
+            } else {
+                assert!(lower.starts_with("post /youtubei/v1/browse?"));
+                assert!(lower.contains("\r\nx-goog-visitor-id: harvested-vd\r\n"));
+                assert_eq!(body["context"]["client"]["visitorData"], "harvested-vd");
+                mobile_fixture(json!({
+                    "timedLyricsData": [{
+                        "lyricLine": "synced line",
+                        "cueRange": {"startTimeMilliseconds": "0", "endTimeMilliseconds": "2500"}
+                    }]
+                }))
+            };
+            let encoded = serde_json::to_vec(&resp_json).unwrap();
+            let mut resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                encoded.len()
+            )
+            .into_bytes();
+            resp.extend_from_slice(&encoded);
+            resp
         });
         let provider = YTMusic {
             agent: ureq::Agent::new_with_defaults(),

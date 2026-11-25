@@ -1,9 +1,9 @@
-//! An async Rust client for Rustlink's own API. No audio libraries are linked
+//! Async Rust client for the Rustlink v1 API. No audio libraries are linked
 //! into the bot: the server resolves tracks and sends audio to Discord.
 //!
 //! Create a session, keep its event stream open, and forward the bot's Discord
 //! voice state to [`Session::set_voice`]. Explicitly call [`Session::destroy`]
-//! at shutdown. Dropping a session leaves it available for its reconnect grace.
+//! at shutdown; dropping a session leaves it resumable for its grace period.
 
 use std::fmt;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest, protocol::WebSocketConfig, Message,
+    client::IntoClientRequest, protocol::WebSocketConfig, Error as WsError, Message,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -34,20 +34,20 @@ pub enum Error {
     #[error("Rustlink returned HTTP {status}: {code}: {message}")]
     Api { status: u16, code: String, message: String },
     #[error("event connection failed: {0}")]
-    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+    WebSocket(Box<WsError>),
     #[error("invalid JSON response: {0}")]
     Json(#[from] serde_json::Error),
     #[error("event connection timed out")]
     Timeout,
 }
 
-impl From<tokio_tungstenite::tungstenite::Error> for Error {
-    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+impl From<WsError> for Error {
+    fn from(error: WsError) -> Self {
         Self::WebSocket(Box::new(error))
     }
 }
 
-/// Cloneable HTTP client. The password is deliberately excluded from Debug.
+/// Cloneable HTTP client. The password is excluded from `Debug`.
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -64,31 +64,41 @@ impl fmt::Debug for Client {
     }
 }
 
-fn wipe_string(secret: &mut String) {
-    // SAFETY: `write_volatile` cannot unwind, and overwriting initialized bytes
-    // with `0` (ASCII NUL) preserves UTF-8 validity before `clear()`.
-    unsafe {
-        for byte in secret.as_bytes_mut() {
-            std::ptr::write_volatile(byte, 0);
-        }
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    secret.clear();
-}
-
 struct SecretBuf(String);
 
 impl Drop for SecretBuf {
     fn drop(&mut self) {
-        wipe_string(&mut self.0);
+        // SAFETY: overwriting initialized bytes with NUL preserves UTF-8 validity before `clear()`.
+        unsafe {
+            for byte in self.0.as_bytes_mut() {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        self.0.clear();
     }
+}
+
+#[derive(Serialize)]
+struct QueryBody<'a> {
+    query: &'a str,
+}
+
+#[derive(Serialize)]
+struct TokenBody<'a> {
+    token: &'a str,
+}
+
+#[derive(Serialize)]
+struct TrackPatch<T> {
+    track: T,
 }
 
 impl Client {
     /// `base` is the server origin, such as `http://127.0.0.1:2333`.
     pub fn new(base: &str, password: impl Into<String>) -> Result<Self, Error> {
         let password = SecretBuf(password.into());
-        let mut base = Url::parse(base).map_err(|error| Error::Invalid(error.to_string()))?;
+        let mut base = Url::parse(base).map_err(|e| Error::Invalid(e.to_string()))?;
         if !matches!(base.scheme(), "http" | "https")
             || base.host_str().is_none()
             || !base.username().is_empty()
@@ -103,7 +113,7 @@ impl Client {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
-        let api_base = base.join("api/v1/").map_err(|error| Error::Invalid(error.to_string()))?;
+        let api_base = base.join("api/v1/").map_err(|e| Error::Invalid(e.to_string()))?;
         if password.0.is_empty() {
             return Err(Error::Invalid(
                 "password is empty or contains invalid header characters".into(),
@@ -126,7 +136,7 @@ impl Client {
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, Error> {
-        self.api_base.join(path).map_err(|error| Error::Invalid(error.to_string()))
+        self.api_base.join(path).map_err(|e| Error::Invalid(e.to_string()))
     }
 
     async fn send<B: Serialize + ?Sized>(
@@ -144,24 +154,6 @@ impl Client {
                 request.header(CONTENT_TYPE, "application/json").body(serde_json::to_vec(body)?);
         }
         Ok(request.send().await?)
-    }
-
-    async fn request<T: DeserializeOwned, B: Serialize + ?Sized>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&B>,
-    ) -> Result<T, Error> {
-        let response = self.send(method, path, body).await?;
-        let status = response.status();
-        if status == StatusCode::NO_CONTENT {
-            return Err(Error::Invalid("unexpected HTTP 204 response with no body".into()));
-        }
-        let bytes = read_response_body(response).await?;
-        if !status.is_success() {
-            return Err(api_error(status, &bytes, "request failed"));
-        }
-        Ok(serde_json::from_slice(&bytes)?)
     }
 
     async fn request_optional<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -182,8 +174,39 @@ impl Client {
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
-    async fn request_empty(&self, method: Method, path: &str) -> Result<(), Error> {
-        let response = self.send::<()>(method, path, None).await?;
+    async fn request<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<T, Error> {
+        self.request_optional(method, path, body)
+            .await?
+            .ok_or_else(|| Error::Invalid("unexpected HTTP 204 response with no body".into()))
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
+        self.request::<T, ()>(Method::GET, path, None).await
+    }
+
+    async fn post_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &(impl Serialize + ?Sized),
+    ) -> Result<T, Error> {
+        self.request(Method::POST, path, Some(body)).await
+    }
+
+    async fn patch_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &(impl Serialize + ?Sized),
+    ) -> Result<T, Error> {
+        self.request(Method::PATCH, path, Some(body)).await
+    }
+
+    async fn delete_empty(&self, path: &str) -> Result<(), Error> {
+        let response = self.send::<()>(Method::DELETE, path, None).await?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -193,28 +216,24 @@ impl Client {
     }
 
     pub async fn info(&self) -> Result<Value, Error> {
-        self.request::<_, ()>(Method::GET, "info", None).await
+        self.get_json("info").await
     }
+
     pub async fn stats(&self) -> Result<Value, Error> {
-        self.request::<_, ()>(Method::GET, "stats", None).await
+        self.get_json("stats").await
     }
+
     pub async fn resolve(&self, query: &str) -> Result<LoadResult, Error> {
         if query.trim().is_empty() || query.len() > 8192 {
             return Err(Error::Invalid("query must contain 1..8192 bytes".into()));
         }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            query: &'a str,
-        }
-        self.request(Method::POST, "tracks/resolve", Some(&Body { query })).await
+        self.post_json("tracks/resolve", &QueryBody { query }).await
     }
+
     pub async fn inspect(&self, token: &str) -> Result<Track, Error> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            token: &'a str,
-        }
-        self.request(Method::POST, "tracks/inspect", Some(&Body { token })).await
+        self.post_json("tracks/inspect", &TokenBody { token }).await
     }
+
     pub async fn inspect_batch(&self, tokens: &[impl AsRef<str>]) -> Result<Vec<Track>, Error> {
         if tokens.len() > 1000 {
             return Err(Error::Invalid("at most 1000 tokens per request".into()));
@@ -228,16 +247,11 @@ impl Client {
             tracks: Vec<Track>,
         }
         let tokens = tokens.iter().map(AsRef::as_ref).collect();
-        let body: Tracks =
-            self.request(Method::POST, "tracks/inspect-batch", Some(&Body { tokens })).await?;
-        Ok(body.tracks)
+        Ok(self.post_json::<Tracks>("tracks/inspect-batch", &Body { tokens }).await?.tracks)
     }
+
     pub async fn lyrics(&self, token: &str) -> Result<Option<Value>, Error> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            token: &'a str,
-        }
-        self.request_optional(Method::POST, "lyrics", Some(&Body { token })).await
+        self.request_optional(Method::POST, "lyrics", Some(&TokenBody { token })).await
     }
 
     pub async fn create_session(
@@ -252,9 +266,8 @@ impl Client {
         }
         validate_snowflake(bot_id, "bot ID")?;
         validate_resume_timeout(resume_timeout_secs)?;
-        let info: SessionInfo = self
-            .request(Method::POST, "sessions", Some(&Body { bot_id, resume_timeout_secs }))
-            .await?;
+        let info: SessionInfo =
+            self.post_json("sessions", &Body { bot_id, resume_timeout_secs }).await?;
         validate_session_id(&info.session_id)?;
         Ok(Session { client: self.clone(), id: info.session_id })
     }
@@ -263,8 +276,7 @@ impl Client {
     /// period resumes it; a server restart or expired session returns HTTP 404.
     pub async fn session(&self, id: &str) -> Result<Session, Error> {
         validate_session_id(id)?;
-        let info: SessionInfo =
-            self.request::<_, ()>(Method::GET, &format!("sessions/{id}"), None).await?;
+        let info: SessionInfo = self.get_json(&format!("sessions/{id}")).await?;
         validate_session_id(&info.session_id)?;
         if info.session_id != id {
             return Err(Error::Invalid("server returned a different session ID".into()));
@@ -286,7 +298,7 @@ fn api_error(status: StatusCode, bytes: &[u8], fallback: &str) -> Error {
 }
 
 async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, Error> {
-    if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) {
+    if response.content_length().is_some_and(|len| len > MAX_RESPONSE_BYTES as u64) {
         return Err(Error::Invalid("Rustlink response body exceeded the configured limit".into()));
     }
     let initial = response.content_length().map_or(0, |len| len.min(64 << 10) as usize);
@@ -303,7 +315,7 @@ async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, 
 }
 
 fn validate_session_id(id: &str) -> Result<(), Error> {
-    if id.len() != 48 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if id.len() != 48 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::Invalid("session ID must contain 48 hexadecimal characters".into()));
     }
     Ok(())
@@ -317,11 +329,7 @@ fn validate_resume_timeout(seconds: u32) -> Result<(), Error> {
 }
 
 fn validate_snowflake(id: &str, label: &str) -> Result<(), Error> {
-    if id.is_empty()
-        || id.len() > 20
-        || id.starts_with('0')
-        || !id.bytes().all(|byte| byte.is_ascii_digit())
-        || !id.parse::<u64>().is_ok_and(|value| value > 0)
+    if id.starts_with('0') || !id.bytes().all(|b| b.is_ascii_digit()) || id.parse::<u64>().is_err()
     {
         return Err(Error::Invalid(format!("{label} must be a nonzero Discord snowflake")));
     }
@@ -350,16 +358,20 @@ impl Session {
     pub fn id(&self) -> &str {
         &self.id
     }
+
     fn path(&self) -> String {
         format!("sessions/{}", self.id)
     }
+
     fn player_path(&self, guild: &str) -> Result<String, Error> {
         validate_snowflake(guild, "guild ID")?;
         Ok(format!("sessions/{}/players/{guild}", self.id))
     }
+
     pub async fn info(&self) -> Result<SessionInfo, Error> {
-        self.client.request::<_, ()>(Method::GET, &self.path(), None).await
+        self.client.get_json(&self.path()).await
     }
+
     pub async fn configure(
         &self,
         resume: bool,
@@ -371,27 +383,25 @@ impl Session {
             resume_timeout_secs: u32,
         }
         validate_resume_timeout(resume_timeout_secs)?;
-        self.client
-            .request(Method::PATCH, &self.path(), Some(&Body { resume, resume_timeout_secs }))
-            .await
+        self.client.patch_json(&self.path(), &Body { resume, resume_timeout_secs }).await
     }
+
     pub async fn destroy(&self) -> Result<(), Error> {
-        self.client.request_empty(Method::DELETE, &self.path()).await
+        self.client.delete_empty(&self.path()).await
     }
+
     pub async fn players(&self) -> Result<Vec<Player>, Error> {
         #[derive(Deserialize)]
         struct Players {
             players: Vec<Player>,
         }
-        let body: Players = self
-            .client
-            .request::<_, ()>(Method::GET, &format!("sessions/{}/players", self.id), None)
-            .await?;
-        Ok(body.players)
+        Ok(self.client.get_json::<Players>(&format!("sessions/{}/players", self.id)).await?.players)
     }
+
     pub async fn player(&self, guild: &str) -> Result<Player, Error> {
-        self.client.request::<_, ()>(Method::GET, &self.player_path(guild)?, None).await
+        self.client.get_json(&self.player_path(guild)?).await
     }
+
     /// `replace = false` preserves an already loaded track.
     pub async fn update_player(
         &self,
@@ -399,64 +409,38 @@ impl Session {
         update: &PlayerUpdate,
         replace: bool,
     ) -> Result<Player, Error> {
-        validate_snowflake(guild, "guild ID")?;
-        self.client
-            .request(
-                Method::PATCH,
-                &format!("sessions/{}/players/{guild}?replace={replace}", self.id),
-                Some(update),
-            )
-            .await
+        let path = format!("{}?replace={replace}", self.player_path(guild)?);
+        self.client.patch_json(&path, update).await
     }
+
+    async fn play_spec(&self, guild: &str, track: impl Serialize) -> Result<Player, Error> {
+        let path = format!("{}?replace=true", self.player_path(guild)?);
+        self.client.patch_json(&path, &TrackPatch { track }).await
+    }
+
     pub async fn play(&self, guild: &str, token: &str) -> Result<Player, Error> {
-        #[derive(Serialize)]
-        struct TrackRef<'a> {
-            token: &'a str,
-        }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            track: TrackRef<'a>,
-        }
-        validate_snowflake(guild, "guild ID")?;
-        self.client
-            .request(
-                Method::PATCH,
-                &format!("sessions/{}/players/{guild}?replace=true", self.id),
-                Some(&Body { track: TrackRef { token } }),
-            )
-            .await
+        self.play_spec(guild, TokenBody { token }).await
     }
+
     /// A URL or source ID must resolve to exactly one track. For search results
     /// and playlists, call `Client::resolve`, choose a track, then `play`.
     pub async fn play_query(&self, guild: &str, query: &str) -> Result<Player, Error> {
-        #[derive(Serialize)]
-        struct TrackRef<'a> {
-            query: &'a str,
-        }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            track: TrackRef<'a>,
-        }
-        validate_snowflake(guild, "guild ID")?;
-        self.client
-            .request(
-                Method::PATCH,
-                &format!("sessions/{}/players/{guild}?replace=true", self.id),
-                Some(&Body { track: TrackRef { query } }),
-            )
-            .await
+        self.play_spec(guild, QueryBody { query }).await
     }
+
     async fn patch_player(&self, guild: &str, update: &PlayerUpdate) -> Result<Player, Error> {
-        let path = self.player_path(guild)?;
-        self.client.request(Method::PATCH, &path, Some(update)).await
+        self.client.patch_json(&self.player_path(guild)?, update).await
     }
+
     pub async fn stop(&self, guild: &str) -> Result<Player, Error> {
         self.update_player(guild, &PlayerUpdate { track: Patch::Null, ..Default::default() }, true)
             .await
     }
+
     pub async fn pause(&self, guild: &str, paused: bool) -> Result<Player, Error> {
         self.patch_player(guild, &PlayerUpdate { paused: Some(paused), ..Default::default() }).await
     }
+
     pub async fn seek(&self, guild: &str, position_ms: i64) -> Result<Player, Error> {
         if position_ms < 0 {
             return Err(Error::Invalid("position_ms must be nonnegative".into()));
@@ -467,6 +451,7 @@ impl Session {
         )
         .await
     }
+
     pub async fn set_volume(&self, guild: &str, volume: i64) -> Result<Player, Error> {
         if !(0..=1000).contains(&volume) {
             return Err(Error::Invalid("volume must be 0..1000".into()));
@@ -477,23 +462,25 @@ impl Session {
         )
         .await
     }
+
     pub async fn set_voice(&self, guild: &str, voice: VoiceState) -> Result<Player, Error> {
         self.patch_player(guild, &PlayerUpdate { voice: Some(voice), ..Default::default() }).await
     }
+
     pub async fn lyrics(&self, guild: &str) -> Result<Option<Value>, Error> {
         let path = format!("{}/lyrics", self.player_path(guild)?);
         self.client.request_optional::<_, ()>(Method::GET, &path, None).await
     }
+
     pub async fn destroy_player(&self, guild: &str) -> Result<(), Error> {
-        self.client.request_empty(Method::DELETE, &self.player_path(guild)?).await
+        self.client.delete_empty(&self.player_path(guild)?).await
     }
 
     /// Connect the single event subscriber. The first `next()` is
     /// `session.ready`, containing current players and the `resumed` flag.
     /// Call `next()` continuously so WebSocket pings are answered.
     pub async fn events(&self) -> Result<Events, Error> {
-        // The server's `event_url` is root-absolute, so it would drop a base
-        // path such as a reverse-proxy prefix; the client builds its own.
+        // Build from `api_base` rather than `event_url` so reverse-proxy prefixes survive.
         let mut url = self.client.endpoint(&format!("sessions/{}/events", self.id))?;
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
         url.set_scheme(scheme).map_err(|_| Error::Invalid("invalid WebSocket scheme".into()))?;
@@ -510,7 +497,7 @@ impl Session {
         .map_err(|_| Error::Timeout)?;
         let (socket, _) = match connected {
             Ok(pair) => pair,
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(WsError::Http(response)) => {
                 let status = response.status();
                 let bytes = response.body().as_deref().unwrap_or_default();
                 return Err(api_error(status, bytes, "websocket upgrade failed"));
@@ -525,20 +512,18 @@ pub struct Events {
     socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     needs_flush: bool,
 }
+
 impl Events {
     pub async fn next(&mut self) -> Result<Option<Value>, Error> {
         loop {
             if self.needs_flush {
                 match tokio::time::timeout(Duration::from_secs(10), self.socket.flush()).await {
                     Ok(Ok(())) => self.needs_flush = false,
-                    Ok(Err(
-                        tokio_tungstenite::tungstenite::Error::ConnectionClosed
-                        | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
-                    )) => {
+                    Ok(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => {
                         self.needs_flush = false;
                         return Ok(None);
                     }
-                    Ok(Err(tokio_tungstenite::tungstenite::Error::Io(ref io_err)))
+                    Ok(Err(WsError::Io(ref io_err)))
                         if matches!(
                             io_err.kind(),
                             std::io::ErrorKind::BrokenPipe
@@ -547,8 +532,6 @@ impl Events {
                                 | std::io::ErrorKind::NotConnected
                         ) =>
                     {
-                        // Peer closed its half while our queued Pong was flushing; still drain
-                        // any buffered Text or Close frames before reporting EOF/error.
                         self.needs_flush = false;
                     }
                     Ok(Err(error)) => return Err(error.into()),
@@ -560,21 +543,14 @@ impl Events {
                 .map_err(|_| Error::Timeout)?;
             match message {
                 Some(Ok(Message::Text(text))) => return Ok(Some(serde_json::from_str(&text)?)),
-                // tungstenite queues the Pong automatically; record flush requirement so
-                // dropping this future in `tokio::select!` never loses the Pong flush.
-                Some(Ok(Message::Ping(_))) => {
-                    self.needs_flush = true;
-                }
+                // Record Pong flush requirement so cancellation in `tokio::select!` cannot drop it.
+                Some(Ok(Message::Ping(_))) => self.needs_flush = true,
                 Some(Ok(Message::Close(_))) => {
                     self.needs_flush = false;
                     let _ = tokio::time::timeout(Duration::from_secs(2), self.socket.flush()).await;
                     return Ok(None);
                 }
-                None
-                | Some(Err(
-                    tokio_tungstenite::tungstenite::Error::ConnectionClosed
-                    | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
-                )) => {
+                None | Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => {
                     self.needs_flush = false;
                     return Ok(None);
                 }
@@ -583,13 +559,10 @@ impl Events {
             }
         }
     }
+
     pub async fn close(&mut self) -> Result<(), Error> {
         match tokio::time::timeout(Duration::from_secs(10), self.socket.close(None)).await {
-            Ok(Ok(()))
-            | Ok(Err(
-                tokio_tungstenite::tungstenite::Error::ConnectionClosed
-                | tokio_tungstenite::tungstenite::Error::AlreadyClosed,
-            )) => Ok(()),
+            Ok(Ok(())) | Ok(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => Ok(()),
             Ok(Err(error)) => Err(error.into()),
             Err(_) => Err(Error::Timeout),
         }
@@ -600,7 +573,31 @@ impl Events {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+
+    fn accept_json_request(listener: &TcpListener, status: &str, body: &str) -> String {
+        let (mut http, _) = listener.accept().unwrap();
+        http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = http.read(&mut buffer).unwrap();
+            assert!(read > 0, "HTTP request ended before its headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        write_json_reply(&mut http, status, body);
+        String::from_utf8_lossy(&request).split_whitespace().nth(1).unwrap().to_owned()
+    }
+
+    fn write_json_reply(http: &mut TcpStream, status: &str, body: &str) {
+        write!(
+            http,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        http.flush().unwrap();
+    }
 
     #[test]
     fn session_ids_are_path_safe_and_fixed_length() {
@@ -608,8 +605,7 @@ mod tests {
         assert!(validate_session_id(&"A".repeat(48)).is_ok());
         let short = "a".repeat(47);
         let long = "a".repeat(49);
-        let mut separator = "a".repeat(47);
-        separator.push('/');
+        let separator = format!("{}/", "a".repeat(47));
         for value in ["", short.as_str(), long.as_str(), separator.as_str()] {
             assert!(validate_session_id(value).is_err(), "accepted session id {value:?}");
         }
@@ -620,45 +616,22 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::task::spawn_blocking(move || {
-            let (mut http, _) = listener.accept().unwrap();
-            http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = http.read(&mut buffer).unwrap();
-                assert!(read > 0, "HTTP request ended before its headers");
-                request.extend_from_slice(&buffer[..read]);
-            }
             let body = format!(
                 "{{\"session_id\":\"{}\",\"bot_id\":\"123\",\"connected\":false,\"resume\":true,\"resume_timeout_secs\":60,\"event_url\":\"/custom-events\"}}",
                 "a".repeat(48)
             );
-            write!(
-                http,
-                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-            http.flush().unwrap();
+            accept_json_request(&listener, "201 Created", &body);
 
             let (socket, _) = listener.accept().unwrap();
             let mut path = None;
-            // Tungstenite's external `Callback` trait fixes this closure's
-            // error type to the full HTTP error response.
             #[allow(clippy::result_large_err)]
             let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                             response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                 path = Some(request.uri().path().to_owned());
                 Ok(response)
             };
-            let mut websocket =
-                tokio_tungstenite::tungstenite::accept_hdr(socket, callback).unwrap();
-            websocket
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    r#"{"type":"session.ready"}"#.into(),
-                ))
-                .unwrap();
+            let mut ws = tokio_tungstenite::tungstenite::accept_hdr(socket, callback).unwrap();
+            ws.send(Message::Text(r#"{"type":"session.ready"}"#.into())).unwrap();
             path.unwrap()
         });
 
@@ -684,28 +657,11 @@ mod tests {
         assert!(matches!(session.seek("456", -1).await, Err(Error::Invalid(_))));
         assert!(matches!(session.set_volume("456", -1).await, Err(Error::Invalid(_))));
         assert!(matches!(session.set_volume("456", 1001).await, Err(Error::Invalid(_))));
+        assert!(matches!(session.set_volume("+456", 80).await, Err(Error::Invalid(_))));
 
         let server = tokio::task::spawn_blocking(move || {
-            let (mut http, _) = listener.accept().unwrap();
-            http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let read = http.read(&mut buffer).unwrap();
-                assert!(read > 0);
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let head = String::from_utf8_lossy(&request);
-            let target = head.split_whitespace().nth(1).unwrap().to_owned();
             let body = r#"{"guild_id":"456","track":null,"volume":80,"paused":false,"state":{"timestamp_ms":0,"position_ms":0,"connected":false,"ping_ms":-1},"voice":{"token":"","endpoint":"","session_id":"","channel_id":null},"filters":{}}"#;
-            write!(
-                http,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-            target
+            accept_json_request(&listener, "200 OK", body)
         });
         let player = session.set_volume("456", 80).await.unwrap();
         assert_eq!(player.volume, 80);
@@ -722,8 +678,8 @@ mod tests {
         let server = tokio::task::spawn_blocking(move || {
             let (socket, _) = listener.accept().unwrap();
             let mut ws = tokio_tungstenite::tungstenite::accept(socket).unwrap();
-            ws.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).unwrap();
-            ws.send(tokio_tungstenite::tungstenite::Message::Close(None)).unwrap();
+            ws.send(Message::Ping(Vec::new().into())).unwrap();
+            ws.send(Message::Close(None)).unwrap();
             let _ = ws.flush();
             while let Ok(msg) = ws.read() {
                 if msg.is_close() {

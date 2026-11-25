@@ -1,4 +1,4 @@
-//! The errors the audio pipeline reports.
+//! Errors reported by the audio pipeline.
 
 use crate::filters::FilterError;
 
@@ -20,20 +20,14 @@ pub enum AudioError {
     NeedsFfmpeg(String),
     #[error("ffmpeg failed: {0}")]
     Ffmpeg(String),
-    /// The track stopped because the connection carrying it failed. The
-    /// pipeline has no opinion about voice, but a track that cannot be sent
-    /// anywhere has ended badly, and the reason has to reach the client.
     #[error("{0}")]
     Transport(String),
 }
 
 impl AudioError {
-    /// Whether the caller should reopen the track and try FFmpeg instead.
-    ///
-    /// The in-process pipeline reads before it can reject, so a decline is only
-    /// recoverable if the body can be fetched again.
+    /// Whether the caller should reopen the track and retry with FFmpeg.
     #[inline]
     pub fn needs_ffmpeg(&self) -> bool {
-        matches!(self, AudioError::NeedsFfmpeg(_) | AudioError::FfmpegMissing)
+        matches!(self, Self::NeedsFfmpeg(_) | Self::FfmpegMissing)
     }
 }

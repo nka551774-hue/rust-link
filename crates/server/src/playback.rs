@@ -1,8 +1,4 @@
-//! What a player needs from the rest of the node.
-//!
-//! Both traits exist so a player can be exercised without a network or a
-//! decoder: the node hands over its source service and its audio engine, and a
-//! test hands over stand-ins that answer from memory.
+//! Source loading and Opus frame production traits used by players and routes.
 
 use std::sync::Arc;
 
@@ -10,15 +6,14 @@ use rustlink_audio::{AudioError, Body, Frames, Preference};
 use rustlink_protocol::{Object, Track};
 use rustlink_source::{LoadResult, SourceError};
 
-/// Resolving identifiers and opening the bytes of a track.
+/// Resolves track identifiers and opens track audio streams.
 pub trait Loader: Send + Sync {
-    /// Turns an identifier into a load result, the way `tracks/resolve` does.
     fn load(&self, identifier: &str) -> Result<LoadResult, SourceError>;
-    /// Shared results avoid copying cached playlists before HTTP serialization.
+
     fn load_shared(&self, identifier: &str) -> Result<Arc<LoadResult>, SourceError> {
         self.load(identifier).map(Arc::new)
     }
-    /// Opens the stream a track plays from.
+
     fn open(&self, track: &Track) -> Result<Box<dyn std::io::Read + Send>, SourceError>;
 }
 
@@ -36,10 +31,8 @@ impl Loader for rustlink_source::Service {
     }
 }
 
-/// Producing the Opus frames of a track.
+/// Opens a track and produces paced Opus frames.
 pub trait Engine: Send + Sync {
-    /// Opens the track and starts decoding it, so the caller only paces what
-    /// comes back.
     fn start(
         &self,
         track: &Track,
@@ -49,8 +42,8 @@ pub trait Engine: Send + Sync {
     ) -> Result<Box<dyn Frames>, AudioError>;
 }
 
-/// The audio engine and the source it plays from, which is what an engine needs
-/// to open a body before it can decode one.
+/// Pairs [`rustlink_audio::Engine`] with a [`Loader`] and falls back to FFmpeg
+/// on a fresh stream when the in-process decoder declines a container/codec.
 pub struct Playback {
     pub engine: rustlink_audio::Engine,
     pub source: Arc<dyn Loader>,
@@ -67,30 +60,35 @@ impl Engine for Playback {
         if !self.engine.in_process && self.engine.ffmpeg.is_none() {
             return Err(AudioError::FfmpegMissing);
         }
-        let body = self.open(track)?;
-        match self.engine.start(track, body, position_ms, volume, filters, Preference::Auto) {
-            Ok(frames) => Ok(frames),
-            // The in-process pipeline reads the body before it can decline a
-            // stream, so the fall back starts from a fresh one rather than a
-            // half-read one.
+        match self.engine.start(
+            track,
+            self.open(track)?,
+            position_ms,
+            volume,
+            filters,
+            Preference::Auto,
+        ) {
             Err(AudioError::NeedsFfmpeg(_)) => {
                 if self.engine.ffmpeg.is_none() {
                     return Err(AudioError::FfmpegMissing);
                 }
-                let body = self.open(track)?;
-                self.engine.start(track, body, position_ms, volume, filters, Preference::Ffmpeg)
+                self.engine.start(
+                    track,
+                    self.open(track)?,
+                    position_ms,
+                    volume,
+                    filters,
+                    Preference::Ffmpeg,
+                )
             }
-            Err(error) => Err(error),
+            other => other,
         }
     }
 }
 
 impl Playback {
     fn open(&self, track: &Track) -> Result<Body, AudioError> {
-        self.source
-            .open(track)
-            .map(Body::new)
-            .map_err(|error| AudioError::Decode(error.to_string()))
+        self.source.open(track).map(Body::new).map_err(|e| AudioError::Decode(e.to_string()))
     }
 }
 

@@ -1,4 +1,6 @@
 //! Exercise the public API with in-memory media and voice, never real services.
+
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,16 +81,16 @@ impl Connection for Media {
 }
 
 struct Node(Arc<Server>);
+
 impl Node {
-    fn new(config: Config) -> Self {
-        Self::with_engine(config, Arc::new(Media))
-    }
-    fn with_engine(config: Config, engine: Arc<dyn Engine>) -> Self {
-        Self::with_media(config, Arc::new(Media), engine)
-    }
-    fn with_media(mut config: Config, loader: Arc<dyn Loader>, engine: Arc<dyn Engine>) -> Self {
+    fn build(
+        mut config: Config,
+        ratelimits: bool,
+        loader: Arc<dyn Loader>,
+        engine: Arc<dyn Engine>,
+    ) -> Self {
         config.password = "test-secret".into();
-        config.ratelimits.enable = false;
+        config.ratelimits.enable = ratelimits;
         Self(
             Server::new(
                 config,
@@ -103,6 +105,31 @@ impl Node {
             .unwrap(),
         )
     }
+
+    fn new(config: Config) -> Self {
+        Self::build(config, false, Arc::new(Media), Arc::new(Media))
+    }
+
+    fn with_engine(config: Config, engine: Arc<dyn Engine>) -> Self {
+        Self::build(config, false, Arc::new(Media), engine)
+    }
+
+    fn with_media(config: Config, loader: Arc<dyn Loader>, engine: Arc<dyn Engine>) -> Self {
+        Self::build(config, false, loader, engine)
+    }
+
+    fn limited() -> Self {
+        Self::build(Config::default(), true, Arc::new(Media), Arc::new(Media))
+    }
+
+    async fn serve(&self) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = self.0.router();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (address, task)
+    }
+
     async fn raw(
         &self,
         method: &str,
@@ -124,11 +151,13 @@ impl Node {
             if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
         (status, headers, value)
     }
+
     async fn request(&self, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
         let (status, _, value) =
             self.raw(method, path, "Bearer test-secret", body.to_string()).await;
         (status, value)
     }
+
     async fn session(&self) -> String {
         let (status, session) =
             self.request("POST", "/api/v1/sessions", json!({"bot_id":"123"})).await;
@@ -136,27 +165,7 @@ impl Node {
         session["session_id"].as_str().unwrap().to_owned()
     }
 }
-impl Node {
-    /// A node that keeps its rate limits, which the other tests switch off.
-    fn limited() -> Self {
-        let mut config = Config::default();
-        config.password = "test-secret".into();
-        config.ratelimits.enable = true;
-        Self(
-            Server::new(
-                config,
-                Dependencies {
-                    loader: Arc::new(Media),
-                    engine: Arc::new(Media),
-                    voice: Arc::new(Media),
-                    lyrics: None,
-                    webhook: None,
-                },
-            )
-            .unwrap(),
-        )
-    }
-}
+
 impl Drop for Node {
     fn drop(&mut self) {
         self.0.close();
@@ -166,7 +175,6 @@ impl Drop for Node {
 #[tokio::test]
 async fn wrong_passwords_cannot_spend_the_allowance_of_a_legitimate_client() {
     let node = Node::limited();
-    // Someone with no password hammers a route the bot also uses.
     let mut refused = 0;
     for _ in 0..40 {
         let (status, _, _) = node.raw("GET", "/api/v1/stats", "Bearer wrong", String::new()).await;
@@ -175,10 +183,8 @@ async fn wrong_passwords_cannot_spend_the_allowance_of_a_legitimate_client() {
             other => assert_eq!(other, StatusCode::UNAUTHORIZED),
         }
     }
-    assert!(refused > 0, "guessing the password is slowed down");
-    // The bot's own budget for that route was never touched.
-    let (status, _) = node.request("GET", "/api/v1/stats", Value::Null).await;
-    assert_eq!(status, StatusCode::OK);
+    assert!(refused > 0);
+    assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -188,25 +194,24 @@ async fn each_session_has_its_own_request_budget() {
     let quiet = node.session().await;
     let mut stopped = false;
     for _ in 0..80 {
-        let (status, _) =
-            node.request("GET", &format!("/api/v1/sessions/{busy}/players/1"), Value::Null).await;
-        if status == StatusCode::TOO_MANY_REQUESTS {
+        if node.request("GET", &format!("/api/v1/sessions/{busy}/players/1"), Value::Null).await.0
+            == StatusCode::TOO_MANY_REQUESTS
+        {
             stopped = true;
             break;
         }
     }
-    assert!(stopped, "a runaway session is stopped");
-    let (status, _) =
-        node.request("GET", &format!("/api/v1/sessions/{quiet}/players/1"), Value::Null).await;
-    assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "another session is not affected");
+    assert!(stopped);
+    assert_ne!(
+        node.request("GET", &format!("/api/v1/sessions/{quiet}/players/1"), Value::Null).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 #[tokio::test]
 async fn closing_before_background_tasks_start_releases_the_server() {
     let node = Node::new(Config::default());
     let server = Arc::downgrade(&node.0);
-    // The current-thread runtime has not polled the reaper yet. Closing here
-    // must remain observable when that task gets its first turn.
     drop(node);
     tokio::time::timeout(Duration::from_secs(1), async {
         while server.strong_count() != 0 {
@@ -273,8 +278,10 @@ async fn native_auth_headers_errors_and_voice_capabilities() {
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(headers["allow"], "POST");
     assert_eq!(error["error"]["code"], "method_not_allowed");
-    let (status, _, _) = node.raw("GET", "/api/v1/tracks/resolve", "", String::new()).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        node.raw("GET", "/api/v1/tracks/resolve", "", String::new()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -362,11 +369,14 @@ async fn rest_session_player_lifecycle_and_patch_semantics() {
         )
         .await;
     assert!(preserved["track"].is_object());
-    assert_eq!(preserved["paused"], false, "preserving a track must still apply other settings");
-    let (_, stopped) = node.request("PATCH", &player, json!({"track":null, "end_ms": null})).await;
-    assert!(stopped["track"].is_null());
-    let (_, settings) = node.request("PATCH", &session, json!({"resume_timeout_secs":120})).await;
-    assert_eq!(settings["resume_timeout_secs"], 120);
+    assert_eq!(preserved["paused"], false);
+    assert!(node.request("PATCH", &player, json!({"track":null, "end_ms": null})).await.1["track"]
+        .is_null());
+    assert_eq!(
+        node.request("PATCH", &session, json!({"resume_timeout_secs":120})).await.1
+            ["resume_timeout_secs"],
+        120
+    );
     for body in [json!({"resume":"yes"}), json!({"timeout":10}), json!({"resume_timeout_secs":0})] {
         assert_eq!(node.request("PATCH", &session, body).await.0, StatusCode::BAD_REQUEST);
     }
@@ -479,9 +489,7 @@ async fn a_failed_first_player_update_does_not_reserve_a_player_slot() {
         .as_array()
         .unwrap()
         .is_empty());
-
-    let (status, _) = node.request("PATCH", &player, json!({})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(node.request("PATCH", &player, json!({})).await.0, StatusCode::OK);
 }
 
 struct BlockingLoader {
@@ -513,17 +521,26 @@ fn blocking_player_node(
     (node, loader, release)
 }
 
+async fn spawn_blocked_patch(
+    node: &Arc<Node>,
+    loader: &BlockingLoader,
+    path: &str,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let node = Arc::clone(node);
+    let path = path.to_owned();
+    let handle = tokio::spawn(async move {
+        node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    handle
+}
+
 #[tokio::test]
 async fn cancelling_the_first_player_update_releases_capacity() {
     let (node, loader, release) = blocking_player_node(1);
     let id = node.session().await;
     let path = format!("/api/v1/sessions/{id}/players/456");
-    let request = tokio::spawn({
-        let node = node.clone();
-        let path = path.clone();
-        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
-    });
-    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    let request = spawn_blocked_patch(&node, &loader, &path).await;
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();
@@ -538,11 +555,7 @@ async fn session_destruction_and_creation_cancellation_release_capacity_only_onc
     let id = node.session().await;
     let session_path = format!("/api/v1/sessions/{id}");
     let path = format!("{session_path}/players/456");
-    let request = tokio::spawn({
-        let node = node.clone();
-        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
-    });
-    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    let request = spawn_blocked_patch(&node, &loader, &path).await;
 
     assert_eq!(node.request("DELETE", &session_path, Value::Null).await.0, StatusCode::NO_CONTENT);
     assert_eq!(node.request("GET", "/api/v1/stats", Value::Null).await.1["players"], 0);
@@ -562,21 +575,13 @@ async fn a_failed_creation_preserves_a_queued_update_and_other_guilds_make_progr
     let (node, loader, release) = blocking_player_node(2);
     let id = node.session().await;
     let path = format!("/api/v1/sessions/{id}/players/456");
-    let first = tokio::spawn({
-        let node = node.clone();
-        let path = path.clone();
-        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
-    });
-    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    let first = spawn_blocked_patch(&node, &loader, &path).await;
     let mut queued = Box::pin(node.request("PATCH", &path, json!({"volume":42})));
-    // Poll the queued request before releasing the loader. It must not commit
-    // while the first request still owns this guild's creation transaction.
     std::future::poll_fn(|context| {
         assert!(std::future::Future::poll(queued.as_mut(), context).is_pending());
         std::task::Poll::Ready(())
     })
     .await;
-    // An unrelated guild must not queue behind the slow source lookup.
     let other = format!("/api/v1/sessions/{id}/players/789");
     let response =
         tokio::time::timeout(Duration::from_secs(2), node.request("PATCH", &other, json!({})))
@@ -595,12 +600,7 @@ async fn deleting_a_player_waits_for_an_inflight_update_on_the_same_guild() {
     let (node, loader, release) = blocking_player_node(1);
     let id = node.session().await;
     let path = format!("/api/v1/sessions/{id}/players/456");
-    let update = tokio::spawn({
-        let node = node.clone();
-        let path = path.clone();
-        async move { node.request("PATCH", &path, json!({"track":{"query":"blocked"}})).await }
-    });
-    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified()).await.unwrap();
+    let update = spawn_blocked_patch(&node, &loader, &path).await;
     let mut delete = Box::pin(node.request("DELETE", &path, Value::Null));
     std::future::poll_fn(|context| {
         assert!(std::future::Future::poll(delete.as_mut(), context).is_pending());
@@ -633,6 +633,7 @@ async fn sessions_expire_and_capacity_is_released() {
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 async fn event(socket: &mut Socket) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -652,18 +653,14 @@ async fn websocket_ready_queue_resume_conflict_and_shutdown() {
     let node = Node::new(Config::default());
     let id = node.session().await;
     let path = format!("/api/v1/sessions/{id}");
-    // Queue an event before attaching, to verify ready is always sent first.
     node.request("PATCH", &format!("{path}/players/456"), json!({"track":{"token":track().token}}))
         .await;
     node.request("PATCH", &format!("{path}/players/456"), json!({"track":null})).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = node.0.router();
-    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (address, task) = node.serve().await;
     let request = || {
-        let mut request = format!("ws://{address}{path}/events").into_client_request().unwrap();
-        request.headers_mut().insert("authorization", "Bearer test-secret".parse().unwrap());
-        request
+        let mut req = format!("ws://{address}{path}/events").into_client_request().unwrap();
+        req.headers_mut().insert("authorization", "Bearer test-secret".parse().unwrap());
+        req
     };
     let (mut socket, _) = tokio_tungstenite::connect_async(request()).await.unwrap();
     let ready = event(&mut socket).await;
@@ -684,10 +681,7 @@ async fn websocket_ready_queue_resume_conflict_and_shutdown() {
     assert_eq!(event(&mut socket).await["error"]["code"], "rest_required");
     socket.close(None).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if node.request("GET", &path, Value::Null).await.1["connected"] == false {
-                break;
-            }
+        while node.request("GET", &path, Value::Null).await.1["connected"] != false {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -717,10 +711,7 @@ async fn websocket_ready_queue_resume_conflict_and_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rust_client_drives_the_real_http_and_event_contract() {
     let node = Node::new(Config::default());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = node.0.router();
-    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (address, task) = node.serve().await;
     let client = rustlink_client::Client::new(&format!("http://{address}"), "test-secret").unwrap();
     let session = client.create_session("123", 60).await.unwrap();
     let mut events = session.events().await.unwrap();
@@ -761,27 +752,27 @@ async fn per_route_body_limits_metrics_gauges_and_lazy_player_reaping_work() {
     config.max_sessions = 2;
     let node = Node::new(config);
 
-    // 16 KiB cap on session creation and tracks/resolve.
     let over_small = "x".repeat((16 << 10) + 1);
-    let (status, _, _) =
-        node.raw("POST", "/api/v1/sessions", "Bearer test-secret", over_small.clone()).await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    let (status, _, _) =
-        node.raw("POST", "/api/v1/tracks/resolve", "Bearer test-secret", over_small).await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-
-    // Unknown session returns 404 before buffering a >16 KiB update_session body.
-    let (status, _, _) = node
-        .raw(
+    assert_eq!(
+        node.raw("POST", "/api/v1/sessions", "Bearer test-secret", over_small.clone()).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        node.raw("POST", "/api/v1/tracks/resolve", "Bearer test-secret", over_small).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        node.raw(
             "PATCH",
             "/api/v1/sessions/nonexistent",
             "Bearer test-secret",
             "x".repeat((32 << 10) + 1),
         )
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
 
-    // Lazy reaping inside reserve_player() frees expired session's player slot immediately.
     let first = node.session().await;
     assert_eq!(
         node.request("PATCH", &format!("/api/v1/sessions/{first}/players/100"), json!({})).await.0,
@@ -789,8 +780,6 @@ async fn per_route_body_limits_metrics_gauges_and_lazy_player_reaping_work() {
     );
     assert_eq!(node.0.active_session_count(), 1);
     assert_eq!(node.0.playing_count(), 0);
-    // Setting resume=false while disconnected makes `first` immediately expired; note update_session
-    // itself also reaps, so verify active_session_count and metrics too.
     let second = node.session().await;
     assert_eq!(node.0.active_session_count(), 2);
     assert_eq!(
@@ -808,7 +797,6 @@ async fn per_route_body_limits_metrics_gauges_and_lazy_player_reaping_work() {
         StatusCode::OK
     );
 
-    // Check Prometheus metrics text output directly via oneshot.
     let response = node
         .0
         .router()

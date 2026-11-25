@@ -1,9 +1,4 @@
-//! The Opus encoder.
-//!
-//! The node speaks Opus to Discord, and libopus is the encoder every other
-//! implementation uses, so this binds to it directly rather than reimplementing
-//! one. The bindings are deliberately small: an encoder, the controls that
-//! matter for music, and nothing else.
+//! System `libopus` bindings for stereo 48 kHz music encoding.
 
 #![allow(non_camel_case_types)]
 
@@ -49,13 +44,11 @@ const OPUS_SET_LSB_DEPTH_REQUEST: c_int = 4036;
 #[cfg(feature = "native-opus")]
 const OPUS_OK: c_int = 0;
 
-/// A frame at 48 kHz is 20 ms, which is what Discord wants and what the pacing
-/// loop counts in.
+/// Samples per channel in one 20 ms frame at 48 kHz.
 pub const FRAME_SAMPLES: usize = crate::dsp::FRAME_SAMPLES;
-/// Two channels, so a frame carries 960 samples on each side.
+/// Interleaved stereo sample count in one 20 ms frame (`1920`).
 pub const FRAME_SAMPLES_STEREO: usize = FRAME_SAMPLES * crate::dsp::CHANNELS;
 
-/// The largest packet libopus will produce for one frame, with room to spare.
 #[cfg(feature = "native-opus")]
 const MAX_PACKET: usize = 4_000;
 
@@ -103,7 +96,18 @@ extern "C" {
     fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
 }
 
-/// A stereo 48 kHz Opus encoder tuned for music.
+#[inline]
+fn check_frame_size<T>(pcm: &[T], frame_samples: usize) -> Result<(), OpusError> {
+    if matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
+        && pcm.len() == frame_samples * crate::dsp::CHANNELS
+    {
+        Ok(())
+    } else {
+        Err(OpusError::FrameSize)
+    }
+}
+
+/// Stereo 48 kHz Opus encoder tuned for music.
 #[cfg(feature = "native-opus")]
 pub struct Encoder {
     state: NonNull<OpusEncoder>,
@@ -115,16 +119,11 @@ pub struct Encoder {
 #[cfg(not(feature = "native-opus"))]
 pub struct Encoder;
 
-// The encoder is only ever touched from the playback task that owns it.
 #[cfg(feature = "native-opus")]
 unsafe impl Send for Encoder {}
 
 #[cfg(feature = "native-opus")]
 impl Encoder {
-    /// Creates an encoder at `bitrate` bits per second, running at
-    /// `complexity` on the encoder's own scale of zero to ten. A machine with
-    /// more players than cores lowers it: the encoder then spends less on every
-    /// frame, which is the knob the operator has for a busy node.
     pub fn new(bitrate: i32, complexity: i32) -> Result<Self, OpusError> {
         let mut error: c_int = OPUS_OK;
         let raw = unsafe { opus_encoder_create(48_000, 2, OPUS_APPLICATION_AUDIO, &mut error) };
@@ -134,23 +133,19 @@ impl Encoder {
             }
             return Err(OpusError::Create(error));
         };
-        let mut encoder = Encoder {
+        let mut encoder = Self {
             state,
             buffer: Vec::new(),
             lookahead: 0,
             softclip_mem: [0.0; crate::dsp::CHANNELS],
         };
         for (request, value) in [
-            // Music, not speech, and variable bitrate so quiet passages spend fewer bits.
             (OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC),
             (OPUS_SET_VBR_REQUEST, 1),
             (OPUS_SET_VBR_CONSTRAINT_REQUEST, 0),
             (OPUS_SET_BITRATE_REQUEST, bitrate),
-            // Full 24-bit floating-point precision lets libopus preserve delicate
-            // quiet-passage detail below the 16-bit (-96 dBFS) quantisation floor.
             (OPUS_SET_LSB_DEPTH_REQUEST, 24),
             (OPUS_SET_COMPLEXITY_REQUEST, complexity),
-            // Request the same loss allowance as the FFmpeg path.
             (OPUS_SET_INBAND_FEC_REQUEST, 1),
             (OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10),
         ] {
@@ -171,23 +166,31 @@ impl Encoder {
 
     fn control(&self, request: c_int, value: c_int) -> Result<(), OpusError> {
         let code = unsafe { opus_encoder_ctl(self.state.as_ptr(), request, value) };
-        if code == OPUS_OK {
-            Ok(())
-        } else {
-            Err(OpusError::Control { request, code })
-        }
+        (code == OPUS_OK).then_some(()).ok_or(OpusError::Control { request, code })
     }
 
-    /// How many samples the encoder holds back, which a caller needs if it is
-    /// aligning output with a source position.
     #[inline]
     pub fn lookahead(&self) -> i32 {
         self.lookahead
     }
 
-    /// Encodes one valid Opus frame size (`120`, `240`, `480`, `960`, `1920`, or
-    /// `2880` samples per channel at 48 kHz) of interleaved stereo PCM directly
-    /// into `out`.
+    #[inline]
+    fn write_packet(
+        out: &mut Vec<u8>,
+        f: impl FnOnce(*mut u8) -> OpusInt32,
+    ) -> Result<(), OpusError> {
+        out.clear();
+        out.reserve(MAX_PACKET);
+        // SAFETY: `out` has `>= MAX_PACKET` writable spare bytes; `f` initializes `0..written`.
+        let written = f(out.spare_capacity_mut().as_mut_ptr().cast::<u8>());
+        if written < 0 {
+            return Err(OpusError::Encode(written));
+        }
+        unsafe { out.set_len(written as usize) };
+        Ok(())
+    }
+
+    /// Encodes a valid Opus frame size (`120|240|480|960|1920|2880`) of stereo `i16` PCM into `out`.
     #[inline]
     pub fn encode_frame_size(
         &mut self,
@@ -195,37 +198,20 @@ impl Encoder {
         frame_samples: usize,
         out: &mut Vec<u8>,
     ) -> Result<(), OpusError> {
-        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
-            || pcm.len() != frame_samples * crate::dsp::CHANNELS
-        {
-            return Err(OpusError::FrameSize);
-        }
-        out.clear();
-        out.reserve(MAX_PACKET);
-        // SAFETY: `out.reserve(MAX_PACKET)` guarantees at least `MAX_PACKET`
-        // writable bytes in `spare_capacity_mut()`, and `opus_encode` initializes
-        // `0..written` bytes (`0 <= written <= MAX_PACKET`) without reading `data`.
-        let written = unsafe {
+        check_frame_size(pcm, frame_samples)?;
+        Self::write_packet(out, |dst| unsafe {
             opus_encode(
                 self.state.as_ptr(),
                 pcm.as_ptr(),
                 frame_samples as c_int,
-                out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                dst,
                 MAX_PACKET as OpusInt32,
             )
-        };
-        if written < 0 {
-            return Err(OpusError::Encode(written));
-        }
-        unsafe {
-            out.set_len(written as usize);
-        }
-        Ok(())
+        })
     }
 
-    /// Encodes one valid Opus frame size of 32-bit floating-point interleaved
-    /// stereo PCM directly into `out`, sanitising non-finite samples and applying
-    /// `libopus`'s stateful C1-continuous soft clipper when DSP boosts exceed 0 dBFS.
+    /// Encodes a valid Opus frame size of stereo `f32` PCM into `out` with 24-bit precision
+    /// and stateful C1-continuous soft clipping (`opus_pcm_soft_clip`).
     #[inline]
     pub fn encode_float_frame_size(
         &mut self,
@@ -233,19 +219,11 @@ impl Encoder {
         frame_samples: usize,
         out: &mut Vec<u8>,
     ) -> Result<(), OpusError> {
-        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
-            || pcm.len() != frame_samples * crate::dsp::CHANNELS
-        {
-            return Err(OpusError::FrameSize);
-        }
+        check_frame_size(pcm, frame_samples)?;
         for sample in pcm.iter_mut() {
             *sample = crate::dsp::clean_f32(*sample).clamp(-16.0, 16.0);
         }
-        out.clear();
-        out.reserve(MAX_PACKET);
-        // SAFETY: `pcm` holds `frame_samples * 2` valid finite `f32`s, `softclip_mem`
-        // holds 2 channel states, and `out` has `>= MAX_PACKET` writable spare bytes.
-        let written = unsafe {
+        Self::write_packet(out, |dst| unsafe {
             opus_pcm_soft_clip(
                 pcm.as_mut_ptr(),
                 frame_samples as c_int,
@@ -256,38 +234,13 @@ impl Encoder {
                 self.state.as_ptr(),
                 pcm.as_ptr(),
                 frame_samples as c_int,
-                out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                dst,
                 MAX_PACKET as OpusInt32,
             )
-        };
-        if written < 0 {
-            return Err(OpusError::Encode(written));
-        }
-        unsafe {
-            out.set_len(written as usize);
-        }
-        Ok(())
+        })
     }
 
-    /// Encodes one 20 ms frame of 32-bit float stereo samples directly into `out`
-    /// with full 24-bit dynamic range and stateful soft-clipping protection.
-    #[inline]
-    pub fn encode_float_into(
-        &mut self,
-        pcm: &mut [f32],
-        out: &mut Vec<u8>,
-    ) -> Result<(), OpusError> {
-        self.encode_float_frame_size(pcm, FRAME_SAMPLES, out)
-    }
-
-    /// Encodes one 20 ms frame of interleaved stereo samples directly into `out`,
-    /// reusing `out`'s allocation without an intermediate copy or zero-fill.
-    #[inline]
-    pub fn encode_into(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), OpusError> {
-        self.encode_frame_size(pcm, FRAME_SAMPLES, out)
-    }
-
-    /// Encodes one 20 ms frame of interleaved stereo samples.
+    /// Encodes one 20 ms frame of interleaved stereo `i16` samples.
     #[inline]
     pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
         let mut buffer = std::mem::take(&mut self.buffer);
@@ -316,11 +269,7 @@ impl Encoder {
         frame_samples: usize,
         _out: &mut Vec<u8>,
     ) -> Result<(), OpusError> {
-        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
-            || pcm.len() != frame_samples * crate::dsp::CHANNELS
-        {
-            return Err(OpusError::FrameSize);
-        }
+        check_frame_size(pcm, frame_samples)?;
         Err(OpusError::Encode(-7))
     }
 
@@ -331,14 +280,19 @@ impl Encoder {
         frame_samples: usize,
         _out: &mut Vec<u8>,
     ) -> Result<(), OpusError> {
-        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
-            || pcm.len() != frame_samples * crate::dsp::CHANNELS
-        {
-            return Err(OpusError::FrameSize);
-        }
+        check_frame_size(pcm, frame_samples)?;
         Err(OpusError::Encode(-7))
     }
 
+    #[inline]
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
+        self.encode_into(pcm, &mut Vec::new())?;
+        Ok(&[])
+    }
+}
+
+impl Encoder {
+    /// Encodes one 20 ms frame of stereo `f32` samples directly into `out`.
     #[inline]
     pub fn encode_float_into(
         &mut self,
@@ -348,15 +302,10 @@ impl Encoder {
         self.encode_float_frame_size(pcm, FRAME_SAMPLES, out)
     }
 
+    /// Encodes one 20 ms frame of stereo `i16` samples directly into `out`.
     #[inline]
     pub fn encode_into(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), OpusError> {
         self.encode_frame_size(pcm, FRAME_SAMPLES, out)
-    }
-
-    #[inline]
-    pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], OpusError> {
-        self.encode_into(pcm, &mut Vec::new())?;
-        Ok(&[])
     }
 }
 
@@ -367,15 +316,11 @@ impl Drop for Encoder {
     }
 }
 
-/// Converts interleaved float samples to the 16 bit form libopus takes.
-///
-/// The clamp is not cosmetic: a filter chain is free to overshoot, and libopus
-/// treats an out of range sample as undefined input.
+/// Converts interleaved float samples to clamped 16-bit PCM.
 #[inline]
 pub fn to_i16(samples: &[f32], out: &mut [i16]) {
     for (target, &sample) in out.iter_mut().zip(samples) {
-        let clean = crate::dsp::clean_f32(sample).clamp(-1.0, 1.0);
-        let scaled = clean * 32767.0;
+        let scaled = crate::dsp::clean_f32(sample).clamp(-1.0, 1.0) * 32767.0;
         *target = (scaled + 0.5f32.copysign(scaled)) as i16;
     }
 }
@@ -405,28 +350,26 @@ mod tests {
         use super::*;
 
         fn tone() -> Vec<i16> {
-            let mut pcm = Vec::with_capacity(FRAME_SAMPLES_STEREO);
-            for i in 0..FRAME_SAMPLES {
-                let value = (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin();
-                pcm.push((value * 16_000.0) as i16);
-                pcm.push((value * 16_000.0) as i16);
-            }
-            pcm
+            (0..FRAME_SAMPLES)
+                .flat_map(|i| {
+                    let s = ((std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() * 16_000.0)
+                        as i16;
+                    [s, s]
+                })
+                .collect()
         }
 
         #[test]
         fn an_encoder_produces_a_packet_for_each_frame() {
             let mut encoder = Encoder::new(128_000, 10).expect("libopus is available");
             let pcm = tone();
-            let mut sizes = Vec::new();
+            let mut total = 0;
             for _ in 0..10 {
                 let packet = encoder.encode(&pcm).unwrap();
-                assert!(!packet.is_empty());
-                assert!(packet.len() < 1500, "a 20 ms packet should not approach the MTU");
-                sizes.push(packet.len());
+                assert!(!packet.is_empty() && packet.len() < 1500);
+                total += packet.len();
             }
-            // A 128 kbps stream carries about 320 bytes in 20 ms.
-            let average = sizes.iter().sum::<usize>() / sizes.len();
+            let average = total / 10;
             assert!((200..500).contains(&average), "average packet was {average} bytes");
         }
 
@@ -438,9 +381,7 @@ mod tests {
 
         #[test]
         fn the_lookahead_is_reported() {
-            let encoder = Encoder::new(128_000, 10).unwrap();
-            // 6.5 ms at 48 kHz, the encoder's own delay.
-            assert_eq!(encoder.lookahead(), 312);
+            assert_eq!(Encoder::new(128_000, 10).unwrap().lookahead(), 312);
         }
 
         #[test]
@@ -462,14 +403,11 @@ mod tests {
         fn float_encoder_soft_clips_overshoots_and_sanitises_non_finite_samples() {
             let mut encoder = Encoder::new(192_000, 10).expect("libopus is available");
             let mut frame = [0.0f32; FRAME_SAMPLES_STEREO];
-            for i in 0..FRAME_SAMPLES {
-                let s =
-                    1.8 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin() as f32;
-                frame[i * 2] = s;
-                frame[i * 2 + 1] = s;
+            for (i, [l, r]) in frame.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let s = 1.8 * (std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() as f32;
+                (*l, *r) = (s, s);
             }
-            frame[0] = f32::NAN;
-            frame[1] = f32::INFINITY;
+            (frame[0], frame[1]) = (f32::NAN, f32::INFINITY);
             let mut out = Vec::new();
             encoder.encode_float_into(&mut frame, &mut out).unwrap();
             assert!(!out.is_empty() && out.len() < 1500);

@@ -19,8 +19,6 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 zeroize = "1"
 
-# The music bot keeps its queue and `.env` logic in modules with unit tests,
-# which `cargo test` only runs for an example that asks for it.
 [[example]]
 name = "music"
 path = "examples/music/main.rs"

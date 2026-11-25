@@ -1,15 +1,7 @@
-//! The FFmpeg engine.
-//!
-//! FFmpeg is handed the whole job: the stream on its standard input, the filter
-//! graph, and Ogg Opus on its standard output. The node reads the packets back
-//! out of the Ogg pages and sends them on.
-//!
-//! Nothing a client sends reaches the command line as text. The filter graph is
-//! rendered from validated numbers, and FFmpeg only ever reads from a pipe, so
-//! it cannot be pointed at a file or a URL.
+//! Child-process FFmpeg engine streaming piped input to Ogg Opus packets.
 
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::io::{self, Read, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,14 +12,9 @@ use crate::error::AudioError;
 use crate::filters::FilterSet;
 use crate::ogg::OggOpusReader;
 
-/// How long a decoder may produce nothing before the track is declared stuck.
 const STALL: Duration = Duration::from_secs(10);
-/// How much of FFmpeg's diagnostics to keep for an error message.
 const STDERR_LIMIT: usize = 32 << 10;
-/// Do not let shutdown wait forever for a broken stderr reader.
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
-/// Bound decode-ahead to 160 ms. Backpressure reaches FFmpeg's pipe, including
-/// while paused, so a long track cannot accumulate in an unbounded channel.
 const PACKET_QUEUE: usize = 8;
 
 pub struct FfmpegFrames {
@@ -35,19 +22,11 @@ pub struct FfmpegFrames {
     recycle: SyncSender<Vec<u8>>,
     child: Child,
     stderr: StderrCollector,
-    input_error: Arc<Mutex<Option<std::io::Error>>>,
+    input_error: Arc<Mutex<Option<io::Error>>>,
     finished: bool,
-    /// How long the next packet may take. It is wider than [`STALL`] for the
-    /// first packet of a seek, and `STALL` from then on.
     wait: Duration,
 }
 
-/// How long the first packet may take after a seek to `position_ms`. A pipe
-/// cannot be seeked, so FFmpeg decodes and throws away everything before the
-/// target, and a position two hours in produces nothing for a long while that is
-/// not a hang. The allowance assumes the skipped audio goes by at twenty times
-/// real time, which a source over a modest connection manages, and is capped so
-/// that a decoder that really is stuck is still found.
 fn first_packet_wait(position_ms: i64) -> Duration {
     const SKIP_SPEED: f64 = 20.0;
     const LONGEST: Duration = Duration::from_secs(600);
@@ -55,12 +34,13 @@ fn first_packet_wait(position_ms: i64) -> Duration {
     (STALL + skipped).min(LONGEST)
 }
 
-/// Owns the stderr reader and its bounded shutdown signal.
-///
-/// The reader is deliberately not joined after a timeout: a platform pipe can
-/// remain blocked even after the child has been reaped, and joining here would
-/// turn an error path into an unbounded wait. Dropping the handle detaches the
-/// reader; its `Arc` keeps the diagnostic buffer alive until the reader exits.
+fn spawn_io(
+    name: &str,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<thread::JoinHandle<()>, AudioError> {
+    thread::Builder::new().name(name.into()).spawn(f).map_err(|e| AudioError::Ffmpeg(e.to_string()))
+}
+
 struct StderrCollector {
     errors: Arc<Mutex<Vec<u8>>>,
     done: Receiver<()>,
@@ -74,29 +54,17 @@ impl StderrCollector {
     ) -> Result<Self, AudioError> {
         let (done_tx, done) = mpsc::sync_channel(1);
         let collected = Arc::clone(&errors);
-        let worker = thread::Builder::new()
-            .name("rustlink-ffmpeg-err".into())
-            .spawn(move || collect_stderr(stderr, collected, done_tx))
-            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
+        let worker = spawn_io("rustlink-ffmpeg-err", move || {
+            collect_stderr(stderr, collected, done_tx);
+        })?;
         Ok(Self { errors, done, worker: Some(worker) })
     }
 
-    /// Wait for the reader only for a bounded interval, then detach it.
+    /// Waits briefly for stderr collection to finish, detaching the reader on timeout.
     fn finish(&mut self) {
-        if self.worker.is_none() {
-            return;
-        }
-        match self.done.recv_timeout(STDERR_DRAIN_TIMEOUT) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                if let Some(worker) = self.worker.take() {
-                    let _ = worker.join();
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // Dropping JoinHandle detaches the reader. Never join an
-                // untrusted pipe reader on the lifecycle/error path.
-                drop(self.worker.take());
-            }
+        let Some(worker) = self.worker.take() else { return };
+        if !matches!(self.done.recv_timeout(STDERR_DRAIN_TIMEOUT), Err(RecvTimeoutError::Timeout)) {
+            let _ = worker.join();
         }
     }
 
@@ -115,13 +83,11 @@ fn collect_stderr<R: Read>(mut stderr: R, errors: Arc<Mutex<Vec<u8>>>, done: Syn
         let read = match stderr.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
         if !full {
             if let Ok(mut guard) = errors.lock() {
-                // Keep the invariant true even if a test or future caller seeded
-                // the shared buffer before collection began.
                 guard.truncate(STDERR_LIMIT);
                 let remaining = STDERR_LIMIT.saturating_sub(guard.len());
                 if remaining > 0 {
@@ -134,11 +100,6 @@ fn collect_stderr<R: Read>(mut stderr: R, errors: Arc<Mutex<Vec<u8>>>, done: Syn
     let _ = done.send(());
 }
 
-/// Owns a spawned FFmpeg child until all worker threads have been created.
-///
-/// The guard is intentionally kept separate from `FfmpegFrames`: setup has
-/// several fallible thread-spawn points, and an early return must not leave a
-/// process running after its pipes have been detached.
 struct StartupChild {
     child: Option<Child>,
 }
@@ -166,13 +127,7 @@ impl Drop for StartupChild {
     }
 }
 
-/// The `-ss` value for a source position. Placed after `-i` it counts output
-/// time, which the filters have already sped up or slowed down, so a source
-/// position is divided by the tempo factor: at speed 2, a seek to 60 s of the
-/// source is 30 s of output. The pure engine seeks in source time, and this
-/// keeps the two engines on the same sample.
 fn output_seek_seconds(position_ms: i64, set: &FilterSet) -> String {
-    // FFmpeg's `av_parse_time` stores `-ss` as signed 64-bit microseconds (~9.22e12 s).
     const MAX_FFMPEG_SECONDS: f64 = 9_000_000_000_000.0;
     let factor = set.tempo_factor().max(f64::MIN_POSITIVE);
     let seconds = (position_ms.max(0) as f64 / 1000.0 / factor).min(MAX_FFMPEG_SECONDS);
@@ -182,7 +137,7 @@ fn output_seek_seconds(position_ms: i64, set: &FilterSet) -> String {
 impl FfmpegFrames {
     pub fn start(
         program: &str,
-        body: Body,
+        mut body: Body,
         position_ms: i64,
         set: &FilterSet,
         bitrate: i32,
@@ -206,12 +161,10 @@ impl FfmpegFrames {
             "pipe:0",
         ]);
         if position_ms > 0 {
-            // Seeking a pipe requires decoding and discarding earlier samples.
             command.args(["-ss", &output_seek_seconds(position_ms, set)]);
         }
-        let bitrate_arg = bitrate.to_string();
-        let complexity_arg = complexity.to_string();
-        let graph = set.render_ffmpeg();
+        let (bitrate_arg, complexity_arg, graph) =
+            (bitrate.to_string(), complexity.to_string(), set.render_ffmpeg());
         command
             .args([
                 "-map",
@@ -255,77 +208,60 @@ impl FfmpegFrames {
 
         let mut startup =
             StartupChild::new(command.spawn().map_err(|e| AudioError::Ffmpeg(e.to_string()))?);
-        let mut stdin = startup.child_mut().stdin.take().expect("stdin was piped");
-        let stdout = startup.child_mut().stdout.take().expect("stdout was piped");
-        let stderr = startup.child_mut().stderr.take().expect("stderr was piped");
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        // Start pipe readers before the body writer. If a later thread spawn
-        // fails, StartupChild can kill the process and these readers exit on
-        // EOF instead of leaving an unobserved pipe blocked.
-        let stderr = StderrCollector::spawn(stderr, Arc::clone(&errors))?;
+        let child_ref = startup.child_mut();
+        let mut stdin = child_ref.stdin.take().expect("stdin was piped");
+        let stdout = child_ref.stdout.take().expect("stdout was piped");
+        let stderr = child_ref.stderr.take().expect("stderr was piped");
+        let stderr = StderrCollector::spawn(stderr, Arc::new(Mutex::new(Vec::new())))?;
 
         let (sender, packets) = mpsc::sync_channel(PACKET_QUEUE);
         let (recycle, recycled) = mpsc::sync_channel(PACKET_QUEUE + 2);
-        thread::Builder::new()
-            .name("rustlink-ffmpeg-out".into())
-            .spawn(move || {
-                let mut reader = OggOpusReader::new(stdout);
-                loop {
-                    let mut packet = recycled.try_recv().unwrap_or_default();
-                    match reader.next_packet_into(&mut packet) {
-                        Ok(true) => {
-                            if sender.send(Ok(packet)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(false) => break,
-                        Err(error) => {
-                            let _ = sender.send(Err(AudioError::Decode(error.to_string())));
+        spawn_io("rustlink-ffmpeg-out", move || {
+            let mut reader = OggOpusReader::new(stdout);
+            loop {
+                let mut packet = recycled.try_recv().unwrap_or_default();
+                match reader.next_packet_into(&mut packet) {
+                    Ok(true) => {
+                        if sender.send(Ok(packet)).is_err() {
                             break;
                         }
                     }
-                }
-            })
-            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
-
-        // The body is written on its own thread, because the reader below is
-        // what the caller waits on and a slow source must not block it.
-        let input_error = Arc::new(Mutex::new(None));
-        let input_failure = Arc::clone(&input_error);
-        thread::Builder::new()
-            .name("rustlink-ffmpeg-in".into())
-            .spawn(move || {
-                use std::io::Write;
-                let mut body = body;
-                let mut buf = [0u8; 16 * 1024];
-                loop {
-                    let read = match body.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(read) => read,
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            // Record only source-read failures. FFmpeg closes
-                            // stdin early after finishing a self-delimited
-                            // audio chunk (`mdat` / `data`) before trailing
-                            // tags, which must not turn EOF into `BrokenPipe`.
-                            if let Ok(mut guard) = input_failure.lock() {
-                                *guard = Some(error);
-                            }
-                            break;
-                        }
-                    };
-                    if stdin.write_all(&buf[..read]).is_err() {
+                    Ok(false) => break,
+                    Err(error) => {
+                        let _ = sender.send(Err(AudioError::Decode(error.to_string())));
                         break;
                     }
                 }
-            })
-            .map_err(|e| AudioError::Ffmpeg(e.to_string()))?;
+            }
+        })?;
 
-        let child = startup.commit();
-        Ok(FfmpegFrames {
+        let input_error = Arc::new(Mutex::new(None));
+        let input_failure = Arc::clone(&input_error);
+        spawn_io("rustlink-ffmpeg-in", move || {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match body.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if stdin.write_all(&buf[..read]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        if let Ok(mut guard) = input_failure.lock() {
+                            *guard = Some(error);
+                        }
+                        break;
+                    }
+                }
+            }
+        })?;
+
+        Ok(Self {
             packets,
             recycle,
-            child,
+            child: startup.commit(),
             stderr,
             input_error,
             finished: false,
@@ -333,11 +269,10 @@ impl FfmpegFrames {
         })
     }
 
-    fn take_input_error(&self) -> Option<std::io::Error> {
+    fn take_input_error(&self) -> Option<io::Error> {
         self.input_error.lock().ok().and_then(|mut guard| guard.take())
     }
 
-    /// Waits for the child and turns a failure into the message FFmpeg printed.
     fn finish(&mut self) -> Result<(), AudioError> {
         self.finish_bounded(STALL)
     }
@@ -348,11 +283,11 @@ impl FfmpegFrames {
 
     fn finish_with_wait(
         &mut self,
-        wait: impl FnOnce(&mut Child) -> std::io::Result<std::process::ExitStatus>,
+        wait: impl FnOnce(&mut Child) -> io::Result<ExitStatus>,
     ) -> Result<(), AudioError> {
         let status = match wait(&mut self.child) {
             Ok(status) => status,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                 self.terminate();
                 return Err(AudioError::Stuck);
             }
@@ -377,39 +312,31 @@ impl FfmpegFrames {
         }))
     }
 
-    /// Stop FFmpeg and drain diagnostics without making cleanup unbounded.
     fn terminate(&mut self) {
         let _ = self.child.kill();
-        let wait_result = self.child.wait();
-        if wait_result.is_ok() {
+        if self.child.wait().is_ok() {
             self.finished = true;
         }
         self.stderr.finish();
     }
 }
 
-fn wait_child_bounded(
-    child: &mut Child,
-    timeout: Duration,
-) -> std::io::Result<std::process::ExitStatus> {
+fn wait_child_bounded(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
     let started = Instant::now();
     let mut poll = Duration::from_millis(1);
     loop {
-        match child.try_wait()? {
-            Some(status) => return Ok(status),
-            None => {
-                let elapsed = started.elapsed();
-                if elapsed >= timeout {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "ffmpeg did not exit within timeout",
-                    ));
-                }
-                let remaining = timeout - elapsed;
-                thread::sleep(poll.min(remaining));
-                poll = (poll * 2).min(Duration::from_millis(20));
-            }
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
         }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ffmpeg did not exit within timeout",
+            ));
+        }
+        thread::sleep(poll.min(timeout - elapsed));
+        poll = (poll * 2).min(Duration::from_millis(20));
     }
 }
 
@@ -420,11 +347,8 @@ impl Frames for FfmpegFrames {
         }
         match self.packets.recv_timeout(self.wait) {
             Ok(Ok(mut next)) => {
-                // Audio is flowing, so the seek is over and a stall is a stall.
                 self.wait = STALL;
                 std::mem::swap(packet, &mut next);
-                // Return the caller's previous buffer without blocking playback.
-                // After the small queue warms up, packets reuse its allocations.
                 let _ = self.recycle.try_send(next);
                 Ok(true)
             }
@@ -434,15 +358,13 @@ impl Frames for FfmpegFrames {
                     return Err(AudioError::Io(io_error));
                 }
                 let stderr = self.stderr.message();
-                if !stderr.is_empty() {
-                    return Err(AudioError::Ffmpeg(format!("{error} ({stderr})")));
-                }
-                Err(error)
+                Err(if stderr.is_empty() {
+                    error
+                } else {
+                    AudioError::Ffmpeg(format!("{error} ({stderr})"))
+                })
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Nothing for ten seconds. The decoder is not coming back, so it
-                // is killed and the track is reported as stuck, which is the
-                // event a client shows for it.
                 self.terminate();
                 Err(AudioError::Stuck)
             }
@@ -470,12 +392,11 @@ mod tests {
 
     #[test]
     fn a_long_seek_is_given_time_to_skip_and_a_short_one_is_not() {
-        assert_eq!(first_packet_wait(0), STALL, "no seek, no extra time");
+        assert_eq!(first_packet_wait(0), STALL);
         assert_eq!(first_packet_wait(-5), STALL);
-        // Two hours in at twenty times real time is six minutes of skipping.
         assert_eq!(first_packet_wait(7_200_000), STALL + Duration::from_secs(360));
         assert!(first_packet_wait(60_000) < STALL + Duration::from_secs(4));
-        assert_eq!(first_packet_wait(i64::MAX), Duration::from_secs(600), "and it is capped");
+        assert_eq!(first_packet_wait(i64::MAX), Duration::from_secs(600));
     }
 
     #[test]
@@ -484,20 +405,23 @@ mod tests {
             let serde_json::Value::Object(filters) = filters else { panic!("not an object") };
             crate::filters::parse(&filters, 100).unwrap()
         };
-        let plain = set(serde_json::json!({}));
-        assert_eq!(output_seek_seconds(60_000, &plain), "60.000");
-        // At twice the speed one second of output holds two of source, so the
-        // 60th second of the source is the 30th of the output. Passing 60 as the
-        // old code did starts at the 120th second of the source.
-        let fast = set(serde_json::json!({"timescale": {"speed": 2.0}}));
-        assert_eq!(output_seek_seconds(60_000, &fast), "30.000");
-        let slow = set(serde_json::json!({"timescale": {"speed": 0.5}}));
-        assert_eq!(output_seek_seconds(10_000, &slow), "20.000");
-        // Pitch alone leaves the length alone; rate scales it like speed does.
-        let pitched = set(serde_json::json!({"timescale": {"pitch": 1.5}}));
-        assert_eq!(output_seek_seconds(60_000, &pitched), "60.000");
-        let rated = set(serde_json::json!({"timescale": {"rate": 1.5}}));
-        assert_eq!(output_seek_seconds(60_000, &rated), "40.000");
+        assert_eq!(output_seek_seconds(60_000, &set(serde_json::json!({}))), "60.000");
+        assert_eq!(
+            output_seek_seconds(60_000, &set(serde_json::json!({"timescale": {"speed": 2.0}}))),
+            "30.000"
+        );
+        assert_eq!(
+            output_seek_seconds(10_000, &set(serde_json::json!({"timescale": {"speed": 0.5}}))),
+            "20.000"
+        );
+        assert_eq!(
+            output_seek_seconds(60_000, &set(serde_json::json!({"timescale": {"pitch": 1.5}}))),
+            "60.000"
+        );
+        assert_eq!(
+            output_seek_seconds(60_000, &set(serde_json::json!({"timescale": {"rate": 1.5}}))),
+            "40.000"
+        );
     }
 
     fn marker_path(label: &str) -> PathBuf {
@@ -506,84 +430,91 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn gated_marker(started: &Path, release: &Path, survived: &Path) -> Child {
-        let started = started.to_string_lossy().replace('\'', "''");
-        let release = release.to_string_lossy().replace('\'', "''");
-        let survived = survived.to_string_lossy().replace('\'', "''");
+    fn ps_escape(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    #[cfg(windows)]
+    fn spawn_gate(started: &Path, release: &Path, tail: &str, pipe_stderr: bool) -> Child {
+        let (st, rl) =
+            (ps_escape(&started.to_string_lossy()), ps_escape(&release.to_string_lossy()));
         Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 &format!(
-                    "$deadline=[DateTime]::UtcNow.AddSeconds(5); [IO.File]::WriteAllText('{started}','started'); while (-not [IO.File]::Exists('{release}') -and [DateTime]::UtcNow -lt $deadline) {{ Start-Sleep -Milliseconds 10 }}; if ([IO.File]::Exists('{release}')) {{ [IO.File]::WriteAllText('{survived}','survived') }}; exit 23"
+                    "$d=[DateTime]::UtcNow.AddSeconds(5); [IO.File]::WriteAllText('{st}','started'); while (-not [IO.File]::Exists('{rl}') -and [DateTime]::UtcNow -lt $d) {{ Start-Sleep -Milliseconds 10 }}; {tail}; exit 23"
                 ),
             ])
-            .spawn()
-            .unwrap()
-    }
-
-    #[cfg(not(windows))]
-    fn gated_marker(started: &Path, release: &Path, survived: &Path) -> Child {
-        fn quote(path: &Path) -> String {
-            format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
-        }
-        Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "printf started > {}; i=0; while [ ! -e {} ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done; if [ -e {} ]; then printf survived > {}; fi; exit 23",
-                    quote(started),
-                    quote(release),
-                    quote(release),
-                    quote(survived)
-                ),
-            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(if pipe_stderr { Stdio::piped() } else { Stdio::null() })
             .spawn()
             .unwrap()
     }
 
     #[cfg(windows)]
+    fn gated_marker(started: &Path, release: &Path, survived: &Path) -> Child {
+        let (rl, sv) =
+            (ps_escape(&release.to_string_lossy()), ps_escape(&survived.to_string_lossy()));
+        spawn_gate(
+            started,
+            release,
+            &format!(
+                "if ([IO.File]::Exists('{rl}')) {{ [IO.File]::WriteAllText('{sv}','survived') }}"
+            ),
+            false,
+        )
+    }
+
+    #[cfg(windows)]
     fn gated_stderr_child(started: &Path, release: &Path, marker: &str) -> Child {
-        let started = started.to_string_lossy().replace('\'', "''");
-        let release = release.to_string_lossy().replace('\'', "''");
-        let marker = marker.replace('\'', "''");
-        Command::new("powershell.exe")
+        spawn_gate(
+            started,
+            release,
+            &format!("[Console]::Error.WriteLine('{}')", ps_escape(marker)),
+            true,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn sh_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_gate(started: &Path, release: &Path, tail: &str, pipe_stderr: bool) -> Child {
+        let (st, rl) = (sh_quote(&started.to_string_lossy()), sh_quote(&release.to_string_lossy()));
+        Command::new("sh")
             .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+                "-c",
                 &format!(
-                    "$deadline=[DateTime]::UtcNow.AddSeconds(5); [IO.File]::WriteAllText('{started}','started'); while (-not [IO.File]::Exists('{release}') -and [DateTime]::UtcNow -lt $deadline) {{ Start-Sleep -Milliseconds 10 }}; [Console]::Error.WriteLine('{marker}'); exit 23"
+                    "printf started > {st}; i=0; while [ ! -e {rl} ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done; {tail}; exit 23"
                 ),
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(if pipe_stderr { Stdio::piped() } else { Stdio::null() })
             .spawn()
             .unwrap()
     }
 
     #[cfg(not(windows))]
+    fn gated_marker(started: &Path, release: &Path, survived: &Path) -> Child {
+        let (rl, sv) =
+            (sh_quote(&release.to_string_lossy()), sh_quote(&survived.to_string_lossy()));
+        spawn_gate(
+            started,
+            release,
+            &format!("if [ -e {rl} ]; then printf survived > {sv}; fi"),
+            false,
+        )
+    }
+
+    #[cfg(not(windows))]
     fn gated_stderr_child(started: &Path, release: &Path, marker: &str) -> Child {
-        fn quote(value: &str) -> String {
-            format!("'{}'", value.replace('\'', "'\\''"))
-        }
-        Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "printf started > {}; i=0; while [ ! -e {} ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done; printf '%s\\n' {} >&2; exit 23",
-                    quote(&started.to_string_lossy()),
-                    quote(&release.to_string_lossy()),
-                    quote(marker)
-                ),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+        spawn_gate(started, release, &format!("printf '%s\\n' {} >&2", sh_quote(marker)), true)
     }
 
     fn wait_for(path: &Path) {
@@ -596,26 +527,18 @@ mod tests {
             if Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         true
     }
 
-    #[cfg(windows)]
     fn failed_child() -> Child {
-        Command::new("cmd.exe")
-            .args(["/d", "/c", "exit /b 23"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
-    }
-
-    #[cfg(not(windows))]
-    fn failed_child() -> Child {
-        Command::new("sh")
-            .args(["-c", "exit 23"])
+        #[cfg(windows)]
+        let (prog, args) = ("cmd.exe", &["/d", "/c", "exit /b 23"][..]);
+        #[cfg(not(windows))]
+        let (prog, args) = ("sh", &["-c", "exit 23"][..]);
+        Command::new(prog)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -630,10 +553,8 @@ mod tests {
     }
 
     fn frames_for_child(child: Child, stderr: StderrCollector) -> FfmpegFrames {
-        let (packet_sender, packets) = mpsc::sync_channel(1);
-        drop(packet_sender);
-        let (recycle, recycled) = mpsc::sync_channel(1);
-        drop(recycled);
+        let (_packet_sender, packets) = mpsc::sync_channel(1);
+        let (recycle, _recycled) = mpsc::sync_channel(1);
         FfmpegFrames {
             packets,
             recycle,
@@ -647,14 +568,14 @@ mod tests {
 
     #[test]
     fn finish_remains_unfinished_when_wait_fails() {
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = frames_for_child(failed_child(), empty_stderr_collector(errors));
+        let mut frames = frames_for_child(
+            failed_child(),
+            empty_stderr_collector(Arc::new(Mutex::new(Vec::new()))),
+        );
         let error = frames
-            .finish_with_wait(|_| Err(std::io::Error::other("injected wait failure")))
+            .finish_with_wait(|_| Err(io::Error::other("injected wait failure")))
             .expect_err("an injected wait failure must be returned");
         let finished = frames.finished;
-        // Preserve the observed value but allow the red case to clean up the
-        // real helper instead of suppressing Drop a second time.
         frames.finished = false;
         drop(frames);
 
@@ -687,8 +608,8 @@ mod tests {
             done_tx.send(()).unwrap();
         });
 
-        let stderr = StderrCollector { errors, done, worker: Some(collector) };
-        let frames = frames_for_child(child, stderr);
+        let frames =
+            frames_for_child(child, StderrCollector { errors, done, worker: Some(collector) });
         let (finisher_ready_tx, finisher_ready_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let finisher = thread::spawn(move || {
@@ -726,10 +647,7 @@ mod tests {
     }
 
     impl Read for ChunkedReader {
-        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
-            if self.offset == self.data.len() {
-                return Ok(0);
-            }
+        fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
             let count = self.chunk.min(target.len()).min(self.data.len() - self.offset);
             target[..count].copy_from_slice(&self.data[self.offset..self.offset + count]);
             self.offset += count;
@@ -751,9 +669,7 @@ mod tests {
         );
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let actual = errors.lock().unwrap().clone();
-        assert_eq!(actual.len(), STDERR_LIMIT);
-        assert_eq!(actual, expected);
+        assert_eq!(*errors.lock().unwrap(), expected);
     }
 
     #[test]
@@ -805,9 +721,9 @@ mod tests {
         }
         dropper.join().unwrap();
 
-        let _ = std::fs::remove_file(started);
-        let _ = std::fs::remove_file(release);
-        let _ = std::fs::remove_file(survived);
+        for p in [started, release, survived] {
+            let _ = std::fs::remove_file(p);
+        }
         assert!(completed_before_release, "startup guard waited instead of killing the child");
         assert!(!child_survived, "child survived failed FFmpeg setup");
     }
@@ -820,8 +736,8 @@ mod tests {
         let child = gated_marker(&started, &release, &survived);
         wait_for(&started);
 
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = frames_for_child(child, empty_stderr_collector(errors));
+        let mut frames =
+            frames_for_child(child, empty_stderr_collector(Arc::new(Mutex::new(Vec::new()))));
         let begin = Instant::now();
         let err = frames
             .finish_bounded(Duration::from_millis(40))
@@ -832,9 +748,9 @@ mod tests {
 
         std::fs::write(&release, b"release").unwrap();
         let child_survived = appears_within(&survived, Duration::from_millis(100));
-        let _ = std::fs::remove_file(started);
-        let _ = std::fs::remove_file(release);
-        let _ = std::fs::remove_file(survived);
+        for p in [started, release, survived] {
+            let _ = std::fs::remove_file(p);
+        }
         assert!(!child_survived, "hung child survived finish timeout");
     }
 }

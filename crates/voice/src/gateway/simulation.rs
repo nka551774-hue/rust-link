@@ -1,4 +1,4 @@
-//! Real loopback WebSocket/UDP peers; these tests do not contact Discord.
+//! Loopback WebSocket/UDP simulation peers; these tests do not contact Discord.
 use super::*;
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -22,15 +22,6 @@ const SSRC: u32 = 77;
 const KEY: [u8; 32] = [29; 32];
 const SILENCE: &[u8] = &[0xf8, 0xff, 0xfe];
 const LIMIT: Duration = Duration::from_secs(5);
-const AES_MODE: &str = "aead_aes256_gcm_rtpsize";
-const XCHACHA_MODE: &str = "aead_xchacha20_poly1305_rtpsize";
-
-fn wire_mode(mode: Mode) -> &'static str {
-    match mode {
-        Mode::AeadAes256GcmRtpSize => AES_MODE,
-        Mode::AeadXChaCha20Poly1305RtpSize => XCHACHA_MODE,
-    }
-}
 
 fn state() -> VoiceState {
     VoiceState {
@@ -39,6 +30,42 @@ fn state() -> VoiceState {
         endpoint: "unused.discord.media".into(),
         channel_id: Some(CHANNEL.to_string()),
     }
+}
+
+async fn listener_with_url() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    (listener, url)
+}
+
+async fn connect_loopback(url: &str) -> (Arc<DiscordConnection>, mpsc::UnboundedReceiver<Closed>) {
+    let (close, closed) = mpsc::unbounded_channel();
+    let conn = connect_url(
+        url,
+        &USER.to_string(),
+        "1111",
+        &state(),
+        Box::new(move |event| {
+            let _ = close.send(event);
+        }),
+    )
+    .await
+    .unwrap();
+    (conn, closed)
+}
+
+async fn recv_closed(closed: &mut mpsc::UnboundedReceiver<Closed>) -> Closed {
+    tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap()
+}
+
+fn external_sender(label: &[u8]) -> (SignatureKeyPair, Vec<u8>) {
+    let suite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+    let signer = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
+    let external =
+        ExternalSender::new(signer.public().into(), BasicCredential::new(label.to_vec()).into())
+            .tls_serialize_detached()
+            .unwrap();
+    (signer, external)
 }
 
 struct Peer {
@@ -61,8 +88,18 @@ impl Peer {
         let identify = peer.control(0).await;
         assert_eq!(identify["d"]["user_id"], USER.to_string());
         assert_eq!(identify["d"]["max_dave_protocol_version"], 1);
-        let offered_mode = wire_mode(mode);
-        peer.send(json!({"op":2,"seq":1,"d":{"ssrc":SSRC,"ip":"127.0.0.1","port":peer.udp.local_addr().unwrap().port(),"modes":[offered_mode]}})).await;
+        let offered_mode = mode.name();
+        peer.send(json!({
+            "op": 2,
+            "seq": 1,
+            "d": {
+                "ssrc": SSRC,
+                "ip": "127.0.0.1",
+                "port": peer.udp.local_addr().unwrap().port(),
+                "modes": [offered_mode]
+            }
+        }))
+        .await;
         let mut discovery = [0u8; 74];
         let (size, remote) =
             tokio::time::timeout(LIMIT, peer.udp.recv_from(&mut discovery)).await.unwrap().unwrap();
@@ -72,13 +109,20 @@ impl Peer {
         discovery[8..17].copy_from_slice(b"127.0.0.1");
         discovery[72..].copy_from_slice(&remote.port().to_be_bytes());
         peer.udp.send_to(&discovery, remote).await.unwrap();
-        let selected = peer.control(1).await;
-        assert_eq!(selected["d"]["data"]["mode"], offered_mode);
+        assert_eq!(peer.control(1).await["d"]["data"]["mode"], offered_mode);
         peer
     }
 
     async fn send(&mut self, value: Value) {
         self.ws.send(Message::Text(value.to_string().into())).await.unwrap();
+    }
+
+    async fn send_binary(&mut self, seq: u16, op: u8, payload: &[u8]) {
+        let mut msg = Vec::with_capacity(3 + payload.len());
+        msg.extend_from_slice(&seq.to_be_bytes());
+        msg.push(op);
+        msg.extend_from_slice(payload);
+        self.ws.send(Message::Binary(msg.into())).await.unwrap();
     }
 
     async fn message(&mut self) -> Message {
@@ -116,30 +160,39 @@ impl Peer {
         }
     }
 
+    async fn wait_for_close(&mut self) {
+        loop {
+            let message = self.message().await;
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+            self.handle(message).await;
+        }
+    }
+
     async fn describe(&mut self, version: u16) {
-        self.send(json!({"op":4,"seq":3,"d":{"mode":wire_mode(self.mode),"secret_key":self.key,"audio_codec":"opus","dave_protocol_version":version}})).await;
+        self.send(json!({
+            "op": 4,
+            "seq": 3,
+            "d": {
+                "mode": self.mode.name(),
+                "secret_key": self.key,
+                "audio_codec": "opus",
+                "dave_protocol_version": version
+            }
+        }))
+        .await;
     }
 
     async fn enable_dave(&mut self) {
-        let suite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
-        let signer = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
-        let external = ExternalSender::new(
-            signer.public().into(),
-            BasicCredential::new(b"loopback Discord peer".to_vec()).into(),
-        )
-        .tls_serialize_detached()
-        .unwrap();
-        let mut message = vec![0, 2, 25];
-        message.extend(&external);
-        self.ws.send(Message::Binary(message.into())).await.unwrap();
+        let (signer, external) = external_sender(b"loopback Discord peer");
+        self.send_binary(2, 25, &external).await;
         self.describe(1).await;
         let package = loop {
             let message = self.message().await;
             if let Message::Binary(bytes) = &message {
                 assert_eq!(bytes[0], 26);
-                // Discord takes a bare KeyPackage on op 26, as libdave sends it.
-                let package = KeyPackageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
-                break package;
+                break KeyPackageIn::tls_deserialize_exact_bytes(&bytes[1..]).unwrap();
             }
             self.handle(message).await;
         };
@@ -165,9 +218,9 @@ impl Peer {
         dave.process_commit(&commit.commit).unwrap();
         self.send(json!({"op":11,"seq":4,"d":{"user_ids":[USER.to_string(),PEER.to_string()]}}))
             .await;
-        let mut welcome = vec![0, 5, 30, 0, 8];
-        welcome.extend(commit.welcome.unwrap());
-        self.ws.send(Message::Binary(welcome.into())).await.unwrap();
+        let mut welcome = 8u16.to_be_bytes().to_vec();
+        welcome.extend_from_slice(&commit.welcome.unwrap());
+        self.send_binary(5, 30, &welcome).await;
         assert_eq!(self.control(23).await["d"]["transition_id"], 8);
         self.send(json!({"op":22,"seq":6,"d":{"transition_id":8}})).await;
         self.dave = Some(dave);
@@ -216,14 +269,15 @@ impl Peer {
         }
     }
 
-    async fn remote_close(&mut self) {
+    async fn close_code(&mut self, code: u16, reason: &'static str) {
         self.ws
-            .close(Some(CloseFrame {
-                code: CloseCode::from(4014),
-                reason: "simulated voice move".into(),
-            }))
+            .close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }))
             .await
             .unwrap();
+    }
+
+    async fn remote_close(&mut self) {
+        self.close_code(4014, "simulated voice move").await;
     }
 }
 
@@ -245,8 +299,7 @@ fn audio_packets() -> Vec<Vec<u8>> {
 #[tokio::test]
 async fn both_transports_preserve_stereo_opus_through_dave_pause_and_resume() {
     for mode in [Mode::AeadAes256GcmRtpSize, Mode::AeadXChaCha20Poly1305RtpSize] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (listener, url) = listener_with_url().await;
         let packets = audio_packets();
         let mut expected = packets[..25].to_vec();
         expected.extend(vec![SILENCE.to_vec(); 5]);
@@ -255,47 +308,32 @@ async fn both_transports_preserve_stereo_opus_through_dave_pause_and_resume() {
         let server = tokio::spawn(async move {
             let mut peer = Peer::transport(&listener, mode, KEY).await;
             peer.enable_dave().await;
-            let mut actual_decoder = Decoder::new().unwrap();
-            let mut reference_decoder = Decoder::new().unwrap();
-            let mut actual = Vec::new();
-            let mut reference = Vec::new();
+            let (mut actual_dec, mut ref_dec) = (Decoder::new().unwrap(), Decoder::new().unwrap());
+            let (mut actual, mut reference) = (Vec::new(), Vec::new());
             let mut samples = 0;
             let mut energy = [0.0f64; 2];
-            for (index, expected) in expected.iter().enumerate() {
-                let actual_packet = peer.packet(index as u16).await;
-                assert_eq!(&actual_packet, expected, "transport changed Opus packet {index}");
-                samples += actual_decoder.decode(&actual_packet, &mut actual).unwrap();
-                reference_decoder.decode(expected, &mut reference).unwrap();
+            for (index, exp) in expected.iter().enumerate() {
+                let got = peer.packet(index as u16).await;
+                assert_eq!(&got, exp, "transport changed Opus packet {index}");
+                samples += actual_dec.decode(&got, &mut actual).unwrap();
+                ref_dec.decode(exp, &mut reference).unwrap();
                 assert_eq!(actual, reference, "decoded channel data changed at packet {index}");
                 for pair in actual.as_chunks::<2>().0 {
-                    for channel in 0..2 {
-                        energy[channel] += f64::from(pair[channel]).powi(2);
-                    }
+                    energy[0] += f64::from(pair[0]).powi(2);
+                    energy[1] += f64::from(pair[1]).powi(2);
                 }
             }
             while peer.speaking.len() < 4 {
-                let message = peer.message().await;
-                peer.handle(message).await;
+                let msg = peer.message().await;
+                peer.handle(msg).await;
             }
             assert_eq!(peer.speaking, [true, false, true, false]);
-            assert!(peer.heartbeats >= 2, "audio must coexist with acknowledged heartbeats");
+            assert!(peer.heartbeats >= 2);
             assert_eq!(samples, 57_600);
-            assert!(energy.iter().all(|value| (*value / samples as f64).sqrt() > 1000.0));
-            eprintln!("loopback mode={} packets=60 samples_per_channel={} heartbeat_acks={} left_rms={:.2} right_rms={:.2}", mode.name(), samples, peer.heartbeats, (energy[0] / samples as f64).sqrt(), (energy[1] / samples as f64).sqrt());
+            assert!(energy.iter().all(|v| (*v / samples as f64).sqrt() > 1000.0));
             peer.remote_close().await;
         });
-        let (close, mut closed) = mpsc::unbounded_channel();
-        let connection = connect_url(
-            &url,
-            &USER.to_string(),
-            "1111",
-            &state(),
-            Box::new(move |event| {
-                close.send(event).unwrap();
-            }),
-        )
-        .await
-        .unwrap();
+        let (connection, mut closed) = connect_loopback(&url).await;
         connection.speaking(true).unwrap();
         for (index, packet) in packets.iter().enumerate() {
             if index == 25 {
@@ -308,11 +346,10 @@ async fn both_transports_preserve_stereo_opus_through_dave_pause_and_resume() {
         }
         connection.speaking(false).unwrap();
         server.await.unwrap();
-        let closed_event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
-        assert_eq!(closed_event.code, 4014);
-        assert_eq!(closed_event.reason, "simulated voice move");
-        assert!(closed_event.by_remote);
-        assert!(!connection.connected());
+        let event = recv_closed(&mut closed).await;
+        assert_eq!(event.code, 4014);
+        assert_eq!(event.reason, "simulated voice move");
+        assert!(event.by_remote && !connection.connected());
         assert!(connection.write(SILENCE).is_err());
         assert!(closed.try_recv().is_err());
     }
@@ -321,8 +358,7 @@ async fn both_transports_preserve_stereo_opus_through_dave_pause_and_resume() {
 #[tokio::test]
 async fn duplicate_description_and_wrong_heartbeat_ack_close_established_connections() {
     for duplicate in [true, false] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (listener, url) = listener_with_url().await;
         let server = tokio::spawn(async move {
             let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
             peer.describe(0).await;
@@ -343,27 +379,15 @@ async fn duplicate_description_and_wrong_heartbeat_ack_close_established_connect
                 }
             }
         });
-        let (close, mut closed) = mpsc::unbounded_channel();
-        let connection = connect_url(
-            &url,
-            &USER.to_string(),
-            "1111",
-            &state(),
-            Box::new(move |event| {
-                close.send(event).unwrap();
-            }),
-        )
-        .await
-        .unwrap();
-        let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
+        let (connection, mut closed) = connect_loopback(&url).await;
+        let event = recv_closed(&mut closed).await;
         assert_eq!(event.code, 1006);
         assert!(event.reason.contains(if duplicate {
             "already installed"
         } else {
             "not acknowledged"
         }));
-        assert!(!connection.connected());
-        assert_eq!(connection.ping(), -1);
+        assert!(!connection.connected() && connection.ping() == -1);
         server.await.unwrap();
         assert!(closed.try_recv().is_err());
     }
@@ -371,8 +395,7 @@ async fn duplicate_description_and_wrong_heartbeat_ack_close_established_connect
 
 #[tokio::test]
 async fn local_close_is_idempotent_and_fresh_connect_uses_a_new_transport_key() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let (received, mut deliveries) = mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
         for round in 0..2 {
@@ -381,37 +404,19 @@ async fn local_close_is_idempotent_and_fresh_connect_uses_a_new_transport_key() 
             peer.describe(0).await;
             assert_eq!(peer.packet(0).await, SILENCE);
             received.send(()).unwrap();
-            loop {
-                let message = peer.message().await;
-                if matches!(message, Message::Close(_)) {
-                    break;
-                }
-                peer.handle(message).await;
-            }
+            peer.wait_for_close().await;
         }
     });
     for _ in 0..2 {
-        let (close, mut closed) = mpsc::unbounded_channel();
-        let connection = connect_url(
-            &url,
-            &USER.to_string(),
-            "1111",
-            &state(),
-            Box::new(move |event| {
-                close.send(event).unwrap();
-            }),
-        )
-        .await
-        .unwrap();
+        let (connection, mut closed) = connect_loopback(&url).await;
         connection.speaking(true).unwrap();
         connection.write(SILENCE).unwrap();
         tokio::time::timeout(LIMIT, deliveries.recv()).await.unwrap().unwrap();
         connection.close();
         connection.close();
-        let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
+        let event = recv_closed(&mut closed).await;
         assert_eq!(event.code, 1000);
-        assert!(!event.by_remote);
-        assert!(!connection.connected());
+        assert!(!event.by_remote && !connection.connected());
         assert!(closed.try_recv().is_err());
     }
     server.await.unwrap();
@@ -419,36 +424,17 @@ async fn local_close_is_idempotent_and_fresh_connect_uses_a_new_transport_key() 
 
 #[tokio::test]
 async fn an_unreachable_udp_peer_does_not_close_the_voice_session() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let (received, mut deliveries) = mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
         let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
         peer.describe(0).await;
         assert_eq!(peer.packet(0).await, SILENCE);
-        // Closing the media port makes later frames draw ICMP port unreachable.
         peer.udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         received.send(()).unwrap();
-        loop {
-            let message = peer.message().await;
-            if matches!(message, Message::Close(_)) {
-                break;
-            }
-            peer.handle(message).await;
-        }
+        peer.wait_for_close().await;
     });
-    let (close, mut closed) = mpsc::unbounded_channel();
-    let connection = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(move |event| {
-            close.send(event).unwrap();
-        }),
-    )
-    .await
-    .unwrap();
+    let (connection, mut closed) = connect_loopback(&url).await;
     connection.speaking(true).unwrap();
     connection.write(SILENCE).unwrap();
     tokio::time::timeout(LIMIT, deliveries.recv()).await.unwrap().unwrap();
@@ -458,26 +444,22 @@ async fn an_unreachable_udp_peer_does_not_close_the_voice_session() {
     }
     assert!(connection.connected(), "closed: {:?}", closed.try_recv());
     connection.close();
-    let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
-    assert!(!event.by_remote);
+    assert!(!recv_closed(&mut closed).await.by_remote);
     server.await.unwrap();
 }
 
 #[tokio::test]
 async fn premature_dave_downgrade_fails_the_loopback_handshake() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-        ws.send(Message::Text(json!({"op":8,"d":{"heartbeat_interval":250}}).to_string().into()))
-            .await
-            .unwrap();
-        ws.send(Message::Text(
-            json!({"op":21,"d":{"protocol_version":0,"transition_id":0}}).to_string().into(),
-        ))
-        .await
-        .unwrap();
+        for msg in [
+            json!({"op":8,"d":{"heartbeat_interval":250}}),
+            json!({"op":21,"d":{"protocol_version":0,"transition_id":0}}),
+        ] {
+            ws.send(Message::Text(msg.to_string().into())).await.unwrap();
+        }
         while let Some(Ok(_)) = ws.next().await {}
     });
     let result = connect_url(
@@ -496,33 +478,22 @@ async fn premature_dave_downgrade_fails_the_loopback_handshake() {
 
 #[tokio::test]
 async fn v8_resume_preserves_dave_session_seq_ack_and_audio_continuity() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let (resumed_ready_tx, resumed_ready_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
         peer.enable_dave().await;
         assert_eq!(peer.packet(0).await, SILENCE);
 
-        // Send a DAVE downgrade prepare (seq=10, transition_id=15) and immediately crash (4015).
         peer.send(json!({"op":21,"seq":10,"d":{"protocol_version":0,"transition_id":15}})).await;
-        peer.ws
-            .close(Some(CloseFrame {
-                code: CloseCode::from(4015),
-                reason: "voice server failover".into(),
-            }))
-            .await
-            .unwrap();
+        peer.close_code(4015, "voice server failover").await;
 
-        // Accept the v8 RESUME on the new WebSocket while reusing the existing UDP socket & DAVE state.
         let (tcp2, _) = tokio::time::timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
         peer.ws = tokio_tungstenite::accept_async(tcp2).await.unwrap();
         peer.send(json!({"op":8,"d":{"heartbeat_interval":200}})).await;
-        let resume = peer.control(7).await;
-        assert_eq!(resume["d"]["seq_ack"], 10);
+        assert_eq!(peer.control(7).await["d"]["seq_ack"], 10);
         peer.send(json!({"op":9,"seq":11,"d":null})).await;
 
-        // Cancel the downgrade back to DAVE v1 (transition_id=16) and execute it!
         peer.send(json!({"op":21,"seq":12,"d":{"protocol_version":1,"transition_id":16}})).await;
         loop {
             let msg = peer.message().await;
@@ -543,55 +514,29 @@ async fn v8_resume_preserves_dave_session_seq_ack_and_audio_continuity() {
         peer.remote_close().await;
     });
 
-    let (close, mut closed) = mpsc::unbounded_channel();
-    let connection = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(move |event| {
-            let _ = close.send(event);
-        }),
-    )
-    .await
-    .unwrap();
-
+    let (connection, mut closed) = connect_loopback(&url).await;
     connection.speaking(true).unwrap();
     connection.write(SILENCE).unwrap();
     resumed_ready_rx.await.unwrap();
     connection.write(SILENCE).unwrap();
 
-    let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
-    assert_eq!(event.code, 4014);
+    assert_eq!(recv_closed(&mut closed).await.code, 4014);
     server.await.unwrap();
 }
 
 #[tokio::test]
 async fn solo_upgrade_from_v0_arms_alone_timer_and_switches_to_dave_v1() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (listener, url) = listener_with_url().await;
     let (alone_ready_tx, alone_ready_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = Peer::transport(&listener, Mode::AeadAes256GcmRtpSize, KEY).await;
         peer.describe(0).await;
-        // First packet in DAVE v0 is cleartext SILENCE inside RTP AEAD.
         assert_eq!(peer.packet(0).await, SILENCE);
 
-        // Send external sender (op 25) and solo upgrade op 24 (v=1, epoch=1).
-        let suite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
-        let signer = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
-        let external = ExternalSender::new(
-            signer.public().into(),
-            BasicCredential::new(b"solo upgrade peer".to_vec()).into(),
-        )
-        .tls_serialize_detached()
-        .unwrap();
-        let mut ext_msg = vec![0, 4, 25];
-        ext_msg.extend(&external);
-        peer.ws.send(Message::Binary(ext_msg.into())).await.unwrap();
+        let (_, external) = external_sender(b"solo upgrade peer");
+        peer.send_binary(4, 25, &external).await;
         peer.send(json!({"op":24,"seq":5,"d":{"protocol_version":1,"epoch":1}})).await;
 
-        // Expect op 26 KeyPackage.
         loop {
             let msg = peer.message().await;
             if let Message::Binary(bytes) = &msg {
@@ -601,7 +546,6 @@ async fn solo_upgrade_from_v0_arms_alone_timer_and_switches_to_dave_v1() {
             peer.handle(msg).await;
         }
 
-        // Keep answering heartbeats across ALONE_GRACE (3s) so start_alone() activates DAVE v1!
         let deadline = Instant::now() + ALONE_GRACE + Duration::from_millis(500);
         while Instant::now() < deadline {
             if let Ok(msg) = tokio::time::timeout(Duration::from_millis(100), peer.ws.next()).await
@@ -611,32 +555,18 @@ async fn solo_upgrade_from_v0_arms_alone_timer_and_switches_to_dave_v1() {
         }
         alone_ready_tx.send(()).unwrap();
 
-        // Next RTP-decrypted frame must carry DAVE v1 magic footer 0xfafa!
         let encrypted_dave = peer.packet(1).await;
         assert_ne!(encrypted_dave, SILENCE);
         assert_eq!(&encrypted_dave[encrypted_dave.len() - 2..], &[0xfa, 0xfa]);
         peer.remote_close().await;
     });
 
-    let (close, mut closed) = mpsc::unbounded_channel();
-    let connection = connect_url(
-        &url,
-        &USER.to_string(),
-        "1111",
-        &state(),
-        Box::new(move |event| {
-            let _ = close.send(event);
-        }),
-    )
-    .await
-    .unwrap();
-
+    let (connection, mut closed) = connect_loopback(&url).await;
     connection.speaking(true).unwrap();
     connection.write(SILENCE).unwrap();
     alone_ready_rx.await.unwrap();
     connection.write(SILENCE).unwrap();
 
-    let event = tokio::time::timeout(LIMIT, closed.recv()).await.unwrap().unwrap();
-    assert_eq!(event.code, 4014);
+    assert_eq!(recv_closed(&mut closed).await.code, 4014);
     server.await.unwrap();
 }

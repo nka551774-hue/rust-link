@@ -1,38 +1,22 @@
-//! The console log, the log files and the startup wordmark.
-//!
-//! The console output is meant to be read by a person: the time is dimmed, the
-//! level is coloured and padded to five columns, and the message follows.
-//! Colour is written only when the output can show it, and never into a log
-//! file, where an escape sequence is noise for every tool that reads one.
-//!
-//! The records themselves arrive through the `log` facade, which every other
-//! crate writes to. A record carries its values inside its message, written as
-//! `key=value` pairs for readable text and structured JSON output.
+//! Console log, rotating daily log files, and startup wordmark.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Days, Local, NaiveDate, SecondsFormat};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
-/// The label of the record written just before the process stops. It sits above
-/// error so an operator can tell a failure the node recovered from at a glance.
 const FATAL: &str = "FATAL";
-
-/// The console timestamp, which carries no date: the date is in the log file
-/// name, and a console line should stay short.
 const CONSOLE_TIME: &str = "%H:%M:%S%.3f";
-
-/// The stem of a daily log file. Only names in this shape are ever removed, so
-/// a directory that holds anything else keeps it.
 const FILE_PREFIX: &str = "rustlink-";
+const ROTATE_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// The process logger, once one has been installed.
 static INSTALLED: OnceLock<&'static Logger> = OnceLock::new();
 
-/// ANSI escapes, kept in one place so the palette is easy to adjust.
 mod paint {
     pub const RESET: &str = "\x1b[0m";
     pub const DIM: &str = "\x1b[2m";
@@ -41,15 +25,10 @@ mod paint {
     pub const GREEN: &str = "\x1b[32m";
     pub const YELLOW: &str = "\x1b[33m";
     pub const CYAN: &str = "\x1b[36m";
-    /// The "LINK" half of the wordmark: the project red, #D93A49. None of the
-    /// basic ANSI colours is that shade, so it is written as truecolor.
     pub const CRIMSON: &str = "\x1b[38;2;217;58;73m";
-    /// The "RUST" half of the wordmark: the project teal, #39C5BB, truecolor
-    /// for the same reason.
     pub const TEAL: &str = "\x1b[38;2;57;197;187m";
 }
 
-/// Where colour is allowed to go.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color {
     Auto,
@@ -58,8 +37,6 @@ pub enum Color {
 }
 
 impl Color {
-    /// Reads the configuration value. The configuration is checked when it is
-    /// loaded, so anything unexpected is treated as auto.
     pub fn parse(value: &str) -> Color {
         let v = value.trim();
         if v.eq_ignore_ascii_case("always") {
@@ -71,13 +48,10 @@ impl Color {
         }
     }
 
-    /// Whether colour may be written to the console.
     pub fn allowed(self) -> bool {
         match self {
             Color::Always => true,
             Color::Never => false,
-            // Auto colours a terminal and leaves a redirected stream alone,
-            // which is what keeps a piped log clean.
             Color::Auto => {
                 std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
             }
@@ -85,7 +59,6 @@ impl Color {
     }
 }
 
-/// What the console and the files are written in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
     Text,
@@ -93,8 +66,6 @@ pub enum Format {
 }
 
 impl Format {
-    /// Reads the configuration value, defaulting to text the way the
-    /// configuration validator does.
     pub fn parse(value: &str) -> Format {
         if value.trim().eq_ignore_ascii_case("json") {
             Format::Json
@@ -104,42 +75,31 @@ impl Format {
     }
 }
 
-/// Everything the process logger needs to be built.
 pub struct Options {
     pub level: LevelFilter,
     pub format: Format,
     pub color: Color,
-    /// Where the daily files are kept. Empty leaves the console as the only
-    /// output.
     pub directory: String,
-    /// How many days of files to keep. Zero keeps every file, which is what a
-    /// node whose logs are rotated by something else asks for.
     pub retention: u32,
 }
 
-/// Builds the process logger and makes it the one every crate writes to.
-///
-/// The log file is opened here rather than on the first record, so a directory
-/// that cannot be written to is a startup failure instead of a surprise later.
 pub fn install(options: &Options) -> Result<&'static Logger, String> {
-    let files = if options.directory.trim().is_empty() {
-        None
-    } else {
-        Some(Mutex::new(Files::open(options.directory.trim(), options.retention)?))
-    };
+    let dir = options.directory.trim();
+    let files = (!dir.is_empty())
+        .then(|| Files::open(dir, options.retention).map(Mutex::new))
+        .transpose()?;
     let logger: &'static Logger = Box::leak(Box::new(Logger {
         level: options.level,
         format: options.format,
         color: options.color.allowed(),
         files,
     }));
-    log::set_logger(logger).map_err(|error| format!("logger: {error}"))?;
+    log::set_logger(logger).map_err(|e| format!("logger: {e}"))?;
     log::set_max_level(options.level);
     let _ = INSTALLED.set(logger);
     Ok(logger)
 }
 
-/// Writes the record that says why the node is stopping, then ends the process.
 pub fn fatal(message: &str, error: &str) -> ! {
     let line = format!("{message} error={}", quote_if_needed(error));
     match INSTALLED.get() {
@@ -150,11 +110,6 @@ pub fn fatal(message: &str, error: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Keeps the last line readable when it was written into a window that closes
-/// with the process, which is the window a double-clicked Windows binary gets.
-///
-/// A node given CLI flags, `RUSTLINK_NO_PAUSE`, a non-terminal stdin, a Unix
-/// shell, or an existing parent console session exits immediately without blocking.
 fn hold_console() {
     if std::env::args_os().nth(1).is_some()
         || std::env::var_os("RUSTLINK_NO_PAUSE").is_some()
@@ -163,8 +118,7 @@ fn hold_console() {
     {
         return;
     }
-    println!();
-    println!("press Enter to close");
+    println!("\npress Enter to close");
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
 }
@@ -176,8 +130,7 @@ fn owns_ephemeral_console() -> bool {
     }
     let mut pids = [0u32; 2];
     // SAFETY: `pids` points to two writable `u32` slots matching `dwProcessCount = 2`.
-    let attached = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) };
-    attached == 1
+    unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) == 1 }
 }
 
 #[cfg(not(windows))]
@@ -185,7 +138,6 @@ fn owns_ephemeral_console() -> bool {
     false
 }
 
-/// The logger the crates write to.
 pub struct Logger {
     level: LevelFilter,
     format: Format,
@@ -194,33 +146,32 @@ pub struct Logger {
 }
 
 impl Logger {
-    /// The file being written to, or `None` when file logging is off.
-    pub fn path(&self) -> Option<String> {
-        self.files
-            .as_ref()
-            .map(|files| files.lock().unwrap_or_else(|error| error.into_inner()).path())
+    fn lock_files(&self) -> Option<MutexGuard<'_, Files>> {
+        self.files.as_ref().map(|f| f.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Writes one record to the console and mirrors it into the file.
+    pub fn path(&self) -> Option<String> {
+        self.lock_files().map(|f| f.path())
+    }
+
     fn write(&self, label: &str, color: &str, message: &str) {
         let at = Local::now();
         let console = match self.format {
             Format::Json => json_line(label, message, at),
             Format::Text => console_line(label, color, message, at, self.color),
         };
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(console.as_bytes());
-        let _ = out.flush();
-        drop(out);
-        if let Some(files) = &self.files {
+        {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(console.as_bytes());
+            let _ = out.flush();
+        }
+        if let Some(mut files) = self.lock_files() {
             let file_line = match self.format {
                 Format::Json => console,
                 Format::Text => text_line(label, message, at),
             };
-            let prune_job = files
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .write_line(&file_line, at.date_naive());
+            let prune_job = files.write_line(&file_line, at.date_naive());
+            drop(files);
             if let Some((directory, retention, today)) = prune_job {
                 spawn_prune(directory, retention, today);
             }
@@ -238,73 +189,53 @@ impl Log for Logger {
             return;
         }
         let (label, color) = style(record.level());
-        if let Some(literal) = record.args().as_str() {
-            self.write(label, color, literal);
-        } else {
-            self.write(label, color, &record.args().to_string());
+        match record.args().as_str() {
+            Some(literal) => self.write(label, color, literal),
+            None => self.write(label, color, &record.args().to_string()),
         }
     }
 
     fn flush(&self) {
         let _ = std::io::stdout().flush();
-        if let Some(files) = &self.files {
-            let _ = files.lock().unwrap_or_else(|error| error.into_inner()).handle.flush();
+        if let Some(mut files) = self.lock_files() {
+            let _ = files.handle.flush();
         }
     }
 }
 
-const ROTATE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The daily file the log is mirrored into. Records are never coloured, even
-/// when the console is: an escape sequence in a file is noise for every tool
-/// that reads one.
 struct Files {
     directory: PathBuf,
     date: NaiveDate,
     handle: File,
-    /// How many days of files are kept.
     retention: u32,
-    /// Cooldown deadline after a failed rotation attempt so subsequent log
-    /// lines do not hammer the filesystem on every record.
-    retry_after: Option<std::time::Instant>,
+    retry_after: Option<Instant>,
 }
 
 impl Files {
     fn open(directory: &str, retention: u32) -> Result<Files, String> {
         let date = Local::now().date_naive();
-        let handle = open_day(Path::new(directory), date)?;
-        let files = Files {
-            directory: PathBuf::from(directory),
-            date,
-            handle,
-            retention,
-            retry_after: None,
-        };
-        spawn_prune(files.directory.clone(), retention, date);
-        Ok(files)
+        let directory = PathBuf::from(directory);
+        let handle = open_day(&directory, date)?;
+        spawn_prune(directory.clone(), retention, date);
+        Ok(Files { directory, date, handle, retention, retry_after: None })
     }
 
-    /// The file currently being written to.
     fn path(&self) -> String {
         self.directory.join(format!("{FILE_PREFIX}{}.log", self.date)).display().to_string()
     }
 
-    /// Appends one record, reopening the file when the date changes so a node
-    /// that stays up for weeks does not grow one file forever.
     fn write_line(&mut self, line: &str, date: NaiveDate) -> Option<(PathBuf, u32, NaiveDate)> {
-        self.write_line_at(line, date, std::time::Instant::now())
+        self.write_line_at(line, date, Instant::now())
     }
 
     fn write_line_at(
         &mut self,
         line: &str,
         date: NaiveDate,
-        now: std::time::Instant,
+        now: Instant,
     ) -> Option<(PathBuf, u32, NaiveDate)> {
         let mut rotated = None;
         if date != self.date && self.retry_after.is_none_or(|until| now >= until) {
-            // Keeping the previous file when the new day cannot be opened is
-            // the lesser loss: a misnamed log beats no log.
             match open_day(&self.directory, date) {
                 Ok(handle) => {
                     self.handle = handle;
@@ -312,9 +243,7 @@ impl Files {
                     self.retry_after = None;
                     rotated = Some((self.directory.clone(), self.retention, date));
                 }
-                Err(_) => {
-                    self.retry_after = Some(now + ROTATE_RETRY_COOLDOWN);
-                }
+                Err(_) => self.retry_after = Some(now + ROTATE_RETRY_COOLDOWN),
             }
         }
         let _ = self.handle.write_all(line.as_bytes());
@@ -338,7 +267,7 @@ fn spawn_prune(directory: PathBuf, retention: u32, today: NaiveDate) {
 
 fn open_day(directory: &Path, date: NaiveDate) -> Result<File, String> {
     std::fs::create_dir_all(directory)
-        .map_err(|error| format!("log directory {}: {error}", directory.display()))?;
+        .map_err(|e| format!("log directory {}: {e}", directory.display()))?;
     let path = directory.join(format!("{FILE_PREFIX}{date}.log"));
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -347,15 +276,9 @@ fn open_day(directory: &Path, date: NaiveDate) -> Result<File, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o640);
     }
-    options.open(&path).map_err(|error| format!("log file {}: {error}", path.display()))
+    options.open(&path).map_err(|e| format!("log file {}: {e}", path.display()))
 }
 
-/// Deletes the daily files older than the retention window.
-///
-/// Only names this node writes are considered, so a directory that holds other
-/// files keeps them. Zero keeps every file. A deletion that fails is passed
-/// over: a log file that could not be removed is not worth stopping a node for,
-/// and the next start tries again.
 fn prune(directory: &Path, retention: u32, today: NaiveDate) {
     if retention == 0 {
         return;
@@ -367,18 +290,12 @@ fn prune(directory: &Path, retention: u32, today: NaiveDate) {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(day) = name.to_str().and_then(logged_day) else {
-            continue;
-        };
-        if day < cutoff {
+        if entry.file_name().to_str().and_then(logged_day).is_some_and(|day| day < cutoff) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
-/// Reads the date out of a file name, or nothing when the name is not one of
-/// this node's daily logs.
 fn logged_day(name: &str) -> Option<NaiveDate> {
     let day = name.strip_prefix(FILE_PREFIX)?.strip_suffix(".log")?;
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
@@ -393,8 +310,6 @@ fn has_unsafe_log_char(text: &str) -> bool {
         && text.chars().any(is_unsafe_log_char)
 }
 
-/// One console line: the time, the level and the message (with raw control and
-/// escape characters neutralized so remote metadata cannot inject ANSI codes).
 fn console_line(
     label: &str,
     color: &str,
@@ -402,12 +317,10 @@ fn console_line(
     at: DateTime<Local>,
     colored: bool,
 ) -> String {
-    let clean: std::borrow::Cow<'_, str> = if has_unsafe_log_char(message) {
-        std::borrow::Cow::Owned(
-            message.chars().map(|c| if is_unsafe_log_char(c) { ' ' } else { c }).collect(),
-        )
+    let clean: Cow<'_, str> = if has_unsafe_log_char(message) {
+        Cow::Owned(message.chars().map(|c| if is_unsafe_log_char(c) { ' ' } else { c }).collect())
     } else {
-        std::borrow::Cow::Borrowed(message)
+        Cow::Borrowed(message)
     };
     let time = at.format(CONSOLE_TIME);
     if !colored {
@@ -421,7 +334,6 @@ fn console_line(
     )
 }
 
-/// One JSON record containing time, level and message.
 fn json_line(label: &str, message: &str, at: DateTime<Local>) -> String {
     let time = at.to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut out = Vec::with_capacity(36 + time.len() + label.len() + message.len());
@@ -435,7 +347,6 @@ fn json_line(label: &str, message: &str, at: DateTime<Local>) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// One text record with quoted values for the log file.
 fn text_line(label: &str, message: &str, at: DateTime<Local>) -> String {
     format!(
         "time={} level={} msg={}\n",
@@ -445,22 +356,18 @@ fn text_line(label: &str, message: &str, at: DateTime<Local>) -> String {
     )
 }
 
-/// Quotes a value that would otherwise be ambiguous. Printable non-ASCII text
-/// is kept as it is, which matters for a title written in CJK.
-fn quote_if_needed(value: &str) -> std::borrow::Cow<'_, str> {
+fn quote_if_needed(value: &str) -> Cow<'_, str> {
     if value.is_empty() {
-        return std::borrow::Cow::Borrowed("\"\"");
+        return Cow::Borrowed("\"\"");
     }
-    if value.bytes().any(|b| b <= b' ' || b == 0x7f || b == b'"' || b == b'\\' || b == b'=')
+    if value.bytes().any(|b| b <= b' ' || b == 0x7f || matches!(b, b'"' | b'\\' | b'='))
         || has_unsafe_log_char(value)
     {
-        return std::borrow::Cow::Owned(format!("{value:?}"));
+        return Cow::Owned(format!("{value:?}"));
     }
-    std::borrow::Cow::Borrowed(value)
+    Cow::Borrowed(value)
 }
 
-/// The label and colour of a level. The label is padded where it is written, so
-/// every line starts its message in the same column.
 const fn style(level: Level) -> (&'static str, &'static str) {
     match level {
         Level::Trace | Level::Debug => ("DEBUG", paint::CYAN),
@@ -470,114 +377,46 @@ const fn style(level: Level) -> (&'static str, &'static str) {
     }
 }
 
-/// The name drawn at startup.
-const WORDMARK: &str = "RUSTLINK";
+/// ANSI Shadow wordmark split into `("RUST", "LINK")` halves per row.
+const WORDMARK: [(&str, &str); 6] = [
+    ("██████╗ ██╗   ██╗███████╗████████╗", "██╗     ██╗███╗   ██╗██╗  ██╗"),
+    ("██╔══██╗██║   ██║██╔════╝╚══██╔══╝", "██║     ██║████╗  ██║██║ ██╔╝"),
+    ("██████╔╝██║   ██║███████╗   ██║   ", "██║     ██║██╔██╗ ██║█████╔╝ "),
+    ("██╔══██╗██║   ██║╚════██║   ██║   ", "██║     ██║██║╚██╗██║██╔═██╗ "),
+    ("██║  ██║╚██████╔╝███████║   ██║   ", "███████╗██║██║ ╚████║██║  ██╗"),
+    ("╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   ", "╚══════╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝"),
+];
 
-/// How many letters take the first colour of the wordmark; the rest take the
-/// second.
-const SPLIT: usize = 4;
-
-/// Draws the wordmark and the version line, which a person reads at startup. A
-/// node that writes JSON logs leaves it out so the stream stays parseable.
 pub fn banner(color: bool, version: &str, api_version: &str) -> String {
     use std::fmt::Write;
-    let mut out = String::with_capacity(if color { 1600 } else { 700 });
-    for row in 0..6 {
-        for (index, letter) in WORDMARK.chars().enumerate() {
-            let glyph = block(letter)[row];
-            if !color {
-                out.push_str(glyph);
-            } else {
-                out.push_str(if index < SPLIT { paint::TEAL } else { paint::CRIMSON });
-                out.push_str(glyph);
-                out.push_str(paint::RESET);
-            }
+    let mut out = String::with_capacity(768);
+    for (rust, link) in WORDMARK {
+        if color {
+            let _ = writeln!(
+                out,
+                "{}{rust}{}{}{link}{}",
+                paint::TEAL,
+                paint::RESET,
+                paint::CRIMSON,
+                paint::RESET
+            );
+        } else {
+            let _ = writeln!(out, "{rust}{link}");
         }
-        out.push('\n');
     }
     if color {
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "\n  {}v{version}  -  Rustlink API {api_version}{}\n\n",
+            "\n  {}v{version}  -  Rustlink API {api_version}{}\n",
             paint::DIM,
             paint::RESET
         );
     } else {
-        let _ = write!(out, "\n  v{version}  -  Rustlink API {api_version}\n\n");
+        let _ = writeln!(out, "\n  v{version}  -  Rustlink API {api_version}\n");
     }
     out
 }
 
-/// The wordmark in the ANSI Shadow face: six rows per letter, ten columns wide.
-const fn block(letter: char) -> [&'static str; 6] {
-    match letter {
-        'R' => [
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d}",
-        ],
-        'U' => [
-            "\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}",
-            " \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d} ",
-        ],
-        'S' => [
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}",
-            "\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}",
-        ],
-        'T' => [
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}",
-            "\u{255a}\u{2550}\u{2550}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{255d}",
-            "   \u{2588}\u{2588}\u{2551}   ",
-            "   \u{2588}\u{2588}\u{2551}   ",
-            "   \u{2588}\u{2588}\u{2551}   ",
-            "   \u{255a}\u{2550}\u{255d}   ",
-        ],
-        'L' => [
-            "\u{2588}\u{2588}\u{2557}     ",
-            "\u{2588}\u{2588}\u{2551}     ",
-            "\u{2588}\u{2588}\u{2551}     ",
-            "\u{2588}\u{2588}\u{2551}     ",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}",
-            "\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}",
-        ],
-        'I' => [
-            "\u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2550}\u{255d}",
-        ],
-        'N' => [
-            "\u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}  \u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}",
-            "\u{2588}\u{2588}\u{2551} \u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
-            "\u{255a}\u{2550}\u{255d}  \u{255a}\u{2550}\u{2550}\u{2550}\u{255d}",
-        ],
-        'K' => [
-            "\u{2588}\u{2588}\u{2557}  \u{2588}\u{2588}\u{2557}",
-            "\u{2588}\u{2588}\u{2551} \u{2588}\u{2588}\u{2554}\u{255d}",
-            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d} ",
-            "\u{2588}\u{2588}\u{2554}\u{2550}\u{2588}\u{2588}\u{2557} ",
-            "\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2557}",
-            "\u{255a}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d}",
-        ],
-        _ => ["          "; 6],
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +424,12 @@ mod tests {
     fn at() -> DateTime<Local> {
         use chrono::TimeZone;
         Local.with_ymd_and_hms(2026, 10, 11, 9, 5, 3).unwrap()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustlink-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 
     #[test]
@@ -597,61 +442,40 @@ mod tests {
     }
 
     #[test]
-    fn a_json_line_carries_the_time_the_level_and_the_message() {
-        let line = json_line("INFO", "Rustlink listening", at());
-        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    fn json_console_and_text_lines_format_cleanly() {
+        let json = json_line("INFO", "Rustlink listening", at());
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["level"], "INFO");
         assert_eq!(value["msg"], "Rustlink listening");
         assert!(value["time"].as_str().unwrap().starts_with("2026-10-11T09:05:03"));
-    }
 
-    #[test]
-    fn a_console_line_starts_with_the_time_and_the_padded_level() {
-        let line = console_line("INFO", paint::GREEN, "Rustlink listening", at(), false);
-        assert_eq!(line, "09:05:03.000 INFO  Rustlink listening\n");
-    }
+        assert_eq!(
+            console_line("INFO", paint::GREEN, "Rustlink listening", at(), false),
+            "09:05:03.000 INFO  Rustlink listening\n"
+        );
 
-    #[test]
-    fn a_coloured_console_line_wraps_the_level_and_the_message() {
-        let line = console_line("WARN", paint::YELLOW, "ffmpeg unavailable", at(), true);
-        assert!(line.contains(paint::YELLOW));
-        assert!(line.contains(paint::BOLD));
-        assert!(line.ends_with(&format!("{}\n", paint::RESET)));
-        assert!(line.contains("ffmpeg unavailable"));
-    }
+        let colored = console_line("WARN", paint::YELLOW, "ffmpeg unavailable", at(), true);
+        assert!(colored.contains(paint::YELLOW) && colored.contains(paint::BOLD));
+        assert!(colored.ends_with(&format!("{}\n", paint::RESET)));
 
-    #[test]
-    fn a_text_line_names_its_fields() {
-        let line = text_line("ERROR", "webhook delivery failed", at());
-        assert!(line.starts_with("time=2026-10-11T09:05:03"));
-        assert!(line.contains(" level=ERROR "));
-        assert!(line.contains("msg=\"webhook delivery failed\""));
+        let text = text_line("ERROR", "webhook delivery failed", at());
+        assert!(text.starts_with("time=2026-10-11T09:05:03"));
+        assert!(text.contains(" level=ERROR msg=\"webhook delivery failed\""));
     }
 
     #[test]
     fn the_wordmark_is_drawn_one_row_per_line() {
         let plain = banner(false, "0.2.0", "1");
-        // Six rows of letters, then a blank line, then the version line.
         let rows: Vec<&str> = plain.lines().take_while(|line| !line.is_empty()).collect();
         assert_eq!(rows.len(), 6);
-        // Every row of a letter has to be as wide as its siblings, or the
-        // letters would not line up.
-        for letter in WORDMARK.chars() {
-            let glyph = block(letter);
-            let width = glyph[0].chars().count();
-            assert!(glyph.iter().all(|row| row.chars().count() == width), "{letter}");
-        }
+        let width = rows[0].chars().count();
+        assert!(rows.iter().all(|row| row.chars().count() == width));
         assert!(rows[0].starts_with("██████╗ "));
         assert!(plain.contains("v0.2.0  -  Rustlink API 1"));
         assert!(!plain.contains('\x1b'));
+
         let colored = banner(true, "0.2.0", "1");
-        // Each half carries a project colour, and both are truecolor escapes
-        // because neither shade is one of the sixteen basic colours.
-        assert!(colored.contains(paint::CRIMSON));
-        assert!(colored.contains(paint::TEAL));
-        assert!(colored.contains("\x1b[38;2;217;58;73m"));
-        assert!(colored.contains("\x1b[38;2;57;197;187m"));
-        // "RUST" comes first, so the teal half is the one that leads.
+        assert!(colored.contains(paint::CRIMSON) && colored.contains(paint::TEAL));
         assert!(colored.find(paint::TEAL) < colored.find(paint::CRIMSON));
     }
 
@@ -666,20 +490,15 @@ mod tests {
 
     #[test]
     fn the_file_name_of_the_day_is_the_one_the_startup_summary_reports() {
-        let directory =
-            std::env::temp_dir().join(format!("rustlink-log-test-{}", std::process::id()));
+        let directory = temp_dir("log-test");
         let files = Files::open(&directory.display().to_string(), 14).unwrap();
         let day = Local::now().format("%Y-%m-%d").to_string();
         assert!(files.path().ends_with(&format!("rustlink-{day}.log")));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// A directory holding one stale file, one file from today and one the node
-    /// did not write.
     fn prepared_directory(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-        let directory =
-            std::env::temp_dir().join(format!("rustlink-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
+        let directory = temp_dir(name);
         std::fs::create_dir_all(&directory).unwrap();
         let stale = directory.join("rustlink-2020-01-01.log");
         let today = directory.join(format!("rustlink-{}.log", Local::now().format("%Y-%m-%d")));
@@ -691,40 +510,24 @@ mod tests {
     }
 
     #[test]
-    fn a_file_older_than_the_window_goes_and_the_others_stay() {
+    fn pruning_respects_retention_window_and_ignores_foreign_files() {
         let (directory, stale, today, foreign) = prepared_directory("prune");
-        prune(&directory, 14, Local::now().date_naive());
-        assert!(!stale.exists(), "a file from 2020 is outside a fourteen day window");
-        assert!(today.exists(), "today's file is inside it");
-        assert!(foreign.exists(), "a file this node did not write is left alone");
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn a_name_that_only_looks_like_a_log_file_is_left_alone() {
-        let directory = std::env::temp_dir().join(format!("rustlink-odd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
         let odd = directory.join("rustlink-not-a-date.log");
         std::fs::write(&odd, b"a line\n").unwrap();
-        prune(&directory, 1, Local::now().date_naive());
-        assert!(odd.exists());
+        prune(&directory, 14, Local::now().date_naive());
+        assert!(!stale.exists());
+        assert!(today.exists() && foreign.exists() && odd.exists());
         let _ = std::fs::remove_dir_all(&directory);
-    }
 
-    #[test]
-    fn zero_retention_keeps_every_file() {
-        let (directory, stale, _, _) = prepared_directory("keep");
-        prune(&directory, 0, Local::now().date_naive());
-        assert!(stale.exists(), "zero days means every file is kept");
-        let _ = std::fs::remove_dir_all(&directory);
+        let (keep_dir, keep_stale, _, _) = prepared_directory("keep");
+        prune(&keep_dir, 0, Local::now().date_naive());
+        assert!(keep_stale.exists());
+        let _ = std::fs::remove_dir_all(&keep_dir);
     }
 
     #[test]
     fn poisoned_file_mutex_recovers_without_panicking() {
-        let directory =
-            std::env::temp_dir().join(format!("rustlink-poison-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
+        let directory = temp_dir("poison");
         let logger = std::sync::Arc::new(Logger {
             level: LevelFilter::Info,
             format: Format::Text,
@@ -745,32 +548,27 @@ mod tests {
 
     #[test]
     fn rotation_recreates_missing_directory_and_throttles_failed_reopens() {
-        let directory =
-            std::env::temp_dir().join(format!("rustlink-rotate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
+        let directory = temp_dir("rotate");
         let mut files = Files::open(&directory.display().to_string(), 0).unwrap();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let earlier = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
 
-        // Removing the directory before a date change must still rotate cleanly.
         let _ = std::fs::remove_dir_all(&directory);
         assert!(files.write_line_at("first\n", earlier, start).is_some());
         assert_eq!(files.date, earlier);
         assert!(directory.join("rustlink-2025-01-02.log").is_file());
 
-        // Block `create_dir_all` by pointing at a regular file as the directory.
         let blocker = directory.join("blocker-file");
         std::fs::write(&blocker, b"x").unwrap();
-        files.directory = blocker.clone();
+        files.directory = blocker;
         let next_day = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
         assert!(files.write_line_at("second\n", next_day, start).is_none());
         let cooldown_until = files.retry_after.expect("failed rotation sets a retry cooldown");
         assert_eq!(files.date, earlier);
 
-        // Restoring a writable directory during the cooldown does not reopen until the cooldown expires.
         files.directory = directory.clone();
         assert!(files
-            .write_line_at("during-cooldown\n", next_day, start + std::time::Duration::from_secs(1))
+            .write_line_at("during-cooldown\n", next_day, start + Duration::from_secs(1))
             .is_none());
         assert_eq!(files.date, earlier);
         assert!(files.write_line_at("after-cooldown\n", next_day, cooldown_until).is_some());

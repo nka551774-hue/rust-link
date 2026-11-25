@@ -1,9 +1,4 @@
-//! The node process: its parameters, the helpers it runs beside, the subsystems
-//! they configure, and the runtime around all of it.
-//!
-//! Nothing here decides how the node behaves; that lives in the crates. This is
-//! the file that reads a configuration, puts the parts together and keeps the
-//! process alive until the operator stops it.
+//! Node entrypoint: CLI options, config discovery, helper resolution, and runtime lifecycle.
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod linux;
@@ -19,9 +14,6 @@ use rustlink_config::Config;
 use rustlink_server::{Dependencies, Engine, Loader, Playback, Server};
 
 fn main() -> std::process::ExitCode {
-    // The arena cap has to be in place while the process is still single
-    // threaded, so it is the first thing that happens, before the runtime, the
-    // helper threads or anything else allocates from a second thread.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     linux::tune_memory();
     match run() {
@@ -30,8 +22,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Rustlink's command-line options.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Arguments {
     config: Option<PathBuf>,
     version: bool,
@@ -42,8 +33,7 @@ struct Arguments {
 fn strip_ascii_os_prefix<'a>(value: &'a OsStr, prefix: &str) -> Option<&'a OsStr> {
     debug_assert!(prefix.is_ascii());
     let rest = value.as_encoded_bytes().strip_prefix(prefix.as_bytes())?;
-    // SAFETY: `prefix` is pure ASCII, which is a valid code-unit boundary in
-    // every platform `OsStr` encoding (UTF-8, WTF-8, and raw byte sequences).
+    // SAFETY: `prefix` is pure ASCII, preserving valid OsStr code-unit boundaries on all platforms.
     Some(unsafe { OsStr::from_encoded_bytes_unchecked(rest) })
 }
 
@@ -54,14 +44,14 @@ impl Arguments {
         T: Into<OsString>,
     {
         let mut arguments = arguments.into_iter().map(Into::into);
-        let mut parsed = Arguments { config: None, version: false, check: false, help: false };
+        let mut parsed = Arguments::default();
         while let Some(argument) = arguments.next() {
             let raw = argument.as_os_str();
             if raw == "--config" || raw == "-c" {
-                let value = arguments.next().ok_or("--config needs a configuration file")?;
-                if value.is_empty() || value.as_encoded_bytes().starts_with(b"-") {
-                    return Err("--config needs a configuration file".into());
-                }
+                let value = arguments
+                    .next()
+                    .filter(|v| !v.is_empty() && !v.as_encoded_bytes().starts_with(b"-"))
+                    .ok_or("--config needs a configuration file")?;
                 parsed.config = Some(PathBuf::from(value));
             } else if let Some(inline) = strip_ascii_os_prefix(raw, "--config=")
                 .or_else(|| strip_ascii_os_prefix(raw, "-c="))
@@ -72,24 +62,19 @@ impl Arguments {
                 parsed.config = Some(PathBuf::from(inline));
             } else if raw == "--version" || raw == "-V" {
                 parsed.version = true;
-            } else if strip_ascii_os_prefix(raw, "--version=").is_some()
-                || strip_ascii_os_prefix(raw, "-V=").is_some()
-            {
-                return Err("--version does not take a value".into());
             } else if raw == "--check" {
                 parsed.check = true;
-            } else if strip_ascii_os_prefix(raw, "--check=").is_some() {
-                return Err("--check does not take a value".into());
             } else if raw == "--help" || raw == "-h" {
                 parsed.help = true;
-            } else if strip_ascii_os_prefix(raw, "--help=").is_some()
-                || strip_ascii_os_prefix(raw, "-h=").is_some()
-            {
-                return Err("--help does not take a value".into());
             } else {
                 let shown = raw.to_string_lossy();
                 let name = shown.split('=').next().unwrap_or(&shown);
-                return Err(format!("unknown option {name}; use --help"));
+                return match name {
+                    "--version" | "-V" => Err("--version does not take a value".into()),
+                    "--check" => Err("--check does not take a value".into()),
+                    "--help" | "-h" => Err("--help does not take a value".into()),
+                    _ => Err(format!("unknown option {name}; use --help")),
+                };
             }
         }
         Ok(parsed)
@@ -111,10 +96,6 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let mut path = rustlink_config::discover(arguments.config.as_deref());
-    // A node that was started with nothing beside it and no password in the
-    // environment is the double-click case. It is given a configuration rather
-    // than refused, because a node with no password cannot start and the window
-    // it would say so in closes with the process.
     let mut starter = None;
     if !arguments.check
         && path.is_none()
@@ -124,53 +105,41 @@ fn run() -> Result<(), String> {
         starter = write_starter();
         path = starter.as_ref().map(|written| written.path.clone());
     }
-    let mut config = rustlink_config::load(path.as_deref()).map_err(|error| error.to_string())?;
+    let mut config = rustlink_config::load(path.as_deref()).map_err(|e| e.to_string())?;
     let format = logging::Format::parse(&config.log_format);
     let color = logging::Color::parse(&config.log_color);
-    // The wordmark is for a person watching a terminal, so it stays out of a
-    // JSON stream that something else is parsing.
     if !arguments.check && format != logging::Format::Json {
         print!(
             "{}",
             logging::banner(color.allowed(), rustlink_server::VERSION, rustlink_server::APIVERSION)
         );
-    }
-    if let Some(starter) = &starter {
-        if format != logging::Format::Json {
-            println!("no configuration file was found, so one was written:");
-            println!("  {}", starter.path.display());
-            println!("the password for clients is {}", starter.password);
-            println!("change it if this node is reachable from anywhere else");
-            println!();
+        if let Some(starter) = &starter {
+            println!(
+                "no configuration file was found, so one was written:\n  {}\nthe password for clients is {}\nchange it if this node is reachable from anywhere else\n",
+                starter.path.display(),
+                starter.password
+            );
         }
     }
-    let log_directory = if arguments.check { String::new() } else { config.log_directory.clone() };
     let logger = logging::install(&logging::Options {
         level: level(&config.log_level),
         format,
         color,
-        directory: log_directory,
+        directory: if arguments.check { String::new() } else { config.log_directory.clone() },
         retention: config.log_retention_days,
     })?;
     if let Some(file) = logger.path() {
         log::info!("logging to file path={file} directory={}", config.log_directory);
     }
-    // Helpers are resolved before anything starts: a copy in the tools
-    // directory is used as it is, and a missing one is installed there, so a
-    // fresh checkout needs no preparation step.
     let explicit_ffmpeg_path = config.ffmpeg.contains('/') || config.ffmpeg.contains('\\');
     let resolver = tools::Resolver::new(&config.tools_directory, config.auto_download);
-    // FFmpeg is the fall back for the formats the in-process pipeline does not
-    // take, so a node without it still plays everything else unless either
-    // inProcessAudio is off or an explicit FFmpeg path was configured.
     match resolve_ffmpeg(&resolver, &config) {
         Ok(Some(ffmpeg)) => {
             config.ffmpeg = ffmpeg;
             log::debug!("media helper ready ffmpeg={}", config.ffmpeg);
         }
         Ok(None) => {
-            // Not wanted at all, which is a choice rather than a failure.
-            config.ffmpeg = String::new();
+            config.ffmpeg.clear();
             log::info!("ffmpeg disabled; tracks in the formats the in-process pipeline does not take will fail to load");
         }
         Err(error) if !config.in_process_audio || explicit_ffmpeg_path => {
@@ -178,16 +147,13 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
         Err(error) => {
-            config.ffmpeg = String::new();
+            config.ffmpeg.clear();
             log::warn!("ffmpeg unavailable; tracks in the formats the in-process pipeline does not take will fail to load error={error}");
         }
     }
     if arguments.check {
-        // Resolving the helpers above can leave the configuration in a state the
-        // server would refuse, so it is checked again here rather than reported
-        // as valid on the strength of the check that ran when it was loaded.
         rustlink_config::validate(&config)
-            .map_err(|error| format!("configuration is not valid: {error}"))?;
+            .map_err(|e| format!("configuration is not valid: {e}"))?;
         log::info!(
             "configuration valid config={} sources={} logLevel={} logFormat={} logColor={} logDirectory={}",
             path.as_deref().unwrap_or_else(|| Path::new("defaults")).display(),
@@ -210,9 +176,6 @@ fn run() -> Result<(), String> {
     };
     let playback: Arc<dyn Engine> =
         Arc::new(Playback { engine, source: Arc::clone(&sources) as Arc<dyn Loader> });
-    // Lyrics come from a public service, so the node only calls one when the
-    // configuration names it. YouTube Music requests share the YouTube source
-    // agent (including youtubeProxy when configured) and warmed visitorData.
     let lyrics = rustlink_lyrics::Manager::from_config_with_youtube_visitor(
         &config,
         sources.agent().clone(),
@@ -220,8 +183,6 @@ fn run() -> Result<(), String> {
         Some(sources.youtube_visitor_bridge()),
     )
     .map(Arc::new);
-    // A configured webhook gets its worker before the server starts, so it is
-    // ready for the first event.
     let webhook = rustlink_server::webhook::Client::with_network_policy(
         &config.webhook,
         config.allow_private_networks,
@@ -230,29 +191,25 @@ fn run() -> Result<(), String> {
         log::warn!("webhook is enabled in config, but worker could not be started");
     }
     let deps = Dependencies {
-        loader: Arc::clone(&sources) as Arc<dyn Loader>,
+        loader: sources,
         engine: playback,
         voice: Arc::new(rustlink_voice::Discord),
         lyrics,
         webhook,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        // The name is what an operator reading `top -H` or `ps -L` on a busy
-        // server has to tell the node's threads from everything else's.
         .thread_name("rustlink")
         .enable_all()
         .build()
-        .map_err(|error| format!("runtime: {error}"))?;
+        .map_err(|e| format!("runtime: {e}"))?;
     let address = config.address.clone();
     let result = runtime.block_on(async {
-        let server = Server::new(config, deps).map_err(|error| error.to_string())?;
+        let server = Server::new(config, deps).map_err(|e| e.to_string())?;
         server
             .clone()
             .listen(&address, interrupt())
             .await
-            .map_err(|error| format!("could not listen on {address}: {error}"))?;
-        // Sessions and players end before the process does, so a client that is
-        // watching sees the tracks stop rather than the socket vanish.
+            .map_err(|e| format!("could not listen on {address}: {e}"))?;
         server.close();
         Ok(())
     });
@@ -261,53 +218,44 @@ fn run() -> Result<(), String> {
     result
 }
 
-/// Resolves when the operator stops the node, which is a keyboard interrupt
-/// everywhere and a termination signal on the platforms that have one.
 async fn interrupt() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(terminate) => terminate,
-            Err(_) => {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    std::future::pending::<()>().await;
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                res = tokio::signal::ctrl_c() => {
+                    if res.is_err() {
+                        let _ = terminate.recv().await;
+                    }
                 }
-                log::info!("shutdown signal received");
-                return;
+                _ = terminate.recv() => {}
             }
-        };
-        tokio::select! {
-            res = tokio::signal::ctrl_c() => {
-                if res.is_err() {
-                    let _ = terminate.recv().await;
-                }
-            }
-            _ = terminate.recv() => {}
+        } else if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
     #[cfg(not(unix))]
-    {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
     }
     log::info!("shutdown signal received");
 }
 
-fn wipe_string(secret: &mut String) {
-    // SAFETY: `write_volatile` cannot unwind, and overwriting initialized bytes
-    // with `0` (ASCII NUL) preserves UTF-8 validity before `clear()`.
-    unsafe {
-        for byte in secret.as_bytes_mut() {
-            std::ptr::write_volatile(byte, 0);
-        }
+fn wipe_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        // SAFETY: `byte` is an initialized mutable byte.
+        unsafe { std::ptr::write_volatile(byte, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn wipe_string(secret: &mut String) {
+    // SAFETY: overwriting initialized bytes with ASCII NUL preserves UTF-8 validity before `clear()`.
+    unsafe { wipe_bytes(secret.as_bytes_mut()) };
     secret.clear();
 }
 
-/// The configuration a node writes for itself when it was started without one.
 struct Starter {
     path: PathBuf,
     password: String,
@@ -319,8 +267,6 @@ impl Drop for Starter {
     }
 }
 
-/// Whether a password was handed to the node through the environment, which is
-/// how a container is configured and why one never needs a file.
 fn password_from_environment() -> bool {
     std::env::var("RUSTLINK_PASSWORD").is_ok_and(|mut value| {
         let present = !value.trim().is_empty();
@@ -339,50 +285,33 @@ fn write_starter_at(path: &Path, temp: &Path, contents: &str) -> std::io::Result
     }
     let write_file = |target: &Path| -> std::io::Result<()> {
         let mut file = options.open(target)?;
-        let result = {
-            use std::io::Write;
-            file.write_all(contents.as_bytes()).and_then(|()| file.sync_all())
-        };
+        let res = std::io::Write::write_all(&mut file, contents.as_bytes())
+            .and_then(|()| file.sync_all());
         drop(file);
-        if result.is_err() {
+        if res.is_err() {
             let _ = std::fs::remove_file(target);
         }
-        result
+        res
     };
-    match write_file(temp) {
-        Ok(()) => match std::fs::hard_link(temp, path) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(temp);
-                Ok(())
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(temp);
-                Err(err)
-            }
-            Err(_) => {
-                if path.exists() {
-                    let _ = std::fs::remove_file(temp);
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "configuration file already exists",
-                    ))
-                } else if std::fs::rename(temp, path).is_ok() {
-                    Ok(())
-                } else {
-                    let _ = std::fs::remove_file(temp);
-                    write_file(path)
-                }
-            }
-        },
-        Err(_) => write_file(path),
+    if write_file(temp).is_err() {
+        return write_file(path);
     }
+    let result = match std::fs::hard_link(temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
+        Err(_) if path.exists() => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "configuration file already exists",
+        )),
+        Err(_) => std::fs::rename(temp, path).or_else(|_| {
+            let _ = std::fs::remove_file(temp);
+            write_file(path)
+        }),
+    };
+    let _ = std::fs::remove_file(temp);
+    result
 }
 
-/// Writes the configuration a first start runs with.
-///
-/// A file that cannot be written is not fatal on its own: the node falls back
-/// to its defaults and the environment, and the validation that follows names
-/// the password it is missing.
 fn write_starter() -> Option<Starter> {
     let Some(mut password) = random_password() else {
         println!("no configuration file was found, and no password could be generated");
@@ -401,10 +330,7 @@ fn write_starter() -> Option<Starter> {
     wipe_string(&mut contents);
     match written {
         Ok(()) => {
-            // The node is normally double-clicked, so the message names the file
-            // in full rather than relative to a directory nobody can see.
-            let shown =
-                std::env::current_dir().map(|directory| directory.join(&path)).unwrap_or(path);
+            let shown = std::env::current_dir().map(|dir| dir.join(&path)).unwrap_or(path);
             Some(Starter { path: shown, password })
         }
         Err(error) => {
@@ -418,32 +344,18 @@ fn write_starter() -> Option<Starter> {
     }
 }
 
-/// Sixteen random bytes as hexadecimal, which is the password a node that
-/// configured itself hands out.
-///
-/// Nothing is returned when the system source cannot be read: a node whose
-/// password can be guessed is worse than one that has to be configured by hand.
 fn random_password() -> Option<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).ok()?;
     let password = tools::hex_encode(&bytes);
-    for byte in &mut bytes {
-        // SAFETY: `byte` is an initialized stack byte.
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    wipe_bytes(&mut bytes);
     Some(password)
 }
 
-/// Reports a helper the configuration has switched off. Naming none is how a
-/// setting says it wants no such helper, which is a different thing from naming
-/// one that cannot be found, and the two are reported differently.
 fn is_none(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("none")
 }
 
-/// Source resolution is native. Only the optional FFmpeg codec helper needs
-/// locating or installing before the server starts.
 fn resolve_ffmpeg(resolver: &tools::Resolver, config: &Config) -> Result<Option<String>, String> {
     if is_none(&config.ffmpeg) {
         Ok(None)
@@ -452,8 +364,6 @@ fn resolve_ffmpeg(resolver: &tools::Resolver, config: &Config) -> Result<Option<
     }
 }
 
-/// Writes the startup summary one setting per log record so text, JSON and
-/// daily file output all remain valid one-line records.
 fn log_startup(config: &Config, path: Option<&Path>) {
     log::info!("Rustlink starting");
     for field in startup_fields(config, path) {
@@ -461,21 +371,17 @@ fn log_startup(config: &Config, path: Option<&Path>) {
     }
 }
 
-/// The startup settings in a stable order for operators and log collectors.
 fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
     vec![
         format!("version={}", rustlink_server::VERSION),
         format!("apiVersion={}", rustlink_server::APIVERSION),
         match path {
-            Some(path) => format!("config={}", path.display()),
+            Some(p) => format!("config={}", p.display()),
             None => "config=defaults".into(),
         },
         format!("sources={}", source_summary(config)),
         format!("inProcessAudio={}", config.in_process_audio),
-        format!(
-            "ffmpeg={}",
-            if config.ffmpeg.is_empty() { "disabled" } else { config.ffmpeg.as_str() }
-        ),
+        format!("ffmpeg={}", if config.ffmpeg.is_empty() { "disabled" } else { &config.ffmpeg }),
         format!("toolsDirectory={}", config.tools_directory),
         format!("autoDownload={}", config.auto_download),
         format!("maxPlayers={}", config.max_players),
@@ -492,7 +398,6 @@ fn startup_fields(config: &Config, path: Option<&Path>) -> Vec<String> {
     ]
 }
 
-/// Which source paths are active, for the startup summary.
 fn source_summary(config: &Config) -> String {
     let mut active = Vec::with_capacity(6);
     if config.youtube_native {
@@ -507,13 +412,10 @@ fn source_summary(config: &Config) -> String {
     if !config.spotify_refresh_token.is_empty() {
         active.push("spotify(user-token)");
     }
-    active.push("deezer");
-    active.push("http");
+    active.extend(["deezer", "http"]);
     active.join(",")
 }
 
-/// Reads the configured level. The configuration is validated when it is
-/// loaded, so anything unexpected falls back to info.
 fn level(name: &str) -> LevelFilter {
     let name = name.trim();
     if name.eq_ignore_ascii_case("debug") {
@@ -537,23 +439,15 @@ mod tests {
 
     #[test]
     fn a_flag_is_read_with_or_without_an_equals_sign() {
-        assert_eq!(arguments("-c node.yaml").unwrap().config, Some(PathBuf::from("node.yaml")));
-        assert_eq!(
-            arguments("--config=node.yaml").unwrap().config,
-            Some(PathBuf::from("node.yaml"))
-        );
-        assert_eq!(
-            arguments("--config node.yaml").unwrap().config,
-            Some(PathBuf::from("node.yaml"))
-        );
+        for raw in ["-c node.yaml", "--config=node.yaml", "--config node.yaml"] {
+            assert_eq!(arguments(raw).unwrap().config, Some(PathBuf::from("node.yaml")));
+        }
     }
 
     #[test]
     fn the_switches_that_take_no_value_are_read_as_present() {
         let parsed = arguments("--version --check").unwrap();
-        assert!(parsed.version);
-        assert!(parsed.check);
-        assert!(parsed.config.is_none());
+        assert!(parsed.version && parsed.check && parsed.config.is_none());
     }
 
     #[test]
@@ -568,27 +462,20 @@ mod tests {
 
     #[test]
     fn a_helper_named_none_is_switched_off() {
-        assert!(is_none("none"));
-        assert!(is_none(" NONE "));
-        assert!(!is_none("ffmpeg"));
+        assert!(is_none("none") && is_none(" NONE ") && !is_none("ffmpeg"));
     }
 
     #[test]
     fn a_generated_password_is_thirty_two_hexadecimal_characters() {
         let password = random_password().expect("the system source answers");
         assert_eq!(password.len(), 32);
-        assert!(password.chars().all(|character| character.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn two_generated_passwords_are_not_the_same() {
+        assert!(password.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(random_password(), random_password());
     }
 
     #[test]
     fn the_startup_summary_names_the_sources_that_are_on() {
-        let config = Config::default();
-        let summary = source_summary(&config);
+        let summary = source_summary(&Config::default());
         assert!(summary.contains("youtube(native)"));
         assert!(summary.contains("soundcloud(native)"));
         assert!(summary.ends_with("deezer,http"));
@@ -604,9 +491,7 @@ mod tests {
         assert_eq!(fields[2], "config=config.yaml");
         assert_eq!(fields[3], format!("sources={}", source_summary(&config)));
         assert_eq!(fields.last().unwrap(), &format!("webhook={}", config.webhook.enable));
-        assert!(fields
-            .iter()
-            .all(|field| !field.chars().any(|character| character == '\r' || character == '\n')));
+        assert!(fields.iter().all(|f| !f.contains(['\r', '\n'])));
     }
 
     #[test]
@@ -617,74 +502,48 @@ mod tests {
         assert_eq!(level(""), LevelFilter::Info);
     }
 
-    /// A tools directory holding a stub for the helper, so the lookup answers
-    /// without touching the network.
-    fn stub_tools() -> PathBuf {
+    #[test]
+    fn ffmpeg_resolution_handles_cached_disabled_and_missing_helpers() {
         let directory =
             std::env::temp_dir().join(format!("rustlink-helpers-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let file = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
-        std::fs::write(directory.join(file), b"stub").unwrap();
-        directory
-    }
+        let exe = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
+        std::fs::write(directory.join(&exe), b"stub").unwrap();
 
-    #[test]
-    fn ffmpeg_is_resolved_from_the_tools_directory() {
-        let directory = stub_tools();
         let mut config = Config::default();
         config.tools_directory = directory.display().to_string();
         config.auto_download = false;
         config.ffmpeg = "ffmpeg".into();
         let resolver = tools::Resolver::new(&config.tools_directory, false);
-        let ffmpeg =
-            resolve_ffmpeg(&resolver, &config).unwrap().expect("ffmpeg is in the tools directory");
-        assert!(ffmpeg.ends_with(&format!("ffmpeg{}", std::env::consts::EXE_SUFFIX)), "{ffmpeg}");
+        assert!(resolve_ffmpeg(&resolver, &config).unwrap().unwrap().ends_with(&exe));
         let _ = std::fs::remove_dir_all(&directory);
-    }
 
-    #[test]
-    fn a_helper_that_is_switched_off_is_not_looked_for() {
-        let mut config = Config::default();
         config.ffmpeg = "none".into();
-        let resolver = tools::Resolver::new(&config.tools_directory, false);
         assert!(resolve_ffmpeg(&resolver, &config).unwrap().is_none());
-    }
 
-    #[test]
-    fn a_helper_that_is_missing_is_reported() {
-        let directory =
-            std::env::temp_dir().join(format!("rustlink-no-tools-{}", std::process::id()));
-        let mut config = Config::default();
-        config.tools_directory = directory.display().to_string();
-        config.auto_download = false;
         config.ffmpeg = "ffmpeg".into();
-        let resolver = tools::Resolver::new(&config.tools_directory, false);
         assert!(resolve_ffmpeg(&resolver, &config).is_err());
     }
 
     #[test]
     fn inline_config_supports_dash_prefixed_files_and_check_value_reports_clear_error() {
-        assert_eq!(
-            arguments("--config=-file.yaml").unwrap().config,
-            Some(PathBuf::from("-file.yaml"))
-        );
-        assert_eq!(arguments("-c=-file.yaml").unwrap().config, Some(PathBuf::from("-file.yaml")));
-        let err = arguments("--check=true").unwrap_err();
-        assert_eq!(err, "--check does not take a value");
+        for flag in ["--config=-file.yaml", "-c=-file.yaml"] {
+            assert_eq!(arguments(flag).unwrap().config, Some(PathBuf::from("-file.yaml")));
+        }
+        assert_eq!(arguments("--check=true").unwrap_err(), "--check does not take a value");
+        assert_eq!(arguments("-V=1").unwrap_err(), "--version does not take a value");
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             let raw = OsString::from_vec(vec![b'-', b'c', 0xff, b'.', b'y', b'm', b'l']);
-            let parsed = Arguments::parse([OsString::from("--config"), raw.clone()])
-                .expect("non-UTF-8 path");
+            let parsed = Arguments::parse([OsString::from("--config"), raw.clone()]).unwrap();
             assert_eq!(parsed.config, Some(PathBuf::from(raw)));
         }
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
             let unpaired = OsString::from_wide(&[0xd800, u16::from(b'.'), u16::from(b'y')]);
-            let parsed = Arguments::parse([OsString::from("--config"), unpaired.clone()])
-                .expect("unpaired UTF-16 path");
+            let parsed = Arguments::parse([OsString::from("--config"), unpaired.clone()]).unwrap();
             assert_eq!(parsed.config, Some(PathBuf::from(unpaired)));
         }
     }

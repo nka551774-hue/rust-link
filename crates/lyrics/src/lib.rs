@@ -1,8 +1,4 @@
-//! Native Rustlink lyrics, supplied by LRCLIB and YouTube Music.
-//!
-//! Providers are asked over the network, so every call in this crate blocks. The
-//! caller runs one off the thread that serves a request, which keeps a slow
-//! public service from stalling the node.
+//! Native Rustlink lyrics supplied by LRCLIB and YouTube Music.
 
 mod lrc;
 mod lrclib;
@@ -13,20 +9,17 @@ pub use ytmusic::{VisitorBridge, VisitorReader, VisitorWriter, YTMusic, YTMUSIC_
 
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
 use rustlink_protocol::{Object, Track};
 use serde::{Deserialize, Serialize};
 
-/// One line of lyrics, timed from the start of the track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     #[serde(rename = "timestamp_ms")]
     pub timestamp: i64,
-    /// How long the line stays on screen, which the provider does not always
-    /// say.
     #[serde(default)]
     #[serde(rename = "duration_ms")]
     pub duration: Option<i64>,
@@ -37,12 +30,6 @@ pub struct Line {
     pub plugin: Object,
 }
 
-/// What a provider returns for a track.
-///
-/// `source_name` is where the track came from and `provider` is who supplied the
-/// words, which is the pair the plugin reports to a client. A track has either
-/// timed lines or plain text; the database answers with one and the catalogue
-/// with the other.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Lyrics {
@@ -57,7 +44,7 @@ pub struct Lyrics {
 
 impl Lyrics {
     pub fn new(source_name: impl Into<String>, provider: impl Into<String>) -> Self {
-        Lyrics {
+        Self {
             source_name: source_name.into(),
             provider: provider.into(),
             text: None,
@@ -67,85 +54,72 @@ impl Lyrics {
     }
 }
 
-/// What a provider can answer.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LyricsError {
-    /// The provider has no lyrics for this track. This is an answer rather than
-    /// a failure, and the caller replies with no content.
     #[error("lyrics: no lyrics for this track")]
     NotFound,
-    /// The lookup could not be made, which is different from a provider that has
-    /// nothing: the client may want to ask again.
     #[error("{0}")]
     Failed(String),
 }
 
-/// Fetches the lyrics of one track.
 pub trait Provider: Send + Sync {
-    /// The provider name reported to the client.
     fn name(&self) -> &'static str;
-    /// Returns the lyrics, or [`LyricsError::NotFound`] when there are none.
     fn fetch(&self, track: &Track) -> Result<Lyrics, LyricsError>;
 }
 
-/// How long a fetched result is reused.
-///
-/// Lyrics do not change, so the cache is there to keep a client that asks twice
-/// from turning into two calls to a free public service, not to keep up with
-/// anything.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
-
-/// Bounds the cache, so a node that runs for weeks does not hold every track it
-/// ever played.
 const CACHE_LIMIT: usize = 256;
-
-/// Bounds what the cache holds in bytes as well, because a count alone says
-/// nothing about size: one answer can be megabytes of lines.
 const CACHE_BYTES: usize = 8 << 20;
-
-/// An answer larger than this is returned but not kept, so that one track with
-/// an enormous lyric cannot push everything else out of the cache.
 const MAX_ENTRY_BYTES: usize = 1 << 20;
 
+#[inline]
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn trim_owned(mut text: String) -> String {
+    let trimmed_len = text.trim().len();
+    if trimmed_len != text.len() {
+        let leading = text.len() - text.trim_start().len();
+        if leading > 0 {
+            text.drain(..leading);
+        }
+        text.truncate(trimmed_len);
+    }
+    text
+}
+
 pub(crate) fn validate_base_url(raw: &str, label: &str) -> Result<String, LyricsError> {
+    let bad = || LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL"));
     let base = raw.trim().trim_end_matches('/');
     if base.is_empty()
         || !base.bytes().all(|b| (0x21..=0x7e).contains(&b) && !matches!(b, b'\\' | b'?' | b'#'))
     {
-        return Err(LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")));
+        return Err(bad());
     }
-    let after_scheme = base
-        .get(..7)
-        .filter(|p| p.eq_ignore_ascii_case("http://"))
-        .map(|_| &base[7..])
-        .or_else(|| {
-            base.get(..8).filter(|p| p.eq_ignore_ascii_case("https://")).map(|_| &base[8..])
+    let after = ["http://", "https://"]
+        .into_iter()
+        .find_map(|s| {
+            base.get(..s.len()).filter(|p| p.eq_ignore_ascii_case(s)).map(|_| &base[s.len()..])
         })
-        .ok_or_else(|| LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")))?;
-    let authority = after_scheme.split('/').next().unwrap_or("");
+        .ok_or_else(bad)?;
+    let authority = after.split('/').next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
-        return Err(LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")));
+        return Err(bad());
     }
-    let valid_host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']').is_some_and(|(ipv6, tail)| {
-            ipv6.parse::<Ipv6Addr>().is_ok()
-                && match tail.strip_prefix(':') {
-                    None => tail.is_empty(),
-                    Some(port) => port.parse::<u16>().is_ok_and(|p| p > 0),
-                }
-        })
-    } else {
-        match authority.split_once(':') {
+    let ok_port = |p: &str| p.parse::<u16>().is_ok_and(|n| n > 0);
+    let valid_host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').is_some_and(|(v6, tail)| {
+            v6.parse::<Ipv6Addr>().is_ok()
+                && (tail.is_empty() || tail.strip_prefix(':').is_some_and(ok_port))
+        }),
+        None => match authority.split_once(':') {
             None => !authority.contains(['[', ']']),
-            Some((host, port)) => {
-                !host.is_empty()
-                    && !host.contains(['[', ']', ':'])
-                    && port.parse::<u16>().is_ok_and(|p| p > 0)
-            }
-        }
+            Some((h, p)) => !h.is_empty() && !h.contains(['[', ']', ':']) && ok_port(p),
+        },
     };
     if !valid_host || base.parse::<ureq::http::Uri>().is_err() {
-        return Err(LyricsError::Failed(format!("lyrics: invalid {label} endpoint URL")));
+        return Err(bad());
     }
     Ok(base.to_owned())
 }
@@ -166,25 +140,21 @@ struct Flight {
 impl Flight {
     fn wait(&self) -> Outcome {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = lock(&self.outcome);
         loop {
             if let Some(outcome) = held.as_ref() {
                 return outcome.clone();
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
                 return Err(LyricsError::Failed("lyrics: timed out waiting for lookup".into()));
             }
-            held = self
-                .ready
-                .wait_timeout(held, remaining)
-                .unwrap_or_else(|error| error.into_inner())
-                .0;
+            held = self.ready.wait_timeout(held, rem).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 
     fn publish(&self, outcome: Outcome) {
-        let mut held = self.outcome.lock().unwrap_or_else(|error| error.into_inner());
+        let mut held = lock(&self.outcome);
         if held.is_none() {
             *held = Some(outcome);
             drop(held);
@@ -221,14 +191,13 @@ impl Drop for Leader<'_> {
         if !self.done {
             self.flight.publish(Err(LyricsError::Failed("lyrics: lookup was interrupted".into())));
         }
-        let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
-        if inflight.get(self.key).is_some_and(|flight| Arc::ptr_eq(flight, &self.flight)) {
+        let mut inflight = lock(self.inflight);
+        if inflight.get(self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
             inflight.remove(self.key);
         }
     }
 }
 
-/// Asks the configured providers in order and remembers what they said.
 pub struct Manager {
     providers: Vec<Box<dyn Provider>>,
     ttl: Duration,
@@ -244,7 +213,6 @@ struct Cache {
     vacant: Vec<usize>,
     first: Option<usize>,
     last: Option<usize>,
-    /// The sum of every entry's weight.
     bytes: usize,
 }
 
@@ -252,16 +220,15 @@ struct Entry {
     key: Arc<str>,
     lyrics: Option<Arc<Lyrics>>,
     at: Instant,
-    /// What this entry counts against [`CACHE_BYTES`], key included.
     weight: usize,
-    previous: Option<usize>,
+    prev: Option<usize>,
     next: Option<usize>,
 }
 
 impl Cache {
     fn get(&mut self, key: &str, ttl: Duration) -> Option<Option<Arc<Lyrics>>> {
         let index = *self.entries.get(key)?;
-        let entry = self.slots[index].as_ref().expect("indexed entry");
+        let entry = self.slots[index].as_ref()?;
         if entry.at.elapsed() > ttl {
             self.remove(index);
             return None;
@@ -276,28 +243,26 @@ impl Cache {
 
     fn put(&mut self, key: &str, lyrics: Option<Arc<Lyrics>>, limit: usize) {
         let entry_weight = weight(key, lyrics.as_deref());
-        let reused_key = self.entries.remove(key).map(|index| self.take_slot(index).key);
+        let reused = self.entries.remove(key).map(|idx| self.take_slot(idx).key);
         if limit == 0 || entry_weight > MAX_ENTRY_BYTES {
             return;
         }
         while self.entries.len() >= limit || self.bytes.saturating_add(entry_weight) > CACHE_BYTES {
-            let Some(oldest) = self.first else {
-                return;
-            };
+            let Some(oldest) = self.first else { return };
             self.remove(oldest);
         }
         let index = self.vacant.pop().unwrap_or_else(|| {
             self.slots.push(None);
             self.slots.len() - 1
         });
-        let shared_key = reused_key.unwrap_or_else(|| Arc::from(key));
+        let shared_key = reused.unwrap_or_else(|| Arc::from(key));
         self.entries.insert(Arc::clone(&shared_key), index);
         self.slots[index] = Some(Entry {
             key: shared_key,
             lyrics,
             at: Instant::now(),
             weight: entry_weight,
-            previous: None,
+            prev: None,
             next: None,
         });
         self.bytes = self.bytes.saturating_add(entry_weight);
@@ -305,35 +270,32 @@ impl Cache {
     }
 
     fn detach(&mut self, index: usize) {
-        let entry = self.slots[index].as_ref().expect("indexed entry");
-        let (previous, next) = (entry.previous, entry.next);
-        if let Some(previous) = previous {
-            self.slots[previous].as_mut().expect("linked entry").next = next;
-        } else {
-            self.first = next;
+        let e = self.slots[index].as_ref().unwrap();
+        let (prev, next) = (e.prev, e.next);
+        match prev {
+            Some(p) => self.slots[p].as_mut().unwrap().next = next,
+            None => self.first = next,
         }
-        if let Some(next) = next {
-            self.slots[next].as_mut().expect("linked entry").previous = previous;
-        } else {
-            self.last = previous;
+        match next {
+            Some(n) => self.slots[n].as_mut().unwrap().prev = prev,
+            None => self.last = prev,
         }
     }
 
     fn append(&mut self, index: usize) {
-        let entry = self.slots[index].as_mut().expect("indexed entry");
-        entry.previous = self.last;
-        entry.next = None;
-        if let Some(last) = self.last {
-            self.slots[last].as_mut().expect("linked entry").next = Some(index);
-        } else {
-            self.first = Some(index);
+        let prev = self.last.replace(index);
+        let e = self.slots[index].as_mut().unwrap();
+        e.prev = prev;
+        e.next = None;
+        match prev {
+            Some(p) => self.slots[p].as_mut().unwrap().next = Some(index),
+            None => self.first = Some(index),
         }
-        self.last = Some(index);
     }
 
     fn take_slot(&mut self, index: usize) -> Entry {
         self.detach(index);
-        let entry = self.slots[index].take().expect("indexed entry");
+        let entry = self.slots[index].take().unwrap();
         self.bytes = self.bytes.saturating_sub(entry.weight);
         self.vacant.push(index);
         entry
@@ -346,12 +308,10 @@ impl Cache {
 }
 
 fn object_weight(object: &Object) -> usize {
-    const NODE_OVERHEAD: usize =
+    const NODE: usize =
         size_of::<String>() + size_of::<serde_json::Value>() + size_of::<[usize; 8]>();
     object.iter().fold(0usize, |acc, (k, v)| {
-        acc.saturating_add(k.capacity())
-            .saturating_add(NODE_OVERHEAD)
-            .saturating_add(value_weight(v))
+        acc.saturating_add(k.capacity()).saturating_add(NODE).saturating_add(value_weight(v))
     })
 }
 
@@ -367,20 +327,15 @@ fn value_weight(value: &serde_json::Value) -> usize {
     }
 }
 
-/// What an answer costs the cache: its text, its lines, container capacities
-/// and the key it is kept under.
 fn weight(key: &str, lyrics: Option<&Lyrics>) -> usize {
     let base = key.len().saturating_add(size_of::<Entry>()).saturating_add(4 * size_of::<usize>());
-    let Some(lyrics) = lyrics else {
-        return base;
-    };
+    let Some(lyrics) = lyrics else { return base };
     let lines = lyrics.lines.as_ref().map_or(0usize, |vec| {
-        vec.capacity().saturating_mul(size_of::<Line>()).saturating_add(vec.iter().fold(
-            0usize,
-            |acc, line| {
-                acc.saturating_add(line.line.capacity()).saturating_add(object_weight(&line.plugin))
-            },
-        ))
+        vec.capacity().saturating_mul(size_of::<Line>()).saturating_add(
+            vec.iter().fold(0usize, |acc, l| {
+                acc.saturating_add(l.line.capacity()).saturating_add(object_weight(&l.plugin))
+            }),
+        )
     });
     base.saturating_add(size_of::<Lyrics>())
         .saturating_add(lyrics.source_name.capacity())
@@ -390,30 +345,25 @@ fn weight(key: &str, lyrics: Option<&Lyrics>) -> usize {
         .saturating_add(lines)
 }
 
-/// What a lookup depends on. The providers search by title, author and length,
-/// so the key has to say all of them: a key of only the source and identifier
-/// would let a track token that names a real video but carries other metadata
-/// leave its lyrics in the cache for everyone who asks about the real one.
 fn cache_key(track: &Track) -> String {
-    let info = &track.metadata;
+    let m = &track.metadata;
     format!(
         "{}:{}{}:{}{}:{}{}:{}{}",
-        info.source_name.len(),
-        info.source_name,
-        info.identifier.len(),
-        info.identifier,
-        info.title.len(),
-        info.title,
-        info.author.len(),
-        info.author,
-        info.length,
+        m.source_name.len(),
+        m.source_name,
+        m.identifier.len(),
+        m.identifier,
+        m.title.len(),
+        m.title,
+        m.author.len(),
+        m.author,
+        m.length,
     )
 }
 
 impl Manager {
-    /// Builds a manager over the providers, which are asked in the order given.
     pub fn new(providers: Vec<Box<dyn Provider>>) -> Self {
-        Manager {
+        Self {
             providers,
             ttl: DEFAULT_TTL,
             limit: CACHE_LIMIT,
@@ -422,19 +372,12 @@ impl Manager {
         }
     }
 
-    /// Builds the manager the configuration asks for, or `None` when lyrics are
-    /// switched off.
-    ///
-    /// The database answers most tracks and the catalogue answers the ones it
-    /// has nothing for, which is where timed lines come from.
     pub fn from_config(config: &Config, agent: ureq::Agent) -> Option<Self> {
         let youtube_agent = (config.youtube_native && config.youtube_proxy.trim().is_empty())
             .then(|| agent.clone());
         Self::from_config_with_youtube(config, agent, youtube_agent)
     }
 
-    /// Builds the manager using a dedicated (potentially proxied) HTTP client
-    /// for YouTube Music when `youtubeNative` is enabled.
     pub fn from_config_with_youtube(
         config: &Config,
         agent: ureq::Agent,
@@ -443,8 +386,6 @@ impl Manager {
         Self::from_config_with_youtube_visitor(config, agent, youtube_agent, None)
     }
 
-    /// Builds the manager while sharing `rustlink-source`'s live anonymous
-    /// `visitorData` session cache with YouTube Music lyrics requests.
     pub fn from_config_with_youtube_visitor(
         config: &Config,
         agent: ureq::Agent,
@@ -455,46 +396,30 @@ impl Manager {
             return None;
         }
         let mut providers: Vec<Box<dyn Provider>> =
-            vec![Box::new(LRCLIB { agent, base: LRCLIB_BASE.to_string() })];
-        if config.youtube_native {
-            if let Some(yt_agent) = youtube_agent {
-                let (visitor_reader, visitor_writer) = match visitor_bridge {
-                    Some((r, w)) => (Some(r), Some(w)),
-                    None => (None, None),
-                };
-                providers.push(Box::new(YTMusic {
-                    agent: yt_agent,
-                    endpoint: config.youtube_music_endpoint.clone(),
-                    // `youtubeClientVersion` configures the Android player client,
-                    // not WEB_REMIX; keep YTMusic's built-in web client version.
-                    version: String::new(),
-                    visitor_data: config.youtube_visitor_data.clone(),
-                    visitor_reader,
-                    visitor_writer,
-                }));
-            }
+            vec![Box::new(LRCLIB { agent, base: LRCLIB_BASE.to_owned() })];
+        if let Some(yt_agent) = youtube_agent.filter(|_| config.youtube_native) {
+            let (visitor_reader, visitor_writer) =
+                visitor_bridge.map_or((None, None), |(r, w)| (Some(r), Some(w)));
+            providers.push(Box::new(YTMusic {
+                agent: yt_agent,
+                endpoint: config.youtube_music_endpoint.clone(),
+                version: String::new(),
+                visitor_data: config.youtube_visitor_data.clone(),
+                visitor_reader,
+                visitor_writer,
+            }));
         }
-        Some(Manager::new(providers))
+        Some(Self::new(providers))
     }
 
-    /// Whether any provider is configured, so a caller can answer without
-    /// asking.
     pub fn enabled(&self) -> bool {
         !self.providers.is_empty()
     }
 
-    /// Returns the lyrics for a track, or [`LyricsError::NotFound`] when no
-    /// provider has any.
-    ///
-    /// A provider that fails is passed over rather than reported straight away,
-    /// because the next one may still answer; only when none of them do is the
-    /// last failure raised.
     pub fn fetch(&self, track: &Track) -> Result<Lyrics, LyricsError> {
-        let shared = self.fetch_shared(track)?;
-        Ok(Arc::unwrap_or_clone(shared))
+        self.fetch_shared(track).map(Arc::unwrap_or_clone)
     }
 
-    /// Returns shared cached lyrics without deep-cloning the lines vector on hits.
     pub fn fetch_shared(&self, track: &Track) -> Result<Arc<Lyrics>, LyricsError> {
         if !self.enabled() {
             return Err(LyricsError::NotFound);
@@ -504,9 +429,8 @@ impl Manager {
             return cached.ok_or(LyricsError::NotFound);
         }
         let flight = {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(flight) = inflight.get(&key) {
-                let flight = Arc::clone(flight);
+            let mut inflight = lock(&self.inflight);
+            if let Some(flight) = inflight.get(&key).cloned() {
                 drop(inflight);
                 return flight.wait();
             }
@@ -519,7 +443,7 @@ impl Manager {
         };
         let leader = Leader::new(flight, &key, &self.inflight);
         let outcome = (|| {
-            let mut last: Option<LyricsError> = None;
+            let mut last = None;
             for provider in &self.providers {
                 match provider.fetch(track) {
                     Ok(found) => {
@@ -528,13 +452,11 @@ impl Manager {
                         return Ok(shared);
                     }
                     Err(LyricsError::NotFound) => {}
-                    Err(error) => last = Some(error),
+                    Err(e) => last = Some(e),
                 }
             }
-            // A provider that failed is not the same as one that has nothing.
-            // Report the failure rather than caching it as a miss.
-            if let Some(error) = last {
-                return Err(error);
+            if let Some(e) = last {
+                return Err(e);
             }
             self.remember(&key, None);
             Err(LyricsError::NotFound)
@@ -543,16 +465,52 @@ impl Manager {
     }
 
     fn cached(&self, key: &str) -> Option<Option<Arc<Lyrics>>> {
-        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-        cache.get(key, self.ttl)
+        lock(&self.cache).get(key, self.ttl)
     }
 
-    /// Stores a result, including a miss, so a track nobody has lyrics for is
-    /// not looked up again on every request.
     fn remember(&self, key: &str, lyrics: Option<Arc<Lyrics>>) {
-        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
-        cache.put(key, lyrics, self.limit);
+        lock(&self.cache).put(key, lyrics, self.limit);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn serve_http(
+    count: usize,
+    mut respond: impl FnMut(usize, &str, &[u8]) -> Vec<u8> + Send + 'static,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for step in 0..count {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (mut req, mut buf) = (Vec::new(), [0u8; 4096]);
+            let (hdr_end, content_len) = loop {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                req.extend_from_slice(&buf[..n]);
+                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let len = std::str::from_utf8(&req[..pos])
+                        .unwrap()
+                        .lines()
+                        .filter_map(|l| l.split_once(':'))
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .map_or(0, |(_, v)| v.trim().parse::<usize>().unwrap());
+                    break (pos + 4, len);
+                }
+            };
+            while req.len() < hdr_end + content_len {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                req.extend_from_slice(&buf[..n]);
+            }
+            let head = std::str::from_utf8(&req[..hdr_end]).unwrap();
+            let raw = respond(step, head, &req[hdr_end..hdr_end + content_len]);
+            let _ = socket.write_all(&raw);
+        }
+    });
+    (base, server)
 }
 
 #[cfg(test)]
@@ -574,8 +532,6 @@ mod tests {
         )
     }
 
-    /// A provider that answers the same way every time and counts its asks, so a
-    /// test can tell a cached answer from a fresh one.
     struct Scripted {
         name: &'static str,
         answer: fn() -> Result<Lyrics, LyricsError>,
@@ -604,14 +560,25 @@ mod tests {
         Lyrics::new("youtube", name)
     }
 
+    fn titled(identifier: &str, title: &str) -> Track {
+        let mut t = track("youtube", identifier);
+        t.metadata.title = title.into();
+        t
+    }
+
+    fn lyrics_of(bytes: usize) -> Result<Lyrics, LyricsError> {
+        let mut l = found("big");
+        l.text = Some("x".repeat(bytes));
+        Ok(l)
+    }
+
     #[test]
     fn the_first_provider_with_an_answer_wins() {
         let manager = Manager::new(vec![
             scripted("empty", || Err(LyricsError::NotFound)).0,
             scripted("full", || Ok(found("full"))).0,
         ]);
-        let answer = manager.fetch(&track("youtube", "abc")).unwrap();
-        assert_eq!(answer.provider, "full");
+        assert_eq!(manager.fetch(&track("youtube", "abc")).unwrap().provider, "full");
     }
 
     #[test]
@@ -666,30 +633,15 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
-    fn titled(identifier: &str, title: &str) -> Track {
-        let mut track = track("youtube", identifier);
-        track.metadata.title = title.into();
-        track
-    }
-
-    fn lyrics_of(bytes: usize) -> Result<Lyrics, LyricsError> {
-        let mut lyrics = found("big");
-        lyrics.text = Some("x".repeat(bytes));
-        Ok(lyrics)
-    }
-
     #[test]
     fn a_track_with_other_metadata_is_not_served_the_lyrics_of_the_real_one() {
         let (provider, calls) = scripted("db", || Ok(found("db")));
         let manager = Manager::new(vec![provider]);
         manager.fetch(&titled("abc", "the real song")).unwrap();
         manager.fetch(&titled("abc", "the real song")).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "the same track is answered from the cache");
-        // A hand-made token with the same video ID and another title is a
-        // different question, so it is asked rather than answered from the cache.
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         manager.fetch(&titled("abc", "something forged")).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
-        // And the length and the author are part of the question too.
         let mut longer = titled("abc", "the real song");
         longer.metadata.length = 99_000;
         manager.fetch(&longer).unwrap();
@@ -703,17 +655,16 @@ mod tests {
     fn the_cache_is_bounded_in_bytes_and_not_only_in_entries() {
         let (provider, calls) = scripted("db", || lyrics_of(600 << 10));
         let manager = Manager::new(vec![provider]);
-        for number in 0..40 {
-            manager.fetch(&titled(&format!("track{number}"), "song")).unwrap();
+        for n in 0..40 {
+            manager.fetch(&titled(&format!("track{n}"), "song")).unwrap();
         }
-        let held = manager.cache.lock().unwrap().bytes;
-        assert!(held <= CACHE_BYTES, "{held} bytes held against a budget of {CACHE_BYTES}");
-        assert!(manager.cache.lock().unwrap().entries.len() < 40, "the oldest were pushed out");
+        assert!(manager.cache.lock().unwrap().bytes <= CACHE_BYTES);
+        assert!(manager.cache.lock().unwrap().entries.len() < 40);
         let before = calls.load(Ordering::Relaxed);
         manager.fetch(&titled("track0", "song")).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), before + 1, "the first track was evicted");
+        assert_eq!(calls.load(Ordering::Relaxed), before + 1);
         manager.fetch(&titled("track39", "song")).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), before + 1, "the latest is still cached");
+        assert_eq!(calls.load(Ordering::Relaxed), before + 1);
     }
 
     #[test]
@@ -722,7 +673,7 @@ mod tests {
         let manager = Manager::new(vec![provider]);
         assert!(manager.fetch(&titled("huge", "song")).is_ok());
         assert!(manager.fetch(&titled("huge", "song")).is_ok());
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "an enormous answer is asked for again");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         let cache = manager.cache.lock().unwrap();
         assert_eq!((cache.bytes, cache.entries.len()), (0, 0));
     }
@@ -732,17 +683,13 @@ mod tests {
         let (provider, _) = scripted("db", || lyrics_of(1000));
         let mut manager = Manager::new(vec![provider]);
         manager.ttl = Duration::from_millis(10);
-        let track = titled("abc", "song");
-        manager.fetch(&track).unwrap();
+        let t = titled("abc", "song");
+        manager.fetch(&t).unwrap();
         let once = manager.cache.lock().unwrap().bytes;
         assert!(once > 1000);
         std::thread::sleep(Duration::from_millis(30));
-        manager.fetch(&track).unwrap();
-        assert_eq!(
-            manager.cache.lock().unwrap().bytes,
-            once,
-            "an expired entry is not counted twice"
-        );
+        manager.fetch(&t).unwrap();
+        assert_eq!(manager.cache.lock().unwrap().bytes, once);
     }
 
     #[test]
@@ -772,7 +719,6 @@ mod tests {
                 Ok(found("blocking"))
             }
         }
-
         let calls = Arc::new(AtomicUsize::new(0));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -824,8 +770,7 @@ mod tests {
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = panic_mgr.fetch_shared(&item);
         }));
-        assert!(unwound.is_err());
-        assert!(panic_mgr.inflight.lock().unwrap().is_empty());
+        assert!(unwound.is_err() && panic_mgr.inflight.lock().unwrap().is_empty());
         assert_eq!(panic_mgr.fetch(&item).unwrap().provider, "recovered");
     }
 
@@ -834,19 +779,16 @@ mod tests {
         let (provider, calls) = scripted("db", || Ok(found("db")));
         let mut manager = Manager::new(vec![provider]);
         manager.limit = 2;
-        let a = titled("a", "song");
-        let b = titled("b", "song");
-        let c = titled("c", "song");
+        let (a, b, c) = (titled("a", "song"), titled("b", "song"), titled("c", "song"));
         manager.fetch(&a).unwrap();
         manager.fetch(&b).unwrap();
-        // Touch `a` so `b` becomes least-recently-used.
         manager.fetch(&a).unwrap();
         manager.fetch(&c).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         manager.fetch(&a).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 3, "promoted entry remained cached");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         manager.fetch(&b).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 4, "least-recently-used entry was evicted");
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
 
         let mut oversized_cap = found("cap");
         oversized_cap.lines = Some(Vec::with_capacity(MAX_ENTRY_BYTES / size_of::<Line>() + 16));
