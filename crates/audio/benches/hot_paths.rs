@@ -250,5 +250,61 @@ fn main() {
             }
             assert_eq!(count, 501); // Includes the encoder's delayed final samples.
         });
+
+        let passthrough_ogg = {
+            let mut out = Vec::new();
+            let mut head = b"OpusHead\x01\x02".to_vec();
+            head.extend_from_slice(&312u16.to_le_bytes());
+            head.extend_from_slice(&48_000u32.to_le_bytes());
+            head.extend_from_slice(&0i16.to_le_bytes());
+            head.push(0);
+            page(0, &[&head], &mut out);
+            page(1, &[b"OpusTags\0\0\0\0\0\0\0\0"], &mut out);
+            let mut enc = rustlink_audio::Encoder::new(160_000, 5).unwrap();
+            let pcm: Vec<i16> = (0..1920)
+                .map(|i| {
+                    (((i / 2) as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 12_000.0)
+                        as i16
+                })
+                .collect();
+            let pkt = enc.encode(&pcm).unwrap().to_vec();
+            for seq in 2u32..502 {
+                let granule = u64::from(seq - 1) * 960;
+                out.extend_from_slice(b"OggS\0");
+                out.push(if seq == 501 { 4 } else { 0 });
+                out.extend_from_slice(&granule.to_le_bytes());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.extend_from_slice(&seq.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                let segs = pkt.len() / 255 + 1;
+                out.push(segs as u8);
+                out.extend(std::iter::repeat_n(255u8, segs - 1));
+                out.push((pkt.len() % 255) as u8);
+                out.extend_from_slice(&pkt);
+            }
+            out
+        };
+        measure("opus_48khz_zero_transcode_passthrough_frames", 500, || {
+            let engine =
+                Engine { ffmpeg: None, in_process: true, bitrate: 192_000, complexity: 10 };
+            let track = Track::new("bench".into(), TrackInfo::default());
+            let mut frames = engine
+                .start(
+                    &track,
+                    Body::new(Box::new(std::io::Cursor::new(passthrough_ogg.clone()))),
+                    0,
+                    100,
+                    &Default::default(),
+                    Preference::Auto,
+                )
+                .unwrap();
+            let mut packet = Vec::new();
+            let mut count = 0;
+            while frames.next_frame(&mut packet).unwrap() {
+                black_box(&packet);
+                count += 1;
+            }
+            assert_eq!(count, 500);
+        });
     }
 }

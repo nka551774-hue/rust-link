@@ -165,11 +165,19 @@ impl Encoder {
         self.lookahead
     }
 
-    /// Encodes one 20 ms frame of interleaved stereo samples directly into `out`,
-    /// reusing `out`'s allocation without an intermediate copy or zero-fill.
+    /// Encodes one valid Opus frame size (`120`, `240`, `480`, `960`, `1920`, or
+    /// `2880` samples per channel at 48 kHz) of interleaved stereo PCM directly
+    /// into `out`.
     #[inline]
-    pub fn encode_into(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), OpusError> {
-        if pcm.len() != FRAME_SAMPLES_STEREO {
+    pub fn encode_frame_size(
+        &mut self,
+        pcm: &[i16],
+        frame_samples: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), OpusError> {
+        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
+            || pcm.len() != frame_samples * crate::dsp::CHANNELS
+        {
             return Err(OpusError::FrameSize);
         }
         out.clear();
@@ -181,7 +189,7 @@ impl Encoder {
             opus_encode(
                 self.state.as_ptr(),
                 pcm.as_ptr(),
-                FRAME_SAMPLES as c_int,
+                frame_samples as c_int,
                 out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
                 MAX_PACKET as OpusInt32,
             )
@@ -193,6 +201,13 @@ impl Encoder {
             out.set_len(written as usize);
         }
         Ok(())
+    }
+
+    /// Encodes one 20 ms frame of interleaved stereo samples directly into `out`,
+    /// reusing `out`'s allocation without an intermediate copy or zero-fill.
+    #[inline]
+    pub fn encode_into(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), OpusError> {
+        self.encode_frame_size(pcm, FRAME_SAMPLES, out)
     }
 
     /// Encodes one 20 ms frame of interleaved stereo samples.
@@ -218,11 +233,23 @@ impl Encoder {
     }
 
     #[inline]
-    pub fn encode_into(&mut self, pcm: &[i16], _out: &mut Vec<u8>) -> Result<(), OpusError> {
-        if pcm.len() != FRAME_SAMPLES_STEREO {
+    pub fn encode_frame_size(
+        &mut self,
+        pcm: &[i16],
+        frame_samples: usize,
+        _out: &mut Vec<u8>,
+    ) -> Result<(), OpusError> {
+        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
+            || pcm.len() != frame_samples * crate::dsp::CHANNELS
+        {
             return Err(OpusError::FrameSize);
         }
         Err(OpusError::Encode(-7))
+    }
+
+    #[inline]
+    pub fn encode_into(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), OpusError> {
+        self.encode_frame_size(pcm, FRAME_SAMPLES, out)
     }
 
     #[inline]

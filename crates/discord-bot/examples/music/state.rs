@@ -4,9 +4,14 @@ use std::collections::VecDeque;
 
 use rustlink_client::Track;
 
+struct QueuedItem {
+    track: Track,
+    start_ms: Option<i64>,
+}
+
 /// What one guild is playing and what is waiting.
 pub struct Guild {
-    queue: VecDeque<Track>,
+    queue: VecDeque<QueuedItem>,
     current: Option<Track>,
     current_play_id: Option<u64>,
     next_play_id: u64,
@@ -33,23 +38,52 @@ impl Guild {
     }
 
     /// Adds tracks up to `max` waiting, and returns how many were accepted.
+    #[allow(dead_code)]
     pub fn enqueue(&mut self, tracks: Vec<Track>, max: usize) -> usize {
+        self.enqueue_with_start(tracks, None, max)
+    }
+
+    /// Adds tracks up to `max` waiting, attaching `first_start_ms` to the first
+    /// track when a single-video timestamp link was requested.
+    pub fn enqueue_with_start(
+        &mut self,
+        tracks: Vec<Track>,
+        first_start_ms: Option<i64>,
+        max: usize,
+    ) -> usize {
         let room = max.saturating_sub(self.queue.len());
         let accepted = tracks.len().min(room);
-        self.queue.extend(tracks.into_iter().take(accepted));
+        for (idx, track) in tracks.into_iter().take(accepted).enumerate() {
+            self.queue.push_back(QueuedItem {
+                track,
+                start_ms: (idx == 0).then_some(first_start_ms).flatten(),
+            });
+        }
         accepted
     }
 
     /// Moves the next waiting track into `current` and returns it.
+    #[allow(dead_code)]
     pub fn advance(&mut self) -> Option<Track> {
-        self.current = self.queue.pop_front();
-        if self.current.is_some() {
-            self.next_play_id = self.next_play_id.wrapping_add(1).max(1);
-            self.current_play_id = Some(self.next_play_id);
-        } else {
-            self.current_play_id = None;
+        self.advance_with_start().map(|(track, _)| track)
+    }
+
+    /// Moves the next waiting track into `current` and returns `(track, start_ms)`.
+    pub fn advance_with_start(&mut self) -> Option<(Track, Option<i64>)> {
+        match self.queue.pop_front() {
+            Some(item) => {
+                self.next_play_id = self.next_play_id.wrapping_add(1).max(1);
+                self.current_play_id = Some(self.next_play_id);
+                let cloned = item.track.clone();
+                self.current = Some(item.track);
+                Some((cloned, item.start_ms))
+            }
+            None => {
+                self.current = None;
+                self.current_play_id = None;
+                None
+            }
         }
-        self.current.clone()
     }
 
     pub fn current_play_id(&self) -> Option<u64> {
@@ -104,7 +138,7 @@ impl Guild {
     }
 
     pub fn upcoming(&self, limit: usize) -> impl Iterator<Item = &Track> {
-        self.queue.iter().take(limit)
+        self.queue.iter().take(limit).map(|item| &item.track)
     }
 }
 

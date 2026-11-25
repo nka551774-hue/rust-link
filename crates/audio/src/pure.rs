@@ -6,7 +6,7 @@
 
 use rustlink_protocol::Track;
 
-use crate::decode::Decoder;
+use crate::decode::{Decoder, PassthroughStep};
 use crate::dsp::DspChain;
 use crate::engine::{Body, Frames};
 use crate::error::AudioError;
@@ -17,6 +17,11 @@ use crate::resample::{ratio_for, SincResampler, TimeStretcher};
 /// How many output frames one resample call may produce. The buffer is drained
 /// after every call, so this only bounds a single step.
 const PRODUCE_LIMIT: usize = 1 << 16;
+
+/// Minimum configured output bitrate at which 48 kHz Opus sources (`itag 251`,
+/// Ogg Opus) stream directly without re-encoding; lower operator caps transcode
+/// to honour explicit bandwidth limits.
+const MIN_PASSTHROUGH_BITRATE: i32 = 96_000;
 
 pub struct PureFrames {
     decoder: Decoder,
@@ -40,6 +45,11 @@ pub struct PureFrames {
     /// Source frames to discard before playback starts, which is how a seek is
     /// performed on a stream that cannot be seeked.
     skip: u64,
+    /// True while 48 kHz Opus packets are forwarded directly without decode+encode.
+    passthrough: bool,
+    passthrough_count: u64,
+    passthrough_ring: [Vec<u8>; 2],
+    handoff_pending: bool,
     drained: bool,
     flushed: bool,
     encoder_flushed: bool,
@@ -92,6 +102,12 @@ impl PureFrames {
         } else {
             0
         };
+        let dsp = DspChain::new(set);
+        let passthrough = bitrate >= MIN_PASSTHROUGH_BITRATE
+            && skip == 0
+            && active_time.is_none()
+            && dsp.is_empty()
+            && decoder.supports_opus_passthrough();
         Ok(PureFrames {
             decoder,
             source_resampler: (rate != 48_000).then(|| SincResampler::new(rate as f64 / 48_000.0)),
@@ -101,18 +117,85 @@ impl PureFrames {
             stretcher,
             stretch_factor,
             time: active_time,
-            dsp: DspChain::new(set),
+            dsp,
             encoder,
             staging: Vec::new(),
             staging_at: 0,
             scratch: Vec::new(),
             pcm: [0; FRAME_SAMPLES_STEREO],
             skip,
+            passthrough,
+            passthrough_count: 0,
+            passthrough_ring: [Vec::new(), Vec::new()],
+            handoff_pending: false,
             drained: false,
             flushed: false,
             encoder_flushed: false,
             encoded_any: false,
         })
+    }
+
+    fn passthrough_history(count: u64, ring: &[Vec<u8>; 2]) -> (Option<&[u8]>, Option<&[u8]>) {
+        match count {
+            0 => (None, None),
+            1 => (None, Some(ring[0].as_slice())),
+            n => {
+                let older = ring[(n % 2) as usize].as_slice();
+                let latest = ring[((n - 1) % 2) as usize].as_slice();
+                (Some(older), Some(latest))
+            }
+        }
+    }
+
+    /// Primes `self.encoder`'s lookahead and MDCT overlap state from the final
+    /// samples of packet `K` (`k_tail`) and the leading `lookahead` samples of
+    /// packet `K+1` (`next_pcm`) using a discarded 10 ms (480-sample) encode so
+    /// live filter changes or final-packet trimming transition with zero sample
+    /// offset and zero discontinuity.
+    fn finish_passthrough_handoff(
+        &mut self,
+        k_tail: &mut [f32],
+        next_pcm: &mut [f32],
+    ) -> Result<(), AudioError> {
+        if !next_pcm.is_empty() {
+            self.dsp.process_pre(next_pcm);
+        }
+        if k_tail.is_empty() {
+            self.staging.extend_from_slice(next_pcm);
+            return Ok(());
+        }
+        if next_pcm.is_empty() {
+            self.drained = true;
+            self.encoder_flushed = true;
+            return Ok(());
+        }
+        let lookahead = (self.encoder.lookahead().max(0) as usize).min(480);
+        let hist_frames = 480 - lookahead;
+        let k_frames = k_tail.len() / 2;
+        let take_k = hist_frames.min(k_frames);
+        let pad_k = hist_frames - take_k;
+
+        let mut prime = [0.0f32; 480 * 2];
+        let k_src = &mut k_tail[(k_frames - take_k) * 2..];
+        self.dsp.process_pre(k_src);
+        prime[pad_k * 2..hist_frames * 2].copy_from_slice(k_src);
+
+        let next_frames = next_pcm.len() / 2;
+        let take_next = lookahead.min(next_frames);
+        prime[hist_frames * 2..(hist_frames + take_next) * 2]
+            .copy_from_slice(&next_pcm[..take_next * 2]);
+        self.dsp.process_post(&mut prime);
+
+        let mut prime_i16 = [0i16; 480 * 2];
+        crate::opus::to_i16(&prime, &mut prime_i16);
+        let mut discard = Vec::new();
+        self.encoder.encode_frame_size(&prime_i16, 480, &mut discard)?;
+        self.encoded_any = true;
+
+        if next_frames > take_next {
+            self.staging.extend_from_slice(&next_pcm[take_next * 2..]);
+        }
+        Ok(())
     }
 
     /// Reads one step of the pipeline, reporting whether anything moved.
@@ -124,7 +207,7 @@ impl PureFrames {
                 return Ok(false);
             }
             let start = self.staging.len();
-            if !self.decoder.decode(&mut self.staging)? {
+            if !self.decoder.decode_with_skip(&mut self.skip, &mut self.staging)? {
                 self.drained = true;
                 return Ok(false);
             }
@@ -143,7 +226,7 @@ impl PureFrames {
         let source_ready = self.source_resampler.as_ref().is_some_and(|r| r.available() > 0);
         self.scratch.clear();
         if !self.drained && !source_ready && !time_ready {
-            if self.decoder.decode(&mut self.scratch)? {
+            if self.decoder.decode_with_skip(&mut self.skip, &mut self.scratch)? {
                 // A chunk that falls entirely inside the seek is still progress:
                 // the rest of the track is still to come, so the caller has to
                 // keep pumping rather than read this as the end of the stream.
@@ -232,6 +315,56 @@ impl PureFrames {
 
 impl Frames for PureFrames {
     fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
+        if self.passthrough {
+            let mut k_tail = Vec::new();
+            let mut next_pcm = Vec::new();
+            let step = {
+                let (older, latest) =
+                    Self::passthrough_history(self.passthrough_count, &self.passthrough_ring);
+                self.decoder.try_passthrough_next(
+                    self.passthrough_count,
+                    packet,
+                    older,
+                    latest,
+                    &mut k_tail,
+                    &mut next_pcm,
+                )?
+            };
+            match step {
+                PassthroughStep::Packet => {
+                    let slot = &mut self.passthrough_ring[(self.passthrough_count % 2) as usize];
+                    slot.clear();
+                    slot.extend_from_slice(packet);
+                    self.passthrough_count += 1;
+                    self.encoded_any = true;
+                    return Ok(true);
+                }
+                PassthroughStep::Eof => {
+                    packet.clear();
+                    self.drained = true;
+                    self.encoder_flushed = true;
+                    return Ok(false);
+                }
+                PassthroughStep::FallbackToTranscode => {
+                    self.passthrough = false;
+                    self.finish_passthrough_handoff(&mut k_tail, &mut next_pcm)?;
+                }
+            }
+        } else if self.handoff_pending {
+            self.handoff_pending = false;
+            let mut k_tail = Vec::new();
+            {
+                let (older, latest) =
+                    Self::passthrough_history(self.passthrough_count, &self.passthrough_ring);
+                self.decoder.warm_from_passthrough(older, latest, &mut k_tail)?;
+            }
+            let mut next_pcm = Vec::new();
+            if !self.decoder.decode(&mut next_pcm)? {
+                self.drained = true;
+            }
+            self.finish_passthrough_handoff(&mut k_tail, &mut next_pcm)?;
+        }
+
         while self.staging.len() - self.staging_at < FRAME_SAMPLES_STEREO {
             if !self.pump()? {
                 // RTP has no Ogg pre-skip/granule metadata. Send the encoder's
@@ -282,6 +415,12 @@ impl Frames for PureFrames {
             return false;
         }
         self.dsp.reconfigure(set);
+        if self.passthrough && !self.dsp.is_empty() {
+            self.passthrough = false;
+            if self.passthrough_count > 0 {
+                self.handoff_pending = true;
+            }
+        }
         true
     }
 }

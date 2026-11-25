@@ -219,6 +219,15 @@ pub struct Service {
     loads: std::sync::atomic::AtomicU64,
 }
 
+/// Shared closure reading the node's cached anonymous YouTube `visitorData`.
+pub type VisitorReader = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Shared closure publishing a newly harvested YouTube `visitorData`.
+pub type VisitorWriter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Paired reader and writer closures for sharing YouTube `visitorData`.
+pub type VisitorBridge = (VisitorReader, VisitorWriter);
+
 impl Service {
     pub fn new(config: Config) -> Self {
         let agent = netguard::agent(config.allow_private_networks);
@@ -254,6 +263,20 @@ impl Service {
     /// `youtubeProxy`), or `None` when `youtubeProxy` could not be constructed.
     pub fn youtube_agent(&self) -> Option<&ureq::Agent> {
         self.youtube_agent.as_ref().ok()
+    }
+
+    /// Returns a shared handle that reads and populates the anonymous YouTube
+    /// `visitorData` cache so sibling subsystems (such as YouTube Music lyrics)
+    /// can reuse the warmed session token without an extra round-trip.
+    pub fn youtube_visitor_bridge(&self) -> VisitorBridge {
+        let reader_cache = Arc::clone(&self.catalog_state.youtube_visitor);
+        let writer_cache = Arc::clone(&self.catalog_state.youtube_visitor);
+        (
+            Arc::new(move || reader_cache.peek()),
+            Arc::new(move |fresh: &str| {
+                writer_cache.store_if_empty(fresh, Duration::from_secs(3600))
+            }),
+        )
     }
 
     /// How many loads were answered from the cache.
@@ -569,6 +592,7 @@ fn youtube_playlist_id(identifier: &str) -> Option<String> {
     let (_, id) = url.query_pairs().find(|(key, _)| key == "list")?;
     valid(&id).then(|| id.into_owned())
 }
+
 impl Service {
     fn with_budget<T>(
         &self,

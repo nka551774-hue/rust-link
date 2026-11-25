@@ -5,6 +5,7 @@
 //! lines inside the elements framework. The mobile answer is asked for first
 //! because a client can follow timed lines and cannot follow a wall of text.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustlink_protocol::{Object, Track};
@@ -43,6 +44,15 @@ const MAX_TIMED_LINES: usize = 10_000;
 /// page type is what identifies it.
 const LYRICS_PAGE: &str = "MUSIC_PAGE_TYPE_TRACK_LYRICS";
 
+/// Shared closure reading an already-warmed YouTube `visitorData` session token.
+pub type VisitorReader = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Shared closure publishing a newly harvested YouTube `visitorData` session token.
+pub type VisitorWriter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Paired reader and writer closures for sharing YouTube `visitorData`.
+pub type VisitorBridge = (VisitorReader, VisitorWriter);
+
 /// Fetches lyrics from YouTube Music's own catalogue.
 ///
 /// It only answers for YouTube tracks, because a video id is the only handle the
@@ -56,6 +66,10 @@ pub struct YTMusic {
     /// Attached when the node has one, the same way the source package attaches
     /// it.
     pub visitor_data: String,
+    /// Optional shared reader for an already-warmed session `visitorData`.
+    pub visitor_reader: Option<VisitorReader>,
+    /// Optional shared sink to publish harvested `visitorData`.
+    pub visitor_writer: Option<VisitorWriter>,
 }
 
 /// One of the two identities the lyrics page is asked with. They are the same
@@ -139,23 +153,38 @@ impl YTMusic {
     /// saying the track has no lyrics rather than a failure.
     fn page(&self, video_id: &str) -> Result<Option<(String, String)>, LyricsError> {
         let configured_vd = self.visitor_data.trim();
-        let answer: Value =
-            self.call(&WEB, "next", configured_vd, json!({ "videoId": video_id }))?;
+        let shared_vd = if configured_vd.is_empty() {
+            self.visitor_reader
+                .as_ref()
+                .and_then(|read| read())
+                .filter(|vd| crate::valid_header_value(vd))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let initial_vd = if !configured_vd.is_empty() { configured_vd } else { shared_vd.as_str() };
+        let answer: Value = self.call(&WEB, "next", initial_vd, &json!({ "videoId": video_id }))?;
+        let harvested = answer
+            .pointer("/responseContext/visitorData")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|vd| {
+                !vd.is_empty()
+                    && vd.len() <= 512
+                    && vd.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                    && crate::valid_header_value(vd)
+            });
+        if configured_vd.is_empty() {
+            if let (Some(vd), Some(write)) = (harvested, self.visitor_writer.as_ref()) {
+                write(vd);
+            }
+        }
         let effective_vd = if !configured_vd.is_empty() {
             configured_vd.to_owned()
+        } else if let Some(vd) = harvested {
+            vd.to_owned()
         } else {
-            answer
-                .pointer("/responseContext/visitorData")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|vd| {
-                    !vd.is_empty()
-                        && vd.len() <= 512
-                        && vd.bytes().all(|b| (0x21..=0x7e).contains(&b))
-                        && crate::valid_header_value(vd)
-                })
-                .map(str::to_owned)
-                .unwrap_or_default()
+            shared_vd
         };
         let tabs = answer
             .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
@@ -178,7 +207,7 @@ impl YTMusic {
 
     /// Posts one browse request for the lyrics page.
     fn ask(&self, client: &Client, page: &str, visitor_data: &str) -> Result<Value, LyricsError> {
-        self.call(client, "browse", visitor_data, json!({ "browseId": page }))
+        self.call(client, "browse", visitor_data, &json!({ "browseId": page }))
     }
 
     /// Posts one InnerTube request and decodes the answer.
@@ -187,7 +216,7 @@ impl YTMusic {
         client: &Client,
         endpoint: &str,
         visitor_data: &str,
-        mut body: Value,
+        body: &Value,
     ) -> Result<Value, LyricsError> {
         let version = if client.name == WEB.name && !self.version.trim().is_empty() {
             self.version.trim()
@@ -201,7 +230,16 @@ impl YTMusic {
         let raw_base =
             if self.endpoint.trim().is_empty() { YTMUSIC_ENDPOINT } else { self.endpoint.trim() };
         let base = crate::validate_base_url(raw_base, "youtube music")?;
-        body["context"] = json!({ "client": client_context(client, version, visitor) });
+        #[derive(serde::Serialize)]
+        struct Envelope<'a> {
+            context: Value,
+            #[serde(flatten)]
+            body: &'a Value,
+        }
+        let payload = Envelope {
+            context: json!({ "client": client_context(client, version, visitor) }),
+            body,
+        };
         let url = format!("{base}/youtubei/v1/{endpoint}?prettyPrint=false");
         let mut request = self
             .agent
@@ -219,7 +257,7 @@ impl YTMusic {
             .timeout_global(Some(TIMEOUT))
             .http_status_as_error(false)
             .build()
-            .send_json(&body)
+            .send_json(&payload)
             .map_err(|error| {
                 LyricsError::Failed(format!("lyrics: youtube music could not be reached: {error}"))
             })?;
@@ -653,6 +691,8 @@ mod tests {
             endpoint,
             version: String::new(),
             visitor_data: String::new(),
+            visitor_reader: None,
+            visitor_writer: None,
         };
         let lyrics = provider.fetch(&track("youtube", "dQw4w9WgXcQ")).unwrap();
         server.join().unwrap();
@@ -663,6 +703,8 @@ mod tests {
             endpoint: "https://music.youtube.com".into(),
             version: "1.0\r\nX-Injected: 1".into(),
             visitor_data: String::new(),
+            visitor_reader: None,
+            visitor_writer: None,
         };
         assert!(matches!(
             bad_header.fetch(&track("youtube", "dQw4w9WgXcQ")),

@@ -20,12 +20,26 @@ struct OpusDecoder {
 
 #[cfg(feature = "native-opus")]
 const OPUS_OK: c_int = 0;
+#[cfg(feature = "native-opus")]
+const OPUS_RESET_STATE: c_int = 4028;
+/// Maximum RFC 6716 compressed payload length for a single 20 ms Opus packet.
+#[cfg(feature = "native-opus")]
+const MAX_DISCORD_OPUS_BYTES: usize = 1_275;
 
 #[cfg(feature = "native-opus")]
 extern "C" {
     fn opus_decoder_create(fs: c_int, channels: c_int, error: *mut c_int) -> *mut OpusDecoder;
     fn opus_decoder_destroy(st: *mut OpusDecoder);
+    fn opus_decoder_ctl(st: *mut OpusDecoder, request: c_int, ...) -> c_int;
     fn opus_packet_get_nb_samples(data: *const u8, len: c_int, fs: c_int) -> c_int;
+    fn opus_packet_parse(
+        data: *const u8,
+        len: c_int,
+        out_toc: *mut u8,
+        frames: *mut *const u8,
+        size: *mut i16,
+        payload_offset: *mut c_int,
+    ) -> c_int;
     fn opus_decode(
         st: *mut OpusDecoder,
         data: *const u8,
@@ -72,6 +86,40 @@ pub fn packet_samples(_packet: &[u8]) -> Option<usize> {
     None
 }
 
+/// Validates without decoding that `packet` is a well-formed RFC 6716 20 ms
+/// (960-sample @ 48 kHz) Opus packet safe to send directly over Discord RTP.
+#[cfg(feature = "native-opus")]
+#[inline]
+pub fn is_valid_20ms_packet(packet: &[u8]) -> bool {
+    if !(1..=MAX_DISCORD_OPUS_BYTES).contains(&packet.len()) {
+        return false;
+    }
+    let Ok((length, 960)) = packet_frame_count(packet) else {
+        return false;
+    };
+    let mut toc = 0u8;
+    let mut frames = [ptr::null(); 48];
+    let mut sizes = [0i16; 48];
+    let mut payload_offset: c_int = 0;
+    let parsed = unsafe {
+        opus_packet_parse(
+            packet.as_ptr(),
+            length,
+            &mut toc,
+            frames.as_mut_ptr(),
+            sizes.as_mut_ptr(),
+            &mut payload_offset,
+        )
+    };
+    (1..=48).contains(&parsed)
+}
+
+#[cfg(not(feature = "native-opus"))]
+#[inline]
+pub fn is_valid_20ms_packet(_packet: &[u8]) -> bool {
+    false
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("libopus refused to create a decoder (code {0})")]
@@ -104,6 +152,15 @@ impl Decoder {
             return Err(DecodeError::Create(error));
         };
         Ok(Decoder { state })
+    }
+
+    /// Clears internal predictor and overlap state before decoding pre-roll
+    /// packets after a compressed-packet skip.
+    #[inline]
+    pub fn reset(&mut self) {
+        unsafe {
+            let _ = opus_decoder_ctl(self.state.as_ptr(), OPUS_RESET_STATE);
+        }
     }
 
     /// Decodes one packet into interleaved stereo 16-bit samples.
@@ -222,6 +279,8 @@ impl Decoder {
     pub fn new() -> Result<Self, DecodeError> {
         Err(DecodeError::Create(-7))
     }
+
+    pub fn reset(&mut self) {}
 
     pub fn decode(&mut self, _packet: &[u8], _out: &mut Vec<i16>) -> Result<usize, DecodeError> {
         Err(DecodeError::Decode(-7))

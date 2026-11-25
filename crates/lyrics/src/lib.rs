@@ -9,7 +9,7 @@ mod lrclib;
 mod ytmusic;
 
 pub use lrclib::{LRCLIB, LRCLIB_BASE};
-pub use ytmusic::{YTMusic, YTMUSIC_ENDPOINT};
+pub use ytmusic::{VisitorBridge, VisitorReader, VisitorWriter, YTMusic, YTMUSIC_ENDPOINT};
 
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
@@ -440,6 +440,17 @@ impl Manager {
         agent: ureq::Agent,
         youtube_agent: Option<ureq::Agent>,
     ) -> Option<Self> {
+        Self::from_config_with_youtube_visitor(config, agent, youtube_agent, None)
+    }
+
+    /// Builds the manager while sharing `rustlink-source`'s live anonymous
+    /// `visitorData` session cache with YouTube Music lyrics requests.
+    pub fn from_config_with_youtube_visitor(
+        config: &Config,
+        agent: ureq::Agent,
+        youtube_agent: Option<ureq::Agent>,
+        visitor_bridge: Option<VisitorBridge>,
+    ) -> Option<Self> {
         if !config.lyrics_enabled() {
             return None;
         }
@@ -447,6 +458,10 @@ impl Manager {
             vec![Box::new(LRCLIB { agent, base: LRCLIB_BASE.to_string() })];
         if config.youtube_native {
             if let Some(yt_agent) = youtube_agent {
+                let (visitor_reader, visitor_writer) = match visitor_bridge {
+                    Some((r, w)) => (Some(r), Some(w)),
+                    None => (None, None),
+                };
                 providers.push(Box::new(YTMusic {
                     agent: yt_agent,
                     endpoint: config.youtube_music_endpoint.clone(),
@@ -454,6 +469,8 @@ impl Manager {
                     // not WEB_REMIX; keep YTMusic's built-in web client version.
                     version: String::new(),
                     visitor_data: config.youtube_visitor_data.clone(),
+                    visitor_reader,
+                    visitor_writer,
                 }));
             }
         }

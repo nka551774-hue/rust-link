@@ -20,9 +20,9 @@
 
 ---
 
-**Rustlink** 是專為高併發、低延遲與零抖動場景設計的原生即時語音媒體伺服器。機器人透過簡潔嚴謹的 **Rustlink API v1**（REST 控制平面 + WebSocket 事件流）建立工作階段與播放器；從**音源解析、128 KiB HTTP 分段串流、容器探測、原生音訊解碼、48 kHz 雙聲道 DSP 濾波、Opus 編碼、Discord Voice Gateway v8 握手、RFC 9420 OpenMLS DAVE v1 端對端加密到 RTP UDP 封包發送**，全鏈路皆在單一原生 Rust 程序內一氣呵成。
+**Rustlink** 是專為高併發、低延遲與零抖動場景設計的原生即時語音媒體伺服器。機器人透過簡潔嚴謹的 **Rustlink API v1**（REST 控制平面 + WebSocket 事件流）建立工作階段與播放器；從**音源解析、預解析串流快取、HTTP 分段串流、容器探測、原生音訊解碼／48 kHz Opus 零轉碼直通、雙聲道 DSP 濾波、Opus 編碼、Discord Voice Gateway v8 握手、RFC 9420 OpenMLS DAVE v1 端對端加密到 RTP UDP 封包發送**，全鏈路皆在單一原生 Rust 程序內一氣呵成。
 
-- **零外部直譯器與零整檔下載**：不執行 `yt-dlp`、Node.js、JVM、Python 或 Go；音訊每次以 **128 KiB** 區間分段讀取（搭配強 `ETag` / `If-Range` 一致性校驗），讀入記憶體即刻解碼並送往語音頻道。
+- **零外部直譯器與零整檔下載**：不執行 `yt-dlp`、Node.js、JVM、Python 或 Go；googlevideo 音訊每次以 **512 KiB** 驗證區間分段讀取（搭配強 `ETag` / `If-Range` 一致性校驗），讀入記憶體即刻直通或解碼並送往語音頻道。
 - **獨立純淨協定**：不依賴亦不模仿 Lavalink、NodeLink 或 GoLink 的歷史包袱，採用自有的強型別 `/api/v1` 與版本化 `rlt1.` 曲目權杖（邊界對照見 [Rust 原生 API 對照](docs/native-api-matrix.md)）。
 - **極簡外部依賴**：僅連結系統 `libopus` 進行高品質編碼，並提供選配的 FFmpeg 作為罕見容器格式的安全後備管線。
 
@@ -73,6 +73,7 @@
 | **Ogg Opus 區段合併解封裝**（`append_next_packet` 零清零） | **19.9 ns / pkt** | **200,000 封包共 5 次** | 較舊版逐封包配置（14.17 ms）快 **3.56×**，消除 **99.997%** 配置 |
 | **DAVE v1 MLS 音框原地加密**（AES-128-GCM + ULEB128） | **226.4 ns / op** | **0.000 allocs / op** | 較 v0.4.0（375.6 ns, 2 allocs）快 **1.66×** |
 | **Discord RTP 傳輸層加密**（`aead_aes256_gcm_rtpsize`） | **263.1 ns / op** | **0.000 allocs / op** | 較 v0.4.0（402.6 ns）快 **1.53×** |
+| **48 kHz Opus 零轉碼直通**（RFC 6716 封包校驗 + 動態濾鏡預熱切換） | **445.2 ns / 20ms 音框** | **穩態 0 allocs / 音框** | 較解碼重編碼快 **441×**（即時速度的 **44,923×**） |
 | **視窗化 Sinc 重取樣**（44.1 kHz → 48 kHz 雙聲道） | **4.54 µs / 20ms 音框** | **0 allocs（5,000 音框）** | 即時速度的 **4,408×**（僅佔音框預算 **0.023%**） |
 | **全開 8 階 SIMD/相量 DSP 濾鏡鏈**（含非線性失真） | **38.78 µs / 20ms 音框** | **0 allocs（5,000 音框）** | 即時速度的 **516×**（僅佔音框預算 **0.19%**） |
 | **48 kHz WAV 解碼 + `libopus` 最高複雜度 10 編碼** | **171.02 µs / 20ms 音框** | 預配置重用緩衝 | 即時速度的 **117.0×**（僅佔音框預算 **0.86%**） |
@@ -109,7 +110,7 @@
 - **控制平面與 SDK**：`/api/v1` REST API、常數時間 Bearer 驗證、每工作階段專屬 WebSocket 事件流、斷線自動續傳（Session Resume），以及非同步強型別客戶端 `rustlink-client`。
 - **次世代 Discord 語音與 E2EE**：完整支援 Discord Voice Gateway v8、UDP IP 探索、**DAVE v1（OpenMLS）端對端加密**、`aead_aes256_gcm_rtpsize` 與 `aead_xchacha20_poly1305_rtpsize` 傳輸加密。
 - **多平台原生音源解析**：
-  - **YouTube / YouTube Music**：純 Rust 原生 InnerTube 多用戶端備援（`IOS_PRODUCER` + 自動引導匿名 `visitorData` 的 `VISIONOS` + 尾端區間防截斷校驗，支援搜尋、單曲、合輯與播放清單續頁、自動迴避 AI 配音音軌，完全不依賴 `yt-dlp`）。
+  - **YouTube / YouTube Music**：純 Rust 原生 InnerTube 多用戶端健康度自適應備援（`IOS_PRODUCER` + 自動引導匿名 `visitorData` 的 `VISIONOS` + 尾端區間防截斷校驗）、預解析串流快取（零重複 `/player` 呼叫）、512 KiB 分段串流、48 kHz Opus 零轉碼直通、壓縮封包快轉定位與 `?t=` 時間戳連結支援，完全不依賴 `yt-dlp`。
   - **SoundCloud**：原生 API v2 解析、漸進式串流與 `client_id` 自動快取輪替。
   - **Spotify / Deezer**：官方中繼資料擷取 + ISRC 優先雙向詞彙精準比對至可播放音源。
   - **Direct HTTP / HTTPS**：支援 MP3（ID3v2）、FLAC、Ogg Opus/Vorbis、MP4/M4A、WebM/Matroska、WAV 標頭探測與嚴格 SSRF 防護。
@@ -252,8 +253,8 @@ RUSTLINK_PASSWORD=your-strong-password docker compose up --build -d
 | `rustlink-protocol` | API v1 強型別結構、三態 `Patch<T>`、零填充 Base64URL `rlt1.` 曲目權杖編解碼 |
 | `rustlink-config` | 嚴格 YAML + 環境變數載入、URL/連接埠安全校驗、敏感欄位自動遮罩與 `Zeroize` |
 | `rustlink-client` | 非同步 REST / WebSocket 客戶端、預編譯敏感標頭、零中間 `Value` 請求序列化 |
-| `rustlink-source` | InnerTube / SoundCloud / Spotify / Deezer / HTTP 解析、`Singleflight`、`Arc` 快取、128 KiB 分段串流與 SSRF 防護 |
-| `rustlink-audio` | Symphonia + 原生 Opus 解碼、雙聲道 SIMD Biquad / 相量 LFO DSP、Sinc 重取樣、WSOLA 與 FFmpeg 後備管線 |
+| `rustlink-source` | InnerTube / SoundCloud / Spotify / Deezer / HTTP 解析、預解析串流快取、`Singleflight`、`Arc` 快取、512 KiB 分段串流與 SSRF 防護 |
+| `rustlink-audio` | 48 kHz Opus 零轉碼直通、壓縮封包快轉、Symphonia + 原生 Opus 解碼、SIMD Biquad / 相量 LFO DSP、Sinc 重取樣與 WSOLA |
 | `rustlink-lyrics` | LRCLIB 與 YouTube Music 雙來源歌詞解析、LRC 時間軸校驗與位元組上限 LRU 快取 |
 | `rustlink-dave` | Discord DAVE v1（RFC 9420 OpenMLS P-256）、發送端金鑰棘輪、零配置 AES-128-GCM 原地音框加密 |
 | `rustlink-voice` | Discord Voice Gateway v8、UDP IP 探索、AES-256-GCM / XChaCha20 RTP 封裝與回收封包池 |

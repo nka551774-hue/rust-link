@@ -69,6 +69,21 @@ impl MediaSource for Unseekable {
     }
 }
 
+/// RFC 7845 section 4.6 mandates an 80 ms (3,840 samples @ 48 kHz) decoder
+/// convergence window before the target sample when seeking in Opus streams.
+const OPUS_SEEK_PREROLL_FRAMES: u64 = 3_840;
+
+/// Pre-roll window (~8 AAC-LC packets) decoded before the target seek sample so
+/// MDCT overlap-add state is warm when playback resumes.
+const AAC_SEEK_PREROLL_FRAMES: u64 = 8_192;
+
+/// Outcome of attempting to read a zero-transcode 20 ms Opus packet.
+pub(crate) enum PassthroughStep {
+    Packet,
+    Eof,
+    FallbackToTranscode,
+}
+
 /// A decoder that yields interleaved stereo float samples at the source rate.
 pub struct Decoder {
     inner: Inner,
@@ -84,6 +99,9 @@ enum Inner {
         mixer: Downmix,
         /// Interleaving buffer kept between packets so steady streams never reallocate.
         samples: SampleBuffer<f32>,
+        can_skip_packets: bool,
+        primed: bool,
+        needs_reset: bool,
     },
     OggOpus(Box<OggDecoder>),
     ContainerOpus(Box<ContainerOpusDecoder>),
@@ -112,17 +130,55 @@ fn make_codec_decoder(params: &CodecParameters) -> Result<Box<dyn SymphoniaDecod
 
 struct OpusStream {
     decoder: opus_decode::Decoder,
+    initial_skip: u32,
     skip: u32,
     gain: f32,
+    gain_is_unity: bool,
+    needs_reset: bool,
 }
 
 impl OpusStream {
-    fn new(skip: u32, gain: f32) -> Result<Self, AudioError> {
+    fn new(skip: u32, output_gain: i16) -> Result<Self, AudioError> {
+        let gain_is_unity = output_gain == 0;
+        let gain =
+            if gain_is_unity { 1.0 } else { 10.0f32.powf(output_gain as f32 / (20.0 * 256.0)) };
         Ok(Self {
             decoder: opus_decode::Decoder::new().map_err(|e| AudioError::Decode(e.to_string()))?,
+            initial_skip: skip,
             skip,
             gain,
+            gain_is_unity,
+            needs_reset: false,
         })
+    }
+
+    #[inline]
+    fn can_passthrough(&self) -> bool {
+        self.gain_is_unity && self.initial_skip <= 480
+    }
+
+    fn warm_from_history(
+        &mut self,
+        older: Option<&[u8]>,
+        latest: Option<&[u8]>,
+        k_tail_out: &mut Vec<f32>,
+    ) -> Result<(), AudioError> {
+        self.skip = 0;
+        self.needs_reset = false;
+        self.decoder.reset();
+        k_tail_out.clear();
+        if let Some(pkt) = older {
+            if let Some(expected) = opus_decode::packet_samples(pkt) {
+                let _ = self.decode_packet(pkt, expected, 0, None, 0, k_tail_out)?;
+                k_tail_out.clear();
+            }
+        }
+        if let Some(pkt) = latest {
+            if let Some(expected) = opus_decode::packet_samples(pkt) {
+                let _ = self.decode_packet(pkt, expected, 0, None, 0, k_tail_out)?;
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -135,6 +191,10 @@ impl OpusStream {
         pkt_trim_end: usize,
         out: &mut Vec<f32>,
     ) -> Result<bool, AudioError> {
+        if self.needs_reset {
+            self.decoder.reset();
+            self.needs_reset = false;
+        }
         let base = out.len();
         let frames = match self.decoder.decode_float_append(packet, out) {
             Ok(frames) => frames,
@@ -178,7 +238,7 @@ struct ContainerOpusDecoder {
     track_id: u32,
 }
 
-fn parse_container_opus_params(params: &CodecParameters) -> Result<(u32, f32), AudioError> {
+fn parse_container_opus_params(params: &CodecParameters) -> Result<(u32, i16), AudioError> {
     let channels = param_channels(params).map(|c| c.count()).unwrap_or(2);
     if !(1..=2).contains(&channels) {
         return Err(AudioError::Decode("unsupported Opus channel count".into()));
@@ -228,8 +288,7 @@ fn parse_container_opus_params(params: &CodecParameters) -> Result<(u32, f32), A
     } else {
         return Err(AudioError::Decode("unsupported Opus header in container".into()));
     }
-    let gain = 10.0f32.powf(output_gain as f32 / (20.0 * 256.0));
-    Ok((skip, gain))
+    Ok((skip, output_gain))
 }
 
 impl ContainerOpusDecoder {
@@ -238,11 +297,11 @@ impl ContainerOpusDecoder {
         track_id: u32,
         params: &CodecParameters,
     ) -> Result<Self, AudioError> {
-        let (skip, gain) = parse_container_opus_params(params)?;
-        Ok(Self { format, opus: OpusStream::new(skip, gain)?, track_id })
+        let (skip, output_gain) = parse_container_opus_params(params)?;
+        Ok(Self { format, opus: OpusStream::new(skip, output_gain)?, track_id })
     }
 
-    fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+    fn decode_with_skip(&mut self, skip: &mut u64, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(packet) => packet,
@@ -254,9 +313,9 @@ impl ContainerOpusDecoder {
                     if track.codec_params.codec != CODEC_TYPE_OPUS {
                         return Err(AudioError::Decode("chained container codec changed".into()));
                     }
-                    let (skip, gain) = parse_container_opus_params(&track.codec_params)?;
+                    let (pre_skip, output_gain) = parse_container_opus_params(&track.codec_params)?;
                     let new_id = track.id;
-                    self.opus = OpusStream::new(skip, gain)?;
+                    self.opus = OpusStream::new(pre_skip, output_gain)?;
                     self.track_id = new_id;
                     continue;
                 }
@@ -269,16 +328,100 @@ impl ContainerOpusDecoder {
             let Some(expected) = opus_decode::packet_samples(buf) else {
                 continue;
             };
-            if self.opus.decode_packet(
-                buf,
-                expected,
-                packet.trim_start() as usize,
-                None,
-                packet.trim_end() as usize,
-                out,
-            )? {
+            let trim_start = packet.trim_start() as usize;
+            let trim_end = packet.trim_end() as usize;
+            let drop_pre = (self.opus.skip as usize).min(expected);
+            let end = expected.saturating_sub(trim_end);
+            let start = drop_pre.max(trim_start).min(end);
+            let usable = end - start;
+            if *skip > (usable as u64).saturating_add(OPUS_SEEK_PREROLL_FRAMES) {
+                self.opus.skip -= drop_pre as u32;
+                *skip -= usable as u64;
+                self.opus.needs_reset = true;
+                continue;
+            }
+            if self.opus.decode_packet(buf, expected, trim_start, None, trim_end, out)? {
                 return Ok(true);
             }
+        }
+    }
+
+    fn try_passthrough_next(
+        &mut self,
+        packet_index: u64,
+        out_packet: &mut Vec<u8>,
+        older_hist: Option<&[u8]>,
+        latest_hist: Option<&[u8]>,
+        k_tail_out: &mut Vec<f32>,
+        next_pcm_out: &mut Vec<f32>,
+    ) -> Result<PassthroughStep, AudioError> {
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(packet) => packet,
+                Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Ok(PassthroughStep::Eof);
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    let track = select_audio_track(self.format.as_ref())?;
+                    if track.codec_params.codec != CODEC_TYPE_OPUS {
+                        return Err(AudioError::Decode("chained container codec changed".into()));
+                    }
+                    let (pre_skip, output_gain) = parse_container_opus_params(&track.codec_params)?;
+                    let new_id = track.id;
+                    self.opus = OpusStream::new(pre_skip, output_gain)?;
+                    self.track_id = new_id;
+                    if packet_index > 0 {
+                        k_tail_out.clear();
+                        next_pcm_out.clear();
+                        let mut zero = 0;
+                        let _ = self.decode_with_skip(&mut zero, next_pcm_out)?;
+                        return Ok(PassthroughStep::FallbackToTranscode);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(map_symphonia_error(e)),
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            let buf = packet.buf();
+            let Some(expected) = opus_decode::packet_samples(buf) else {
+                continue;
+            };
+            let trim_start = packet.trim_start() as usize;
+            let trim_end = packet.trim_end() as usize;
+            let trim_ok = trim_end == 0
+                && if packet_index == 0 { trim_start <= 480 } else { trim_start == 0 };
+            if self.opus.can_passthrough() && trim_ok && opus_decode::is_valid_20ms_packet(buf) {
+                let drop_pre = (self.opus.skip as usize).min(expected);
+                self.opus.skip -= drop_pre as u32;
+                out_packet.clear();
+                out_packet.extend_from_slice(buf);
+                return Ok(PassthroughStep::Packet);
+            }
+            next_pcm_out.clear();
+            if packet_index > 0 {
+                self.opus.warm_from_history(older_hist, latest_hist, k_tail_out)?;
+                let _ = self.opus.decode_packet(
+                    buf,
+                    expected,
+                    trim_start,
+                    None,
+                    trim_end,
+                    next_pcm_out,
+                )?;
+            } else {
+                k_tail_out.clear();
+                let _ = self.opus.decode_packet(
+                    buf,
+                    expected,
+                    trim_start,
+                    None,
+                    trim_end,
+                    next_pcm_out,
+                )?;
+            }
+            return Ok(PassthroughStep::FallbackToTranscode);
         }
     }
 }
@@ -307,7 +450,7 @@ impl OggDecoder {
     fn new(body: Body) -> Result<Self, AudioError> {
         let mut decoder = Self {
             reader: OggOpusReader::new(body),
-            opus: OpusStream::new(0, 1.0)?,
+            opus: OpusStream::new(0, 0)?,
             page: Vec::new(),
             packets: VecDeque::new(),
             previous_granule: None,
@@ -360,9 +503,16 @@ impl OggDecoder {
             }
             let keep = match self.previous_granule {
                 None => {
-                    self.opus.skip = self.reader.pre_skip();
-                    self.opus.gain =
-                        10.0f32.powf(self.reader.output_gain() as f32 / (20.0 * 256.0));
+                    let pre_skip = self.reader.pre_skip();
+                    let output_gain = self.reader.output_gain();
+                    self.opus.initial_skip = pre_skip;
+                    self.opus.skip = pre_skip;
+                    self.opus.gain_is_unity = output_gain == 0;
+                    self.opus.gain = if output_gain == 0 {
+                        1.0
+                    } else {
+                        10.0f32.powf(output_gain as f32 / (20.0 * 256.0))
+                    };
                     if end_of_stream {
                         // A single EOS page can trim from a zero origin, or
                         // have a nonzero origin when its granule exceeds its
@@ -402,7 +552,7 @@ impl OggDecoder {
         }
     }
 
-    fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+    fn decode_with_skip(&mut self, skip: &mut u64, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         loop {
             if self.packets.is_empty() && !self.read_page()? {
                 return Ok(false);
@@ -411,18 +561,72 @@ impl OggDecoder {
             if self.ended && packet.keep == 0 {
                 continue;
             }
+            let frames = usize::from(packet.frames);
+            let keep = usize::from(packet.keep).min(frames);
+            let drop_pre = (self.opus.skip as usize).min(frames);
+            let usable = keep.saturating_sub(drop_pre);
+            if *skip > (usable as u64).saturating_add(OPUS_SEEK_PREROLL_FRAMES) {
+                self.opus.skip -= drop_pre as u32;
+                *skip -= usable as u64;
+                self.opus.needs_reset = true;
+                continue;
+            }
             let start_byte = packet.offset as usize;
             let end_byte = start_byte + packet.length as usize;
             if self.opus.decode_packet(
                 &self.page[start_byte..end_byte],
-                usize::from(packet.frames),
+                frames,
                 0,
-                Some(usize::from(packet.keep)),
+                Some(keep),
                 0,
                 out,
             )? {
                 return Ok(true);
             }
+        }
+    }
+
+    fn try_passthrough_next(
+        &mut self,
+        packet_index: u64,
+        out_packet: &mut Vec<u8>,
+        older_hist: Option<&[u8]>,
+        latest_hist: Option<&[u8]>,
+        k_tail_out: &mut Vec<f32>,
+        next_pcm_out: &mut Vec<f32>,
+    ) -> Result<PassthroughStep, AudioError> {
+        loop {
+            if self.packets.is_empty() && !self.read_page()? {
+                return Ok(PassthroughStep::Eof);
+            }
+            let packet = self.packets.pop_front().expect("a nonempty audio page was loaded");
+            if self.ended && packet.keep == 0 {
+                continue;
+            }
+            let frames = usize::from(packet.frames);
+            let keep = usize::from(packet.keep).min(frames);
+            let start_byte = packet.offset as usize;
+            let end_byte = start_byte + packet.length as usize;
+            let raw = &self.page[start_byte..end_byte];
+            if self.opus.can_passthrough()
+                && keep == frames
+                && opus_decode::is_valid_20ms_packet(raw)
+            {
+                let drop_pre = (self.opus.skip as usize).min(frames);
+                self.opus.skip -= drop_pre as u32;
+                out_packet.clear();
+                out_packet.extend_from_slice(raw);
+                return Ok(PassthroughStep::Packet);
+            }
+            next_pcm_out.clear();
+            if packet_index > 0 {
+                self.opus.warm_from_history(older_hist, latest_hist, k_tail_out)?;
+                let _ = self.opus.decode_packet(raw, frames, 0, Some(keep), 0, next_pcm_out)?;
+            } else {
+                k_tail_out.clear();
+                let _ = self.opus.decode_packet(raw, frames, 0, Some(keep), 0, next_pcm_out)?;
+            }
+            return Ok(PassthroughStep::FallbackToTranscode);
         }
     }
 }
@@ -568,6 +772,8 @@ impl Decoder {
         if channels.count() == 0 {
             return Err(AudioError::Decode("the stream has zero audio channels".into()));
         }
+        let can_skip_packets = track.codec_params.codec == CODEC_TYPE_AAC
+            && track.codec_params.time_base == Some(symphonia::core::units::TimeBase::new(1, rate));
         let decoder = make_codec_decoder(&track.codec_params)?;
         let spec = SignalSpec::new(rate, channels);
         Ok(Decoder {
@@ -578,6 +784,9 @@ impl Decoder {
                 spec,
                 mixer: Downmix::new(channels),
                 samples: SampleBuffer::new(0, spec),
+                can_skip_packets,
+                primed: false,
+                needs_reset: false,
             },
             rate,
         })
@@ -589,25 +798,111 @@ impl Decoder {
         self.rate
     }
 
+    /// Whether the source is 48 kHz Opus with unity container gain and bounded
+    /// encoder lookahead, allowing lossless zero-transcode packet passthrough
+    /// whenever filters and volume are neutral.
+    #[inline]
+    pub fn supports_opus_passthrough(&self) -> bool {
+        match &self.inner {
+            Inner::OggOpus(d) => d.opus.can_passthrough(),
+            Inner::ContainerOpus(d) => d.opus.can_passthrough(),
+            Inner::Symphonia { .. } => false,
+        }
+    }
+
+    pub(crate) fn warm_from_passthrough(
+        &mut self,
+        older_hist: Option<&[u8]>,
+        latest_hist: Option<&[u8]>,
+        k_tail_out: &mut Vec<f32>,
+    ) -> Result<(), AudioError> {
+        match &mut self.inner {
+            Inner::OggOpus(d) => d.opus.warm_from_history(older_hist, latest_hist, k_tail_out),
+            Inner::ContainerOpus(d) => {
+                d.opus.warm_from_history(older_hist, latest_hist, k_tail_out)
+            }
+            Inner::Symphonia { .. } => {
+                k_tail_out.clear();
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn try_passthrough_next(
+        &mut self,
+        packet_index: u64,
+        out_packet: &mut Vec<u8>,
+        older_hist: Option<&[u8]>,
+        latest_hist: Option<&[u8]>,
+        k_tail_out: &mut Vec<f32>,
+        next_pcm_out: &mut Vec<f32>,
+    ) -> Result<PassthroughStep, AudioError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut self.inner {
+            Inner::OggOpus(d) => d.try_passthrough_next(
+                packet_index,
+                out_packet,
+                older_hist,
+                latest_hist,
+                k_tail_out,
+                next_pcm_out,
+            ),
+            Inner::ContainerOpus(d) => d.try_passthrough_next(
+                packet_index,
+                out_packet,
+                older_hist,
+                latest_hist,
+                k_tail_out,
+                next_pcm_out,
+            ),
+            Inner::Symphonia { .. } => Ok(PassthroughStep::FallbackToTranscode),
+        }))
+        .unwrap_or_else(|_| Err(AudioError::Decode("the decoder panicked on the stream".into())))
+    }
+
     /// Decodes the next chunk, appending interleaved stereo samples to `out`.
     ///
     /// Returns whether anything was appended. A damaged packet is skipped rather
     /// than ending the track, which is what a listener expects from a stream
     /// that arrived over a lossy connection.
     pub fn decode(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
-        // As in `new`: a symphonia panic on malformed packets ends the track
-        // with an error instead of unwinding through the player.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.decode_next(out)))
-            .unwrap_or_else(|_| {
-                Err(AudioError::Decode("the decoder panicked on the stream".into()))
-            })
+        let mut zero = 0;
+        self.decode_with_skip(&mut zero, out)
     }
 
-    fn decode_next(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
+    /// Decodes the next chunk while skipping compressed demuxer packets that lie
+    /// strictly before the codec's convergence pre-roll window of `*skip` frames.
+    pub fn decode_with_skip(
+        &mut self,
+        skip: &mut u64,
+        out: &mut Vec<f32>,
+    ) -> Result<bool, AudioError> {
+        // As in `new`: a symphonia panic on malformed packets ends the track
+        // with an error instead of unwinding through the player.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.decode_next_with_skip(skip, out)
+        }))
+        .unwrap_or_else(|_| Err(AudioError::Decode("the decoder panicked on the stream".into())))
+    }
+
+    fn decode_next_with_skip(
+        &mut self,
+        skip: &mut u64,
+        out: &mut Vec<f32>,
+    ) -> Result<bool, AudioError> {
         match &mut self.inner {
-            Inner::OggOpus(decoder) => decoder.decode(out),
-            Inner::ContainerOpus(decoder) => decoder.decode(out),
-            Inner::Symphonia { format, decoder, track_id, spec, mixer, samples } => loop {
+            Inner::OggOpus(decoder) => decoder.decode_with_skip(skip, out),
+            Inner::ContainerOpus(decoder) => decoder.decode_with_skip(skip, out),
+            Inner::Symphonia {
+                format,
+                decoder,
+                track_id,
+                spec,
+                mixer,
+                samples,
+                can_skip_packets,
+                primed,
+                needs_reset,
+            } => loop {
                 let packet = match format.next_packet() {
                     Ok(packet) => packet,
                     Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -638,6 +933,11 @@ impl Decoder {
                                 "the stream has zero audio channels".into(),
                             ));
                         }
+                        *can_skip_packets = track.codec_params.codec == CODEC_TYPE_AAC
+                            && track.codec_params.time_base
+                                == Some(symphonia::core::units::TimeBase::new(1, self.rate));
+                        *primed = false;
+                        *needs_reset = false;
                         *decoder = make_codec_decoder(&track.codec_params)?;
                         *track_id = new_id;
                         if new_channels != spec.channels {
@@ -652,6 +952,21 @@ impl Decoder {
                 if packet.track_id() != *track_id {
                     continue;
                 }
+                if *primed
+                    && *can_skip_packets
+                    && packet.trim_start() == 0
+                    && packet.trim_end() == 0
+                    && packet.dur() > 0
+                    && *skip > packet.dur().saturating_add(AAC_SEEK_PREROLL_FRAMES)
+                {
+                    *skip -= packet.dur();
+                    *needs_reset = true;
+                    continue;
+                }
+                if *needs_reset {
+                    decoder.reset();
+                    *needs_reset = false;
+                }
                 let audio = match decoder.decode(&packet) {
                     Ok(audio) => audio,
                     // A packet that does not decode is a packet lost.
@@ -664,6 +979,7 @@ impl Decoder {
                 if audio.frames() == 0 {
                     continue;
                 }
+                *primed = true;
                 let decoded_spec = *audio.spec();
                 if decoded_spec.rate != self.rate {
                     return Err(AudioError::Decode(
@@ -1023,8 +1339,7 @@ mod tests {
         mp4_params.with_extra_data(mp4_extra.into_boxed_slice());
         let (skip_be, gain_be) = parse_container_opus_params(&mp4_params).unwrap();
         assert_eq!(skip_be, 312);
-        let expected_gain = 10.0f32.powf(256.0 / (20.0 * 256.0));
-        assert!((gain_be - expected_gain).abs() < 1e-6, "gain_be={gain_be}");
+        assert_eq!(gain_be, 256);
 
         // RFC 7845 `OpusHead` (`Version = 1`, little-endian PreSkip = 0x0138, OutputGain = 0x0100).
         let mut webm_extra = b"OpusHead".to_vec();
@@ -1033,7 +1348,7 @@ mod tests {
         webm_params.with_extra_data(webm_extra.into_boxed_slice());
         let (skip_le, gain_le) = parse_container_opus_params(&webm_params).unwrap();
         assert_eq!(skip_le, 312);
-        assert!((gain_le - expected_gain).abs() < 1e-6, "gain_le={gain_le}");
+        assert_eq!(gain_le, 256);
     }
 
     #[test]

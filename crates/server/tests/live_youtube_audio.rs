@@ -37,4 +37,19 @@ fn youtube_vevo_link_decodes_to_opus_frames_past_seventy_seconds_in_pure_rust() 
     }
     println!("decoded and encoded {count} Opus frames ({bytes} bytes) in pure Rust");
     assert_eq!(count, 3_750, "stream ended early before 75s ({count} frames)");
+
+    // Seeking to 2:00 (120_000 ms) reuses the cached googlevideo stream URL and
+    // skips compressed demuxer packets without decoding 2 minutes of PCM.
+    let seek_start = std::time::Instant::now();
+    let seek_reader = source.open(&track).unwrap();
+    let mut seek_frames = engine
+        .start(&track, Body::new(seek_reader), 120_000, 100, &Object::new(), Preference::Auto)
+        .unwrap();
+    let mut seek_count = 0usize;
+    while seek_count < 250 && seek_frames.next_frame(&mut packet).unwrap() {
+        assert!(!packet.is_empty());
+        seek_count += 1;
+    }
+    println!("sought to 120s and emitted {seek_count} Opus frames in {:?}", seek_start.elapsed());
+    assert_eq!(seek_count, 250);
 }

@@ -504,6 +504,129 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> &str {
     text.char_indices().nth(max_chars).map_or(text, |(end, _)| &text[..end])
 }
 
+fn parse_timestamp_token_ms(raw: &str) -> Option<i64> {
+    const MAX_TIMESTAMP_SECS: u64 = 7 * 86_400;
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 32 {
+        return None;
+    }
+    if raw.bytes().all(|b| b.is_ascii_digit()) {
+        let secs = raw.parse::<u64>().ok()?;
+        return (1..=MAX_TIMESTAMP_SECS).contains(&secs).then_some((secs as i64) * 1000);
+    }
+    let mut total_secs = 0u64;
+    let mut num_start = 0usize;
+    let mut seen_h = false;
+    let mut seen_m = false;
+    let mut seen_s = false;
+    let bytes = raw.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_digit() {
+            continue;
+        }
+        if idx == num_start {
+            return None;
+        }
+        let val = raw[num_start..idx].parse::<u64>().ok()?;
+        let mult = match b.to_ascii_lowercase() {
+            b'h' if !seen_h && !seen_m && !seen_s => {
+                seen_h = true;
+                3600
+            }
+            b'm' if !seen_m && !seen_s => {
+                seen_m = true;
+                60
+            }
+            b's' if !seen_s => {
+                seen_s = true;
+                1
+            }
+            _ => return None,
+        };
+        total_secs = total_secs.checked_add(val.checked_mul(mult)?)?;
+        num_start = idx + 1;
+    }
+    if num_start < bytes.len() {
+        if !(seen_h || seen_m) || seen_s {
+            return None;
+        }
+        let tail = raw[num_start..].parse::<u64>().ok()?;
+        let mult = if seen_m { 1 } else { 60 };
+        total_secs = total_secs.checked_add(tail.checked_mul(mult)?)?;
+    }
+    (1..=MAX_TIMESTAMP_SECS).contains(&total_secs).then_some((total_secs as i64) * 1000)
+}
+
+/// Extracts a positive start timestamp in milliseconds (`?t=90`, `?t=1m30s`,
+/// `?t=1h2m3s`, `&start=43`, `&time_continue=75`, or `#t=45s`) from a YouTube
+/// single-video link inside `text`, returning `None` for plain searches,
+/// playlist-only links, or non-YouTube URLs.
+pub fn extract_url_timestamp_ms(text: &str) -> Option<i64> {
+    let text = unwrap_spoilers(text);
+    let unwrapped =
+        text.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')).map_or(text, str::trim);
+    let after_scheme = if let Some(url) = extract_http_url(unwrapped) {
+        if url.as_bytes().get(..8).is_some_and(|s| s.eq_ignore_ascii_case(b"https://")) {
+            &url[8..]
+        } else {
+            &url[7..]
+        }
+    } else {
+        extract_schemeless_music_url(unwrapped)?
+    };
+    let (without_frag, fragment) = after_scheme.split_once('#').unwrap_or((after_scheme, ""));
+    let (authority_and_path, query) = without_frag.split_once('?').unwrap_or((without_frag, ""));
+    let (authority, path) = authority_and_path.split_once('/')?;
+    if authority.contains('@') {
+        return None;
+    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    let is_yt_video = if host.eq_ignore_ascii_case("youtu.be") {
+        let mut segs = path.split('/').filter(|s| !s.is_empty());
+        matches!((segs.next(), segs.next()), (Some(_), None))
+    } else if host_is_or_subdomain(host, "youtube.com")
+        || host_is_or_subdomain(host, "youtube-nocookie.com")
+    {
+        let mut segs = path.split('/').filter(|s| !s.is_empty());
+        match segs.next() {
+            Some("watch") => {
+                segs.next().is_none()
+                    && query
+                        .split('&')
+                        .any(|pair| pair.strip_prefix("v=").is_some_and(|v| !v.is_empty()))
+            }
+            Some("shorts" | "live" | "embed" | "v" | "e") => {
+                matches!((segs.next(), segs.next()), (Some(_), None))
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if !is_yt_video {
+        return None;
+    }
+    for pair in query.split('&') {
+        if let Some((key, val)) = pair.split_once('=') {
+            if matches!(key, "t" | "start" | "time_continue") {
+                if let Some(ms) = parse_timestamp_token_ms(val) {
+                    return Some(ms);
+                }
+            }
+        }
+    }
+    for pair in fragment.split('&') {
+        if let Some((key, val)) = pair.split_once('=') {
+            if matches!(key, "t" | "start") {
+                if let Some(ms) = parse_timestamp_token_ms(val) {
+                    return Some(ms);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,5 +797,33 @@ mod tests {
                 "expected ignored in bare chat: {non_playable}"
             );
         }
+    }
+
+    #[test]
+    fn extract_url_timestamp_ms_parses_youtube_query_and_fragment_cues() {
+        assert_eq!(
+            extract_url_timestamp_ms("https://youtu.be/dQw4w9WgXcQ?si=abc&t=43"),
+            Some(43_000)
+        );
+        assert_eq!(
+            extract_url_timestamp_ms("<https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1m30s>"),
+            Some(90_000)
+        );
+        assert_eq!(extract_url_timestamp_ms("||youtu.be/dQw4w9WgXcQ?t=1h2m3s||"), Some(3_723_000));
+        assert_eq!(
+            extract_url_timestamp_ms("幫我播 https://www.youtube.com/embed/dQw4w9WgXcQ?start=75"),
+            Some(75_000)
+        );
+        assert_eq!(
+            extract_url_timestamp_ms("https://music.youtube.com/watch?v=dQw4w9WgXcQ#t=2m"),
+            Some(120_000)
+        );
+        assert_eq!(extract_url_timestamp_ms("https://youtu.be/dQw4w9WgXcQ?t=0"), None);
+        assert_eq!(
+            extract_url_timestamp_ms("https://www.youtube.com/playlist?list=PL123&t=45"),
+            None
+        );
+        assert_eq!(extract_url_timestamp_ms("https://example.com/audio.mp3?t=45"), None);
+        assert_eq!(extract_url_timestamp_ms("lofi hip hop t=45"), None);
     }
 }

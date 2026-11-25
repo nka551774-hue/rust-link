@@ -28,8 +28,8 @@ use rustlink_client::{
     Client, LoadResult, Object, Patch, PlayerUpdate, Session, Track, TrackUpdate, VoiceState,
 };
 use rustlink_discord_bot::{
-    extract_message_query, truncate_chars, BotEvent, DiscordRest, Gateway, Interaction,
-    MessageCreate, VoiceStatePairer, VoiceStateUpdate,
+    extract_message_query, extract_url_timestamp_ms, truncate_chars, BotEvent, DiscordRest,
+    Gateway, Interaction, MessageCreate, VoiceStatePairer, VoiceStateUpdate,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -332,7 +332,7 @@ impl Bot {
     async fn start_next(&mut self, guild: &str) {
         loop {
             let Some(state) = self.guilds.get_mut(guild) else { return };
-            let Some(track) = state.advance() else {
+            let Some((track, start_ms)) = state.advance_with_start() else {
                 self.idle_since.insert(guild.to_string(), Instant::now());
                 return;
             };
@@ -345,6 +345,7 @@ impl Bot {
                     user_data: Some(user_data),
                     ..Default::default()
                 }),
+                position: start_ms.map(Into::into),
                 ..Default::default()
             };
             match self.session.update_player(guild, &update, true).await {
@@ -498,8 +499,9 @@ impl Bot {
         }
     }
 
-    async fn play(&mut self, guild: &str, channel: &str, query: &str) -> String {
-        let query = normalize_query(query);
+    async fn play(&mut self, guild: &str, channel: &str, raw_query: &str) -> String {
+        let requested_start = extract_url_timestamp_ms(raw_query);
+        let query = normalize_query(raw_query);
         if query.is_empty() {
             return "請提供連結或關鍵字。".into();
         }
@@ -535,12 +537,16 @@ impl Bot {
             }
         }
         let total = tracks.len();
+        let first_start = (total == 1).then_some(requested_start).flatten().filter(|&ms| {
+            tracks[0].metadata.is_seekable
+                && (tracks[0].metadata.length <= 0 || ms < tracks[0].metadata.length)
+        });
         let first = tracks[0].metadata.title.clone();
         let state =
             self.guilds.entry(guild.to_string()).or_insert_with(|| Guild::new(self.config.volume));
         let was_playing = state.playing();
         let was_busy = state.busy();
-        let added = state.enqueue(tracks, self.config.max_queue);
+        let added = state.enqueue_with_start(tracks, first_start, self.config.max_queue);
         if added == 0 {
             return format!("佇列已滿（上限 {} 首）。", self.config.max_queue);
         }

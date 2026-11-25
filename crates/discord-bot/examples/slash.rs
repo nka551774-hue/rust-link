@@ -12,10 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustlink_client::{Client, LoadResult, Session, Track};
+use rustlink_client::{Client, LoadResult, Patch, PlayerUpdate, Session, Track, TrackUpdate};
 use rustlink_discord_bot::{
-    extract_message_query, normalize_query, truncate_chars, BotEvent, DiscordRest, Gateway,
-    Interaction, VoiceStatePairer,
+    extract_message_query, extract_url_timestamp_ms, normalize_query, truncate_chars, BotEvent,
+    DiscordRest, Gateway, Interaction, VoiceStatePairer,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -446,11 +446,37 @@ async fn play(
         PendingPlay::Slash(interaction) => interaction.option("url").unwrap_or_default(),
         PendingPlay::Message { query, .. } => query.as_str(),
     };
+    let requested_start = extract_url_timestamp_ms(query);
     let message = match resolve(rustlink, query).await {
-        Ok(track) => match session.play(guild, &track.token).await {
-            Ok(_) => format!("正在播放：{}（{}）", track.metadata.title, track.metadata.author),
-            Err(error) => format!("播放失敗：{error}"),
-        },
+        Ok(track) => {
+            let start_ms = requested_start.filter(|&ms| {
+                track.metadata.is_seekable
+                    && (track.metadata.length <= 0 || ms < track.metadata.length)
+            });
+            let started = match start_ms {
+                Some(pos) => {
+                    session
+                        .update_player(
+                            guild,
+                            &PlayerUpdate {
+                                track: Patch::Value(TrackUpdate {
+                                    token: Patch::Value(track.token.clone()),
+                                    ..Default::default()
+                                }),
+                                position: Some(pos.into()),
+                                ..Default::default()
+                            },
+                            true,
+                        )
+                        .await
+                }
+                None => session.play(guild, &track.token).await,
+            };
+            match started {
+                Ok(_) => format!("正在播放：{}（{}）", track.metadata.title, track.metadata.author),
+                Err(error) => format!("播放失敗：{error}"),
+            }
+        }
         Err(error) => format!("找不到可播放的內容：{error}"),
     };
     reply(rest, application_id, request, &message).await;

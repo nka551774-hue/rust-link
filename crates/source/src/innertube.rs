@@ -9,8 +9,12 @@ use std::{
 
 use rustlink_config::Config;
 use rustlink_protocol::{encode_track_owned, LoadResult, Playlist, Track, TrackInfo};
+use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::catalog::{
+    youtube_stream_ttl, CachedYoutubeStream, State as CatalogState, YoutubeStreamKey,
+};
 use crate::{deadline, netguard, youtube_id, SourceError};
 
 /// One of the client identities YouTube answers.
@@ -162,41 +166,105 @@ pub struct Format {
     pub headers: BTreeMap<String, String>,
 }
 
-/// Posts one InnerTube request.
-fn call(
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientIdentity<'a> {
+    client_name: &'a str,
+    client_version: &'a str,
+    hl: &'static str,
+    gl: &'static str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    visitor_data: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    android_sdk_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_make: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_version: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RequestContext<'a> {
+    client: ClientIdentity<'a>,
+}
+
+#[derive(Serialize)]
+struct RequestEnvelope<'a, B: Serialize + ?Sized> {
+    context: RequestContext<'a>,
+    #[serde(flatten)]
+    body: &'a B,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntegrityDimensions<'a> {
+    po_token: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayerRequest<'a> {
+    video_id: &'a str,
+    content_check_ok: bool,
+    racy_check_ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_integrity_dimensions: Option<IntegrityDimensions<'a>>,
+}
+
+#[derive(Serialize)]
+struct SearchRequest<'a> {
+    query: &'a str,
+    params: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowseRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browse_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NextRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_id: Option<&'a str>,
+    playlist_id: &'a str,
+}
+
+/// Posts one InnerTube request without cloning or mutating a `serde_json::Value` tree.
+fn call<B: Serialize + ?Sized>(
     agent: &ureq::Agent,
     base: &str,
     client: &Client,
     visitor_data: &str,
     endpoint: &str,
-    mut body: Value,
+    body: &B,
 ) -> Result<Value, SourceError> {
     let visitor = visitor_data.trim();
-    let mut identity = json!({
-        "clientName": client.name,
-        "clientVersion": client.version.as_ref(),
-        "hl": "en",
-        "gl": "US",
-    });
-    if !visitor.is_empty() {
-        identity["visitorData"] = json!(visitor);
-    }
-    if let Some(sdk) = client.sdk {
-        identity["androidSdkVersion"] = json!(sdk);
-    }
-    if let Some(make) = client.device_make {
-        identity["deviceMake"] = json!(make);
-    }
-    if let Some(model) = client.device_model {
-        identity["deviceModel"] = json!(model);
-    }
-    if let Some(os) = client.os_name {
-        identity["osName"] = json!(os);
-    }
-    if let Some(os) = client.os_version {
-        identity["osVersion"] = json!(os);
-    }
-    body["context"] = json!({ "client": identity });
+    let payload = RequestEnvelope {
+        context: RequestContext {
+            client: ClientIdentity {
+                client_name: client.name,
+                client_version: client.version.as_ref(),
+                hl: "en",
+                gl: "US",
+                visitor_data: visitor,
+                android_sdk_version: client.sdk,
+                device_make: client.device_make,
+                device_model: client.device_model,
+                os_name: client.os_name,
+                os_version: client.os_version,
+            },
+        },
+        body,
+    };
     let url = format!("{}/youtubei/v1/{endpoint}?prettyPrint=false", base.trim_end_matches('/'));
     netguard::validate_url(&url)?;
     let mut request = agent
@@ -212,7 +280,7 @@ fn call(
         .timeout_global(Some(deadline::timeout(std::time::Duration::from_secs(20))?))
         .http_status_as_error(false)
         .build()
-        .send_json(&body)
+        .send_json(&payload)
         .map_err(|error| SourceError::Http(format!("youtube could not be reached: {error}")))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -356,20 +424,91 @@ fn probe_tail_byte(
 pub struct Catalog<'a> {
     pub agent: &'a ureq::Agent,
     pub config: &'a Config,
-    visitor_cache: Option<&'a crate::catalog::CredentialCache>,
+    state: Option<&'a CatalogState>,
 }
+
+const RECENTLY_RESOLVED_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl<'a> Catalog<'a> {
     pub fn new(agent: &'a ureq::Agent, config: &'a Config) -> Self {
-        Self { agent, config, visitor_cache: None }
+        Self { agent, config, state: None }
     }
 
-    pub fn with_state(
-        agent: &'a ureq::Agent,
-        config: &'a Config,
-        state: &'a crate::catalog::State,
-    ) -> Self {
-        Self { agent, config, visitor_cache: Some(&state.youtube_visitor) }
+    pub fn with_state(agent: &'a ureq::Agent, config: &'a Config, state: &'a CatalogState) -> Self {
+        Self { agent, config, state: Some(state) }
+    }
+
+    fn visitor_cache(&self) -> Option<&'a crate::catalog::CredentialCache> {
+        self.state.map(|s| s.youtube_visitor.as_ref())
+    }
+
+    fn ordered_clients(&self) -> [Client; 4] {
+        let base = clients(self.config);
+        match self.state.filter(|_| is_https(&self.config.youtube_endpoint)) {
+            Some(state) => state.youtube_health.partition_clients(base, |client| client.name),
+            None => base,
+        }
+    }
+
+    fn ordered_catalogue_clients(&self) -> [Client; 2] {
+        let android = catalogue_client(self.config);
+        let visionos = visionos_client();
+        if let Some(state) = self.state.filter(|_| is_https(&self.config.youtube_endpoint)) {
+            if !state.youtube_health.is_healthy(android.name)
+                && state.youtube_health.is_healthy(visionos.name)
+            {
+                return [visionos, android];
+            }
+        }
+        [android, visionos]
+    }
+
+    fn record_client_outcome(&self, name: &'static str, ok: bool) {
+        let Some(state) = self.state.filter(|_| is_https(&self.config.youtube_endpoint)) else {
+            return;
+        };
+        if ok {
+            state.youtube_health.record_success(name);
+        } else {
+            state.youtube_health.record_failure(name);
+        }
+    }
+
+    fn stream_key(&self, video_id: &str) -> YoutubeStreamKey {
+        YoutubeStreamKey {
+            video_id: video_id.to_owned(),
+            endpoint: self.config.youtube_endpoint.trim().to_owned(),
+            client_version: self.config.youtube_client_version.trim().to_owned(),
+            has_po_token: !self.config.youtube_po_token.trim().is_empty(),
+        }
+    }
+
+    fn store_cached_stream(
+        &self,
+        video_id: &str,
+        client: &Client,
+        format: Format,
+        tail_probed: bool,
+    ) {
+        let Some(state) = self.state else {
+            return;
+        };
+        let Some(ttl) = youtube_stream_ttl(&format.url) else {
+            return;
+        };
+        state.youtube_streams.put(
+            self.stream_key(video_id),
+            CachedYoutubeStream {
+                url: format.url,
+                content_length: format.content_length,
+                headers: format.headers,
+                user_agent: client.user_agent.clone(),
+                client_name: client.name,
+                throttled_without_pot: client.throttled_without_pot,
+                tail_probed,
+            },
+            ttl,
+        );
     }
 
     fn effective_visitor_data(&self, bootstrap: bool) -> String {
@@ -377,13 +516,13 @@ impl<'a> Catalog<'a> {
         if !configured.is_empty() {
             return configured.to_owned();
         }
-        if let Some(cached) = self.visitor_cache.and_then(|c| c.peek()) {
+        if let Some(cached) = self.visitor_cache().and_then(|c| c.peek()) {
             return cached;
         }
         if !bootstrap || !is_https(&self.config.youtube_endpoint) {
             return String::new();
         }
-        match self.visitor_cache {
+        match self.visitor_cache() {
             Some(cache) => cache
                 .get_or_refresh(|| {
                     fetch_visitor_data(
@@ -407,7 +546,7 @@ impl<'a> Catalog<'a> {
         if !self.config.youtube_visitor_data.trim().is_empty() {
             return;
         }
-        if let Some(cache) = self.visitor_cache {
+        if let Some(cache) = self.visitor_cache() {
             if let Some(vd) = answer
                 .pointer("/responseContext/visitorData")
                 .and_then(Value::as_str)
@@ -423,7 +562,7 @@ impl<'a> Catalog<'a> {
         if used_vd.is_empty() || !self.config.youtube_visitor_data.trim().is_empty() {
             return;
         }
-        if let Some(cache) = self.visitor_cache {
+        if let Some(cache) = self.visitor_cache() {
             let reason = answer
                 .pointer("/playabilityStatus/reason")
                 .and_then(Value::as_str)
@@ -439,29 +578,39 @@ impl<'a> Catalog<'a> {
         }
     }
 
-    fn web_call(&self, client: &Client, endpoint: &str, body: Value) -> Result<Value, SourceError> {
+    fn web_call<B: Serialize + ?Sized>(
+        &self,
+        client: &Client,
+        endpoint: &str,
+        body: &B,
+    ) -> Result<Value, SourceError> {
         let vd = self.effective_visitor_data(client.needs_visitor_data);
         let answer = call(self.agent, &self.config.youtube_endpoint, client, &vd, endpoint, body)?;
         self.harvest_visitor_data(&answer);
         Ok(answer)
     }
 
+    fn player_request<'b>(&'b self, video_id: &'b str) -> PlayerRequest<'b> {
+        let token = self.config.youtube_po_token.trim();
+        PlayerRequest {
+            video_id,
+            content_check_ok: true,
+            racy_check_ok: true,
+            service_integrity_dimensions: (!token.is_empty())
+                .then_some(IntegrityDimensions { po_token: token }),
+        }
+    }
+
     fn player_call(&self, client: &Client, video_id: &str) -> Result<Value, SourceError> {
+        let req = self.player_request(video_id);
         let vd = self.effective_visitor_data(client.needs_visitor_data);
-        let answer = call(
-            self.agent,
-            &self.config.youtube_endpoint,
-            client,
-            &vd,
-            "player",
-            self.player_body(video_id),
-        )?;
+        let answer = call(self.agent, &self.config.youtube_endpoint, client, &vd, "player", &req)?;
         if let Err(err) = check_playability(&answer) {
             self.invalidate_visitor_if_stale(&vd, &answer);
             if client.needs_visitor_data
                 && !vd.is_empty()
                 && self.config.youtube_visitor_data.trim().is_empty()
-                && self.visitor_cache.is_some()
+                && self.visitor_cache().is_some()
                 && is_https(&self.config.youtube_endpoint)
             {
                 let fresh = self.effective_visitor_data(true);
@@ -472,7 +621,7 @@ impl<'a> Catalog<'a> {
                         client,
                         &fresh,
                         "player",
-                        self.player_body(video_id),
+                        &req,
                     )?;
                     if let Err(retry_err) = check_playability(&retried) {
                         self.invalidate_visitor_if_stale(&fresh, &retried);
@@ -488,7 +637,11 @@ impl<'a> Catalog<'a> {
         Ok(answer)
     }
 
-    fn music_call(&self, endpoint: &str, body: Value) -> Result<Value, SourceError> {
+    fn music_call<B: Serialize + ?Sized>(
+        &self,
+        endpoint: &str,
+        body: &B,
+    ) -> Result<Value, SourceError> {
         let vd = self.effective_visitor_data(false);
         let answer = call(
             self.agent,
@@ -507,12 +660,18 @@ impl<'a> Catalog<'a> {
         if query.trim().is_empty() || want == 0 {
             return Ok(Vec::new());
         }
-        let client = catalogue_client(self.config);
-        let body = json!({ "query": query, "params": SEARCH_PARAMS });
-        let answer = match self.web_call(&client, "search", body.clone()) {
-            Ok(answer) => answer,
+        let [primary, fallback] = self.ordered_catalogue_clients();
+        let req = SearchRequest { query, params: SEARCH_PARAMS };
+        let answer = match self.web_call(&primary, "search", &req) {
+            Ok(answer) => {
+                self.record_client_outcome(primary.name, true);
+                answer
+            }
             Err(_) if is_https(&self.config.youtube_endpoint) => {
-                self.web_call(&visionos_client(), "search", body)?
+                self.record_client_outcome(primary.name, false);
+                let answer = self.web_call(&fallback, "search", &req)?;
+                self.record_client_outcome(fallback.name, true);
+                answer
             }
             Err(error) => return Err(error),
         };
@@ -527,8 +686,8 @@ impl<'a> Catalog<'a> {
         if query.trim().is_empty() || want == 0 {
             return Ok(Vec::new());
         }
-        let body = json!({ "query": query, "params": MUSIC_SONGS_PARAMS });
-        let answer = self.music_call("search", body)?;
+        let req = SearchRequest { query, params: MUSIC_SONGS_PARAMS };
+        let answer = self.music_call("search", &req)?;
         let mut found = Vec::with_capacity(want.min(64));
         collect_videos_up_to(&answer, &mut found, want);
         Ok(found.into_iter().filter_map(|media| media.into_track("youtube")).take(want).collect())
@@ -545,7 +704,8 @@ impl<'a> Catalog<'a> {
         if limit == 0 {
             return Ok(LoadResult::Empty);
         }
-        let mut client = catalogue_client(self.config);
+        let [mut client, fallback_client] = self.ordered_catalogue_clients();
+        let browse_id = format!("VL{playlist_id}");
         let mut videos = Vec::new();
         let mut page_videos = Vec::new();
         let mut seen_ids = HashSet::new();
@@ -556,13 +716,14 @@ impl<'a> Catalog<'a> {
         let mut last_error: Option<SourceError> = None;
         let mut saw_ok = false;
         loop {
-            let req_body = if continuation.is_empty() {
-                json!({ "browseId": format!("VL{playlist_id}") })
+            let req = if continuation.is_empty() {
+                BrowseRequest { browse_id: Some(&browse_id), continuation: None }
             } else {
-                json!({ "continuation": continuation.as_str() })
+                BrowseRequest { browse_id: None, continuation: Some(&continuation) }
             };
-            let answer = match self.web_call(&client, "browse", req_body.clone()) {
+            let answer = match self.web_call(&client, "browse", &req) {
                 Ok(answer) => {
+                    self.record_client_outcome(client.name, true);
                     saw_ok = true;
                     answer
                 }
@@ -571,10 +732,12 @@ impl<'a> Catalog<'a> {
                     break;
                 }
                 Err(error) if pages == 0 && is_https(&self.config.youtube_endpoint) => {
+                    self.record_client_outcome(client.name, false);
                     last_error = Some(error);
-                    client = visionos_client();
-                    match self.web_call(&client, "browse", req_body) {
+                    client = fallback_client.clone();
+                    match self.web_call(&client, "browse", &req) {
                         Ok(answer) => {
+                            self.record_client_outcome(client.name, true);
                             saw_ok = true;
                             answer
                         }
@@ -614,16 +777,16 @@ impl<'a> Catalog<'a> {
             }
         }
         if videos.is_empty() && playlist_id.starts_with("RD") {
-            let next_body = match playlist_id.strip_prefix("RD").filter(|seed| youtube_id(seed)) {
-                Some(seed) => json!({ "videoId": seed, "playlistId": playlist_id }),
-                None => json!({ "playlistId": playlist_id }),
+            let next_req = NextRequest {
+                video_id: playlist_id.strip_prefix("RD").filter(|seed| youtube_id(seed)),
+                playlist_id,
             };
             let https = is_https(&self.config.youtube_endpoint);
             for attempt in 0..3 {
                 let outcome = match attempt {
-                    0 => self.web_call(&client, "next", next_body.clone()),
-                    1 if https => self.web_call(&visionos_client(), "next", next_body.clone()),
-                    2 if https => self.music_call("next", next_body.clone()),
+                    0 => self.web_call(&client, "next", &next_req),
+                    1 if https => self.web_call(&visionos_client(), "next", &next_req),
+                    2 if https => self.music_call("next", &next_req),
                     _ => break,
                 };
                 match outcome {
@@ -684,8 +847,9 @@ impl<'a> Catalog<'a> {
         self.with_media_url(video_id, |url, headers| Ok((url, headers)))
     }
 
-    /// Tries the next client when a CDN rejects the URL a client returned.
-    /// Resolving a URL alone does not prove that the audio can be opened.
+    /// Tries a pre-resolved stream from `YoutubeStreamCache` first (populated when
+    /// `video()` fetched metadata, or on an earlier playback/seek), falling back
+    /// to live client iteration when the cache is empty or the CDN rejects the URL.
     pub(crate) fn with_media_url<T>(
         &self,
         video_id: &str,
@@ -693,10 +857,70 @@ impl<'a> Catalog<'a> {
     ) -> Result<T, SourceError> {
         let mut first: Option<SourceError> = None;
         let mut stream_error = None;
-        for client in clients(self.config) {
+        let mut skip_recent_client: Option<&'static str> = None;
+
+        if let Some(state) = self.state {
+            let key = self.stream_key(video_id);
+            if let Some((cached, age)) = state.youtube_streams.get(&key) {
+                netguard::validate_url(&cached.url)?;
+                let mut headers = cached.headers.clone();
+                headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+                headers.insert("User-Agent".into(), cached.user_agent.to_string());
+                let url = with_po_token(cached.url.clone(), &self.config.youtube_po_token);
+                let mut probe_failed = false;
+                if cached.throttled_without_pot
+                    && !cached.tail_probed
+                    && self.config.youtube_po_token.trim().is_empty()
+                    && cached.content_length > 1_048_576
+                {
+                    match probe_tail_byte(self.agent, &url, &headers, cached.content_length) {
+                        Ok(()) => state.youtube_streams.mark_tail_probed(&key),
+                        Err(error) if error.retryable() => {
+                            state.youtube_streams.invalidate(&key);
+                            self.record_client_outcome(cached.client_name, false);
+                            stream_error = Some(error);
+                            if age < RECENTLY_RESOLVED_WINDOW {
+                                skip_recent_client = Some(cached.client_name);
+                            }
+                            probe_failed = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !probe_failed {
+                    match open(url, headers) {
+                        Ok(stream) => {
+                            self.record_client_outcome(cached.client_name, true);
+                            return Ok(stream);
+                        }
+                        Err(error) if error.retryable() => {
+                            state.youtube_streams.invalidate(&key);
+                            self.record_client_outcome(cached.client_name, false);
+                            stream_error = Some(error);
+                            if age < RECENTLY_RESOLVED_WINDOW {
+                                skip_recent_client = Some(cached.client_name);
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+
+        for client in self.ordered_clients() {
+            if skip_recent_client == Some(client.name) {
+                continue;
+            }
             match self.player(&client, video_id) {
                 Ok(Some(format)) => {
                     netguard::validate_url(&format.url)?;
+                    let cache_candidate = Format {
+                        url: format.url.clone(),
+                        mime_type: String::new(),
+                        bitrate: format.bitrate,
+                        content_length: format.content_length,
+                        headers: format.headers.clone(),
+                    };
                     let mut headers = format.headers;
                     headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
                     headers.insert("User-Agent".into(), client.user_agent.to_string());
@@ -709,6 +933,7 @@ impl<'a> Catalog<'a> {
                             probe_tail_byte(self.agent, &url, &headers, format.content_length)
                         {
                             if error.retryable() {
+                                self.record_client_outcome(client.name, false);
                                 if stream_error.is_none() {
                                     stream_error = Some(error);
                                 }
@@ -718,8 +943,13 @@ impl<'a> Catalog<'a> {
                         }
                     }
                     match open(url, headers) {
-                        Ok(stream) => return Ok(stream),
+                        Ok(stream) => {
+                            self.store_cached_stream(video_id, &client, cache_candidate, true);
+                            self.record_client_outcome(client.name, true);
+                            return Ok(stream);
+                        }
                         Err(error) if error.retryable() => {
+                            self.record_client_outcome(client.name, false);
                             if stream_error.is_none() {
                                 stream_error = Some(error);
                             }
@@ -729,6 +959,7 @@ impl<'a> Catalog<'a> {
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    self.record_client_outcome(client.name, false);
                     if first.is_none() {
                         first = Some(error);
                     }
@@ -740,13 +971,9 @@ impl<'a> Catalog<'a> {
         )))
     }
 
+    #[cfg(test)]
     fn player_body(&self, video_id: &str) -> Value {
-        let mut body = json!({ "videoId": video_id, "contentCheckOk": true, "racyCheckOk": true });
-        let token = self.config.youtube_po_token.trim();
-        if !token.is_empty() {
-            body["serviceIntegrityDimensions"] = json!({ "poToken": token });
-        }
-        body
+        serde_json::to_value(self.player_request(video_id)).expect("valid player request")
     }
 
     /// Asks one client for a video's streams.
@@ -757,13 +984,19 @@ impl<'a> Catalog<'a> {
     }
 
     /// Reads a video's own metadata, which is how a bare video id becomes a
-    /// track without a search.
+    /// track without a search. When the player response also carries usable
+    /// `streamingData`, caches the picked stream so `open()` starts with zero
+    /// additional InnerTube `/player` round-trips.
     pub fn video(&self, video_id: &str) -> Result<Track, SourceError> {
         let mut first = None;
-        for client in clients(self.config) {
+        for client in self.ordered_clients() {
             match self.video_with_client(&client, video_id) {
-                Ok(track) => return Ok(track),
+                Ok(track) => {
+                    self.record_client_outcome(client.name, true);
+                    return Ok(track);
+                }
                 Err(error) => {
+                    self.record_client_outcome(client.name, false);
                     if first.is_none() {
                         first = Some(error);
                     }
@@ -795,9 +1028,15 @@ impl<'a> Catalog<'a> {
             live,
             artwork: thumbnails(answer.pointer("/videoDetails/thumbnail")),
         };
-        media.into_track("youtube").ok_or_else(|| {
+        let track = media.into_track("youtube").ok_or_else(|| {
             SourceError::Http("youtube described a video that cannot be encoded".into())
-        })
+        })?;
+        if !live {
+            if let Some(format) = pick_format(&answer) {
+                self.store_cached_stream(video_id, client, format, false);
+            }
+        }
+        Ok(track)
     }
 }
 
@@ -1099,8 +1338,15 @@ fn collect_videos_up_to(value: &Value, out: &mut Vec<Media>, limit: usize) {
                     "videoRenderer"
                     | "compactVideoRenderer"
                     | "playlistVideoRenderer"
-                    | "playlistPanelVideoRenderer" => {
+                    | "playlistPanelVideoRenderer"
+                    | "reelItemRenderer" => {
                         if let Some(media) = video_from_renderer(child) {
+                            out.push(media);
+                        }
+                        continue;
+                    }
+                    "shortsLockupViewModel" => {
+                        if let Some(media) = video_from_shorts_lockup(child) {
                             out.push(media);
                         }
                         continue;
@@ -1133,7 +1379,7 @@ fn video_from_renderer(value: &Value) -> Option<Media> {
     if !youtube_id(id) {
         return None;
     }
-    let title = runs_text(value.get("title"));
+    let title = runs_text(value.get("title").or_else(|| value.get("headline")));
     if title.is_empty() {
         return None;
     }
@@ -1164,6 +1410,36 @@ fn video_from_renderer(value: &Value) -> Option<Media> {
         seconds,
         live,
         artwork: thumbnails(value.get("thumbnail")),
+    })
+}
+
+fn video_from_shorts_lockup(value: &Value) -> Option<Media> {
+    let id = value
+        .pointer("/onTap/innertubeCommand/reelWatchEndpoint/videoId")
+        .or_else(|| value.pointer("/onTap/innertubeCommand/watchEndpoint/videoId"))
+        .and_then(Value::as_str)
+        .filter(|id| youtube_id(id))?;
+    let title = value
+        .pointer("/overlayMetadata/primaryText/content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_owned();
+    let artwork = value
+        .pointer("/thumbnailViewModel/thumbnailViewModel/image/sources")
+        .or_else(|| value.pointer("/thumbnail/sources"))
+        .and_then(Value::as_array)
+        .and_then(|list| list.last())
+        .and_then(|item| item.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(Media {
+        id: id.to_owned(),
+        title,
+        author: String::new(),
+        seconds: 0.0,
+        live: false,
+        artwork,
     })
 }
 
@@ -1873,5 +2149,136 @@ mod tests {
             "frameworkUpdates": {"continuationCommand": {"token": "wrong"}}
         }))
         .is_none());
+    }
+
+    #[test]
+    fn video_metadata_caches_stream_so_open_and_seek_skip_duplicate_player_calls() {
+        let future_expire =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                + 7200;
+        let (base, server) = crate::test_http::serve(1, move |_, _, body| {
+            assert_eq!(body["videoId"], "1CXveaq_vFU");
+            json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {
+                    "videoId": "1CXveaq_vFU",
+                    "title": "Cached Song",
+                    "author": "Artist",
+                    "lengthSeconds": "200"
+                },
+                "streamingData": {"adaptiveFormats": [{
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "bitrate": 160000,
+                    "contentLength": "3200000",
+                    "url": format!("https://rr1---sn-test.googlevideo.com/videoplayback?expire={future_expire}&id=1"),
+                    "httpHeaders": {"X-Test": "cached"}
+                }]}
+            })
+        });
+        let state = CatalogState::default();
+        let mut config = Config::default();
+        config.youtube_endpoint = base;
+        let agent = netguard::agent(true);
+        let catalog = Catalog::with_state(&agent, &config, &state);
+        let track = catalog.video("1CXveaq_vFU").unwrap();
+        assert_eq!(track.metadata.title, "Cached Song");
+
+        let mut opens = 0;
+        for _ in 0..2 {
+            let url = catalog
+                .with_media_url("1CXveaq_vFU", |url, headers| {
+                    opens += 1;
+                    assert_eq!(headers["X-Test"], "cached");
+                    Ok(url)
+                })
+                .unwrap();
+            assert!(url.contains("googlevideo.com/videoplayback"));
+        }
+        server.join().unwrap();
+        assert_eq!(opens, 2, "both initial open and seek used the cached stream");
+        assert!(youtube_stream_ttl("https://rr1.googlevideo.com/videoplayback?expire=1").is_none());
+    }
+
+    #[test]
+    fn rejected_cached_stream_skips_same_client_and_falls_back_cleanly() {
+        let (base, server) = crate::test_http::serve(2, |_, _, body| {
+            let client = body["context"]["client"]["clientName"].as_str().unwrap();
+            json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {
+                    "videoId": "1CXveaq_vFU",
+                    "title": "Fallback Song",
+                    "lengthSeconds": "180"
+                },
+                "streamingData": {"adaptiveFormats": [{
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "bitrate": 160000,
+                    "url": format!("https://cdn.example/{client}")
+                }]}
+            })
+        });
+        let state = CatalogState::default();
+        let mut config = Config::default();
+        config.youtube_endpoint = base;
+        let agent = netguard::agent(true);
+        let catalog = Catalog::with_state(&agent, &config, &state);
+        let _ = catalog.video("1CXveaq_vFU").unwrap();
+
+        let mut attempts = Vec::new();
+        let chosen = catalog
+            .with_media_url("1CXveaq_vFU", |url, _| {
+                attempts.push(url.clone());
+                if url.ends_with("/IOS_PRODUCER") {
+                    Err(SourceError::Media { status: 403 })
+                } else {
+                    Ok(url)
+                }
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(attempts, ["https://cdn.example/IOS_PRODUCER", "https://cdn.example/VISIONOS"]);
+        assert_eq!(chosen, "https://cdn.example/VISIONOS");
+    }
+
+    #[test]
+    fn client_health_promotes_healthy_identities_while_retaining_cooled_down_fallbacks() {
+        let state = CatalogState::default();
+        let config = Config::default();
+        state.youtube_health.record_failure("IOS_PRODUCER");
+        let partitioned =
+            state.youtube_health.partition_clients(clients(&config), |client| client.name);
+        let names: Vec<_> = partitioned.iter().map(|c| c.name).collect();
+        assert_eq!(names, ["VISIONOS", "ANDROID_VR", "ANDROID", "IOS_PRODUCER"]);
+
+        state.youtube_health.record_success("IOS_PRODUCER");
+        let restored =
+            state.youtube_health.partition_clients(clients(&config), |client| client.name);
+        let restored_names: Vec<_> = restored.iter().map(|c| c.name).collect();
+        assert_eq!(restored_names, ["IOS_PRODUCER", "VISIONOS", "ANDROID_VR", "ANDROID"]);
+    }
+
+    #[test]
+    fn shorts_lockup_and_reel_renderers_become_tracks() {
+        let payload = json!({
+            "contents": [
+                {"reelItemRenderer": {
+                    "videoId": "dQw4w9WgXcQ",
+                    "headline": {"simpleText": "Short One"},
+                    "thumbnail": {"thumbnails": [{"url": "https://i.ytimg.com/1.jpg"}]}
+                }},
+                {"shortsLockupViewModel": {
+                    "onTap": {"innertubeCommand": {"reelWatchEndpoint": {"videoId": "1CXveaq_vFU"}}},
+                    "overlayMetadata": {"primaryText": {"content": "Short Two"}},
+                    "thumbnailViewModel": {"thumbnailViewModel": {"image": {"sources": [{"url": "https://i.ytimg.com/2.jpg"}]}}}
+                }}
+            ]
+        });
+        let mut found = Vec::new();
+        collect_videos(&payload, &mut found);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "dQw4w9WgXcQ");
+        assert_eq!(found[0].title, "Short One");
+        assert_eq!(found[1].id, "1CXveaq_vFU");
+        assert_eq!(found[1].title, "Short Two");
     }
 }

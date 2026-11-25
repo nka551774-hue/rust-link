@@ -24,13 +24,220 @@ const MAX_BODY: u64 = 4 << 20;
 /// How many pages of a collection are read before stopping.
 const MAX_PAGES: usize = 10;
 
-/// Provider credentials live as long as the source service, independently of
-/// the short-lived catalogue view used for one resolution.
+/// Provider credentials and pre-resolved YouTube stream metadata live as long
+/// as the source service, independently of the short-lived catalogue view used
+/// for one resolution.
 #[derive(Default)]
 pub struct State {
     spotify_token: Arc<CredentialCache>,
     soundcloud_client_id: Arc<CredentialCache>,
     pub(crate) youtube_visitor: Arc<CredentialCache>,
+    pub(crate) youtube_streams: Arc<YoutubeStreamCache>,
+    pub(crate) youtube_health: Arc<YoutubeClientHealth>,
+}
+
+const MAX_YOUTUBE_STREAM_CACHE: usize = 512;
+const YOUTUBE_STREAM_MAX_TTL: Duration = Duration::from_secs(1800);
+const YOUTUBE_STREAM_DEFAULT_TTL: Duration = Duration::from_secs(300);
+const YOUTUBE_STREAM_EXPIRY_MARGIN_SECS: u64 = 120;
+const CLIENT_COOLDOWN_BASE: Duration = Duration::from_secs(30);
+const CLIENT_COOLDOWN_MAX: Duration = Duration::from_secs(300);
+
+fn wipe_string(secret: &mut String) {
+    // SAFETY: overwriting initialized UTF-8 bytes with NUL (0x00) preserves
+    // UTF-8 validity before clearing length.
+    unsafe {
+        for byte in secret.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    secret.clear();
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct YoutubeStreamKey {
+    pub video_id: String,
+    pub endpoint: String,
+    pub client_version: String,
+    pub has_po_token: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedYoutubeStream {
+    pub url: String,
+    pub content_length: i64,
+    pub headers: BTreeMap<String, String>,
+    pub user_agent: Cow<'static, str>,
+    pub client_name: &'static str,
+    pub throttled_without_pot: bool,
+    pub tail_probed: bool,
+}
+
+impl Drop for CachedYoutubeStream {
+    fn drop(&mut self) {
+        wipe_string(&mut self.url);
+    }
+}
+
+struct StreamCacheEntry {
+    stream: CachedYoutubeStream,
+    inserted_at: Instant,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct YoutubeStreamCache {
+    entries: Mutex<std::collections::HashMap<YoutubeStreamKey, StreamCacheEntry>>,
+}
+
+pub(crate) fn youtube_stream_ttl(url: &str) -> Option<Duration> {
+    let without_frag = url.split('#').next().unwrap_or(url);
+    let Some((_, query)) = without_frag.split_once('?') else {
+        return Some(YOUTUBE_STREAM_DEFAULT_TTL);
+    };
+    for pair in query.split('&') {
+        if let Some(raw_exp) = pair.strip_prefix("expire=") {
+            let exp_secs = raw_exp.parse::<u64>().ok()?;
+            let now_secs =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            let usable =
+                exp_secs.checked_sub(now_secs.saturating_add(YOUTUBE_STREAM_EXPIRY_MARGIN_SECS))?;
+            if usable == 0 {
+                return None;
+            }
+            return Some(Duration::from_secs(usable).min(YOUTUBE_STREAM_MAX_TTL));
+        }
+    }
+    Some(YOUTUBE_STREAM_DEFAULT_TTL)
+}
+
+impl YoutubeStreamCache {
+    pub(crate) fn get(&self, key: &YoutubeStreamKey) -> Option<(CachedYoutubeStream, Duration)> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
+        let valid = entries.get(key).is_some_and(|entry| entry.expires_at > now);
+        if !valid {
+            entries.remove(key);
+            return None;
+        }
+        let entry = entries.get(key)?;
+        Some((entry.stream.clone(), now.saturating_duration_since(entry.inserted_at)))
+    }
+
+    pub(crate) fn put(&self, key: YoutubeStreamKey, stream: CachedYoutubeStream, ttl: Duration) {
+        if ttl.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
+        if entries.len() >= MAX_YOUTUBE_STREAM_CACHE && !entries.contains_key(&key) {
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= MAX_YOUTUBE_STREAM_CACHE {
+                if let Some(oldest_key) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.inserted_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    entries.remove(&oldest_key);
+                }
+            }
+        }
+        entries.insert(key, StreamCacheEntry { stream, inserted_at: now, expires_at: now + ttl });
+    }
+
+    pub(crate) fn mark_tail_probed(&self, key: &YoutubeStreamKey) {
+        let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = entries.get_mut(key) {
+            entry.stream.tail_probed = true;
+        }
+    }
+
+    pub(crate) fn invalidate(&self, key: &YoutubeStreamKey) {
+        let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
+        entries.remove(key);
+    }
+}
+
+struct ClientHealthSlot {
+    name: &'static str,
+    failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
+#[derive(Default)]
+pub(crate) struct YoutubeClientHealth {
+    slots: Mutex<Vec<ClientHealthSlot>>,
+}
+
+impl YoutubeClientHealth {
+    pub(crate) fn is_healthy(&self, name: &str) -> bool {
+        let now = Instant::now();
+        let slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+        slots
+            .iter()
+            .find(|slot| slot.name == name)
+            .and_then(|slot| slot.cooldown_until)
+            .is_none_or(|until| until <= now)
+    }
+
+    pub(crate) fn record_success(&self, name: &'static str) {
+        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) {
+            slot.failures = 0;
+            slot.cooldown_until = None;
+        }
+    }
+
+    pub(crate) fn record_failure(&self, name: &'static str) {
+        let now = Instant::now();
+        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+        let slot = match slots.iter_mut().find(|slot| slot.name == name) {
+            Some(slot) => slot,
+            None => {
+                slots.push(ClientHealthSlot { name, failures: 0, cooldown_until: None });
+                slots.last_mut().expect("just pushed")
+            }
+        };
+        slot.failures = slot.failures.saturating_add(1);
+        let shift = slot.failures.saturating_sub(1).min(4);
+        let backoff = (CLIENT_COOLDOWN_BASE * (1u32 << shift)).min(CLIENT_COOLDOWN_MAX);
+        slot.cooldown_until = Some(now + backoff);
+    }
+
+    pub(crate) fn partition_clients<T>(
+        &self,
+        list: [T; 4],
+        name_of: impl Fn(&T) -> &str,
+    ) -> [T; 4] {
+        let now = Instant::now();
+        let healthy_mask: [bool; 4] = {
+            let slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+            std::array::from_fn(|idx| {
+                let target = name_of(&list[idx]);
+                slots
+                    .iter()
+                    .find(|slot| slot.name == target)
+                    .and_then(|slot| slot.cooldown_until)
+                    .is_none_or(|until| until <= now)
+            })
+        };
+        if healthy_mask.iter().all(|&ok| ok) || healthy_mask.iter().all(|&ok| !ok) {
+            return list;
+        }
+        let mut opts = list.map(Some);
+        let mut ordered = Vec::with_capacity(4);
+        for pass in [true, false] {
+            for idx in 0..4 {
+                if healthy_mask[idx] == pass {
+                    if let Some(item) = opts[idx].take() {
+                        ordered.push(item);
+                    }
+                }
+            }
+        }
+        ordered.try_into().unwrap_or_else(|_| unreachable!("exact 4 elements"))
+    }
 }
 
 #[derive(Default)]

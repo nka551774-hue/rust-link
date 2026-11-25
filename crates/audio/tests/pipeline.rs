@@ -687,3 +687,113 @@ fn native_ogg_vorbis_and_flac_do_not_require_a_fallback_process() {
         assert!((7000.0..10000.0).contains(&rms), "{codec}: unexpected RMS {rms}");
     }
 }
+
+fn ogg_opus_packets(packet_count: u32, silence_prefix_packets: u32) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut out = Vec::new();
+    let write_page = |sequence: u32, flags: u8, granule: u64, packet: &[u8], dst: &mut Vec<u8>| {
+        dst.extend_from_slice(b"OggS\0");
+        dst.push(flags);
+        dst.extend_from_slice(&granule.to_le_bytes());
+        dst.extend_from_slice(&1u32.to_le_bytes());
+        dst.extend_from_slice(&sequence.to_le_bytes());
+        dst.extend_from_slice(&0u32.to_le_bytes());
+        let segments = packet.len() / 255 + 1;
+        dst.push(segments as u8);
+        dst.extend(std::iter::repeat_n(255u8, segments - 1));
+        dst.push((packet.len() % 255) as u8);
+        dst.extend_from_slice(packet);
+    };
+    let mut head = b"OpusHead\x01\x02".to_vec();
+    head.extend_from_slice(&312u16.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0i16.to_le_bytes());
+    head.push(0);
+    write_page(0, 2, 0, &head, &mut out);
+    write_page(1, 0, 0, b"OpusTags\0\0\0\0\0\0\0\0", &mut out);
+
+    let mut encoder = rustlink_audio::Encoder::new(160_000, 8).unwrap();
+    let silence_pcm = vec![0i16; 1920];
+    let mut raw_packets = Vec::with_capacity(packet_count as usize);
+    for idx in 0..packet_count {
+        let pkt = if idx < silence_prefix_packets {
+            encoder.encode(&silence_pcm).unwrap().to_vec()
+        } else {
+            let base_sample = idx as usize * 960;
+            let pcm: Vec<i16> = (0..1920)
+                .map(|s| {
+                    let t = (base_sample + s / 2) as f64 / 48_000.0;
+                    ((t * 440.0 * std::f64::consts::TAU).sin() * 14_000.0) as i16
+                })
+                .collect();
+            encoder.encode(&pcm).unwrap().to_vec()
+        };
+        let seq = idx + 2;
+        let flags = if idx + 1 == packet_count { 4 } else { 0 };
+        let granule = u64::from(idx + 1) * 960;
+        write_page(seq, flags, granule, &pkt, &mut out);
+        raw_packets.push(pkt);
+    }
+    (out, raw_packets)
+}
+
+#[test]
+fn ogg_opus_passthrough_preserves_exact_packets_and_switches_cleanly_on_live_volume_change() {
+    let (stream, expected_packets) = ogg_opus_packets(25, 0);
+    let passthrough_frames = collect(stream.clone(), serde_json::json!({}), 0);
+    assert_eq!(
+        passthrough_frames, expected_packets,
+        "neutral 48 kHz Opus must stream bit-identically"
+    );
+
+    let engine = Engine { ffmpeg: None, in_process: true, bitrate: 192_000, complexity: 8 };
+    let mut frames = engine
+        .start(
+            &track(),
+            Body::new(Box::new(std::io::Cursor::new(stream))),
+            0,
+            100,
+            &Default::default(),
+            Preference::Auto,
+        )
+        .unwrap();
+    let mut emitted = Vec::new();
+    let mut buf = Vec::new();
+    for expected in expected_packets.iter().take(6) {
+        assert!(frames.next_frame(&mut buf).unwrap());
+        assert_eq!(&buf, expected);
+        emitted.push(buf.clone());
+    }
+    let half_vol = rustlink_audio::parse_filters(&Default::default(), 50).unwrap();
+    assert!(frames.set_filters(&half_vol));
+    while frames.next_frame(&mut buf).unwrap() {
+        emitted.push(buf.clone());
+    }
+    assert!(emitted.len() >= 25);
+    let decoded = decode_packets(emitted);
+    let boundary = &decoded[5 * 1920..8 * 1920];
+    let settled_half = &decoded[10 * 1920..20 * 1920];
+    let boundary_rms =
+        (boundary.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / boundary.len() as f64).sqrt();
+    let half_rms = (settled_half.iter().map(|s| (*s as f64).powi(2)).sum::<f64>()
+        / settled_half.len() as f64)
+        .sqrt();
+    assert!(boundary_rms > 3000.0, "warm handoff lost signal across boundary: {boundary_rms}");
+    assert!((4000.0..6500.0).contains(&half_rms), "expected ~50% tone RMS, got {half_rms}");
+}
+
+#[test]
+fn compressed_packet_fast_seek_matches_decoded_sample_offset() {
+    // 250 packets = 5.0 seconds total; first 150 packets (3.0 s) are silence, last 100 are 440 Hz.
+    let (stream, _) = ogg_opus_packets(250, 150);
+    let sought = collect(stream, serde_json::json!({}), 3_000);
+    assert!(
+        (99..=101).contains(&sought.len()),
+        "seeking to 3.0s of a 5.0s Opus stream should leave ~100 frames, got {}",
+        sought.len()
+    );
+    let decoded = decode_packets(sought);
+    let settled = &decoded[4 * 1920..50 * 1920];
+    let rms =
+        (settled.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / settled.len() as f64).sqrt();
+    assert!(rms > 8000.0, "fast-sought region did not land on the 440 Hz tone: rms={rms}");
+}

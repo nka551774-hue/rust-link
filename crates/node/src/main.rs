@@ -212,11 +212,12 @@ fn run() -> Result<(), String> {
         Arc::new(Playback { engine, source: Arc::clone(&sources) as Arc<dyn Loader> });
     // Lyrics come from a public service, so the node only calls one when the
     // configuration names it. YouTube Music requests share the YouTube source
-    // agent (including youtubeProxy when configured).
-    let lyrics = rustlink_lyrics::Manager::from_config_with_youtube(
+    // agent (including youtubeProxy when configured) and warmed visitorData.
+    let lyrics = rustlink_lyrics::Manager::from_config_with_youtube_visitor(
         &config,
         sources.agent().clone(),
         sources.youtube_agent().cloned(),
+        Some(sources.youtube_visitor_bridge()),
     )
     .map(Arc::new);
     // A configured webhook gets its worker before the server starts, so it is

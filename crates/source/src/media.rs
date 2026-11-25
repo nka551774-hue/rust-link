@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use crate::{deadline, host_matches, http_url, netguard, SourceError};
 
-/// Google video CDNs reject open-ended or large byte ranges for otherwise
-/// playable URLs. Keep their requests at the verified 128 KiB chunk size.
-const GOOGLEVIDEO_CHUNK_BYTES: i64 = 128 * 1024;
+/// Google video CDNs reject open-ended or multi-megabyte byte ranges for
+/// otherwise playable URLs. A 512 KiB window stays safely below YouTube's
+/// range-shaping ceiling while cutting per-track HTTP round-trips by 4x.
+const GOOGLEVIDEO_CHUNK_BYTES: i64 = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MediaRange {
@@ -792,11 +793,11 @@ mod tests {
         ] {
             assert_eq!(MediaRange::for_url(url), MediaRange::OpenEnded, "{url}");
         }
-        assert_eq!(MediaRange::Chunked.header(0), "bytes=0-131071");
-        assert_eq!(MediaRange::Chunked.header(131_072), "bytes=131072-262143");
-        assert_eq!(MediaRange::Chunked.header(123), "bytes=123-131194");
+        assert_eq!(MediaRange::Chunked.header(0), "bytes=0-524287");
+        assert_eq!(MediaRange::Chunked.header(524_288), "bytes=524288-1048575");
+        assert_eq!(MediaRange::Chunked.header(123), "bytes=123-524410");
         assert_eq!(MediaRange::Chunked.header(i64::MAX), format!("bytes={0}-{0}", i64::MAX));
-        assert_eq!(MediaRange::OpenEnded.header(131_072), "bytes=131072-");
+        assert_eq!(MediaRange::OpenEnded.header(524_288), "bytes=524288-");
     }
 
     #[test]
