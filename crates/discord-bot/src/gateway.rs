@@ -172,7 +172,34 @@ impl Gateway {
     pub async fn connect(token: impl Into<String>, intents: u64) -> Result<Self, BotError> {
         let raw_token = Zeroizing::new(token.into());
         let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
-        let auth_text = Zeroizing::new(format!("Bot {}", token.as_str()));
+        let info = Self::fetch_gateway_info(&token).await?;
+        let mut gateway = Self::connect_url(info.url, token, intents).await?;
+        apply_initial_heartbeat_jitter(&mut gateway);
+        Ok(gateway)
+    }
+
+    /// Connects and awaits `READY` with `GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES | MESSAGE_CONTENT`,
+    /// automatically falling back to unprivileged `GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES`
+    /// if Discord closes with `4014` (`Disallowed intent(s)`).
+    ///
+    /// The returned boolean is `true` when full channel message content is enabled,
+    /// and `false` when only slash commands and `@bot` mentions carry message text.
+    pub async fn connect_with_messages(
+        token: impl Into<String>,
+    ) -> Result<(Self, Ready, bool), BotError> {
+        let raw_token = Zeroizing::new(token.into());
+        let token = Zeroizing::new(validate_gateway_token(&raw_token)?);
+        let info = Self::fetch_gateway_info(&token).await?;
+        Self::connect_url_with_messages(
+            &info.url,
+            token,
+            GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES,
+        )
+        .await
+    }
+
+    async fn fetch_gateway_info(token: &str) -> Result<GatewayInfo, BotError> {
+        let auth_text = Zeroizing::new(format!("Bot {token}"));
         let mut auth = reqwest::header::HeaderValue::from_str(&auth_text).map_err(|_| {
             BotError::Invalid("bot token contains invalid header characters".into())
         })?;
@@ -205,10 +232,28 @@ impl Gateway {
                 message: format!("gateway endpoint returned {} bytes", body.len()),
             });
         }
-        let info: GatewayInfo = serde_json::from_slice(&body)?;
-        let mut gateway = Self::connect_url(info.url, token, intents).await?;
+        serde_json::from_slice(&body).map_err(BotError::from)
+    }
+
+    async fn connect_url_with_messages(
+        base: &str,
+        token: Zeroizing<String>,
+        base_intents: u64,
+    ) -> Result<(Self, Ready, bool), BotError> {
+        let mut gateway =
+            Self::connect_url(base.to_owned(), token.clone(), base_intents | MESSAGE_CONTENT)
+                .await?;
         apply_initial_heartbeat_jitter(&mut gateway);
-        Ok(gateway)
+        match gateway.next_ready().await {
+            Ok(ready) => Ok((gateway, ready, true)),
+            Err(_) if gateway.close_code() == Some(4014) => {
+                let mut fallback = Self::connect_url(base.to_owned(), token, base_intents).await?;
+                apply_initial_heartbeat_jitter(&mut fallback);
+                let ready = fallback.next_ready().await?;
+                Ok((fallback, ready, false))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Reconnects to `resume_gateway_url`, receives HELLO, and sends RESUME (`op: 6`).
@@ -249,14 +294,21 @@ impl Gateway {
     /// Reconnects after `Reconnect`, `InvalidSession`, WebSocket error, or non-fatal
     /// close, resuming (`OP 6`) when valid and falling back to `IDENTIFY` (`OP 2`).
     pub async fn reconnect(&mut self, cause: Option<&BotError>) -> Result<(), BotError> {
+        let stripped_message_content =
+            self.close_code == Some(4014) && (self.intents & MESSAGE_CONTENT) != 0;
+        if stripped_message_content {
+            self.intents &= !MESSAGE_CONTENT;
+            self.close_code = None;
+        }
         if let Some(code) = self.close_code.filter(|&c| Self::is_fatal_close_code(c)) {
             return Err(BotError::Protocol(format!("fatal Discord gateway close code {code}")));
         }
         let _ = tokio::time::timeout(Duration::from_secs(1), self.socket.close(None)).await;
-        let can_resume = match cause {
-            Some(BotError::InvalidSession) => self.invalid_session_resumable,
-            _ => !matches!(self.close_code, Some(4007 | 4009)),
-        };
+        let can_resume = !stripped_message_content
+            && match cause {
+                Some(BotError::InvalidSession) => self.invalid_session_resumable,
+                _ => !matches!(self.close_code, Some(4007 | 4009)),
+            };
         if can_resume {
             if let (Some(url), Some(session_id), Some(seq)) =
                 (self.resume_gateway_url.clone(), self.session_id.clone(), self.sequence)
@@ -607,6 +659,9 @@ fn dispatch(payload: Value) -> Result<Option<BotEvent>, BotError> {
         }
         "MESSAGE_CREATE" => {
             let message: RawMessage = serde_json::from_value(data)?;
+            if message.author.bot || message.webhook_id.is_some() {
+                return Ok(None);
+            }
             Some(BotEvent::MessageCreate(MessageCreate {
                 id: message.id,
                 channel_id: message.channel_id,
@@ -665,6 +720,8 @@ fn default_resume_url() -> String {
 #[derive(Debug, Deserialize)]
 struct RawUser {
     id: String,
+    #[serde(default)]
+    bot: bool,
 }
 
 #[derive(Deserialize)]
@@ -724,6 +781,8 @@ struct RawMessage {
     guild_id: Option<String>,
     author: RawUser,
     #[serde(default)]
+    webhook_id: Option<String>,
+    #[serde(default)]
     content: String,
 }
 
@@ -732,6 +791,105 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn message_create_ignores_bots_and_webhooks_and_emits_human_messages() {
+        let bot_msg = json!({"op": 0, "t": "MESSAGE_CREATE", "d": {
+            "id": "1", "channel_id": "10", "guild_id": "20",
+            "author": {"id": "30", "bot": true},
+            "content": "https://youtu.be/dQw4w9WgXcQ"
+        }});
+        assert_eq!(dispatch(bot_msg).unwrap(), None);
+
+        let webhook_msg = json!({"op": 0, "t": "MESSAGE_CREATE", "d": {
+            "id": "2", "channel_id": "10", "guild_id": "20",
+            "author": {"id": "31"},
+            "webhook_id": "99",
+            "content": "https://youtu.be/dQw4w9WgXcQ"
+        }});
+        assert_eq!(dispatch(webhook_msg).unwrap(), None);
+
+        let user_msg = json!({"op": 0, "t": "MESSAGE_CREATE", "d": {
+            "id": "3", "channel_id": "10", "guild_id": "20",
+            "author": {"id": "32"},
+            "content": "https://youtu.be/dQw4w9WgXcQ"
+        }});
+        assert_eq!(
+            dispatch(user_msg).unwrap(),
+            Some(BotEvent::MessageCreate(MessageCreate {
+                id: "3".into(),
+                channel_id: "10".into(),
+                guild_id: Some("20".into()),
+                author_id: "32".into(),
+                content: "https://youtu.be/dQw4w9WgXcQ".into(),
+            }))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_url_with_messages_falls_back_when_message_content_is_disallowed() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_intents = GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES;
+        let server = tokio::spawn(async move {
+            // Connection 1: reject MESSAGE_CONTENT with close code 4014.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = json!({"op": 10, "d": {"heartbeat_interval": 5000}});
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let Message::Text(first_identify) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected IDENTIFY text")
+            };
+            let first: Value = serde_json::from_str(&first_identify).unwrap();
+            assert_eq!(first["d"]["intents"].as_u64(), Some(base_intents | MESSAGE_CONTENT));
+            let frame =
+                CloseFrame { code: CloseCode::from(4014), reason: "Disallowed intent(s)".into() };
+            socket.close(Some(frame)).await.unwrap();
+
+            // Connection 2: accept unprivileged base_intents and send READY.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+            let Message::Text(second_identify) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected fallback IDENTIFY text")
+            };
+            let second: Value = serde_json::from_str(&second_identify).unwrap();
+            assert_eq!(second["d"]["intents"].as_u64(), Some(base_intents));
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op": 0,
+                        "t": "READY",
+                        "s": 1,
+                        "d": {
+                            "session_id": "sess-fallback",
+                            "resume_gateway_url": "wss://gateway.discord.gg",
+                            "user": {"id": "777"},
+                            "application": {"id": "888"}
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let (gateway, ready, message_content) = Gateway::connect_url_with_messages(
+            &format!("ws://{address}"),
+            Zeroizing::new("bot-token".to_owned()),
+            base_intents,
+        )
+        .await
+        .unwrap();
+        assert!(!message_content);
+        assert_eq!(ready.user_id, "777");
+        assert_eq!(ready.application_id, "888");
+        assert_eq!(gateway.intents, base_intents);
+        server.await.unwrap();
+    }
 
     #[test]
     fn voice_server_dispatch_is_decoded_without_exposing_gateway_token() {

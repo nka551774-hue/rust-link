@@ -30,10 +30,11 @@ const MAX_PAGES: usize = 10;
 pub struct State {
     spotify_token: Arc<CredentialCache>,
     soundcloud_client_id: Arc<CredentialCache>,
+    pub(crate) youtube_visitor: Arc<CredentialCache>,
 }
 
 #[derive(Default)]
-struct CredentialCache {
+pub(crate) struct CredentialCache {
     held: Mutex<Credential>,
     ready: Condvar,
 }
@@ -45,7 +46,26 @@ struct Credential {
 }
 
 impl CredentialCache {
-    fn get_or_refresh(
+    pub(crate) fn peek(&self) -> Option<String> {
+        let held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        held.value
+            .as_ref()
+            .and_then(|(value, expires)| (*expires > Instant::now()).then(|| value.clone()))
+    }
+
+    pub(crate) fn store_if_empty(&self, fresh: &str, ttl: Duration) {
+        let fresh = fresh.trim();
+        if fresh.is_empty() {
+            return;
+        }
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        let valid = held.value.as_ref().is_some_and(|(_, expires)| *expires > Instant::now());
+        if !valid {
+            held.value = Some((fresh.to_owned(), Instant::now() + ttl));
+        }
+    }
+
+    pub(crate) fn get_or_refresh(
         &self,
         fetch: impl FnOnce() -> Result<(String, Duration), SourceError>,
     ) -> Result<String, SourceError> {
@@ -88,7 +108,7 @@ impl CredentialCache {
         Ok(value)
     }
 
-    fn invalidate_if(&self, stale: &str) {
+    pub(crate) fn invalidate_if(&self, stale: &str) {
         let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
         if held.value.as_ref().is_some_and(|(current, _)| current == stale) {
             held.value = None;

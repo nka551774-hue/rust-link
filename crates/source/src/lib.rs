@@ -135,6 +135,7 @@ pub fn source_kind(id: &str) -> &'static str {
     let host = url.host_str().expect("http_url requires a host");
     [
         ("youtube.com", "youtube"),
+        ("youtube-nocookie.com", "youtube"),
         ("youtu.be", "youtube"),
         ("soundcloud.com", "soundcloud"),
         ("open.spotify.com", "spotify"),
@@ -364,7 +365,7 @@ impl Service {
             return Err(SourceError::Disabled("YouTube is disabled (youtubeNative: false)".into()));
         }
         let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
-        let catalog = innertube::Catalog { agent, config: &self.config };
+        let catalog = innertube::Catalog::with_state(agent, &self.config, &self.catalog_state);
         if let Some((query, music)) = identifier
             .strip_prefix("ytsearch:")
             .map(|q| (q, false))
@@ -509,6 +510,15 @@ fn youtube_video_from_url(identifier: &str) -> Option<String> {
         let id = parts.next()?;
         return (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned());
     }
+    if host_matches(host, "youtube-nocookie.com") {
+        return match parts.next() {
+            Some("embed") | Some("v") | Some("e") => {
+                let id = parts.next()?;
+                (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned())
+            }
+            _ => None,
+        };
+    }
     if !host_matches(host, "youtube.com") {
         return None;
     }
@@ -517,7 +527,15 @@ fn youtube_video_from_url(identifier: &str) -> Option<String> {
             let (_, id) = url.query_pairs().find(|(key, _)| key == "v")?;
             youtube_id(&id).then(|| id.into_owned())
         }
-        Some("shorts") | Some("embed") | Some("live") | Some("v") => {
+        Some("attribution_link") if parts.all(str::is_empty) => {
+            let (_, inner) = url.query_pairs().find(|(key, _)| key == "u")?;
+            if !inner.starts_with('/') {
+                return None;
+            }
+            let resolved = format!("https://www.youtube.com{inner}");
+            youtube_video_from_url(&resolved)
+        }
+        Some("shorts") | Some("embed") | Some("live") | Some("v") | Some("e") => {
             let id = parts.next()?;
             (youtube_id(id) && parts.all(str::is_empty)).then(|| id.to_owned())
         }
@@ -639,14 +657,12 @@ impl Service {
                         return Err(SourceError::Url("invalid YouTube video identifier".into()));
                     }
                     let agent = self.youtube_agent.as_ref().map_err(Clone::clone)?;
-                    innertube::Catalog { agent, config: &self.config }.with_media_url(
-                        &track.metadata.identifier,
-                        |url, headers| {
+                    innertube::Catalog::with_state(agent, &self.config, &self.catalog_state)
+                        .with_media_url(&track.metadata.identifier, |url, headers| {
                             let range = MediaRange::for_url(&url);
                             let body = MediaBody::open(agent.clone(), url, headers, range)?;
                             Ok(Box::new(body) as Box<dyn Read + Send>)
-                        },
-                    )
+                        })
                 }
                 "soundcloud" if self.config.soundcloud_native => {
                     catalog::SoundCloud::with_state(&self.agent, &self.config, &self.catalog_state)
@@ -1086,7 +1102,7 @@ mod tests {
         let media_server = std::thread::spawn(move || {
             for (path, expected_agent, response) in [
                 ("/blocked", "com.google.ios.youtubeproducer/", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                ("/allowed", "com.google.android.apps.youtube.vr.oculus/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
+                ("/allowed", "applewebkit/605.1.15", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
             ] {
                 let until = Instant::now() + Duration::from_secs(5);
                 let (mut socket, _) = loop {
@@ -1129,7 +1145,7 @@ mod tests {
                 }});
             }
             let (client, path) =
-                if call == 2 { ("IOS_PRODUCER", "/blocked") } else { ("ANDROID_VR", "/allowed") };
+                if call == 2 { ("IOS_PRODUCER", "/blocked") } else { ("VISIONOS", "/allowed") };
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(serde_json::Value::as_str),
                 Some(client)

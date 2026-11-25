@@ -109,7 +109,7 @@
 - **控制平面與 SDK**：`/api/v1` REST API、常數時間 Bearer 驗證、每工作階段專屬 WebSocket 事件流、斷線自動續傳（Session Resume），以及非同步強型別客戶端 `rustlink-client`。
 - **次世代 Discord 語音與 E2EE**：完整支援 Discord Voice Gateway v8、UDP IP 探索、**DAVE v1（OpenMLS）端對端加密**、`aead_aes256_gcm_rtpsize` 與 `aead_xchacha20_poly1305_rtpsize` 傳輸加密。
 - **多平台原生音源解析**：
-  - **YouTube / YouTube Music**：原生 InnerTube 協定（支援搜尋、單曲、播放清單續頁、自動迴避 AI 配音音軌）。
+  - **YouTube / YouTube Music**：純 Rust 原生 InnerTube 多用戶端備援（`IOS_PRODUCER` + 自動引導匿名 `visitorData` 的 `VISIONOS` + 尾端區間防截斷校驗，支援搜尋、單曲、合輯與播放清單續頁、自動迴避 AI 配音音軌，完全不依賴 `yt-dlp`）。
   - **SoundCloud**：原生 API v2 解析、HLS / 漸進式串流與 `client_id` 自動快取輪替。
   - **Spotify / Deezer**：官方中繼資料擷取 + ISRC 優先雙向詞彙精準比對至可播放音源。
   - **Direct HTTP / HTTPS**：支援 MP3（ID3v2）、FLAC、Ogg Opus/Vorbis、MP4/M4A、WebM/Matroska、WAV 標頭探測與嚴格 SSRF 防護。
@@ -143,9 +143,9 @@ target/release/rustlink --config config.yaml
 ---
 
 <a id="examples"></a>
-## 在 Discord 用 `/play` 播 YouTube
+## 在 Discord 直接貼連結或用 `/play` 播 YouTube
 
-`crates/discord-bot/examples/slash.rs` 是一個精簡完整的純 Rust 斜線指令機器人：自動註冊 `/play url:<連結或關鍵字>`、配對語音狀態並指揮節點播放。啟動節點後執行：
+`crates/discord-bot/examples/slash.rs` 與 `examples/music` 皆內建直接連結播放與斜線指令支援：加入語音頻道後，無論是輸入 `/play`、`@Bot <連結或關鍵字>`，或在文字頻道直接貼上 YouTube／SoundCloud／Spotify／Deezer 連結（含手機分享文字、`||...||` 防雷標記與省略 `https://` 的 `youtu.be/...` 短網址），機器人都會自動加入語音頻道並交由節點原生解析播放。啟動節點後執行：
 
 ```sh
 export DISCORD_BOT_TOKEN=...        # 僅透過環境變數傳入，切勿寫入程式碼或日誌
@@ -153,10 +153,10 @@ export RUSTLINK_PASSWORD=...        # 與節點 config.yaml 的 password 相同
 cargo run -p rustlink-discord-bot --example slash
 ```
 
-斜線指令會直接註冊至機器人所在的各個伺服器（立即生效，無須等待全域指令快取），且僅要求最小權限的 `GUILDS` 與 `GUILD_VOICE_STATES` Intent，無須開啟 Message Content。
+機器人連線時會透過 `Gateway::connect_with_messages` 自動偵測權限：若已在 Discord Developer Portal 開啟 `Message Content Intent`，在頻道直接貼連結即可自動開播；若未開啟該特權 Intent（4014），會自動無縫退回免特權模式，`/play` 與 `@Bot <連結>` 仍可正常運作，絕不崩潰。
 
 > [!IMPORTANT]
-> **關於資料中心 IP 的 YouTube 限制**：YouTube 對部分雲端機房 IP 可能回傳「Sign in to confirm you're not a bot」或限制僅能讀取前約 900 KiB 音訊。Rustlink 預設優先使用免權杖的 `IOS_PRODUCER` 用戶端；若您的網路環境仍遭限制，可在設定檔配置 `youtubeProxy` 將 YouTube 流量導向代理伺服器，詳見 [YouTube 指南](docs/youtube.md)。
+> **關於 YouTube 機器人驗證與一分鐘斷音防護**：Rustlink 完全不使用 `yt-dlp`，改以純 Rust 原生 `IOS_PRODUCER` 與自動引導匿名 `visitorData` 的 `VISIONOS` 雙主力用戶端繞過「Sign in to confirm you're not a bot」，並對未附 PO token 的後備用戶端執行尾端位元組預檢以杜絕播約一分鐘（~900 KiB）後 403 斷音。若高風控雲端機房 IP 仍受限，可在設定檔配置 `youtubeProxy` 將 YouTube 流量導向代理伺服器，詳見 [YouTube 指南](docs/youtube.md)。
 
 ---
 

@@ -5,7 +5,9 @@
 //! argument is a Rustlink source query (the resolver itself is native Rust).
 
 use rustlink_client::{Client, LoadResult};
-use rustlink_discord_bot::{DiscordRest, Gateway, VoiceStatePairer, GUILDS, GUILD_VOICE_STATES};
+use rustlink_discord_bot::{
+    normalize_query, DiscordRest, Gateway, VoiceStatePairer, GUILDS, GUILD_VOICE_STATES,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     gateway.set_voice_state(&guild, Some(&channel)).await?;
     let mut pairer = VoiceStatePairer::for_guild(&ready.user_id, &guild)?;
-    let query = std::env::args().nth(1).unwrap_or_else(|| "ytsearch:lofi".into());
+    let raw_query = std::env::args().nth(1).unwrap_or_else(|| "ytsearch:lofi".into());
+    let query = normalize_query(&raw_query);
     let mut started = false;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);

@@ -1,6 +1,8 @@
-//! `/play` slash-command bot. Join a voice channel, type `/play url:<YouTube
-//! link>`, and the bot joins that channel and plays through Rustlink. The link
-//! is resolved by Rustlink's native Rust source layer; nothing runs yt-dlp.
+//! `/play` and direct-link Discord bot. Join a voice channel, paste a YouTube /
+//! SoundCloud / Spotify / Deezer link directly in chat (or `@Bot <link / query>`,
+//! or `/play url:<link>`), and the bot joins that channel and plays through
+//! Rustlink. The link is resolved by Rustlink's native Rust source layer;
+//! nothing runs yt-dlp.
 //!
 //! Required environment: DISCORD_BOT_TOKEN, RUSTLINK_PASSWORD. Optional:
 //! RUSTLINK_URL (default http://127.0.0.1:2333). The command is registered in
@@ -11,10 +13,15 @@ use std::sync::Arc;
 
 use rustlink_client::{Client, LoadResult, Session, Track};
 use rustlink_discord_bot::{
-    normalize_query, truncate_chars, BotEvent, DiscordRest, Gateway, Interaction, VoiceStatePairer,
-    GUILDS, GUILD_VOICE_STATES,
+    extract_message_query, normalize_query, truncate_chars, BotEvent, DiscordRest, Gateway,
+    Interaction, VoiceStatePairer,
 };
 use serde_json::{json, Value};
+
+enum PendingPlay {
+    Slash(Interaction),
+    Message { channel_id: String, query: String },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,12 +31,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("RUSTLINK_PASSWORD")?,
     )?;
     let rest = Arc::new(DiscordRest::new(token.clone())?);
-    let mut gateway = Gateway::connect(token, GUILDS | GUILD_VOICE_STATES).await?;
-    let ready = gateway.next_ready().await?;
+    let (mut gateway, ready, message_content) = Gateway::connect_with_messages(token).await?;
     if ready.application_id.is_empty() {
         return Err("READY carried no application ID".into());
     }
     println!("Discord bot READY as {}", ready.user_id);
+    if !message_content {
+        println!(
+            "note: Message Content intent is off; /play and @bot <link> work, enable Message Content Intent in Discord Developer Portal to auto-play bare links in chat"
+        );
+    }
 
     let session = rustlink.create_session(&ready.user_id, 60).await?;
     let mut rustlink_events = session.events().await?;
@@ -55,8 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut channels: HashMap<String, HashMap<String, String>> = HashMap::new();
     // Guilds whose voice state Rustlink currently holds.
     let mut voiced: HashSet<String> = HashSet::new();
-    // A request waiting for the bot to finish joining: guild -> interaction.
-    let mut waiting: HashMap<String, Interaction> = HashMap::new();
+    // A request waiting for the bot to finish joining: guild -> pending request.
+    let mut waiting: HashMap<String, PendingPlay> = HashMap::new();
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -146,27 +157,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             BotEvent::Interaction(request) if request.command == "play" => {
                 rest.defer_interaction(&request.id, &request.token).await?;
-                let Some(guild) = request.guild_id.clone() else {
-                    reply(&rest, &ready.application_id, &request, "請在伺服器裡使用 /play。").await;
+                let pending = PendingPlay::Slash(request);
+                let PendingPlay::Slash(ref req) = pending else { unreachable!() };
+                let Some(guild) = req.guild_id.clone() else {
+                    reply(&rest, &ready.application_id, &pending, "請在伺服器裡使用 /play。").await;
                     continue;
                 };
                 let Some(channel) = channels
                     .get(&guild)
-                    .and_then(|guild_channels| guild_channels.get(&request.user_id))
+                    .and_then(|guild_channels| guild_channels.get(&req.user_id))
                     .cloned()
                 else {
-                    reply(&rest, &ready.application_id, &request, "請先加入一個語音頻道。").await;
+                    reply(&rest, &ready.application_id, &pending, "請先加入一個語音頻道。").await;
                     continue;
                 };
                 let bot_channel = channels
                     .get(&guild)
                     .and_then(|guild_channels| guild_channels.get(&ready.user_id));
                 if voiced.contains(&guild) && bot_channel == Some(&channel) {
-                    play(&rustlink, &session, &rest, &ready.application_id, &guild, &request).await;
+                    play(&rustlink, &session, &rest, &ready.application_id, &guild, &pending).await;
                 } else {
-                    // Joining (or moving) produces a fresh voice pair; play once it lands.
-                    if let Some(previous) = waiting.insert(guild.clone(), request) {
-                        reply(&rest, &ready.application_id, &previous, "已被新的 /play 指令取代。")
+                    if let Some(previous) = waiting.insert(guild.clone(), pending) {
+                        reply(&rest, &ready.application_id, &previous, "已被新的點播請求取代。")
+                            .await;
+                    }
+                    gateway.set_voice_state(&guild, Some(&channel)).await?;
+                }
+            }
+            BotEvent::MessageCreate(message) => {
+                if message.author_id == ready.user_id {
+                    continue;
+                }
+                let Some(guild) = message.guild_id else { continue };
+                let Some((query, mentioned)) =
+                    extract_message_query(&message.content, &ready.user_id)
+                else {
+                    continue;
+                };
+                let Some(channel) = channels
+                    .get(&guild)
+                    .and_then(|guild_channels| guild_channels.get(&message.author_id))
+                    .cloned()
+                else {
+                    if mentioned {
+                        send_text(&rest, &message.channel_id, "請先加入一個語音頻道。").await;
+                    }
+                    continue;
+                };
+                let pending = PendingPlay::Message {
+                    channel_id: message.channel_id,
+                    query: query.into_owned(),
+                };
+                let bot_channel = channels
+                    .get(&guild)
+                    .and_then(|guild_channels| guild_channels.get(&ready.user_id));
+                if voiced.contains(&guild) && bot_channel == Some(&channel) {
+                    play(&rustlink, &session, &rest, &ready.application_id, &guild, &pending).await;
+                } else {
+                    if let Some(previous) = waiting.insert(guild.clone(), pending) {
+                        reply(&rest, &ready.application_id, &previous, "已被新的點播請求取代。")
                             .await;
                     }
                     gateway.set_voice_state(&guild, Some(&channel)).await?;
@@ -184,16 +233,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Resolves the query natively in Rustlink, plays the first playable track,
-/// and edits the deferred reply with the outcome.
+/// and sends or edits the reply with the outcome.
 async fn play(
     rustlink: &Client,
     session: &Session,
     rest: &DiscordRest,
     application_id: &str,
     guild: &str,
-    request: &Interaction,
+    request: &PendingPlay,
 ) {
-    let query = request.option("url").unwrap_or_default();
+    let query = match request {
+        PendingPlay::Slash(interaction) => interaction.option("url").unwrap_or_default(),
+        PendingPlay::Message { query, .. } => query.as_str(),
+    };
     let message = match resolve(rustlink, query).await {
         Ok(track) => match session.play(guild, &track.token).await {
             Ok(_) => format!("正在播放：{}（{}）", track.metadata.title, track.metadata.author),
@@ -219,12 +271,24 @@ async fn resolve(rustlink: &Client, query: &str) -> Result<Track, Box<dyn std::e
     track.ok_or_else(|| "連結沒有解析出曲目".into())
 }
 
-async fn reply(rest: &DiscordRest, application_id: &str, request: &Interaction, text: &str) {
-    // Discord caps a message at 2000 characters; a long error must not fail the edit.
+async fn reply(rest: &DiscordRest, application_id: &str, request: &PendingPlay, text: &str) {
+    // Discord caps a message at 2000 characters; a long error must not fail the reply.
     let bounded = truncate_chars(text, 1900);
-    if let Err(error) =
-        rest.edit_interaction_response(application_id, &request.token, bounded).await
-    {
-        eprintln!("could not answer /play: {error}");
+    match request {
+        PendingPlay::Slash(interaction) => {
+            if let Err(error) =
+                rest.edit_interaction_response(application_id, &interaction.token, bounded).await
+            {
+                eprintln!("could not answer /play: {error}");
+            }
+        }
+        PendingPlay::Message { channel_id, .. } => send_text(rest, channel_id, bounded).await,
+    }
+}
+
+async fn send_text(rest: &DiscordRest, channel_id: &str, text: &str) {
+    let bounded = truncate_chars(text, 1900);
+    if let Err(error) = rest.send_text(channel_id, bounded).await {
+        eprintln!("could not send reply in channel {channel_id}: {error}");
     }
 }

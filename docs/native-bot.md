@@ -17,10 +17,10 @@
 | --- | --- |
 | `crates/client/examples/bot.rs` | 只示範客戶端，voice 資料從環境變數讀入，不登入 Discord |
 | `crates/discord-bot/examples/play.rs` | 登入、加入指定頻道、播放一個查詢（`DISCORD_BOT_TOKEN`、`DISCORD_GUILD_ID`、`DISCORD_CHANNEL_ID`、`RUSTLINK_URL`、`RUSTLINK_PASSWORD`） |
-| `crates/discord-bot/examples/slash.rs` | `/play url:<YouTube 連結>` 斜線指令機器人（`DISCORD_BOT_TOKEN`、`RUSTLINK_PASSWORD`，可選 `RUSTLINK_URL`） |
-| `crates/discord-bot/examples/music/` | 完整的音樂機器人，用 `.env` 設定（見下） |
+| `crates/discord-bot/examples/slash.rs` | `/play`、頻道直接貼連結與 `@Bot <連結／關鍵字>` 機器人（`DISCORD_BOT_TOKEN`、`RUSTLINK_PASSWORD`，可選 `RUSTLINK_URL`） |
+| `crates/discord-bot/examples/music/` | 完整的佇列音樂機器人，同時支援斜線指令與直接貼連結播放，用 `.env` 設定（見下） |
 
-`slash.rs` 在每個 `GUILD_CREATE` 為該伺服器註冊指令，追蹤各使用者所在的語音頻道，收到 `/play` 後先回覆「處理中」，透過 Rustlink 解析並播放第一首可播的曲目，再編輯回應；機器人尚未在使用者的頻道時，會先加入，等語音配對完成再播放。它沒有佇列，新的 `/play` 會替換正在播放的曲目。
+`slash.rs` 與 `music` 啟動時透過 `Gateway::connect_with_messages` 連線：若已在 Discord Developer Portal 開啟 Message Content Intent，使用者在語音頻道時直接於文字頻道貼上 YouTube／SoundCloud／Spotify／Deezer 連結即會自動加入並播放；若未開啟該權限（Discord 回應 4014），會自動退回免特權連線，此時 `/play` 與 `@Bot <連結／關鍵字>` 依然立即可用，且支援手機分享文字擷取與省略 `https://` 的連結（如 `youtu.be/…`）。
 
 ## 音樂機器人（`music` 範例）
 

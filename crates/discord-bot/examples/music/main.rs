@@ -28,8 +28,8 @@ use rustlink_client::{
     Client, LoadResult, Object, Patch, PlayerUpdate, Session, Track, TrackUpdate, VoiceState,
 };
 use rustlink_discord_bot::{
-    truncate_chars, BotEvent, DiscordRest, Gateway, Interaction, VoiceStatePairer,
-    VoiceStateUpdate, GUILDS, GUILD_VOICE_STATES,
+    extract_message_query, truncate_chars, BotEvent, DiscordRest, Gateway, Interaction,
+    MessageCreate, VoiceStatePairer, VoiceStateUpdate,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -61,12 +61,17 @@ async fn run() -> Result<(), Failure> {
         .map_err(|error| format!("cannot reach Rustlink at {}: {error}", config.rustlink_url))?;
 
     let rest = Arc::new(DiscordRest::new(config.token.clone())?);
-    let mut gateway = Gateway::connect(config.token.clone(), GUILDS | GUILD_VOICE_STATES).await?;
-    let ready = gateway.next_ready().await?;
+    let (gateway, ready, message_content) =
+        Gateway::connect_with_messages(config.token.clone()).await?;
     if ready.application_id.is_empty() {
         return Err("READY carried no application ID".into());
     }
     println!("music bot ready as {} (Rustlink at {})", ready.user_id, config.rustlink_url);
+    if !message_content {
+        println!(
+            "note: Message Content intent is off; /play and @bot <link> work, enable Message Content Intent in Discord Developer Portal to auto-play bare links in chat"
+        );
+    }
 
     let session = rustlink.create_session(&ready.user_id, 60).await?;
     let mut stream = session.events().await?;
@@ -191,6 +196,7 @@ impl Bot {
             }
             BotEvent::VoiceStateUpdate(update) => self.voice_state(update).await,
             BotEvent::Interaction(request) => self.command(request).await,
+            BotEvent::MessageCreate(message) => self.message(message).await,
             _ => {}
         }
         Ok(())
@@ -372,6 +378,44 @@ impl Bot {
             self.rest.edit_interaction_response(&self.application_id, &request.token, bounded).await
         {
             eprintln!("could not answer /{}: {error}", request.command);
+        }
+    }
+
+    async fn message(&mut self, message: MessageCreate) {
+        if message.author_id == self.user_id {
+            return;
+        }
+        let Some(guild) = message.guild_id.as_deref() else { return };
+        if !self.config.serves(guild) {
+            return;
+        }
+        let Some((query, mentioned)) = extract_message_query(&message.content, &self.user_id)
+        else {
+            return;
+        };
+        let Some(channel) = self.member_channel(guild, &message.author_id).map(str::to_owned)
+        else {
+            if mentioned {
+                self.send_channel_reply(&message.channel_id, "請先加入一個語音頻道。").await;
+            }
+            return;
+        };
+        let bot_channel = self.member_channel(guild, &self.user_id);
+        let active_channel = bot_channel.or_else(|| self.joining.get(guild).map(String::as_str));
+        if !mentioned
+            && self.guilds.get(guild).is_some_and(Guild::busy)
+            && active_channel.is_some_and(|current| current != channel)
+        {
+            return;
+        }
+        let text = self.play(guild, &channel, &query).await;
+        self.send_channel_reply(&message.channel_id, &text).await;
+    }
+
+    async fn send_channel_reply(&self, channel_id: &str, text: &str) {
+        let bounded = truncate_chars(text, 1900);
+        if let Err(error) = self.rest.send_text(channel_id, bounded).await {
+            eprintln!("could not send reply in channel {channel_id}: {error}");
         }
     }
 
