@@ -70,4 +70,23 @@ fn vevo_track_search_and_mix_playlist_resolve_without_bot_blocks() {
         panic!("RD Mix playlist did not resolve");
     };
     assert!(!mix.tracks.is_empty(), "RD Mix playlist returned zero tracks");
+
+    // Verify `clients()[0]` (`VISIONOS`) serves native 48 kHz WebM Opus (`itag 251`)
+    // so playback runs bit-exact Zero-Transcode Passthrough without AAC transcoding.
+    let mut cfg = Config::default();
+    apply_env(&mut cfg);
+    let agent = rustlink_source::netguard::agent(false);
+    let catalog = rustlink_source::innertube::Catalog::new(&agent, &cfg);
+    let primary = &rustlink_source::innertube::clients(&cfg)[0];
+    assert_eq!(primary.name, "VISIONOS");
+    let format = catalog
+        .player(primary, "dQw4w9WgXcQ")
+        .unwrap()
+        .expect("VISIONOS returned no playable format");
+    println!("VISIONOS selected mime={} bitrate={}", format.mime_type, format.bitrate);
+    assert!(
+        format.mime_type.to_ascii_lowercase().contains("opus"),
+        "expected native Opus format from VISIONOS, got {}",
+        format.mime_type
+    );
 }

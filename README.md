@@ -35,9 +35,9 @@
 
 | 工程維度 | Rustlink 的純 Rust 實作細節 | 實際系統收益 |
 | --- | --- | --- |
-| **零 GC 確定性排程** | 編譯期所有權（Ownership）與 RAII 生命週期管理，結合世代計數（Generation-Safe）高精度 20 ms 播放執行緒與 Linux `MALLOC_ARENA_MAX` 競技場收斂。 | **無任何 GC 暫停抖動**；長時間高併發運作下記憶體曲線平坦、不膨脹。 |
+| **零 GC 確定性排程與背景預讀** | 編譯期所有權（Ownership）與 RAII 生命週期管理，結合 2 MiB 背景預讀環形緩衝（`PrefetchReader`）、微秒級自旋對齊 20 ms 播放執行緒（Windows 1 ms 高精度計時器 + 5 ms 緩步追幀防爆衝）與 Linux `MALLOC_ARENA_MAX` 競技場收斂。 | **無任何 GC 暫停抖動、無網路續傳斷音**；長時間高併發運作下記憶體曲線平坦、不膨脹。 |
 | **零配置即時熱路徑** | 以全域 Counting Allocator 實測驗證：Ogg 區段合併讀取、視窗化 Sinc 重取樣、8 階 DSP 濾波、DAVE v1 原地加密（`encrypt_in_place`）與 RTP 加密（`seal_into`）全數重用預先配置緩衝池。 | 穩態音訊加密與 DSP 熱路徑達成 **每音框 `0` 次堆積配置**，徹底釋放分配器鎖競爭。 |
-| **SIMD 向量化 DSP 與重取樣** | 雙聲道 `__m128d` 2-lane SSE2 雙二階濾波器（Biquad）、1024 樣本分塊複數相量遞迴 LFO（消除每樣本 `sin`/`cos` 呼叫）、16-tap 展開 SLP 向量化 Sinc 摺積與 8 路向量化 WSOLA 時間伸縮。 | 全開 8 階音效濾鏡（含非線性 `sin`/`cos`/`tan` 失真）每 20 ms 音框僅需 **38.8 µs**（即時速度的 **516 倍**），保留 **98.93%** CPU 餘裕。 |
+| **SIMD 向量化 DSP 與 24-Bit 浮點編碼** | 雙聲道 `__m128d` 2-lane SSE2 雙二階濾波器（Biquad）、1024 樣本分塊複數相量遞迴 LFO、32-tap 四階 Blackman-Harris（-92 dB 阻帶）向量化 Sinc 重取樣、8 路向量化 WSOLA 時間伸縮與 `opus_encode_float`（24-bit 浮點動態範圍 + `opus_pcm_soft_clip` 軟削波）。 | 全開 8 階音效濾鏡每 20 ms 音框僅需 **38.8 µs**（即時速度的 **516 倍**），消除 16-bit 量化雜訊與等化器大增益破音。 |
 | **無鎖原子與零拷貝快取** | `Singleflight` 合併相同查詢的併發上游請求；解析快取直接共享不可變 `Arc<LoadResult>` 與 `Arc<str>` 鍵，CPU 負載與統計計數全面採用無鎖 `AtomicU64`。 | 100 首播放清單快取命中僅 **43.3 ns**（較傳統 JSON 重複解析快 **4,944 倍**）。 |
 | **密碼學衛生與防禦縱深** | RFC 9420 OpenMLS（P-256）實作 Discord DAVE v1 E2EE，拒絕未驗證外部發送者與過早明文降級；密碼採 `subtle` 常數時間比對，MLS/RTP 金鑰與設定憑證實作 `ZeroizeOnDrop`。 | 金鑰卸載即自 RAM 清零；全鏈路具備 DNS/IP 與代理目標雙層 SSRF 私網攔截及日誌／Webhook 敏感網址自動遮罩。 |
 | **單一原生執行檔** | 全工作區 11 個 Crate 編譯為單一 **~9.7 MiB** 原生二進位檔，設定檔採 `deny_unknown_fields` 嚴格校驗與零中間樹（Zero-`Value`）序列化。 | 秒級冷啟動、極低容器映像體積，部署不需維護任何腳本執行環境。 |
@@ -110,11 +110,11 @@
 - **控制平面與 SDK**：`/api/v1` REST API、常數時間 Bearer 驗證、每工作階段專屬 WebSocket 事件流、斷線自動續傳（Session Resume），以及非同步強型別客戶端 `rustlink-client`。
 - **次世代 Discord 語音與 E2EE**：完整支援 Discord Voice Gateway v8、UDP IP 探索、**DAVE v1（OpenMLS）端對端加密**、`aead_aes256_gcm_rtpsize` 與 `aead_xchacha20_poly1305_rtpsize` 傳輸加密。
 - **多平台原生音源解析**：
-  - **YouTube / YouTube Music**：純 Rust 原生 InnerTube 多用戶端健康度自適應備援（`IOS_PRODUCER` + 自動引導匿名 `visitorData` 的 `VISIONOS` + 尾端區間防截斷校驗）、預解析串流快取（零重複 `/player` 呼叫）、512 KiB 分段串流、48 kHz Opus 零轉碼直通、壓縮封包快轉定位與 `?t=` 時間戳連結支援，完全不依賴 `yt-dlp`。
+  - **YouTube / YouTube Music**：純 Rust 原生 InnerTube 多用戶端健康度自適應備援（首選自動引導匿名 `visitorData` 的 `VISIONOS` 取得原生 48 kHz WebM Opus `itag 251`，搭配 `IOS_PRODUCER` 即時備援 + 尾端區間防截斷校驗）、預解析串流快取（零重複 `/player` 呼叫）、512 KiB 分段搭配 2 MiB 背景預讀無斷音串流、48 kHz Opus 零轉碼直通、壓縮封包快轉定位與 `?t=` 時間戳連結支援，完全不依賴 `yt-dlp`。
   - **SoundCloud**：原生 API v2 解析、漸進式串流與 `client_id` 自動快取輪替。
   - **Spotify / Deezer**：官方中繼資料擷取 + ISRC 優先雙向詞彙精準比對至可播放音源。
   - **Direct HTTP / HTTPS**：支援 MP3（ID3v2）、FLAC、Ogg Opus/Vorbis、MP4/M4A、WebM/Matroska、WAV 標頭探測與嚴格 SSRF 防護。
-- **高傳真音訊引擎與 10 種即時濾鏡**：Symphonia + 原生 WebM/MP4/Ogg Opus 解碼、ITU-R 多聲道立體聲混音、無爆音即時平滑切換 10 種濾鏡（`volume`、15 段 `equalizer`、`karaoke`、`timescale`、`tremolo`、`vibrato`、`rotation`、`distortion`、`channelMix`、`lowPass`）。
+- **高傳真音訊引擎與 10 種即時濾鏡**：Symphonia + 原生 WebM/MP4/Ogg Opus 解碼、32-tap Blackman-Harris 重取樣、24-bit 浮點 `opus_encode_float` + `opus_pcm_soft_clip` 軟削波、ITU-R 多聲道立體聲混音、無爆音即時平滑切換 10 種濾鏡（`volume`、15 段 `equalizer`、`karaoke`、`timescale`、`tremolo`、`vibrato`、`rotation`、`distortion`、`channelMix`、`lowPass`）。
 - **同步歌詞與生產級可觀測性**：內建 LRCLIB 與 YouTube Music 時間軸歌詞擷取（位元組上限 LRU 快取）、客戶端 IP 權杖桶限流、Prometheus `/metrics` 指標、每日自動輪替日誌與 Discord Embed / 通用 Webhook 通知。
 
 ---
@@ -157,7 +157,7 @@ cargo run -p rustlink-discord-bot --example slash
 機器人連線時會透過 `Gateway::connect_with_messages` 自動偵測權限：若已在 Discord Developer Portal 開啟 `Message Content Intent`，在頻道直接貼連結即可自動開播；若未開啟該特權 Intent（4014），會自動無縫退回免特權模式，`/play` 與 `@Bot <連結>` 仍可正常運作，絕不崩潰。
 
 > [!IMPORTANT]
-> **關於 YouTube 機器人驗證與一分鐘斷音防護**：Rustlink 完全不使用 `yt-dlp`，改以純 Rust 原生 `IOS_PRODUCER` 與自動引導匿名 `visitorData` 的 `VISIONOS` 雙主力用戶端繞過「Sign in to confirm you're not a bot」，並對未附 PO token 的後備用戶端執行尾端位元組預檢以杜絕播約一分鐘（~900 KiB）後 403 斷音。若高風控雲端機房 IP 仍受限，可在設定檔配置 `youtubeProxy` 將 YouTube 流量導向代理伺服器，詳見 [YouTube 指南](docs/youtube.md)。
+> **關於 YouTube 機器人驗證與一分鐘斷音防護**：Rustlink 完全不使用 `yt-dlp`，改以純 Rust 原生自動引導匿名 `visitorData` 的 `VISIONOS`（優先提供原生 48 kHz WebM Opus `itag 251` 零轉碼直通）與 `IOS_PRODUCER` 雙主力用戶端繞過「Sign in to confirm you're not a bot」，搭配 2 MiB 背景預讀緩衝與尾端位元組預檢杜絕分段續傳卡頓及播約一分鐘（~900 KiB）後 403 斷音。若高風控雲端機房 IP 仍受限，可在設定檔配置 `youtubeProxy` 將 YouTube 流量導向代理伺服器，詳見 [YouTube 指南](docs/youtube.md)。
 
 ---
 

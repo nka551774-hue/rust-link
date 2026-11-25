@@ -86,8 +86,13 @@ pub fn visionos_client() -> Client {
 }
 
 /// The clients tried in order.
+///
+/// `VISIONOS` leads because it serves native 48 kHz WebM Opus (`itag 251`,
+/// ~160 kbps VBR) for bit-exact zero-transcode passthrough to Discord, while
+/// `IOS_PRODUCER` stands right behind as an instant sessionless AAC-LC fallback.
 pub fn clients(config: &Config) -> [Client; 4] {
     [
+        visionos_client(),
         Client {
             name: "IOS_PRODUCER",
             // Serves whole files with no proof of origin and no visitor session,
@@ -103,7 +108,6 @@ pub fn clients(config: &Config) -> [Client; 4] {
             needs_visitor_data: false,
             throttled_without_pot: false,
         },
-        visionos_client(),
         Client {
             name: "ANDROID_VR",
             // Serves whole files with no proof of origin to an address YouTube
@@ -1145,7 +1149,7 @@ fn pick_format(answer: &Value) -> Option<Format> {
         url: &'a str,
         mime: &'a str,
         bitrate: i64,
-        rank: (bool, bool, bool, bool, bool, i64),
+        rank: (bool, bool, bool, bool, bool, u8, i64),
     }
 
     fn select<'a>(formats: &'a [Value], audio_only: bool) -> Option<Candidate<'a>> {
@@ -1185,7 +1189,17 @@ fn pick_format(answer: &Value) -> Option<Format> {
                 .unwrap_or(true);
             let he_aac = mime_contains(mime, b"mp4a.40.5") || mime_contains(mime, b"mp4a.40.29");
             let drc = entry.get("isDrc").and_then(Value::as_bool).unwrap_or(false);
-            let rank = (!dubbed, original, default_track, !he_aac, !drc, bitrate);
+            // Prefer lossless FLAC first, then native 48 kHz Opus (which passes
+            // straight to Discord without resampling or second-generation lossy
+            // transcoding), over 44.1 kHz AAC/Vorbis.
+            let codec_tier = if mime_contains(mime, b"flac") {
+                3
+            } else if mime_contains(mime, b"opus") {
+                2
+            } else {
+                1
+            };
+            let rank = (!dubbed, original, default_track, !he_aac, !drc, codec_tier, bitrate);
             if best.is_some_and(|held| held.rank >= rank) {
                 continue;
             }
@@ -1592,10 +1606,10 @@ mod tests {
             request += 1;
             assert_eq!(body["videoId"], "1CXveaq_vFU");
             if request == 1 {
-                assert_eq!(body["context"]["client"]["clientName"], "IOS_PRODUCER");
+                assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
                 json!({"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"client refused"}})
             } else {
-                assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
+                assert_eq!(body["context"]["client"]["clientName"], "IOS_PRODUCER");
                 json!({"playabilityStatus":{"status":"OK"},"videoDetails":{
                     "videoId":"1CXveaq_vFU","title":"Shared video","author":"Artist","lengthSeconds":"180"
                 }})
@@ -1657,16 +1671,16 @@ mod tests {
             );
             assert_eq!(headers["X-Media-Fixture"], "preserved");
             if opened == 1 {
-                assert!(url.ends_with("/IOS_PRODUCER"));
+                assert!(url.ends_with("/VISIONOS"));
                 Err(SourceError::Media { status: 403 })
             } else {
-                assert!(url.ends_with("/VISIONOS"));
-                assert!(headers["User-Agent"].contains("AppleWebKit/605.1.15"));
+                assert!(url.ends_with("/IOS_PRODUCER"));
+                assert!(headers["User-Agent"].contains("com.google.ios.youtubeproducer/"));
                 Ok(url)
             }
         });
         server.join().unwrap();
-        assert!(result.unwrap().ends_with("/VISIONOS"));
+        assert!(result.unwrap().ends_with("/IOS_PRODUCER"));
         assert_eq!(opened, 2);
     }
 
@@ -1762,7 +1776,7 @@ mod tests {
             );
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(Value::as_str),
-                Some("IOS_PRODUCER")
+                Some("VISIONOS")
             );
             assert_eq!(
                 body.pointer("/serviceIntegrityDimensions/poToken").and_then(Value::as_str),
@@ -1886,12 +1900,12 @@ mod tests {
     fn an_audio_only_format_is_preferred_over_a_progressive_one() {
         let answer = json!({"streamingData": {"adaptiveFormats": [
             {"mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"", "url": "https://a", "bitrate": 900000},
-            {"mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "url": "https://b", "bitrate": 128000},
-            {"mimeType": "audio/webm; codecs=\"opus\"", "url": "https://c", "bitrate": 160000}
+            {"mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "url": "https://b", "bitrate": 135000},
+            {"mimeType": "audio/webm; codecs=\"opus\"", "url": "https://c", "bitrate": 129000}
         ]}});
         let picked = pick_format(&answer).unwrap();
         assert_eq!(picked.url, "https://c");
-        assert_eq!(picked.bitrate, 160_000);
+        assert_eq!(picked.bitrate, 129_000);
     }
 
     #[test]
@@ -1958,9 +1972,10 @@ mod tests {
         let config = Config::default();
         let clients = clients(&config);
         let names: Vec<_> = clients.iter().map(|client| client.name).collect();
-        assert_eq!(names, ["IOS_PRODUCER", "VISIONOS", "ANDROID_VR", "ANDROID"]);
-        assert_eq!(clients[1].version, "0.1");
-        assert!(clients[1].needs_visitor_data);
+        assert_eq!(names, ["VISIONOS", "IOS_PRODUCER", "ANDROID_VR", "ANDROID"]);
+        assert_eq!(clients[0].version, "0.1");
+        assert!(clients[0].needs_visitor_data);
+        assert_eq!(clients[1].version, "0.147.945");
         assert_eq!(clients[2].version, "1.60.19");
         assert!(clients[2].user_agent.contains("oculus/1.60.19 "));
         assert_eq!(catalogue_client(&config).name, "ANDROID");
@@ -1981,13 +1996,13 @@ mod tests {
         let (base, server) = crate::test_http::serve(2, move |_, headers, body| {
             request += 1;
             if request == 1 {
-                assert_eq!(body["context"]["client"]["clientName"], "IOS_PRODUCER");
+                assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
                 json!({
                     "responseContext": {"visitorData": "tainted-visitor"},
                     "playabilityStatus": {"status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"}
                 })
             } else {
-                assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
+                assert_eq!(body["context"]["client"]["clientName"], "IOS_PRODUCER");
                 assert!(!headers.to_ascii_lowercase().contains("tainted-visitor"));
                 assert!(body["context"]["client"].get("visitorData").is_none());
                 json!({
@@ -2228,7 +2243,7 @@ mod tests {
         let chosen = catalog
             .with_media_url("1CXveaq_vFU", |url, _| {
                 attempts.push(url.clone());
-                if url.ends_with("/IOS_PRODUCER") {
+                if url.ends_with("/VISIONOS") {
                     Err(SourceError::Media { status: 403 })
                 } else {
                     Ok(url)
@@ -2236,25 +2251,25 @@ mod tests {
             })
             .unwrap();
         server.join().unwrap();
-        assert_eq!(attempts, ["https://cdn.example/IOS_PRODUCER", "https://cdn.example/VISIONOS"]);
-        assert_eq!(chosen, "https://cdn.example/VISIONOS");
+        assert_eq!(attempts, ["https://cdn.example/VISIONOS", "https://cdn.example/IOS_PRODUCER"]);
+        assert_eq!(chosen, "https://cdn.example/IOS_PRODUCER");
     }
 
     #[test]
     fn client_health_promotes_healthy_identities_while_retaining_cooled_down_fallbacks() {
         let state = CatalogState::default();
         let config = Config::default();
-        state.youtube_health.record_failure("IOS_PRODUCER");
+        state.youtube_health.record_failure("VISIONOS");
         let partitioned =
             state.youtube_health.partition_clients(clients(&config), |client| client.name);
         let names: Vec<_> = partitioned.iter().map(|c| c.name).collect();
-        assert_eq!(names, ["VISIONOS", "ANDROID_VR", "ANDROID", "IOS_PRODUCER"]);
+        assert_eq!(names, ["IOS_PRODUCER", "ANDROID_VR", "ANDROID", "VISIONOS"]);
 
-        state.youtube_health.record_success("IOS_PRODUCER");
+        state.youtube_health.record_success("VISIONOS");
         let restored =
             state.youtube_health.partition_clients(clients(&config), |client| client.name);
         let restored_names: Vec<_> = restored.iter().map(|c| c.name).collect();
-        assert_eq!(restored_names, ["IOS_PRODUCER", "VISIONOS", "ANDROID_VR", "ANDROID"]);
+        assert_eq!(restored_names, ["VISIONOS", "IOS_PRODUCER", "ANDROID_VR", "ANDROID"]);
     }
 
     #[test]

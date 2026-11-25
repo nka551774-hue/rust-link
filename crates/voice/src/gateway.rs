@@ -25,7 +25,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a DAVE session waits for a welcome before deciding it is alone.
 const ALONE_GRACE: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const COMMAND_CAPACITY: usize = 32;
+const COMMAND_CAPACITY: usize = 64;
 /// Slots of the command queue that audio frames never take. Speaking and Close
 /// always find room there, however far behind the gateway task is.
 const CONTROL_RESERVE: usize = 4;

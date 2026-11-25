@@ -32,7 +32,7 @@ use rustlink_protocol::{Track, TrackInfo};
 use url::Url;
 
 pub use media::MediaBody;
-use media::{request, MediaRange};
+use media::{request, MediaRange, PrefetchReader};
 pub use rustlink_protocol::LoadResult;
 
 /// What went wrong while resolving a track.
@@ -624,7 +624,7 @@ impl Service {
                 self.with_budget(|| {
                     let range = MediaRange::for_url(uri);
                     let body = MediaBody::open(self.agent.clone(), uri, Default::default(), range)?;
-                    Ok(Box::new(body) as Box<dyn Read + Send>)
+                    Ok(PrefetchReader::boxed(body))
                 })
             }
             "spotify" | "deezer" => {
@@ -689,7 +689,7 @@ impl Service {
                         .with_media_url(&track.metadata.identifier, |url, headers| {
                             let range = MediaRange::for_url(&url);
                             let body = MediaBody::open(agent.clone(), url, headers, range)?;
-                            Ok(Box::new(body) as Box<dyn Read + Send>)
+                            Ok(PrefetchReader::boxed(body))
                         })
                 }
                 "soundcloud" if self.config.soundcloud_native => {
@@ -698,7 +698,7 @@ impl Service {
                         .and_then(|(url, headers)| {
                             let range = MediaRange::for_url(&url);
                             let body = MediaBody::open(self.agent.clone(), url, headers, range)?;
-                            Ok(Box::new(body) as Box<dyn Read + Send>)
+                            Ok(PrefetchReader::boxed(body))
                         })
                 }
                 source => Err(SourceError::Disabled(format!("{source} native source is disabled"))),
@@ -1140,8 +1140,8 @@ mod tests {
         let cdn = format!("http://{}", listener.local_addr().unwrap());
         let media_server = std::thread::spawn(move || {
             for (path, expected_agent, response) in [
-                ("/blocked", "com.google.ios.youtubeproducer/", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                ("/allowed", "applewebkit/605.1.15", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
+                ("/blocked", "applewebkit/605.1.15", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                ("/allowed", "com.google.ios.youtubeproducer/", "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nConnection: close\r\n\r\nabc"),
             ] {
                 let until = Instant::now() + Duration::from_secs(5);
                 let (mut socket, _) = loop {
@@ -1184,7 +1184,7 @@ mod tests {
                 }});
             }
             let (client, path) =
-                if call == 2 { ("IOS_PRODUCER", "/blocked") } else { ("VISIONOS", "/allowed") };
+                if call == 2 { ("VISIONOS", "/blocked") } else { ("IOS_PRODUCER", "/allowed") };
             assert_eq!(
                 body.pointer("/context/client/clientName").and_then(serde_json::Value::as_str),
                 Some(client)

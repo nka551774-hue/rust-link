@@ -12,20 +12,21 @@
 
 use crate::dsp::CHANNELS;
 
-/// Taps of the window when the rate is not being lowered. Sixteen is enough that
-/// the error sits below the noise floor of the Opus encoder that follows.
-const TAPS: usize = 16;
+/// Taps of the window when the rate is not being lowered. Thirty-two taps with a
+/// 4-term Blackman-Harris window keep high-frequency passband air up to ~20 kHz
+/// while pushing stopband aliasing below -92 dB.
+const TAPS: usize = 32;
 
 /// The widest half-window a resampler may use. Lowering the rate narrows the
 /// filter's cutoff, and a narrower cutoff needs proportionally more taps to keep
 /// its stopband; this bounds that at a ratio of 32 to 1.
-const MAX_HALF: usize = 256;
+const MAX_HALF: usize = 512;
 
 /// The bytes a weight table may take, which bounds how many phases it holds.
-const MAX_TABLE_BYTES: usize = 128 * 1024;
+const MAX_TABLE_BYTES: usize = 256 * 1024;
 
 /// The longest period a weight table may repeat over. A table is 128 bytes per
-/// phase, so this bounds one resampler at 128 KiB.
+/// phase (32 `f32` weights), so 1024 phases remain comfortably bounded.
 const MAX_PHASES: usize = 1024;
 
 /// Converts an interleaved stereo stream from one rate to another.
@@ -465,14 +466,14 @@ fn sinc(x: f64) -> f64 {
     }
 }
 
-/// A Blackman window, which trades a slightly wider transition for stopband
-/// attenuation well past what audio needs.
+/// A minimum 4-term Blackman-Harris window (~92 dB sidelobe rejection), suppressing
+/// stopband imaging far below audible and 16-bit quantisation thresholds.
 fn window(x: f64) -> f64 {
     if x.abs() >= 1.0 {
         return 0.0;
     }
     let p = std::f64::consts::PI * (x + 1.0);
-    0.42 - 0.5 * p.cos() + 0.08 * (2.0 * p).cos()
+    0.35875 - 0.48829 * p.cos() + 0.14128 * (2.0 * p).cos() - 0.01168 * (3.0 * p).cos()
 }
 
 /// Where the tap at `tap_index` sits relative to the read position, in input
@@ -895,9 +896,18 @@ mod tests {
         let mut out = Vec::new();
         let produced = resampler.produce(8192, &mut out);
         // Half of each side of the window is held back as lookahead until the
-        // stream ends: 16 input frames at this ratio, so 8 fewer output frames
-        // than the whole of the input would give.
-        assert!((produced as i64 - 4088).abs() <= 2, "produced {produced}");
+        // stream ends: `TAPS` input frames at this ratio, so `TAPS / 2` fewer
+        // output frames than the whole of the input would give.
+        let expected = 4096 - (TAPS / 2) as i64;
+        assert!((produced as i64 - expected).abs() <= 2, "produced {produced}");
+    }
+
+    #[test]
+    fn upsampling_cd_audio_preserves_high_passband_and_deep_stopband() {
+        let air = tone_gain(44_100.0, 44_100.0 / 48_000.0, 18_000.0);
+        assert!((0.97..1.02).contains(&air), "18 kHz passband gain was {air:.5}");
+        let deep_stop = tone_gain(192_000.0, 4.0, 48_000.0);
+        assert!(deep_stop < 0.000_05, "48 kHz stopband gain was {deep_stop:.7}");
     }
 
     #[test]

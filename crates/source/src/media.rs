@@ -636,6 +636,106 @@ impl Read for MediaBody {
     }
 }
 
+/// Read-ahead chunk size handed between the background HTTP worker and decoder.
+const PREFETCH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Maximum buffered chunks (~2 MiB total, ~100 seconds of 160 kbps Opus audio),
+/// isolating the real-time 20 ms audio thread from CDN range-continuation RTTs.
+const PREFETCH_QUEUE_CHUNKS: usize = 32;
+
+enum PrefetchItem {
+    Data(Vec<u8>),
+    Error(io::Error),
+}
+
+/// Decouples blocking HTTP/TLS range continuations from the real-time playback
+/// thread while recycling chunk buffers for zero steady-state heap allocations.
+pub(crate) struct PrefetchReader {
+    data_rx: std::sync::mpsc::Receiver<PrefetchItem>,
+    recycle_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    current: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+impl PrefetchReader {
+    pub(crate) fn boxed(body: MediaBody) -> Box<dyn Read + Send> {
+        if body.is_empty() {
+            return Box::new(io::empty());
+        }
+        let (body_tx, body_rx) = std::sync::mpsc::sync_channel::<MediaBody>(1);
+        let (data_tx, data_rx) = std::sync::mpsc::sync_channel(PREFETCH_QUEUE_CHUNKS);
+        let (recycle_tx, recycle_rx) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(PREFETCH_QUEUE_CHUNKS);
+        let spawned =
+            std::thread::Builder::new().name("rustlink-prefetch".into()).spawn(move || {
+                let Ok(mut body) = body_rx.recv() else {
+                    return;
+                };
+                loop {
+                    let mut chunk = recycle_rx
+                        .try_recv()
+                        .unwrap_or_else(|_| Vec::with_capacity(PREFETCH_CHUNK_BYTES));
+                    chunk.resize(PREFETCH_CHUNK_BYTES, 0);
+                    match body.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            chunk.truncate(read);
+                            if data_tx.send(PrefetchItem::Data(chunk)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = data_tx.send(PrefetchItem::Error(error));
+                            break;
+                        }
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                let _ = body_tx.send(body);
+                Box::new(Self { data_rx, recycle_tx, current: Vec::new(), pos: 0, done: false })
+            }
+            // Fall back to direct synchronous reading if OS thread creation is exhausted.
+            Err(_) => Box::new(body),
+        }
+    }
+}
+
+impl Read for PrefetchReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.done {
+            return Ok(0);
+        }
+        if self.pos >= self.current.len() {
+            let previous = std::mem::take(&mut self.current);
+            if previous.capacity() >= PREFETCH_CHUNK_BYTES {
+                let _ = self.recycle_tx.try_send(previous);
+            }
+            self.pos = 0;
+            match self.data_rx.recv() {
+                Ok(PrefetchItem::Data(chunk)) => {
+                    self.current = chunk;
+                }
+                Ok(PrefetchItem::Error(error)) => {
+                    self.done = true;
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let available = &self.current[self.pos..];
+        let count = available.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&available[..count]);
+        self.pos += count;
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,5 +1081,58 @@ mod tests {
             server.join().unwrap();
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn prefetch_reader_hides_segment_latency_and_propagates_midstream_errors() {
+        let chunks = vec![vec![7u8; 32 * 1024], vec![9u8; 32 * 1024], vec![11u8; 1024]];
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let (body, server) = segmented_fixture(chunks, expected.len());
+        let mut reader = PrefetchReader::boxed(body);
+        let mut actual = Vec::with_capacity(expected.len());
+        let mut small = [0u8; 4096];
+        loop {
+            let n = reader.read(&mut small).unwrap();
+            if n == 0 {
+                break;
+            }
+            actual.extend_from_slice(&small[..n]);
+        }
+        server.join().unwrap();
+        assert_eq!(actual, expected);
+
+        struct FailAfterFirst {
+            sent: bool,
+        }
+        impl Read for FailAfterFirst {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    buf[..4].copy_from_slice(b"data");
+                    return Ok(4);
+                }
+                Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt"))
+            }
+        }
+        let failing_body = MediaBody {
+            agent: netguard::agent(true),
+            origin_url: "http://127.0.0.1:1/unused".into(),
+            url: "http://127.0.0.1:1/unused".into(),
+            headers: Default::default(),
+            provider_headers: false,
+            range: MediaRange::OpenEnded,
+            reader: Some(Box::new(FailAfterFirst { sent: false })),
+            offset: 0,
+            response_start: 0,
+            size: 100,
+            attempts: 0,
+            validator: None,
+        };
+        let mut prefetched = PrefetchReader::boxed(failing_body);
+        let mut head = [0u8; 4];
+        prefetched.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"data");
+        let err = prefetched.read(&mut head).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -63,19 +63,19 @@ async fn play_youtube_url(
 
 | 順序 | 用戶端 | 說明 |
 | --- | --- | --- |
-| 1 | `IOS_PRODUCER 0.147.945` | 免 PO token、免登入即可穩定取得完整長度的 AAC-LC（itag 140） |
-| 2 | `VISIONOS 0.1` | 自動透過 `/youtubei/v1/visitor_id`（與 `/sw.js_data` 後備）引導並快取匿名 `visitorData`，提供高音質 WebM Opus（itag 251）與 AAC-LC；若快取憑證遭機器人驗證攔截會自動失效重取一次 |
+| 1 | `VISIONOS 0.1` | 自動透過 `/youtubei/v1/visitor_id`（與 `/sw.js_data` 後備）引導並快取匿名 `visitorData`，優先提供原生 48 kHz WebM Opus（itag 251，~160 kbps VBR）直通 Discord；若快取憑證遭機器人驗證攔截會自動失效重取一次 |
+| 2 | `IOS_PRODUCER 0.147.945` | 免 PO token、免登入即可穩定取得完整長度的 AAC-LC（itag 140）高速備援 |
 | 3 | `ANDROID_VR 1.60.19` | 精簡欄位備援用戶端 |
 | 4 | `ANDROID` | 版本可用 `youtubeClientVersion` 覆寫；未設定 `youtubePoToken` 且檔案大於 1 MiB 時，開啟串流前會先探測尾端 1 位元組確認未受 ~900 KiB 截斷限制 |
 
-搜尋與播放清單（含 Shorts 架位項目）優先使用 `ANDROID`，失敗時自動退回 `VISIONOS`；`RD…` 合輯清單若 `/browse` 無項目會自動改走 `/next` 面板解析。某個用戶端被要求「確認不是機器人」，或影音伺服器（googlevideo）回應 403／尾端截斷時，節點會記錄該用戶端的短期指數退避冷卻狀態，後續請求優先嘗試健康用戶端以省去無效往返，同時仍保留冷卻中用戶端作為最後防線。選音軌時優先非自動配音、原音、未動態壓縮與非 HE-AAC（優先 Opus 與 AAC-LC）的版本，再比較位元率。
+搜尋與播放清單（含 Shorts 架位項目）優先使用 `ANDROID`，失敗時自動退回 `VISIONOS`；`RD…` 合輯清單若 `/browse` 無項目會自動改走 `/next` 面板解析。某個用戶端被要求「確認不是機器人」，或影音伺服器（googlevideo）回應 403／尾端截斷時，節點會記錄該用戶端的短期指數退避冷卻狀態，後續請求優先嘗試健康用戶端以省去無效往返，同時仍保留冷卻中用戶端作為最後防線。選音軌時優先非自動配音、原音、未動態壓縮與非 HE-AAC，並依無損 FLAC、原生 48 kHz Opus（itag 251，免重取樣與免二次有損轉碼）、AAC-LC 編碼層級排序後再比較位元率。
 
 ### 極致低延遲串流與零轉碼音訊加速
 
 - **預解析串流快取（零重複 `/player` 呼叫）**：`resolve` 單曲時取得的 `streamingData` 會依影片 ID 與 `?expire=` 到期時間（預留 120 秒安全邊界，卸載時自動清零記憶體中的簽章網址）存入有界快取；緊接著 `play` 開播或中途 `seek` 快轉時直接開啟已快取的 CDN 串流，減少 50% InnerTube `/player` 請求並大幅縮短首幀出聲延遲。
 - **歌詞共用匿名 `visitorData`**：`rustlink-source` 與 `rustlink-lyrics` 共用同一份 `visitorData` 快取橋接器，播放時引導出的匿名憑證可直接供 YouTube Music 同步歌詞查詢重用。
-- **512 KiB 驗證分塊讀取**：googlevideo 音訊每次以經驗證的 **512 KiB** 有界區間分段讀取，下一段緊接上一段結尾並嚴格核對 `Content-Range` 位移、總長與強 `ETag`，將每首歌的 HTTP 往返次數降低 4 倍，同時避開開放區間遭拒絕的限制。
-- **48 kHz Opus 零轉碼直通與無縫濾鏡預熱切換**：當來源為 48 kHz Opus（如 `VISIONOS`／`ANDROID_VR` 的 WebM Opus `itag 251` 或 Ogg Opus）且音量為 100%、未啟用音效濾鏡時，引擎經 `opus_packet_parse` 驗證 20 ms 封包結構後直接送往 Discord RTP（實測每音框僅 **445.2 ns**，較解碼重編碼快 **441 倍**，完全保留原始無損音質）；若播放途中即時調整音量或等化器，引擎會以最近兩個封包預熱解碼器與編碼器 312 樣本前瞻視窗，達成零相位偏移、零爆音平滑切換。
+- **512 KiB 驗證分塊讀取與 2 MiB 背景預讀緩衝（`PrefetchReader` 零斷音）**：googlevideo 音訊每次以經驗證的 **512 KiB** 有界區間分段讀取並嚴格核對 `Content-Range` 與強 `ETag`；獨立背景預讀執行緒預先將後續分段讀入可循環重用的 64 KiB 緩衝池（上限 **2 MiB**，約 100 秒 Opus 音訊，穩態零堆積配置），搭配微秒級高精度排程器（Windows `winmm` 1 ms 計時粒度 + 尾端自旋對齊 + 5 ms 緩步追幀防爆衝）與加倍的語音閘道佇列餘裕，徹底隔離網路續傳延遲並杜絕播放途中的瞬時斷音。
+- **48 kHz Opus 零轉碼直通與 24-Bit 浮點高傳真管線**：預設首選 `VISIONOS` 取得原生 48 kHz WebM Opus（`itag 251`），當音量為 100% 且未啟用音效濾鏡時，引擎經 `opus_packet_parse` 驗證 20 ms 封包結構後直接送往 Discord RTP（實測每音框僅 **445.2 ns**，完全保留原始無損封包、零二次轉碼損耗）；若來源非 48 kHz 或播放途中即時調整音量／等化器，引擎透過最近兩個封包完成零相位預熱切換，並改由 **32-tap 四階 Blackman-Harris Sinc 重取樣**（阻帶抑制超過 -92 dB，完整保留 18–20 kHz 高頻細節）與 `libopus` 原生 **`opus_encode_float`（24-bit 浮點動態範圍 + `opus_pcm_soft_clip` 連續狀態軟削波）** 編碼，消除 16-bit 量化雜訊與大增益破音。
 - **壓縮封包層級快轉定位（Fast Compressed Seek）**：對 YouTube 串流執行 `seek` 時，解封裝層直接依封包時長跳過目標時間點前的壓縮封包，僅在目標前解碼收斂預熱視窗（Opus 為 RFC 7845 規範之 80 ms `SeekPreRoll`、AAC-LC 為 8 個 MDCT 音框），省去數分鐘無謂的 PCM 解碼運算。
 
 ## 被 YouTube 擋下時

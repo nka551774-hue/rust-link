@@ -87,6 +87,19 @@ extern "C" {
         data: *mut u8,
         max_data_bytes: OpusInt32,
     ) -> OpusInt32;
+    fn opus_encode_float(
+        st: *mut OpusEncoder,
+        pcm: *const f32,
+        frame_size: c_int,
+        data: *mut u8,
+        max_data_bytes: OpusInt32,
+    ) -> OpusInt32;
+    fn opus_pcm_soft_clip(
+        pcm: *mut f32,
+        frame_size: c_int,
+        channels: c_int,
+        softclip_mem: *mut f32,
+    );
     fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
 }
 
@@ -96,6 +109,7 @@ pub struct Encoder {
     state: NonNull<OpusEncoder>,
     buffer: Vec<u8>,
     lookahead: i32,
+    softclip_mem: [f32; crate::dsp::CHANNELS],
 }
 
 #[cfg(not(feature = "native-opus"))]
@@ -120,15 +134,21 @@ impl Encoder {
             }
             return Err(OpusError::Create(error));
         };
-        let mut encoder = Encoder { state, buffer: Vec::new(), lookahead: 0 };
+        let mut encoder = Encoder {
+            state,
+            buffer: Vec::new(),
+            lookahead: 0,
+            softclip_mem: [0.0; crate::dsp::CHANNELS],
+        };
         for (request, value) in [
             // Music, not speech, and variable bitrate so quiet passages spend fewer bits.
             (OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC),
             (OPUS_SET_VBR_REQUEST, 1),
             (OPUS_SET_VBR_CONSTRAINT_REQUEST, 0),
             (OPUS_SET_BITRATE_REQUEST, bitrate),
-            // 16-bit integer input lets libopus avoid spending bits below quantisation noise.
-            (OPUS_SET_LSB_DEPTH_REQUEST, 16),
+            // Full 24-bit floating-point precision lets libopus preserve delicate
+            // quiet-passage detail below the 16-bit (-96 dBFS) quantisation floor.
+            (OPUS_SET_LSB_DEPTH_REQUEST, 24),
             (OPUS_SET_COMPLEXITY_REQUEST, complexity),
             // Request the same loss allowance as the FFmpeg path.
             (OPUS_SET_INBAND_FEC_REQUEST, 1),
@@ -203,6 +223,63 @@ impl Encoder {
         Ok(())
     }
 
+    /// Encodes one valid Opus frame size of 32-bit floating-point interleaved
+    /// stereo PCM directly into `out`, sanitising non-finite samples and applying
+    /// `libopus`'s stateful C1-continuous soft clipper when DSP boosts exceed 0 dBFS.
+    #[inline]
+    pub fn encode_float_frame_size(
+        &mut self,
+        pcm: &mut [f32],
+        frame_samples: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), OpusError> {
+        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
+            || pcm.len() != frame_samples * crate::dsp::CHANNELS
+        {
+            return Err(OpusError::FrameSize);
+        }
+        for sample in pcm.iter_mut() {
+            *sample = crate::dsp::clean_f32(*sample).clamp(-16.0, 16.0);
+        }
+        out.clear();
+        out.reserve(MAX_PACKET);
+        // SAFETY: `pcm` holds `frame_samples * 2` valid finite `f32`s, `softclip_mem`
+        // holds 2 channel states, and `out` has `>= MAX_PACKET` writable spare bytes.
+        let written = unsafe {
+            opus_pcm_soft_clip(
+                pcm.as_mut_ptr(),
+                frame_samples as c_int,
+                crate::dsp::CHANNELS as c_int,
+                self.softclip_mem.as_mut_ptr(),
+            );
+            opus_encode_float(
+                self.state.as_ptr(),
+                pcm.as_ptr(),
+                frame_samples as c_int,
+                out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                MAX_PACKET as OpusInt32,
+            )
+        };
+        if written < 0 {
+            return Err(OpusError::Encode(written));
+        }
+        unsafe {
+            out.set_len(written as usize);
+        }
+        Ok(())
+    }
+
+    /// Encodes one 20 ms frame of 32-bit float stereo samples directly into `out`
+    /// with full 24-bit dynamic range and stateful soft-clipping protection.
+    #[inline]
+    pub fn encode_float_into(
+        &mut self,
+        pcm: &mut [f32],
+        out: &mut Vec<u8>,
+    ) -> Result<(), OpusError> {
+        self.encode_float_frame_size(pcm, FRAME_SAMPLES, out)
+    }
+
     /// Encodes one 20 ms frame of interleaved stereo samples directly into `out`,
     /// reusing `out`'s allocation without an intermediate copy or zero-fill.
     #[inline]
@@ -245,6 +322,30 @@ impl Encoder {
             return Err(OpusError::FrameSize);
         }
         Err(OpusError::Encode(-7))
+    }
+
+    #[inline]
+    pub fn encode_float_frame_size(
+        &mut self,
+        pcm: &mut [f32],
+        frame_samples: usize,
+        _out: &mut Vec<u8>,
+    ) -> Result<(), OpusError> {
+        if !matches!(frame_samples, 120 | 240 | 480 | 960 | 1920 | 2880)
+            || pcm.len() != frame_samples * crate::dsp::CHANNELS
+        {
+            return Err(OpusError::FrameSize);
+        }
+        Err(OpusError::Encode(-7))
+    }
+
+    #[inline]
+    pub fn encode_float_into(
+        &mut self,
+        pcm: &mut [f32],
+        out: &mut Vec<u8>,
+    ) -> Result<(), OpusError> {
+        self.encode_float_frame_size(pcm, FRAME_SAMPLES, out)
     }
 
     #[inline]
@@ -355,6 +456,24 @@ mod tests {
         fn invalid_controls_are_reported_instead_of_silently_using_defaults() {
             assert!(matches!(Encoder::new(192_000, 11), Err(OpusError::Control { .. })));
             assert!(matches!(Encoder::new(0, 10), Err(OpusError::Control { .. })));
+        }
+
+        #[test]
+        fn float_encoder_soft_clips_overshoots_and_sanitises_non_finite_samples() {
+            let mut encoder = Encoder::new(192_000, 10).expect("libopus is available");
+            let mut frame = [0.0f32; FRAME_SAMPLES_STEREO];
+            for i in 0..FRAME_SAMPLES {
+                let s =
+                    1.8 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin() as f32;
+                frame[i * 2] = s;
+                frame[i * 2 + 1] = s;
+            }
+            frame[0] = f32::NAN;
+            frame[1] = f32::INFINITY;
+            let mut out = Vec::new();
+            encoder.encode_float_into(&mut frame, &mut out).unwrap();
+            assert!(!out.is_empty() && out.len() < 1500);
+            assert!(frame.iter().all(|v| v.is_finite() && v.abs() <= 1.0001));
         }
     }
 }

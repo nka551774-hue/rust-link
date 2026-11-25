@@ -29,9 +29,83 @@ const FRAME_MILLIS: f64 = 20.0;
 /// How late a frame may be before the deficit counter notices.
 const LATE: Duration = Duration::from_millis(100);
 
+/// Minimum spacing between catch-up frames after a transient scheduler hiccup
+/// (`<= LATE`) so late ticks never flood Discord's UDP jitter buffer in 0 µs.
+const MIN_CATCHUP_GAP: Duration = Duration::from_millis(5);
+
 /// The stall threshold the node reports in a `track.stalled`. The engine
 /// applies the same limit, and a client is told what it was.
 const STUCK_MILLIS: i64 = 10_000;
+
+#[cfg(windows)]
+mod high_res_timer {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(uPeriod: u32) -> u32;
+        fn timeEndPeriod(uPeriod: u32) -> u32;
+    }
+
+    static ACTIVE_PUMPS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) struct Guard;
+
+    impl Guard {
+        pub(super) fn acquire() -> Self {
+            if ACTIVE_PUMPS.fetch_add(1, Ordering::AcqRel) == 0 {
+                // SAFETY: `timeBeginPeriod(1)` is thread-safe and requests 1 ms OS
+                // timer ticks instead of Windows' default 15.625 ms granularity.
+                unsafe {
+                    let _ = timeBeginPeriod(1);
+                }
+            }
+            Self
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if ACTIVE_PUMPS.fetch_sub(1, Ordering::AcqRel) == 1 {
+                // SAFETY: Balances `timeBeginPeriod(1)` when the last active pump exits.
+                unsafe {
+                    let _ = timeEndPeriod(1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod high_res_timer {
+    pub(super) struct Guard;
+
+    impl Guard {
+        pub(super) fn acquire() -> Self {
+            Self
+        }
+    }
+}
+
+/// Sleeps in the OS kernel for the bulk of the interval and spin-parks across
+/// the final sub-millisecond tail so 20 ms RTP frames fire with microsecond accuracy.
+#[inline]
+fn sleep_until_precise(deadline: Instant) {
+    const KERNEL_SLEEP_MARGIN: Duration = Duration::from_micros(1_200);
+    const YIELD_MARGIN: Duration = Duration::from_micros(150);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        if remaining > KERNEL_SLEEP_MARGIN {
+            std::thread::sleep(remaining - KERNEL_SLEEP_MARGIN);
+        } else if remaining > YIELD_MARGIN {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
 
 /// The connection frames are written to, and whether that connection has been
 /// told the node is speaking.
@@ -717,8 +791,10 @@ impl Player {
         tempo: f64,
         output: &mut VoiceOutput,
     ) {
+        let mut timer_guard = Some(high_res_timer::Guard::acquire());
         let mut position = position as f64;
         let mut next = Instant::now();
+        let mut last_send: Option<Instant> = None;
         // One packet buffer for the life of the pump: a player runs for hours,
         // and one frame is written here every twenty milliseconds.
         let mut frame = Vec::with_capacity(1500);
@@ -750,8 +826,11 @@ impl Player {
                         output.speaking = false;
                     }
                     drop(state);
+                    drop(timer_guard.take());
                     self.wait(generation);
+                    timer_guard = Some(high_res_timer::Guard::acquire());
                     next = Instant::now();
+                    last_send = None;
                     continue;
                 }
                 if let Some(set) = state.pending_filters.take() {
@@ -773,10 +852,11 @@ impl Player {
                 }
             }
             loop {
-                let wait = next.saturating_duration_since(Instant::now());
-                if !wait.is_zero() {
-                    thread::sleep(wait);
-                }
+                let target = match last_send {
+                    Some(prev) => next.max(prev + MIN_CATCHUP_GAP),
+                    None => next,
+                };
+                sleep_until_precise(target);
                 let started_track = {
                     let mut state = self.state.lock().unwrap();
                     if state.generation != generation || state.closed {
@@ -800,8 +880,11 @@ impl Player {
                             output.speaking = false;
                         }
                         drop(state);
+                        drop(timer_guard.take());
                         self.wait(generation);
+                        timer_guard = Some(high_res_timer::Guard::acquire());
                         next = Instant::now();
+                        last_send = None;
                         continue;
                     }
                     if !output.speaking {
@@ -835,6 +918,7 @@ impl Player {
                         self.finish(generation, Some(AudioError::Transport(error.to_string())));
                         return;
                     }
+                    last_send = Some(Instant::now());
                     self.counters.sent.fetch_add(1, Ordering::Relaxed);
                     position += FRAME_MILLIS * tempo;
                     state.body.state.position = position as i64;
@@ -848,6 +932,7 @@ impl Player {
                 if let Some(track) = started_track {
                     self.event("track.started", json!({ "track": track }));
                 }
+                let _ = &timer_guard;
                 break;
             }
             let frame_duration = Duration::from_millis(FRAME_MILLIS as u64);
@@ -1961,5 +2046,112 @@ mod tests {
         // Frame 1 stalled, triggering the deficit reset; frame 2 must be paced ~20ms later, not 0ms.
         let gap = stamps[2].saturating_duration_since(stamps[1]);
         assert!(gap >= Duration::from_millis(14), "frame after stall burst too early: {gap:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sub_threshold_hiccup_recovers_smoothly_without_zero_microsecond_packet_bursts() {
+        struct HiccupFrames {
+            index: usize,
+        }
+        impl Frames for HiccupFrames {
+            fn next_frame(&mut self, packet: &mut Vec<u8>) -> Result<bool, AudioError> {
+                match self.index {
+                    0 => {
+                        self.index += 1;
+                        packet.clear();
+                        packet.resize(8, 1);
+                        Ok(true)
+                    }
+                    1 => {
+                        self.index += 1;
+                        // 55 ms decode delay -> 35 ms late (<= LATE = 100 ms), so catch-up runs.
+                        std::thread::sleep(Duration::from_millis(55));
+                        packet.clear();
+                        packet.resize(8, 2);
+                        Ok(true)
+                    }
+                    2 | 3 => {
+                        self.index += 1;
+                        packet.clear();
+                        packet.resize(8, 3);
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+        }
+        struct HiccupEngine;
+        impl Engine for HiccupEngine {
+            fn start(
+                &self,
+                _: &Track,
+                _: i64,
+                _: i64,
+                _: &Object,
+            ) -> Result<Box<dyn Frames>, AudioError> {
+                Ok(Box::new(HiccupFrames { index: 0 }))
+            }
+        }
+        struct TimedConnection(Mutex<Vec<Instant>>);
+        impl Connection for TimedConnection {
+            fn write(&self, _: &[u8]) -> Result<(), VoiceError> {
+                self.0.lock().unwrap().push(Instant::now());
+                Ok(())
+            }
+            fn speaking(&self, _: bool) -> Result<(), VoiceError> {
+                Ok(())
+            }
+            fn connected(&self) -> bool {
+                true
+            }
+            fn ping(&self) -> i64 {
+                1
+            }
+            fn close(&self) {}
+        }
+        struct TimedFactory(Arc<TimedConnection>);
+        impl Factory for TimedFactory {
+            fn connect(
+                &self,
+                _: String,
+                _: String,
+                _: VoiceState,
+                _: rustlink_voice::CloseHandler,
+            ) -> futures_util::future::BoxFuture<'static, Result<Arc<dyn Connection>, VoiceError>>
+            {
+                let conn = Arc::clone(&self.0);
+                Box::pin(async move { Ok(conn as Arc<dyn Connection>) })
+            }
+        }
+        let writes = Arc::new(TimedConnection(Mutex::new(Vec::new())));
+        let (sender, events) = channel();
+        let player = Player::new(
+            "1".into(),
+            "10".into(),
+            Arc::new(Deps {
+                loader: Arc::new(FakeLoader),
+                engine: Arc::new(HiccupEngine),
+                voice: Arc::new(TimedFactory(Arc::clone(&writes))),
+            }),
+            Arc::new(move |e| {
+                let _ = sender.send(Value::Object(e));
+            }),
+            Arc::new(Counters::default()),
+        );
+        player
+            .update(
+                update(json!({ "track": { "token": sample().token }, "voice": voice() })),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for(&events, "track.ended");
+        let stamps = writes.0.lock().unwrap().clone();
+        assert_eq!(stamps.len(), 4);
+        let catchup_gap = stamps[2].saturating_duration_since(stamps[1]);
+        assert!(
+            catchup_gap >= Duration::from_millis(4),
+            "catch-up frame burst in {catchup_gap:?} instead of respecting MIN_CATCHUP_GAP"
+        );
     }
 }

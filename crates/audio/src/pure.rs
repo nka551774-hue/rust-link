@@ -41,7 +41,6 @@ pub struct PureFrames {
     staging_at: usize,
     /// Shared temporary PCM buffer for resampling/stretching stages.
     scratch: Vec<f32>,
-    pcm: [i16; FRAME_SAMPLES_STEREO],
     /// Source frames to discard before playback starts, which is how a seek is
     /// performed on a stream that cannot be seeked.
     skip: u64,
@@ -122,7 +121,6 @@ impl PureFrames {
             staging: Vec::new(),
             staging_at: 0,
             scratch: Vec::new(),
-            pcm: [0; FRAME_SAMPLES_STEREO],
             skip,
             passthrough,
             passthrough_count: 0,
@@ -186,10 +184,8 @@ impl PureFrames {
             .copy_from_slice(&next_pcm[..take_next * 2]);
         self.dsp.process_post(&mut prime);
 
-        let mut prime_i16 = [0i16; 480 * 2];
-        crate::opus::to_i16(&prime, &mut prime_i16);
         let mut discard = Vec::new();
-        self.encoder.encode_frame_size(&prime_i16, 480, &mut discard)?;
+        self.encoder.encode_float_frame_size(&mut prime, 480, &mut discard)?;
         self.encoded_any = true;
 
         if next_frames > take_next {
@@ -386,13 +382,19 @@ impl Frames for PureFrames {
         if take == 0 {
             return Ok(false);
         }
-        // Process post-DSP in place on `staging`, quantise directly into `pcm`,
-        // and zero-pad the final short frame's remainder.
+        // Process post-DSP in place on `staging` and feed 32-bit float samples
+        // straight into `opus_encode_float` (preserving full 24-bit dynamic range
+        // and stateful soft-clipping without 16-bit quantisation loss).
         let from = self.staging_at;
         let slice = &mut self.staging[from..from + take];
         self.dsp.process_post(slice);
-        crate::opus::to_i16(slice, &mut self.pcm[..take]);
-        self.pcm[take..].fill(0);
+        if take == FRAME_SAMPLES_STEREO {
+            self.encoder.encode_float_into(slice, packet)?;
+        } else {
+            let mut tail = [0.0f32; FRAME_SAMPLES_STEREO];
+            tail[..take].copy_from_slice(slice);
+            self.encoder.encode_float_into(&mut tail, packet)?;
+        }
         self.staging_at += take;
         // Walk the cursor back once what has been used outweighs what is left,
         // so the move happens every many frames rather than on every frame.
@@ -400,8 +402,6 @@ impl Frames for PureFrames {
             self.staging.drain(..self.staging_at);
             self.staging_at = 0;
         }
-        // Encode directly into the caller's packet buffer with zero extra copies.
-        self.encoder.encode_into(&self.pcm, packet)?;
         self.encoded_any = true;
         Ok(true)
     }
