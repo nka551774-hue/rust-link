@@ -34,9 +34,9 @@
 | `youtubeEndpoint` | `https://youtubei.googleapis.com` | InnerTube API 端點 |
 | `youtubeMusicEndpoint` | `https://music.youtube.com` | YouTube Music 搜尋與歌詞端點 |
 | `youtubeClientVersion` | 空 | 覆寫 `ANDROID` 用戶端版本（預設內建 `20.10.38`） |
-| `youtubePoTokenFile` | 空（初始範本為 `potoken.yaml`） | 獨立 PO Token 設定檔路徑（支援 YAML / JSON / 瀏覽器 `v1/player` 原始 Payload；存檔即自動免重啟熱載入，未填時自動探索同目錄 `potoken.{yaml,yml,json}`） |
+| `youtubePoTokenFile` | 空（初始範本為 `potoken.yaml`） | 獨立 PO Token 設定檔路徑（支援 YTDLnis `GVS`/`Player`/`Subs` YAML 或原文直貼、`mweb.gvs+...` 及瀏覽器 `v1/player` Payload；存檔即自動免重啟熱載入） |
 | `youtubeRequirePoToken` | `false`（初始範本為 `true`） | 強制所有 YouTube / YouTube Music 解析、串流與歌詞請求皆須帶入有效 `poToken` |
-| `youtubePoToken` / `youtubeVisitorData` | 空 | 內嵌或環境變數覆寫之 Proof-of-Origin Token 與 Visitor Data |
+| `youtubePoToken` / `youtubeGvsPoToken` / `youtubePlayerPoToken` / `youtubeVisitorData` | 空 | 內嵌或環境變數覆寫之 Proof-of-Origin Token（通用 / GVS / Player）與 Visitor Data |
 | `youtubeProxy` | 空 | 將所有 YouTube API 與音訊流量導向 `http(s)://`、`socks4(a)://` 或 `socks5(h)://` 代理；代理失敗時直接報錯不退回直連 |
 | `soundcloudNative` | `true` | 啟用 SoundCloud 公開 API 解析 |
 | `soundcloudApiEndpoint` / `soundcloudWebEndpoint` | 官方端點 | API 與抓取 `client_id` 的網頁端點 |
@@ -68,7 +68,7 @@
 
 - **節點與工具**：`RUSTLINK_ADDRESS`、`RUSTLINK_PASSWORD`、`RUSTLINK_FFMPEG`、`RUSTLINK_TOOLS_DIRECTORY`、`RUSTLINK_AUTO_DOWNLOAD`、`RUSTLINK_IN_PROCESS_AUDIO`、`RUSTLINK_LYRICS_SOURCE`
 - **日誌**：`RUSTLINK_LOG_LEVEL`、`RUSTLINK_LOG_FORMAT`、`RUSTLINK_LOG_COLOR`、`RUSTLINK_LOG_DIRECTORY`、`RUSTLINK_LOG_RETENTION_DAYS`
-- **YouTube**：`RUSTLINK_YOUTUBE_NATIVE`、`RUSTLINK_YOUTUBE_ENDPOINT`、`RUSTLINK_YOUTUBE_MUSIC_ENDPOINT`、`RUSTLINK_YOUTUBE_CLIENT_VERSION`、`RUSTLINK_YOUTUBE_PO_TOKEN_FILE`、`RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN`、`RUSTLINK_YOUTUBE_PO_TOKEN`、`RUSTLINK_YOUTUBE_VISITOR_DATA`、`RUSTLINK_YOUTUBE_PROXY`
+- **YouTube**：`RUSTLINK_YOUTUBE_NATIVE`、`RUSTLINK_YOUTUBE_ENDPOINT`、`RUSTLINK_YOUTUBE_MUSIC_ENDPOINT`、`RUSTLINK_YOUTUBE_CLIENT_VERSION`、`RUSTLINK_YOUTUBE_PO_TOKEN_FILE`、`RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN`、`RUSTLINK_YOUTUBE_PO_TOKEN`、`RUSTLINK_YOUTUBE_GVS_PO_TOKEN`、`RUSTLINK_YOUTUBE_PLAYER_PO_TOKEN`、`RUSTLINK_YOUTUBE_VISITOR_DATA`、`RUSTLINK_YOUTUBE_PROXY`
 - **其他音源**：`RUSTLINK_SOUNDCLOUD_NATIVE`、`RUSTLINK_SOUNDCLOUD_API_ENDPOINT`、`RUSTLINK_SOUNDCLOUD_WEB_ENDPOINT`、`RUSTLINK_SOUNDCLOUD_CLIENT_ID`、`RUSTLINK_SOUNDCLOUD_CLIENT_ID_TTL_SECONDS`、`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_MARKET`、`RUSTLINK_DEEZER_API_ENDPOINT`、`RUSTLINK_ALLOW_PRIVATE_NETWORKS`
 - **容量、限流與 Webhook**：`RUSTLINK_MAX_PLAYERS`、`RUSTLINK_MAX_SESSIONS`、`RUSTLINK_MAX_CONCURRENT_LOADS`、`RUSTLINK_MAX_PLAYLIST_TRACKS`、`RUSTLINK_SEARCH_RESULTS`、`RUSTLINK_CACHE_ENTRIES`、`RUSTLINK_CACHE_TTL_SECONDS`、`RUSTLINK_LOAD_TIMEOUT_SECONDS`、`RUSTLINK_PLAYER_UPDATE_SECONDS`、`RUSTLINK_STATS_SECONDS`、`RUSTLINK_EVENT_BUFFER`、`RUSTLINK_OPUS_BITRATE`、`RUSTLINK_OPUS_COMPLEXITY`、`RUSTLINK_RATELIMITS_ENABLE`、`RUSTLINK_WEBHOOK_ENABLE`、`RUSTLINK_WEBHOOK_URL`、`RUSTLINK_WEBHOOK_STATE_LATENCY_SECONDS`
 

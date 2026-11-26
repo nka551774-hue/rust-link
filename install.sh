@@ -277,11 +277,14 @@ apply_youtube_settings() {
             if [ -f "$SOURCE/potoken.yaml" ]; then
                 cp "$SOURCE/potoken.yaml" "$pot_file"
             else
-                printf '# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\npoToken: ""\nvisitorData: ""\n' >"$pot_file"
+                printf '# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\ngvsPoToken: ""\nplayerPoToken: ""\nsubsPoToken: ""\nvisitorData: ""\nplayerClient: "mweb"\n' >"$pot_file"
             fi
         )
     fi
-    [ -z "$PO_TOKEN" ] || set_yaml_single "$pot_file" poToken "$PO_TOKEN"
+    if [ -n "$PO_TOKEN" ]; then
+        set_yaml_single "$pot_file" gvsPoToken "$PO_TOKEN"
+        set_yaml_single "$pot_file" playerPoToken "$PO_TOKEN"
+    fi
     [ -z "$VISITOR_DATA" ] || set_yaml_single "$pot_file" visitorData "$VISITOR_DATA"
     chown "root:$SERVICE_GROUP" "$pot_file"
     chmod 0640 "$pot_file"

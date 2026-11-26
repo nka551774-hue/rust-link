@@ -955,8 +955,16 @@ async fn read_track_body(server: &Server, body: Body, path: &str) -> Result<Trac
 struct YoutubeTokensRequest {
     #[serde(default, alias = "poToken")]
     po_token: String,
+    #[serde(default, alias = "gvsPoToken")]
+    gvs_po_token: String,
+    #[serde(default, alias = "playerPoToken")]
+    player_po_token: String,
+    #[serde(default, alias = "subsPoToken")]
+    subs_po_token: String,
     #[serde(default, alias = "visitorData")]
     visitor_data: String,
+    #[serde(default, alias = "playerClient")]
+    player_client: String,
 }
 
 #[allow(clippy::result_large_err)]
@@ -964,10 +972,27 @@ async fn update_youtube(State(server): State<Arc<Server>>, body: Body) -> RouteR
     let path = "/api/v1/youtube";
     server.rate_limit(Route::UpdateYoutube, path)?;
     let req: YoutubeTokensRequest = read_body_json(&server, body, SMALL_BODY_LIMIT, path).await?;
+    let payload = if !req.gvs_po_token.is_empty()
+        || !req.player_po_token.is_empty()
+        || !req.subs_po_token.is_empty()
+        || !req.player_client.is_empty()
+    {
+        json!({
+            "poToken": req.po_token,
+            "gvsPoToken": req.gvs_po_token,
+            "playerPoToken": req.player_po_token,
+            "subsPoToken": req.subs_po_token,
+            "visitorData": req.visitor_data,
+            "playerClient": req.player_client,
+        })
+        .to_string()
+    } else {
+        req.po_token
+    };
     let (po_token_configured, visitor_data_configured) = server
         .deps
         .loader
-        .set_youtube_tokens(req.po_token, req.visitor_data)
+        .set_youtube_tokens(payload, req.visitor_data)
         .map_err(|e| server.fail(StatusCode::BAD_REQUEST, &e.to_string(), path))?;
     log::info!(
         "youtube runtime credentials updated poToken={} visitorData={}",

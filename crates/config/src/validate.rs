@@ -119,6 +119,8 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     for (name, value) in [
         ("youtubePoTokenFile", config.youtube_po_token_file.as_str()),
         ("youtubePoToken", config.youtube_po_token.as_str()),
+        ("youtubeGvsPoToken", config.youtube_gvs_po_token.as_str()),
+        ("youtubePlayerPoToken", config.youtube_player_po_token.as_str()),
         ("youtubeVisitorData", config.youtube_visitor_data.as_str()),
         ("soundcloudClientId", config.soundcloud_client_id.as_str()),
         ("spotifyClientId", config.spotify_client_id.as_str()),
@@ -157,12 +159,21 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-pub(crate) fn validate_youtube_tokens(pot: &str, vd: &str) -> Result<(), ConfigError> {
-    if has_control_bytes(pot) {
-        return invalid("youtubePoToken must not contain control characters");
+pub(crate) fn validate_po_tokens(tokens: &crate::PoTokens) -> Result<(), ConfigError> {
+    for (name, val) in [
+        ("gvsPoToken", tokens.gvs.as_str()),
+        ("playerPoToken", tokens.player.as_str()),
+        ("subsPoToken", tokens.subs.as_str()),
+    ] {
+        if has_control_bytes(val) || val.bytes().any(|b| b.is_ascii_whitespace()) {
+            return invalid(format!("{name} must not contain whitespace or control characters"));
+        }
     }
-    if has_control_bytes(vd) || !is_printable_ascii(vd) {
+    if has_control_bytes(&tokens.visitor_data) || !is_printable_ascii(&tokens.visitor_data) {
         return invalid("youtubeVisitorData must contain only printable ASCII characters");
+    }
+    if has_control_bytes(&tokens.player_client) || !is_printable_ascii(&tokens.player_client) {
+        return invalid("playerClient must contain only printable ASCII characters");
     }
     Ok(())
 }

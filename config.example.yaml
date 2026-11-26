@@ -24,6 +24,8 @@ youtubeClientVersion: ""
 youtubePoTokenFile: potoken.yaml           # dedicated PO token config (auto-reloaded on save)
 youtubeRequirePoToken: true                # always route YouTube through poToken
 youtubePoToken: ""
+youtubeGvsPoToken: ""
+youtubePlayerPoToken: ""
 youtubeVisitorData: ""
 youtubeProxy: ""                           # http://, https://, socks4://, socks5://, socks5h://
 

@@ -43,10 +43,12 @@ ENV_VD=${RUSTLINK_YOUTUBE_VISITOR_DATA-__unset__}
 
 yaml_single() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
 write_potoken_file() {
+    local p
+    p=$(yaml_single "$1")
     (
         umask 077
-        printf '# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\npoToken: %s\nvisitorData: %s\n' \
-            "$(yaml_single "$1")" "$(yaml_single "$2")" > "$POTOKEN_FILE"
+        printf '# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\n# Supports YTDLnis (gvsPoToken / playerPoToken / subsPoToken / visitorData / playerClient) or raw YTDLnis paste.\ngvsPoToken: %s\nplayerPoToken: %s\nsubsPoToken: '"''"'\nvisitorData: %s\nplayerClient: '"'mweb'"'\n' \
+            "$p" "$p" "$(yaml_single "$2")" > "$POTOKEN_FILE"
     )
 }
 

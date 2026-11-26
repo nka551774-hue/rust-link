@@ -82,6 +82,8 @@ define_config! {
     [plain] youtube_po_token_file: String = String::new();
     [plain] youtube_require_po_token: bool = false;
     [secret] youtube_po_token: String = String::new();
+    [secret] youtube_gvs_po_token: String = String::new();
+    [secret] youtube_player_po_token: String = String::new();
     [secret] youtube_visitor_data: String = String::new();
     [secret] youtube_proxy: String = String::new();
     [plain, d_sc_native = "d_sc_native"] soundcloud_native: bool = true;
@@ -262,10 +264,13 @@ pub fn discover_potoken(base_dir: Option<&Path>) -> Option<PathBuf> {
 
 pub const fn starter_potoken() -> &'static str {
     "# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).\n\
-     # Copy serviceIntegrityDimensions.poToken and context.client.visitorData from a browser\n\
-     # F12 Network -> v1/player request on https://music.youtube.com or https://www.youtube.com.\n\
-     poToken: \"\"\n\
-     visitorData: \"\"\n"
+     # Supports YTDLnis (GVS / Player / Subs / Visitor Data / Player Client), single poToken,\n\
+     # or pasting raw YTDLnis output / browser v1/player JSON directly into this file.\n\
+     gvsPoToken: \"\"\n\
+     playerPoToken: \"\"\n\
+     subsPoToken: \"\"\n\
+     visitorData: \"\"\n\
+     playerClient: \"mweb\"\n"
 }
 
 pub fn starter(password: &str) -> String {
@@ -333,46 +338,247 @@ fn read_bounded_config(path: &Path) -> Result<String, ConfigError> {
     })
 }
 
-pub fn split_pot_pair(raw_pot: &str, raw_vd: &str) -> (String, String) {
-    let (pot, vd) = (raw_pot.trim(), raw_vd.trim());
-    if pot.starts_with('{') {
-        if let Ok((parsed_pot, parsed_vd)) = parse_potoken_mapping_str(pot) {
-            return (parsed_pot, if vd.is_empty() { parsed_vd } else { vd.to_owned() });
-        }
-    }
-    if vd.is_empty() && !pot.contains("://") {
-        if let Some((left, right)) = pot.split_once(':') {
-            let (left, right) = (left.trim(), right.trim());
-            if !left.is_empty() && !right.is_empty() {
-                return (right.to_owned(), left.to_owned());
-            }
-        }
-    }
-    (pot.to_owned(), vd.to_owned())
+/// Parsed YouTube Proof-of-Origin token bundle (`GVS`, `Player`, `Subs`, `Visitor Data`, `Player Client`).
+/// Secret buffers are zeroed on drop and redacted in `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PoTokens {
+    pub gvs: String,
+    pub player: String,
+    pub subs: String,
+    pub visitor_data: String,
+    pub player_client: String,
 }
 
-fn parse_potoken_mapping_str(text: &str) -> Result<(String, String), serde_yaml::Error> {
-    let val: serde_yaml::Value = serde_yaml::from_str(text)?;
-    Ok(extract_potoken_value(&val).unwrap_or_default())
+impl Drop for PoTokens {
+    fn drop(&mut self) {
+        wipe_string(&mut self.gvs);
+        wipe_string(&mut self.player);
+        wipe_string(&mut self.subs);
+        wipe_string(&mut self.visitor_data);
+    }
+}
+
+impl std::fmt::Debug for PoTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoTokens")
+            .field("gvs", &redacted(&self.gvs))
+            .field("player", &redacted(&self.player))
+            .field("subs", &redacted(&self.subs))
+            .field("visitor_data", &redacted(&self.visitor_data))
+            .field("player_client", &self.player_client)
+            .finish()
+    }
+}
+
+impl PoTokens {
+    #[inline]
+    pub fn is_configured(&self) -> bool {
+        !self.gvs.is_empty() || !self.player.is_empty()
+    }
+
+    /// Token appended as `&pot=` on `googlevideo.com` media stream requests.
+    #[inline]
+    pub fn effective_gvs(&self) -> &str {
+        if !self.gvs.is_empty() {
+            &self.gvs
+        } else {
+            &self.player
+        }
+    }
+
+    /// Token sent in `serviceIntegrityDimensions.poToken` on InnerTube JSON requests.
+    #[inline]
+    pub fn effective_player(&self) -> &str {
+        if !self.player.is_empty() {
+            &self.player
+        } else {
+            &self.gvs
+        }
+    }
+
+    pub fn single(pot: &str, vd: &str) -> Self {
+        Self {
+            gvs: pot.to_owned(),
+            player: pot.to_owned(),
+            subs: String::new(),
+            visitor_data: vd.to_owned(),
+            player_client: String::new(),
+        }
+    }
+
+    #[inline]
+    pub fn from_config(config: &Config) -> Self {
+        let mut out = parse_potoken_bundle(&config.youtube_po_token).unwrap_or_default();
+        let gvs = config.youtube_gvs_po_token.trim();
+        let player = config.youtube_player_po_token.trim();
+        let vd = config.youtube_visitor_data.trim();
+        if !gvs.is_empty() {
+            out.gvs = gvs.to_owned();
+        }
+        if !player.is_empty() {
+            out.player = player.to_owned();
+        }
+        if !vd.is_empty() {
+            out.visitor_data = vd.to_owned();
+        }
+        out
+    }
+}
+
+pub fn split_pot_pair(raw_pot: &str, raw_vd: &str) -> (String, String) {
+    let mut bundle = parse_potoken_bundle(raw_pot)
+        .unwrap_or_else(|_| PoTokens::single(raw_pot.trim(), raw_vd.trim()));
+    if !raw_vd.trim().is_empty() {
+        bundle.visitor_data = raw_vd.trim().to_owned();
+    }
+    (bundle.effective_player().to_owned(), bundle.visitor_data.clone())
+}
+
+fn unquote_token(raw: &str) -> &str {
+    let s = raw.trim();
+    for q in ['`', '"', '\''] {
+        if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
+            return inner.trim();
+        }
+    }
+    s
+}
+
+fn parse_ytdlp_pot_spec(spec: &str) -> Option<PoTokens> {
+    let s = unquote_token(spec);
+    if !(s.contains(".gvs+") || s.contains(".player+") || s.contains(".subs+")) {
+        return None;
+    }
+    let mut out = PoTokens::default();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (lhs, tok) = part.split_once('+')?;
+        let (client, kind) = lhs.rsplit_once('.')?;
+        let tok = unquote_token(tok);
+        if out.player_client.is_empty() && !client.trim().is_empty() {
+            out.player_client = client.trim().to_owned();
+        }
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "gvs" => out.gvs = tok.to_owned(),
+            "player" => out.player = tok.to_owned(),
+            "subs" => out.subs = tok.to_owned(),
+            _ => {}
+        }
+    }
+    out.is_configured().then_some(out)
+}
+
+fn parse_ytdlnis_text(text: &str) -> Option<PoTokens> {
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Gvs,
+        Player,
+        Subs,
+        Visitor,
+        Client,
+    }
+    fn classify(label: &str) -> Option<Slot> {
+        match label.trim().trim_end_matches(':').trim().to_ascii_lowercase().as_str() {
+            "po token (gvs)" | "gvs po token" | "potoken (gvs)" => Some(Slot::Gvs),
+            "po token (player)" | "player po token" | "potoken (player)" => Some(Slot::Player),
+            "po token (subs)" | "subs po token" | "potoken (subs)" => Some(Slot::Subs),
+            "visitor data" => Some(Slot::Visitor),
+            "player client" => Some(Slot::Client),
+            _ => None,
+        }
+    }
+    let set_slot = |out: &mut PoTokens, slot: Slot, val: &str| match slot {
+        Slot::Gvs => out.gvs = val.to_owned(),
+        Slot::Player => out.player = val.to_owned(),
+        Slot::Subs => out.subs = val.to_owned(),
+        Slot::Visitor => out.visitor_data = val.to_owned(),
+        Slot::Client => out.player_client = val.to_owned(),
+    };
+    let mut out = PoTokens::default();
+    let mut pending: Option<Slot> = None;
+    let mut matched = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((head, tail)) = line.split_once(':') {
+            if let Some(slot) = classify(head) {
+                matched = true;
+                let val = unquote_token(tail);
+                if val.is_empty() {
+                    pending = Some(slot);
+                } else {
+                    set_slot(&mut out, slot, val);
+                    pending = None;
+                }
+                continue;
+            }
+        }
+        if let Some(slot) = classify(line) {
+            matched = true;
+            pending = Some(slot);
+            continue;
+        }
+        if let Some(slot) = pending.take() {
+            set_slot(&mut out, slot, unquote_token(line));
+        }
+    }
+    matched.then_some(out)
 }
 
 fn pick_str<'a>(map: &'a serde_yaml::Mapping, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| map.get(*k)?.as_str()).map(str::trim)
 }
 
-fn extract_potoken_value(val: &serde_yaml::Value) -> Option<(String, String)> {
+fn parse_scalar_bundle(raw: &str) -> PoTokens {
+    let s = unquote_token(raw);
+    if let Some(ytdlp) = parse_ytdlp_pot_spec(s) {
+        return ytdlp;
+    }
+    if !s.contains("://") {
+        if let Some((left, right)) = s.split_once(':') {
+            let (left, right) = (left.trim(), right.trim());
+            if !left.is_empty() && !right.is_empty() {
+                return PoTokens::single(right, left);
+            }
+        }
+    }
+    PoTokens::single(s, "")
+}
+
+fn extract_potoken_bundle(val: &serde_yaml::Value) -> Option<PoTokens> {
     match val {
-        serde_yaml::Value::Null => Some((String::new(), String::new())),
-        serde_yaml::Value::String(s) => Some(split_pot_pair(s, "")),
+        serde_yaml::Value::Null => Some(PoTokens::default()),
+        serde_yaml::Value::String(s) => Some(parse_scalar_bundle(s)),
         serde_yaml::Value::Mapping(m) => {
-            let pot = pick_str(m, &["poToken", "po_token", "youtubePoToken", "youtube_po_token"])
-                .or_else(|| {
-                    m.get("serviceIntegrityDimensions")?
-                        .as_mapping()
-                        .and_then(|s| pick_str(s, &["poToken", "po_token"]))
-                })
-                .unwrap_or_default();
-            let vd = pick_str(
+            let shared =
+                pick_str(m, &["poToken", "po_token", "youtubePoToken", "youtube_po_token"])
+                    .or_else(|| {
+                        m.get("serviceIntegrityDimensions")?
+                            .as_mapping()
+                            .and_then(|s| pick_str(s, &["poToken", "po_token"]))
+                    })
+                    .unwrap_or_default();
+            let mut out =
+                if !shared.is_empty() { parse_scalar_bundle(shared) } else { PoTokens::default() };
+            if let Some(gvs) =
+                pick_str(m, &["gvsPoToken", "gvs_po_token", "youtubeGvsPoToken", "gvs"])
+                    .filter(|s| !s.is_empty())
+            {
+                out.gvs = unquote_token(gvs).to_owned();
+            }
+            if let Some(plr) =
+                pick_str(m, &["playerPoToken", "player_po_token", "youtubePlayerPoToken", "player"])
+                    .filter(|s| !s.is_empty())
+            {
+                out.player = unquote_token(plr).to_owned();
+            }
+            if let Some(subs) =
+                pick_str(m, &["subsPoToken", "subs_po_token", "subs"]).filter(|s| !s.is_empty())
+            {
+                out.subs = unquote_token(subs).to_owned();
+            }
+            if let Some(vd) = pick_str(
                 m,
                 &["visitorData", "visitor_data", "youtubeVisitorData", "youtube_visitor_data"],
             )
@@ -383,32 +589,56 @@ fn extract_potoken_value(val: &serde_yaml::Value) -> Option<(String, String)> {
                     .as_mapping()
                     .and_then(|c| pick_str(c, &["visitorData", "visitor_data"]))
             })
-            .unwrap_or_default();
-            Some(split_pot_pair(pot, vd))
+            .filter(|s| !s.is_empty())
+            {
+                out.visitor_data = unquote_token(vd).to_owned();
+            }
+            if let Some(client) =
+                pick_str(m, &["playerClient", "player_client", "client"]).filter(|s| !s.is_empty())
+            {
+                out.player_client = unquote_token(client).to_owned();
+            }
+            Some(out)
         }
         _ => None,
     }
 }
 
-pub fn parse_potoken_text(text: &str) -> Result<(String, String), ConfigError> {
+pub fn parse_potoken_bundle(text: &str) -> Result<PoTokens, ConfigError> {
     let body = text.strip_prefix('\u{feff}').unwrap_or(text).trim();
     if body.is_empty() {
-        return Ok((String::new(), String::new()));
+        return Ok(PoTokens::default());
     }
-    let val: serde_yaml::Value = serde_yaml::from_str(body)
-        .map_err(|e| ConfigError::Invalid(format!("invalid poToken file: {e}")))?;
-    let (pot, vd) = extract_potoken_value(&val).ok_or_else(|| {
-        ConfigError::Invalid("poToken file must be a YAML/JSON mapping or string".into())
-    })?;
-    validate::validate_youtube_tokens(&pot, &vd)?;
-    Ok((pot, vd))
+    let bundle = if let Some(ytdlnis) = parse_ytdlnis_text(body) {
+        ytdlnis
+    } else if let Some(ytdlp) = parse_ytdlp_pot_spec(body) {
+        ytdlp
+    } else {
+        let val: serde_yaml::Value = serde_yaml::from_str(body)
+            .map_err(|e| ConfigError::Invalid(format!("invalid poToken file: {e}")))?;
+        extract_potoken_bundle(&val).ok_or_else(|| {
+            ConfigError::Invalid("poToken file must be a YAML/JSON mapping or string".into())
+        })?
+    };
+    validate::validate_po_tokens(&bundle)?;
+    Ok(bundle)
+}
+
+pub fn parse_potoken_text(text: &str) -> Result<(String, String), ConfigError> {
+    let b = parse_potoken_bundle(text)?;
+    Ok((b.effective_player().to_owned(), b.visitor_data.clone()))
+}
+
+pub fn load_potoken_bundle(path: &Path) -> Result<PoTokens, ConfigError> {
+    let mut text = read_bounded_config(path)?;
+    let parsed = parse_potoken_bundle(&text);
+    wipe_string(&mut text);
+    parsed
 }
 
 pub fn load_potoken_file(path: &Path) -> Result<(String, String), ConfigError> {
-    let mut text = read_bounded_config(path)?;
-    let parsed = parse_potoken_text(&text);
-    wipe_string(&mut text);
-    parsed
+    let b = load_potoken_bundle(path)?;
+    Ok((b.effective_player().to_owned(), b.visitor_data.clone()))
 }
 
 pub fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
@@ -447,15 +677,24 @@ fn resolve_potoken_file(config: &mut Config, base_dir: Option<&Path>) -> Result<
     }
     let pot_path = config.youtube_po_token_file.trim();
     if !pot_path.is_empty() && Path::new(pot_path).is_file() {
-        let (mut pot, mut vd) = load_potoken_file(Path::new(pot_path))?;
+        let mut bundle = load_potoken_bundle(Path::new(pot_path))?;
+        if config.youtube_gvs_po_token.trim().is_empty() && !bundle.gvs.is_empty() {
+            std::mem::swap(&mut config.youtube_gvs_po_token, &mut bundle.gvs);
+        }
+        if config.youtube_player_po_token.trim().is_empty() && !bundle.player.is_empty() {
+            std::mem::swap(&mut config.youtube_player_po_token, &mut bundle.player);
+        }
         if config.youtube_po_token.trim().is_empty() {
-            std::mem::swap(&mut config.youtube_po_token, &mut pot);
+            let fallback = if !config.youtube_player_po_token.is_empty() {
+                config.youtube_player_po_token.clone()
+            } else {
+                config.youtube_gvs_po_token.clone()
+            };
+            config.youtube_po_token = fallback;
         }
-        if config.youtube_visitor_data.trim().is_empty() {
-            std::mem::swap(&mut config.youtube_visitor_data, &mut vd);
+        if config.youtube_visitor_data.trim().is_empty() && !bundle.visitor_data.is_empty() {
+            std::mem::swap(&mut config.youtube_visitor_data, &mut bundle.visitor_data);
         }
-        wipe_string(&mut pot);
-        wipe_string(&mut vd);
     }
     Ok(())
 }
@@ -620,12 +859,30 @@ mod tests {
         let cfg_path = dir.join("config.yaml");
         let pot_path = dir.join("potoken.yaml");
         std::fs::write(&cfg_path, "password: secret12\nyoutubeRequirePoToken: true\n").unwrap();
-        std::fs::write(&pot_path, "poToken: MnSFromFile==\nvisitorData: CgtFromFile==\n").unwrap();
+        std::fs::write(
+            &pot_path,
+            "PO Token (GVS)\n`MnSGvsTok==`\n\nPO Token (Player)\n`MpkPlrTok==`\n\nPO Token (Subs)\n`MpkSubsTok==`\n\nVisitor Data\n`CgtVd%3D%3D`\n\nPlayer Client\n`mweb`\n",
+        )
+        .unwrap();
         let loaded = load(Some(&cfg_path)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(Path::new(&loaded.youtube_po_token_file), pot_path.as_path());
         assert!(loaded.youtube_require_po_token);
-        assert_eq!(loaded.youtube_po_token, "MnSFromFile==");
-        assert_eq!(loaded.youtube_visitor_data, "CgtFromFile==");
+        assert_eq!(loaded.youtube_gvs_po_token, "MnSGvsTok==");
+        assert_eq!(loaded.youtube_player_po_token, "MpkPlrTok==");
+        assert_eq!(loaded.youtube_po_token, "MpkPlrTok==");
+        assert_eq!(loaded.youtube_visitor_data, "CgtVd%3D%3D");
+
+        let spec = parse_potoken_bundle("mweb.gvs+Gvs1,mweb.player+Plr1,mweb.subs+Sub1").unwrap();
+        assert_eq!(
+            (
+                spec.gvs.as_str(),
+                spec.player.as_str(),
+                spec.subs.as_str(),
+                spec.player_client.as_str()
+            ),
+            ("Gvs1", "Plr1", "Sub1", "mweb")
+        );
+        assert!(!format!("{spec:?}").contains("Gvs1") && !format!("{spec:?}").contains("Plr1"));
     }
 }

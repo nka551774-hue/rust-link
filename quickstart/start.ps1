@@ -14,7 +14,7 @@ $Utf8 = New-Object Text.UTF8Encoding $false
 function Write-PoTokenConfig([string]$Pot, [string]$Vd) {
     $p = $Pot.Replace("'", "''")
     $v = $Vd.Replace("'", "''")
-    $body = "# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).`npoToken: '$p'`nvisitorData: '$v'`n"
+    $body = "# YouTube Proof-of-Origin Token configuration (auto-reloaded on save without restart).`n# Supports YTDLnis (gvsPoToken / playerPoToken / subsPoToken / visitorData / playerClient) or raw YTDLnis paste.`ngvsPoToken: '$p'`nplayerPoToken: '$p'`nsubsPoToken: ''`nvisitorData: '$v'`nplayerClient: 'mweb'`n"
     [IO.File]::WriteAllText($PoTokenFile, $body, $Utf8)
 }
 

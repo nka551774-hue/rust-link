@@ -122,12 +122,10 @@ fn clients_with_pot(config: &Config, has_pot: bool) -> [Client; 4] {
 
 /// Client identities tried in priority order.
 pub fn clients(config: &Config) -> [Client; 4] {
-    let (pot, _) = parse_pot_pair(&config.youtube_po_token, &config.youtube_visitor_data);
-    clients_with_pot(config, !pot.is_empty())
+    clients_with_pot(config, rustlink_config::PoTokens::from_config(config).is_configured())
 }
 
-/// Parses operator-supplied `poToken` and `visitorData`, supporting separate strings,
-/// JSON `{"poToken":"...","visitorData":"..."}`, or combined `<visitorData>:<poToken>`.
+#[cfg(test)]
 pub(crate) fn parse_pot_pair(raw_pot: &str, raw_vd: &str) -> (String, String) {
     rustlink_config::split_pot_pair(raw_pot, raw_vd)
 }
@@ -286,6 +284,23 @@ fn call<B: Serialize + ?Sized>(
         .map_err(|e| SourceError::Http(format!("youtube could not be reached: {e}")))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
+        if status == 400 {
+            if let Some(msg) = resp
+                .into_body()
+                .with_config()
+                .limit(16 << 10)
+                .read_to_vec()
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| {
+                    v.pointer("/error/message").and_then(Value::as_str).map(str::to_owned)
+                })
+            {
+                return Err(SourceError::Http(format!(
+                    "youtube rejected request (HTTP 400): {msg}"
+                )));
+            }
+        }
         return Err(SourceError::Media { status });
     }
     let raw = resp
@@ -422,25 +437,24 @@ impl<'a> Catalog<'a> {
         self.state.filter(|_| is_https(&self.config.youtube_endpoint))
     }
 
-    fn configured_auth(&self) -> (String, String) {
+    fn configured_auth(&self) -> rustlink_config::PoTokens {
         if let Some(state) = self.state {
             state.sync_potoken_file(self.config);
             if let Some(auth) = crate::lock(&state.youtube_auth).as_ref() {
-                return (auth.po_token.clone(), auth.visitor_data.clone());
+                return auth.clone();
             }
         } else {
             let file = self.config.youtube_po_token_file.trim();
             if !file.is_empty() && std::path::Path::new(file).is_file() {
-                if let Ok((pot, vd)) =
-                    rustlink_config::load_potoken_file(std::path::Path::new(file))
+                if let Ok(bundle) = rustlink_config::load_potoken_bundle(std::path::Path::new(file))
                 {
-                    if !pot.is_empty() || !vd.is_empty() {
-                        return (pot, vd);
+                    if bundle.is_configured() || !bundle.visitor_data.is_empty() {
+                        return bundle;
                     }
                 }
             }
         }
-        parse_pot_pair(&self.config.youtube_po_token, &self.config.youtube_visitor_data)
+        rustlink_config::PoTokens::from_config(self.config)
     }
 
     pub(crate) fn ensure_po_token(&self) -> Result<(), SourceError> {
@@ -449,20 +463,18 @@ impl<'a> Catalog<'a> {
         if !require {
             return Ok(());
         }
-        let (pot, _) = self.configured_auth();
-        if pot.is_empty() {
+        if !self.configured_auth().is_configured() {
             let file = self.config.youtube_po_token_file.trim();
             let target = if file.is_empty() { rustlink_config::STARTER_POTOKEN_FILE } else { file };
             return Err(SourceError::Disabled(format!(
-                "YouTube requires a poToken; set poToken and visitorData in {target}"
+                "YouTube requires a poToken; set gvsPoToken / playerPoToken and visitorData in {target}"
             )));
         }
         Ok(())
     }
 
     fn ordered_clients(&self) -> [Client; 4] {
-        let (pot, _) = self.configured_auth();
-        let base = clients_with_pot(self.config, !pot.is_empty());
+        let base = clients_with_pot(self.config, self.configured_auth().is_configured());
         match self.https_state() {
             Some(s) => s.youtube_health.partition_clients(base, |c| c.name),
             None => base,
@@ -470,8 +482,7 @@ impl<'a> Catalog<'a> {
     }
 
     fn ordered_catalogue_clients(&self) -> [Client; 2] {
-        let (pot, _) = self.configured_auth();
-        let (first, second) = if !pot.is_empty() {
+        let (first, second) = if self.configured_auth().is_configured() {
             (visionos_client(), catalogue_client(self.config))
         } else {
             (catalogue_client(self.config), visionos_client())
@@ -496,12 +507,11 @@ impl<'a> Catalog<'a> {
     }
 
     fn stream_key(&self, video_id: &str) -> YoutubeStreamKey {
-        let (pot, _) = self.configured_auth();
         YoutubeStreamKey {
             video_id: video_id.to_owned(),
             endpoint: self.config.youtube_endpoint.trim().to_owned(),
             client_version: self.config.youtube_client_version.trim().to_owned(),
-            has_po_token: !pot.is_empty(),
+            has_po_token: self.configured_auth().is_configured(),
         }
     }
 
@@ -530,17 +540,17 @@ impl<'a> Catalog<'a> {
         );
     }
 
-    fn effective_credentials(&self, bootstrap: bool) -> (String, String) {
-        let (pot, explicit_vd) = self.configured_auth();
-        if !explicit_vd.is_empty() {
-            return (pot, explicit_vd);
+    fn effective_credentials(&self, bootstrap: bool) -> (rustlink_config::PoTokens, String) {
+        let tokens = self.configured_auth();
+        if !tokens.visitor_data.is_empty() {
+            let vd = tokens.visitor_data.clone();
+            return (tokens, vd);
         }
         if let Some(cached) = self.visitor_cache().and_then(CredentialCache::peek) {
-            return (pot, cached);
+            return (tokens, cached);
         }
-        // Always ensure visitorData is present when a poToken is configured on HTTPS.
-        if (!bootstrap && pot.is_empty()) || !is_https(&self.config.youtube_endpoint) {
-            return (pot, String::new());
+        if (!bootstrap && !tokens.is_configured()) || !is_https(&self.config.youtube_endpoint) {
+            return (tokens, String::new());
         }
         let fetch = || {
             fetch_visitor_data(
@@ -553,11 +563,11 @@ impl<'a> Catalog<'a> {
             Some(cache) => cache.get_or_refresh(fetch).unwrap_or_default(),
             None => fetch().map(|(vd, _)| vd).unwrap_or_default(),
         };
-        (pot, vd)
+        (tokens, vd)
     }
 
     fn has_explicit_visitor_data(&self) -> bool {
-        !self.configured_auth().1.is_empty()
+        !self.configured_auth().visitor_data.is_empty()
     }
 
     fn harvest_visitor_data(&self, answer: &Value) {
@@ -596,9 +606,16 @@ impl<'a> Catalog<'a> {
         endpoint: &str,
         body: &B,
     ) -> Result<Value, SourceError> {
-        let (pot, vd) = self.effective_credentials(client.needs_visitor_data);
-        let answer =
-            call(self.agent, &self.config.youtube_endpoint, client, &vd, &pot, endpoint, body)?;
+        let (tokens, vd) = self.effective_credentials(client.needs_visitor_data);
+        let answer = call(
+            self.agent,
+            &self.config.youtube_endpoint,
+            client,
+            &vd,
+            tokens.effective_player(),
+            endpoint,
+            body,
+        )?;
         self.harvest_visitor_data(&answer);
         Ok(answer)
     }
@@ -609,10 +626,27 @@ impl<'a> Catalog<'a> {
 
     fn player_call(&self, client: &Client, video_id: &str) -> Result<Value, SourceError> {
         let req = self.player_request(video_id);
-        let (pot, vd) = self.effective_credentials(client.needs_visitor_data);
+        let (tokens, vd) = self.effective_credentials(client.needs_visitor_data);
+        let pot = tokens.effective_player();
         let answer =
-            call(self.agent, &self.config.youtube_endpoint, client, &vd, &pot, "player", &req)?;
+            call(self.agent, &self.config.youtube_endpoint, client, &vd, pot, "player", &req)?;
         if let Err(err) = check_playability(&answer) {
+            if !tokens.gvs.is_empty() && tokens.gvs != pot {
+                if let Ok(alt) = call(
+                    self.agent,
+                    &self.config.youtube_endpoint,
+                    client,
+                    &vd,
+                    &tokens.gvs,
+                    "player",
+                    &req,
+                ) {
+                    if check_playability(&alt).is_ok() {
+                        self.harvest_visitor_data(&alt);
+                        return Ok(alt);
+                    }
+                }
+            }
             self.invalidate_visitor_if_stale(&vd, &answer);
             if (client.needs_visitor_data || !pot.is_empty())
                 && !vd.is_empty()
@@ -626,7 +660,7 @@ impl<'a> Catalog<'a> {
                         &self.config.youtube_endpoint,
                         client,
                         &fresh,
-                        &pot,
+                        pot,
                         "player",
                         &req,
                     )?;
@@ -649,13 +683,13 @@ impl<'a> Catalog<'a> {
         endpoint: &str,
         body: &B,
     ) -> Result<Value, SourceError> {
-        let (pot, vd) = self.effective_credentials(false);
+        let (tokens, vd) = self.effective_credentials(false);
         let answer = call(
             self.agent,
             &self.config.youtube_music_endpoint,
             &MUSIC_CLIENT,
             &vd,
-            &pot,
+            tokens.effective_player(),
             endpoint,
             body,
         )?;
@@ -843,8 +877,9 @@ impl<'a> Catalog<'a> {
     ) -> Result<T, SourceError> {
         self.ensure_po_token()?;
         let (mut first, mut stream_error, mut skip_recent) = (None, None, None);
-        let (pot, _) = self.configured_auth();
-        let no_pot = pot.is_empty();
+        let tokens = self.configured_auth();
+        let gvs_pot = tokens.effective_gvs();
+        let no_pot = gvs_pot.is_empty();
 
         if let Some(state) = self.state {
             let key = self.stream_key(video_id);
@@ -858,7 +893,7 @@ impl<'a> Catalog<'a> {
                         cached.url.clone(),
                         cached.headers.clone(),
                         &cached.user_agent,
-                        &pot,
+                        gvs_pot,
                         need_probe.then_some(cached.content_length),
                     )
                     .and_then(|(url, headers)| {
@@ -905,7 +940,7 @@ impl<'a> Catalog<'a> {
                             format.url,
                             format.headers,
                             &client.user_agent,
-                            &pot,
+                            gvs_pot,
                             need_probe.then_some(format.content_length),
                         )
                         .and_then(|(url, headers)| open(url, headers));
@@ -936,7 +971,8 @@ impl<'a> Catalog<'a> {
 
     #[cfg(test)]
     fn player_body(&self, video_id: &str) -> Value {
-        let (pot, vd) = self.effective_credentials(false);
+        let (tokens, vd) = self.effective_credentials(false);
+        let pot = tokens.effective_player();
         let req = self.player_request(video_id);
         let client = visionos_client();
         serde_json::to_value(RequestEnvelope {

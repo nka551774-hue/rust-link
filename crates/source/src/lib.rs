@@ -249,9 +249,9 @@ impl Service {
         (
             Arc::new(move || {
                 svc.sync_potoken_file();
-                let (_, vd) = svc.active_youtube_auth();
-                if !vd.is_empty() {
-                    Some(vd)
+                let auth = svc.active_youtube_auth();
+                if !auth.visitor_data.is_empty() {
+                    Some(auth.visitor_data.clone())
                 } else {
                     svc.catalog_state.youtube_visitor.peek()
                 }
@@ -264,16 +264,17 @@ impl Service {
         let svc = Arc::clone(self);
         Arc::new(move || {
             svc.sync_potoken_file();
-            let (pot, _) = svc.active_youtube_auth();
+            let auth = svc.active_youtube_auth();
+            let pot = auth.effective_player().to_owned();
             (!pot.is_empty()).then_some(pot)
         })
     }
 
-    fn active_youtube_auth(&self) -> (String, String) {
+    fn active_youtube_auth(&self) -> rustlink_config::PoTokens {
         if let Some(auth) = lock(&self.catalog_state.youtube_auth).as_ref() {
-            return (auth.po_token.clone(), auth.visitor_data.clone());
+            return auth.clone();
         }
-        innertube::parse_pot_pair(&self.config.youtube_po_token, &self.config.youtube_visitor_data)
+        rustlink_config::PoTokens::from_config(&self.config)
     }
 
     fn sync_potoken_file(&self) {
@@ -282,8 +283,8 @@ impl Service {
         }
     }
 
-    /// Hot-reloads YouTube `poToken` and `visitorData` in memory without restarting
-    /// the node or dropping active voice players, flushing cached YouTube state.
+    /// Hot-reloads YouTube `poToken` (`GVS` / `Player` / `Subs`) and `visitorData` in memory
+    /// without restarting the node or dropping active voice players, flushing cached state.
     pub fn set_youtube_tokens(
         &self,
         po_token: impl Into<String>,
@@ -291,19 +292,19 @@ impl Service {
     ) -> Result<(bool, bool), SourceError> {
         let raw_pot = po_token.into();
         let raw_vd = visitor_data.into();
-        let (pot, vd) = innertube::parse_pot_pair(&raw_pot, &raw_vd);
-        if pot.bytes().any(|b| b <= 0x1f || b == 0x7f) || pot.chars().any(char::is_control) {
-            return Err(SourceError::Url(
-                "youtubePoToken must not contain control characters".into(),
-            ));
+        let mut bundle = rustlink_config::parse_potoken_bundle(&raw_pot)
+            .map_err(|e| SourceError::Url(e.to_string()))?;
+        let trimmed_vd = raw_vd.trim();
+        if !trimmed_vd.is_empty() {
+            if !trimmed_vd.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                return Err(SourceError::Url(
+                    "youtubeVisitorData must contain only printable ASCII characters".into(),
+                ));
+            }
+            bundle.visitor_data = trimmed_vd.to_owned();
         }
-        if !vd.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
-            return Err(SourceError::Url(
-                "youtubeVisitorData must contain only printable ASCII characters".into(),
-            ));
-        }
-        let (has_pot, has_vd) = (!pot.is_empty(), !vd.is_empty());
-        self.catalog_state.record_manual_youtube_auth(&self.config, pot, vd);
+        let (has_pot, has_vd) = (bundle.is_configured(), !bundle.visitor_data.is_empty());
+        self.catalog_state.record_manual_youtube_auth(&self.config, bundle);
         lock(&self.cache).clear();
         Ok((has_pot, has_vd))
     }
@@ -1214,7 +1215,7 @@ mod tests {
         let mut call = 0;
         let (base, server) = test_http::serve(2, move |_, headers, body| {
             call += 1;
-            let expected_pot = if call == 1 { "MnSFileV1==" } else { "MnSFileV2Updated==" };
+            let expected_pot = if call == 1 { "MnSFileV1==" } else { "MpkFileV2Updated==" };
             let expected_vd = if call == 1 { "cgtfilev1==" } else { "cgtfilev2==" };
             assert!(headers
                 .to_ascii_lowercase()
@@ -1257,9 +1258,12 @@ mod tests {
         };
         assert_eq!(t1.metadata.title, "Token v1");
 
-        // Saving v2 into potoken.yaml flushes cache and uses the updated token immediately.
-        std::fs::write(&pot_file, "poToken: MnSFileV2Updated==\nvisitorData: CgtFileV2==\n")
-            .unwrap();
+        // Saving YTDLnis GVS + Player tokens routes Player token to /player and GVS token to &pot=.
+        std::fs::write(
+            &pot_file,
+            "gvsPoToken: MnSGvsV2==\nplayerPoToken: MpkFileV2Updated==\nvisitorData: CgtFileV2==\nplayerClient: mweb\n",
+        )
+        .unwrap();
         let LoadResult::Track(t2) = service.load("dQw4w9WgXcQ").unwrap() else {
             panic!("expected track v2");
         };

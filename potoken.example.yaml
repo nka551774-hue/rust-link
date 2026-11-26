@@ -1,6 +1,8 @@
 # YouTube Proof-of-Origin Token configuration (copy to potoken.yaml; auto-reloaded on save).
-# Open https://music.youtube.com or https://www.youtube.com in an incognito window, play any
-# track, press F12 -> Network -> v1/player -> Payload, and copy these two fields (or paste
-# the raw v1/player request JSON directly into potoken.json).
-poToken: ""
+# Supports YTDLnis (GVS / Player / Subs / Visitor Data / Player Client) or a single poToken.
+# You can also paste raw YTDLnis summary output or a browser v1/player JSON payload directly.
+gvsPoToken: ""
+playerPoToken: ""
+subsPoToken: ""
 visitorData: ""
+playerClient: "mweb"

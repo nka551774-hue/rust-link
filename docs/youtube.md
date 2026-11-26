@@ -39,15 +39,21 @@ Rustlink 以 100% 純 Rust 原生 InnerTube 協定解析與串流 YouTube / YouT
 > [!NOTE]
 > **全鏈路強制 PO Token 與免重啟自動熱載入**：啟動腳本、預設 `config.yaml` 與 `install.sh` 皆預設啟用 `youtubePoTokenFile: potoken.yaml` 與 `youtubeRequirePoToken: true`。所有 YouTube / YouTube Music 請求（`/player`、`/search`、`/browse`、`/next`、歌詞與 `googlevideo.com` 音訊網址 `&pot=`）一律強制走 `poToken` 驗證（優先採用原生支援 `poToken` 與 **48 kHz WebM Opus `itag 251`** 的 `VISIONOS` 與 `ANDROID`），未設定時拒絕匿名直連以避免觸發風控。檔案存檔後節點會**自動偵測變更並即時熱更新、清空舊快取**，全程無須重啟節點或中斷語音通話。
 
-### 1. 從瀏覽器取得 `poToken` 與 `visitorData`（30 秒步驟）
-1. 在自己的瀏覽器開啟無痕視窗前往 `https://music.youtube.com` 或 `https://www.youtube.com` 隨意播放一首歌。
-2. 按 `F12` 開啟開發者工具 -> **Network（網路）** -> 篩選 `v1/player` -> 點開任一筆請求的 **Payload（載荷）**。
-3. 複製以下兩個欄位填入專案根目錄（或 `/opt/rustlink/`）的 **`potoken.yaml`**（範本見 [`potoken.example.yaml`](../potoken.example.yaml)）：
-   ```yaml
-   poToken: "<serviceIntegrityDimensions.poToken>"
-   visitorData: "<context.client.visitorData>"
-   ```
-   - 亦支援將整個 `v1/player` Request Payload JSON 直接貼入 `potoken.json`、使用 `{"poToken":"...","visitorData":"..."}` JSON，或 `<visitorData>:<poToken>` 合併字串。
+### 1. 取得並填入 `potoken.yaml`（支援 YTDLnis 多權杖與瀏覽器 F12）
+
+- **方式 A：使用 YTDLnis 產生的五組資訊（推薦）**
+  在 YTDLnis（`More -> Settings -> Advanced -> Generate PO tokens`）產生權杖後，填入專案根目錄（或 `/opt/rustlink/`）的 **`potoken.yaml`**（範本見 [`potoken.example.yaml`](../potoken.example.yaml)）：
+  ```yaml
+  gvsPoToken: "<PO Token (GVS)>"         # 自動附加於 googlevideo.com 音訊串流 &pot=
+  playerPoToken: "<PO Token (Player)>"   # 自動帶入 InnerTube serviceIntegrityDimensions.poToken（若單片綁定失效會自動回退至 gvsPoToken）
+  subsPoToken: "<PO Token (Subs)>"
+  visitorData: "<Visitor Data>"
+  playerClient: "mweb"
+  ```
+  - 亦支援將 YTDLnis 產生的整段摘要文字（含 `PO Token (GVS)`、`PO Token (Player)`、`Visitor Data` 標題）或 `mweb.gvs+<GVS>,mweb.player+<PLAYER>` 字串**原封不動直接貼入 `potoken.yaml`**，解析器會自動擷取各欄位。
+
+- **方式 B：從電腦瀏覽器 F12 取得**
+  開啟無痕視窗前往 `https://music.youtube.com` 播放任一首，按 `F12 -> Network -> v1/player -> Payload` 複製 `serviceIntegrityDimensions.poToken` 與 `context.client.visitorData` 填入 `potoken.yaml`（或直接貼入完整 `v1/player` JSON）。
 
 ### 2. 部署與免重啟更新方式
 - **直接編輯 `potoken.yaml`（推薦）**：

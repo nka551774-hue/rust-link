@@ -25,19 +25,6 @@ const YOUTUBE_STREAM_EXPIRY_MARGIN_SECS: u64 = 120;
 const CLIENT_COOLDOWN_BASE: Duration = Duration::from_secs(30);
 const CLIENT_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 
-/// Runtime override for YouTube `poToken` and `visitorData`, wiped on drop.
-pub(crate) struct YoutubeAuth {
-    pub po_token: String,
-    pub visitor_data: String,
-}
-
-impl Drop for YoutubeAuth {
-    fn drop(&mut self) {
-        wipe_string(&mut self.po_token);
-        wipe_string(&mut self.visitor_data);
-    }
-}
-
 type FileStamp = Option<(Option<SystemTime>, u64)>;
 
 #[derive(Default)]
@@ -55,7 +42,7 @@ pub struct State {
     pub(crate) youtube_visitor: Arc<CredentialCache>,
     pub(crate) youtube_streams: Arc<YoutubeStreamCache>,
     pub(crate) youtube_health: Arc<YoutubeClientHealth>,
-    pub(crate) youtube_auth: Mutex<Option<YoutubeAuth>>,
+    pub(crate) youtube_auth: Mutex<Option<rustlink_config::PoTokens>>,
     pub(crate) youtube_pot_watch: Mutex<PoTokenWatch>,
 }
 
@@ -73,7 +60,11 @@ fn stat_file(path: &std::path::Path) -> FileStamp {
 }
 
 impl State {
-    pub(crate) fn record_manual_youtube_auth(&self, config: &Config, pot: String, vd: String) {
+    pub(crate) fn record_manual_youtube_auth(
+        &self,
+        config: &Config,
+        tokens: rustlink_config::PoTokens,
+    ) {
         let stamp = potoken_path(config).and_then(|p| stat_file(&p));
         {
             let mut watch = lock(&self.youtube_pot_watch);
@@ -81,7 +72,7 @@ impl State {
             watch.stamp = stamp;
             watch.manual_override = true;
         }
-        *lock(&self.youtube_auth) = Some(YoutubeAuth { po_token: pot, visitor_data: vd });
+        *lock(&self.youtube_auth) = Some(tokens);
         self.youtube_streams.clear();
         self.youtube_health.clear();
     }
@@ -106,22 +97,18 @@ impl State {
                 watch.manual_override = false;
             }
         }
-        let (pot, vd) = if stamp.is_some() {
-            let Ok(pair) = rustlink_config::load_potoken_file(&path) else { return false };
-            pair
+        let next = if stamp.is_some() {
+            let Ok(bundle) = rustlink_config::load_potoken_bundle(&path) else { return false };
+            bundle
         } else {
-            rustlink_config::split_pot_pair(&config.youtube_po_token, &config.youtube_visitor_data)
+            rustlink_config::PoTokens::from_config(config)
         };
         let changed = {
             let mut held = lock(&self.youtube_auth);
-            let prev = held.as_ref().map(|a| (a.po_token.as_str(), a.visitor_data.as_str()));
-            let fallback = rustlink_config::split_pot_pair(
-                &config.youtube_po_token,
-                &config.youtube_visitor_data,
-            );
-            let cur = prev.unwrap_or((fallback.0.as_str(), fallback.1.as_str()));
-            let diff = cur != (pot.as_str(), vd.as_str());
-            *held = Some(YoutubeAuth { po_token: pot, visitor_data: vd });
+            let fallback = rustlink_config::PoTokens::from_config(config);
+            let cur = held.as_ref().unwrap_or(&fallback);
+            let diff = cur != &next;
+            *held = Some(next);
             diff
         };
         if changed {
