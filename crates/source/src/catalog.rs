@@ -1188,12 +1188,23 @@ struct SoundCloudTrack {
     streamable: bool,
     #[serde(deserialize_with = "null_default")]
     policy: String,
+    media: Value,
 }
 
 impl SoundCloudTrack {
-    /// Go+ tracks ("SNIP") stream only a 30-second preview to anonymous clients.
-    fn is_preview(&self) -> bool {
-        self.policy.eq_ignore_ascii_case("snip")
+    /// False for Go+ tracks ("SNIP"), which stream only a 30-second preview to anonymous
+    /// clients, and for tracks offered only as encrypted (DRM) HLS.
+    fn plays_in_full(&self) -> bool {
+        let Some(formats) = self.media.pointer("/transcodings").and_then(Value::as_array) else {
+            return !self.policy.eq_ignore_ascii_case("snip");
+        };
+        !self.policy.eq_ignore_ascii_case("snip")
+            && formats.iter().any(|f| {
+                matches!(
+                    f.pointer("/format/protocol").and_then(Value::as_str),
+                    Some("progressive" | "hls")
+                )
+            })
     }
 }
 
@@ -1280,7 +1291,7 @@ impl SoundCloud<'_> {
             return Ok(finish_search(
                 list.collection
                     .into_iter()
-                    .filter(|e| !e.is_preview())
+                    .filter(SoundCloudTrack::plays_in_full)
                     .filter_map(|e| self.track(e))
                     .collect(),
             ));
@@ -1398,7 +1409,14 @@ impl SoundCloud<'_> {
         let auth =
             track.get("track_authorization").and_then(Value::as_str).filter(|t| !t.is_empty());
         // SoundCloud still lists formats it has retired and answers 404 for them; try the next.
-        let mut last = SourceError::Http("soundcloud offered no playable audio stream".into());
+        let offered: Vec<&str> = transcodings
+            .iter()
+            .filter_map(|e| e.pointer("/format/protocol").and_then(Value::as_str))
+            .collect();
+        let mut last = SourceError::Http(format!(
+            "soundcloud offered no playable audio stream (only {})",
+            offered.join(", ")
+        ));
         for ((_, hls, _), url) in candidates {
             match self.stream_url(url, auth) {
                 Ok(direct) if hls => return Ok(SoundCloudStream::Playlist(direct)),
@@ -1965,6 +1983,7 @@ mod tests {
                 streamable: true,
                 artwork_url: None,
                 policy: "ALLOW".into(),
+                media: Value::Null,
             })
             .unwrap();
         assert_eq!(track.metadata.title, "A Song");
@@ -1973,13 +1992,16 @@ mod tests {
     }
 
     #[test]
-    fn only_go_plus_previews_count_as_soundcloud_previews() {
-        let list: SoundCloudList = serde_json::from_str(
-            r#"{"collection":[{"id":1,"policy":"SNIP"},{"id":2,"policy":"ALLOW"},{"id":3,"policy":null},{"id":4}]}"#,
-        )
+    fn previews_and_drm_only_tracks_do_not_play_in_full() {
+        let drm = r#"{"transcodings":[{"format":{"protocol":"ctr-encrypted-hls"}}]}"#;
+        let hls = r#"{"transcodings":[{"format":{"protocol":"hls"}}]}"#;
+        let list: SoundCloudList = serde_json::from_str(&format!(
+            r#"{{"collection":[{{"id":1,"policy":"SNIP"}},{{"id":2,"policy":"ALLOW"}},
+            {{"id":3,"policy":null}},{{"id":4}},{{"id":5,"media":{drm}}},{{"id":6,"media":{hls}}}]}}"#
+        ))
         .unwrap();
-        let previews: Vec<bool> = list.collection.iter().map(SoundCloudTrack::is_preview).collect();
-        assert_eq!(previews, [true, false, false, false]);
+        let full: Vec<bool> = list.collection.iter().map(SoundCloudTrack::plays_in_full).collect();
+        assert_eq!(full, [false, true, true, true, false, true]);
     }
 
     #[test]
