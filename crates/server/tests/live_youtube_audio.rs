@@ -64,3 +64,40 @@ fn youtube_vevo_link_decodes_to_opus_frames_past_seventy_seconds_in_pure_rust() 
     println!("sought to 120s and emitted {seek_count} Opus frames in {:?}", seek_start.elapsed());
     assert_eq!(seek_count, 250);
 }
+
+#[test]
+#[ignore = "talks to SoundCloud"]
+fn a_soundcloud_hls_track_plays_to_its_end_and_seeks_in_pure_rust() {
+    let mut config = Config::default();
+    apply_env(&mut config);
+    let source = Service::new(config);
+    let LoadResult::Search(hits) = source.load("scsearch:lofi hip hop").unwrap() else {
+        panic!("scsearch did not return search results");
+    };
+    let track = hits
+        .into_iter()
+        .find(|t| (60_000..600_000).contains(&t.metadata.length))
+        .expect("no SoundCloud hit between one and ten minutes long");
+    let engine = Engine { ffmpeg: None, in_process: true, bitrate: 192_000, complexity: 5 };
+    let start = |position_ms| {
+        let body = Body::new(source.open(&track).unwrap());
+        engine.start(&track, body, position_ms, 100, &Object::new(), Preference::Auto).unwrap()
+    };
+
+    let mut frames = start(0);
+    let (count, _) = decode_frames(frames.as_mut(), usize::MAX);
+    let played_ms = count as i64 * 20;
+    println!("{:?}: played {played_ms} of {} ms", track.metadata.title, track.metadata.length);
+    assert!(
+        played_ms.abs_diff(track.metadata.length) < 2_000,
+        "played {played_ms} ms of a {} ms track",
+        track.metadata.length
+    );
+
+    let half = track.metadata.length / 2;
+    let mut sought = start(half);
+    let (rest, _) = decode_frames(sought.as_mut(), usize::MAX);
+    let rest_ms = rest as i64 * 20;
+    println!("after seeking to {half} ms, {rest_ms} ms remained");
+    assert!(rest_ms.abs_diff(track.metadata.length - half) < 2_000, "{rest_ms} ms remained");
+}
