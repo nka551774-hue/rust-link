@@ -366,7 +366,19 @@ impl Bot {
                 if ended_id.is_none() || state.current_play_id() != ended_id {
                     return;
                 }
+                let failed = (event["reason"] == "load_failed").then(|| state.current().cloned());
                 state.finish();
+                // YouTube refuses some hosts ("confirm you're not a bot"); play the same song
+                // from SoundCloud instead of skipping it.
+                if let Some(twin) = self.soundcloud_twin(failed.flatten()).await {
+                    println!("playing {:?} from SoundCloud instead", twin.metadata.title);
+                    if let Some(state) = self.guilds.get_mut(&guild) {
+                        state.retry_with(twin);
+                    }
+                    self.start_next(&guild).await;
+                    return;
+                }
+                let Some(state) = self.guilds.get_mut(&guild) else { return };
                 if state.record(event["reason"] == "finished") {
                     eprintln!(
                         "stopped queue in guild {guild}: {} consecutive load failures",
@@ -551,6 +563,17 @@ impl Bot {
             LoadResult::Empty => Vec::new(),
         };
         (!tracks.is_empty()).then_some(tracks).ok_or_else(|| "沒有相符的結果".into())
+    }
+
+    /// The closest SoundCloud match for a YouTube track that could not be loaded.
+    async fn soundcloud_twin(&self, failed: Option<Track>) -> Option<Track> {
+        let failed = failed.filter(|t| t.metadata.source_name == "youtube")?;
+        let query = format!("scsearch:{} {}", failed.metadata.author, failed.metadata.title);
+        match self.rustlink.resolve(query.trim()).await.ok()? {
+            LoadResult::Search(tracks) => tracks.into_iter().next(),
+            LoadResult::Track(track) => Some(*track),
+            _ => None,
+        }
     }
 
     async fn skip(&mut self, guild: &str) -> String {

@@ -55,6 +55,11 @@ impl Guild {
         accepted
     }
 
+    /// Puts a replacement for the track that just failed at the head of the queue.
+    pub fn retry_with(&mut self, track: Track) {
+        self.queue.push_front(QueuedItem { track, start_ms: None });
+    }
+
     #[allow(dead_code)]
     pub fn advance(&mut self) -> Option<Track> {
         self.advance_with_start().map(|(track, _)| track)
