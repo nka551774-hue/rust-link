@@ -116,7 +116,9 @@ if ($reuse) {
         Write-PoTokenConfig $PoToken $VisitorData
     }
     $escapedPotFile = $PoTokenFile.Replace("'", "''")
-    $extraYaml = @("youtubePoTokenFile: '$escapedPotFile'", 'youtubeRequirePoToken: true')
+    $extraYaml = @("youtubePoTokenFile: '$escapedPotFile'")
+    # Refuse anonymous YouTube only when a token was given; otherwise the proxy carries it.
+    if ($PoToken) { $extraYaml += 'youtubeRequirePoToken: true' }
     if ($Proxy) { $extraYaml += "youtubeProxy: `"$Proxy`"" }
     $extraBlock = ($extraYaml -join "`n") + "`n"
     [IO.Directory]::CreateDirectory($Data) | Out-Null
@@ -131,9 +133,8 @@ $env:RUSTLINK_ADDRESS = "127.0.0.1:$Port"
 $env:DISCORD_BOT_TOKEN = $Token
 $env:RUSTLINK_URL = "http://127.0.0.1:$Port"
 $env:RUSTLINK_YOUTUBE_PO_TOKEN_FILE = $PoTokenFile
-$env:RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN = 'true'
 $env:RUSTLINK_NO_PAUSE = '1'
-Remove-Item Env:RUSTLINK_YOUTUBE_PO_TOKEN, Env:RUSTLINK_YOUTUBE_VISITOR_DATA, Env:RUSTLINK_YOUTUBE_PROXY -ErrorAction SilentlyContinue
+Remove-Item Env:RUSTLINK_YOUTUBE_PO_TOKEN, Env:RUSTLINK_YOUTUBE_VISITOR_DATA, Env:RUSTLINK_YOUTUBE_PROXY, Env:RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN -ErrorAction SilentlyContinue
 
 $msysRoot = if ($env:RUSTLINK_MSYS2_ROOT) { $env:RUSTLINK_MSYS2_ROOT } else { 'C:\msys64' }
 $bash = Join-Path $msysRoot 'usr\bin\bash.exe'

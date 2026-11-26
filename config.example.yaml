@@ -22,7 +22,7 @@ youtubeEndpoint: https://youtubei.googleapis.com
 youtubeMusicEndpoint: https://music.youtube.com
 youtubeClientVersion: ""
 youtubePoTokenFile: potoken.yaml           # dedicated PO token config (auto-reloaded on save)
-youtubeRequirePoToken: true                # always route YouTube through poToken
+youtubeRequirePoToken: false               # true = refuse YouTube until potoken.yaml has a token
 youtubePoToken: ""
 youtubeGvsPoToken: ""
 youtubePlayerPoToken: ""

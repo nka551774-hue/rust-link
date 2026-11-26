@@ -458,9 +458,8 @@ impl<'a> Catalog<'a> {
     }
 
     pub(crate) fn ensure_po_token(&self) -> Result<(), SourceError> {
-        let require = self.config.youtube_require_po_token
-            || !self.config.youtube_po_token_file.trim().is_empty();
-        if !require {
+        // A token file alone only supplies tokens; refusing anonymous YouTube is opt-in.
+        if !self.config.youtube_require_po_token {
             return Ok(());
         }
         if !self.configured_auth().is_configured() {
@@ -1498,6 +1497,16 @@ mod tests {
         let mut c = Config::default();
         c.youtube_endpoint = base;
         c
+    }
+
+    #[test]
+    fn an_empty_token_file_refuses_youtube_only_when_required() {
+        let agent = ureq::Agent::new_with_defaults();
+        let mut cfg = Config::default();
+        cfg.youtube_po_token_file = "missing-potoken.yaml".into();
+        assert!(Catalog::new(&agent, &cfg).ensure_po_token().is_ok());
+        cfg.youtube_require_po_token = true;
+        assert!(Catalog::new(&agent, &cfg).ensure_po_token().is_err());
     }
 
     #[test]

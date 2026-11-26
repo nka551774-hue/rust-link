@@ -129,8 +129,10 @@ else
     mkdir -p "$DATA"
     chmod 700 "$DATA"
     {
-        printf 'address: 127.0.0.1:%s\npassword: "%s"\nlogLevel: info\nlogDirectory: logs\ntoolsDirectory: .tools\nautoDownload: true\nyoutubePoTokenFile: %s\nyoutubeRequirePoToken: true\n' \
+        printf 'address: 127.0.0.1:%s\npassword: "%s"\nlogLevel: info\nlogDirectory: logs\ntoolsDirectory: .tools\nautoDownload: true\nyoutubePoTokenFile: %s\n' \
             "$PORT" "$PASSWORD" "$(yaml_single "$POTOKEN_FILE")"
+        # Refuse anonymous YouTube only when a token was given; otherwise the proxy carries it.
+        [ -z "$PO_TOKEN" ] || printf 'youtubeRequirePoToken: true\n'
         [ -z "$PROXY" ] || printf 'youtubeProxy: "%s"\n' "$PROXY"
     } > "$CONFIG"
     printf 'DISCORD_BOT_TOKEN=%s\nRUSTLINK_PASSWORD=%s\nRUSTLINK_URL=http://127.0.0.1:%s\n' "$TOKEN" "$PASSWORD" "$PORT" > "$ENV_FILE"
@@ -140,8 +142,8 @@ fi
 [ -f "$POTOKEN_FILE" ] || write_potoken_file "" ""
 export RUSTLINK_PASSWORD="$PASSWORD" RUSTLINK_ADDRESS="127.0.0.1:$PORT"
 export DISCORD_BOT_TOKEN="$TOKEN" RUSTLINK_URL="http://127.0.0.1:$PORT"
-export RUSTLINK_YOUTUBE_PO_TOKEN_FILE="$POTOKEN_FILE" RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN=true
-unset RUSTLINK_YOUTUBE_PO_TOKEN RUSTLINK_YOUTUBE_VISITOR_DATA RUSTLINK_YOUTUBE_PROXY
+export RUSTLINK_YOUTUBE_PO_TOKEN_FILE="$POTOKEN_FILE"
+unset RUSTLINK_YOUTUBE_PO_TOKEN RUSTLINK_YOUTUBE_VISITOR_DATA RUSTLINK_YOUTUBE_PROXY RUSTLINK_YOUTUBE_REQUIRE_PO_TOKEN
 
 for p in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do
     [ -d "$p" ] && case :$PATH: in *:"$p":*) ;; *) PATH="$PATH:$p" ;; esac

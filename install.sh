@@ -270,7 +270,6 @@ set_yaml_raw() {
 apply_youtube_settings() {
     local pot_file="$DIRECTORY/potoken.yaml"
     set_yaml_single "$DIRECTORY/config.yaml" youtubePoTokenFile "$pot_file"
-    set_yaml_raw "$DIRECTORY/config.yaml" youtubeRequirePoToken true
     if [ ! -f "$pot_file" ]; then
         (
             umask 0027

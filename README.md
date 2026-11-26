@@ -14,7 +14,7 @@
 [![Zero GC](https://img.shields.io/badge/20ms%20Hot%20Path-0%20GC%20%C2%B7%200%20Heap%20Allocs-2ea043)](#benchmarks)
 [![License](https://img.shields.io/badge/License-GPL--3.0--or--later-blue)](LICENSE)
 
-[一鍵部署](#one-click) · [為何選擇純 Rust](#why-rust) · [橫向對比](#comparison) · [系統架構](#architecture) · [實測效能](#benchmarks) · [機器人開發](#examples) · [文件索引](#docs)
+[一鍵部署](#one-click) · [為何選擇純 Rust](#why-rust) · [系統架構](#architecture) · [實測效能](#benchmarks) · [機器人開發](#examples) · [文件索引](#docs)
 
 </div>
 
@@ -103,28 +103,6 @@ RUSTLINK_PASSWORD=... docker compose up -d --build
 | **視窗化 Sinc 重取樣**（44.1 → 48 kHz 雙聲道） | **4.54 µs / 音框** | **0 allocs（5,000 框）** | 即時速度 **4,408×**（佔預算 **0.023%**） |
 | **全開 8 階 SIMD/相量 DSP 濾鏡鏈** | **38.78 µs / 音框** | **0 allocs（5,000 框）** | 即時速度 **516×**（佔預算 **0.19%**） |
 | **48 kHz WAV 解碼 + `libopus` 複雜度 10 編碼** | **171.02 µs / 音框** | 預配置重用緩衝 | 即時速度 **117.0×**（佔預算 **0.86%**） |
-
----
-
-<a id="comparison"></a>
-## 與其他音訊節點方案對比
-
-<p align="center">
-  <img src="docs/assets/comparison.svg" alt="Rustlink vs Lavalink vs NodeLink vs Go Audio Nodes vs yt-dlp Comparison" width="100%" />
-</p>
-
-| 對比維度 | **Rustlink（純 Rust）** | **Lavalink（Java / JVM）** | **NodeLink（Node.js / V8）** | **Go 節點 / GoLink** | **`yt-dlp` + `FFmpeg` 子程序** |
-| --- | --- | --- | --- | --- | --- |
-| **部署產物** | **單一 ~9.7 MiB 執行檔** + `libopus` | JRE 17/21 + Spring Boot JAR + 外掛 | Node.js V8 + `node_modules` + 原生擴充 | Go 執行檔 + `cgo` C 綁定 | 機器人 + Python + `yt-dlp` + `FFmpeg` |
-| **典型閒置記憶體** | **~12–18 MiB** | ~220–450+ MiB | ~75–130 MiB | ~25–45 MiB | 每首解析額外暴增 **+60–120 MiB** |
-| **冷啟動時間** | **< 15 ms** | ~2,000–6,000 ms | ~300–900 ms | ~30–80 ms | 每次切歌啟動子程序 **~800–2,500 ms** |
-| **20 ms 排程與抖動** | **0 GC** + 獨立排程執行緒 + 熱路徑 `0` 配置 | 受 G1GC / ZGC Safepoint 影響 | 單執行緒事件迴圈易受大 JSON 阻塞 | 並行 GC + 每 20 ms `cgo` 棧切換 | OS Pipe 緩衝不可控，改濾鏡需重啟斷音 |
-| **DAVE v1 + RTP** | **純 Rust OpenMLS 原地加密**（489.5 ns，0 配置） | JNI / JNA 跨界呼叫 `libdave` | N-API 原生擴充跨界呼叫 | `cgo` 綁定外部 C/C++ 函式庫 | 依各語言機器人框架 FFI 實作而異 |
-| **音源解析快取** | **原生解析 + `Singleflight` + `Arc` 共享** | 成熟外掛生態，物件駐留 JVM Heap | JS 串流解析，受 V8 物件模型限制 | `goroutine` 併發高，深拷貝產生 GC 壓力 | 每次呼叫外部 CLI 輸出大 JSON |
-| **即時濾鏡切換** | **10 種濾鏡原位更新係數**（零爆音、零重啟） | 原生濾鏡鏈，外掛易增短命陣列配置 | JS / Native 濾鏡，受執行緒池排程限制 | 常仰賴外部 `FFmpeg` 濾鏡圖 | 修改濾鏡通常需重建 `FFmpeg` 並 Seek |
-
-> [!NOTE]
-> Lavalink、NodeLink 與 Go 節點數值反映各受管執行環境典型基準；Rustlink 數據來自本倉庫可重現 `--release` 基準測試。若需沿用既有 Lavalink v4 外掛生態可選 Lavalink；若追求**極低 VPS 記憶體成本、零 GC 音訊穩定度、原生 DAVE v1 安全性與一鍵純 Rust 部署**，Rustlink 以不到十分之一的閒置資源達成最佳表現。
 
 ---
 

@@ -37,7 +37,7 @@ Rustlink 以 100% 純 Rust 原生 InnerTube 協定解析與串流 YouTube / YouT
 ## PO Token 專屬設定檔模式（`potoken.yaml`，預設強制啟用）
 
 > [!NOTE]
-> **全鏈路強制 PO Token 與免重啟自動熱載入**：啟動腳本、預設 `config.yaml` 與 `install.sh` 皆預設啟用 `youtubePoTokenFile: potoken.yaml` 與 `youtubeRequirePoToken: true`。所有 YouTube / YouTube Music 請求（`/player`、`/search`、`/browse`、`/next`、歌詞與 `googlevideo.com` 音訊網址 `&pot=`）一律強制走 `poToken` 驗證（優先採用原生支援 `poToken` 與 **48 kHz WebM Opus `itag 251`** 的 `VISIONOS` 與 `ANDROID`），未設定時拒絕匿名直連以避免觸發風控。檔案存檔後節點會**自動偵測變更並即時熱更新、清空舊快取**，全程無須重啟節點或中斷語音通話。
+> **PO Token 與免重啟自動熱載入**：啟動腳本、預設 `config.yaml` 與 `install.sh` 皆設定 `youtubePoTokenFile: potoken.yaml`。檔案填入 token 後，所有 YouTube / YouTube Music 請求（`/player`、`/search`、`/browse`、`/next`、歌詞與 `googlevideo.com` 音訊網址 `&pot=`）都會帶上 `poToken`（優先採用原生支援 `poToken` 與 **48 kHz WebM Opus `itag 251`** 的 `VISIONOS` 與 `ANDROID`）；檔案留空時照常匿名解析（建議搭配 `youtubeProxy`）。只有 `youtubeRequirePoToken: true` 會在未設定時拒絕匿名直連；一鍵腳本只在你輸入 PO token 時開啟它。檔案存檔後節點會**自動偵測變更並即時熱更新、清空舊快取**，全程無須重啟節點或中斷語音通話。
 
 ### 1. 取得並填入 `potoken.yaml`（支援 YTDLnis 多權杖與瀏覽器 F12）
 

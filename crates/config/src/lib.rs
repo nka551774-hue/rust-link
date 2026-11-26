@@ -283,7 +283,6 @@ pub fn starter(password: &str) -> String {
         logLevel: info\n\
         logDirectory: logs\n\
         youtubePoTokenFile: potoken.yaml\n\
-        youtubeRequirePoToken: true\n\
         # Fetch FFmpeg on first start for media formats the built-in\n\
         # decoders do not support. Source resolution runs in Rust.\n\
         autoDownload: true\n";
@@ -761,7 +760,7 @@ mod tests {
         assert_eq!(config.password, "4f2a9c");
         assert_eq!(config.address, "0.0.0.0:2333");
         assert_eq!(config.youtube_po_token_file, STARTER_POTOKEN_FILE);
-        assert!(config.youtube_require_po_token && config.auto_download);
+        assert!(!config.youtube_require_po_token && config.auto_download);
         assert_eq!(parse_potoken_text(starter_potoken()).unwrap(), (String::new(), String::new()));
     }
 
