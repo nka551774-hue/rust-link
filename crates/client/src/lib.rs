@@ -79,6 +79,23 @@ impl Drop for SecretBuf {
     }
 }
 
+/// Runtime YouTube Proof-of-Origin token bundle for `PATCH /api/v1/youtube`.
+#[derive(Default, Clone, Serialize)]
+pub struct YoutubeTokens<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub po_token: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub gvs_po_token: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub player_po_token: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub subs_po_token: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub visitor_data: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub player_client: &'a str,
+}
+
 #[derive(Serialize)]
 struct QueryBody<'a> {
     query: &'a str,
@@ -260,12 +277,20 @@ impl Client {
         po_token: &str,
         visitor_data: &str,
     ) -> Result<Value, Error> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            po_token: &'a str,
-            visitor_data: &'a str,
-        }
-        self.patch_json("youtube", &Body { po_token, visitor_data }).await
+        self.set_youtube_token_bundle(&YoutubeTokens {
+            po_token,
+            visitor_data,
+            ..YoutubeTokens::default()
+        })
+        .await
+    }
+
+    /// Hot-reloads a full YTDLnis `GVS` / `Player` / `Subs` / `Visitor Data` bundle on the node.
+    pub async fn set_youtube_token_bundle(
+        &self,
+        tokens: &YoutubeTokens<'_>,
+    ) -> Result<Value, Error> {
+        self.patch_json("youtube", tokens).await
     }
 
     pub async fn create_session(

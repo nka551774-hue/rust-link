@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustlink_config::Config;
@@ -42,7 +42,8 @@ pub struct State {
     pub(crate) youtube_visitor: Arc<CredentialCache>,
     pub(crate) youtube_streams: Arc<YoutubeStreamCache>,
     pub(crate) youtube_health: Arc<YoutubeClientHealth>,
-    pub(crate) youtube_auth: Mutex<Option<rustlink_config::PoTokens>>,
+    pub(crate) youtube_auth: Mutex<Option<Arc<rustlink_config::PoTokens>>>,
+    config_auth: OnceLock<Arc<rustlink_config::PoTokens>>,
     pub(crate) youtube_pot_watch: Mutex<PoTokenWatch>,
 }
 
@@ -60,6 +61,18 @@ fn stat_file(path: &std::path::Path) -> FileStamp {
 }
 
 impl State {
+    fn base_youtube_auth(&self, config: &Config) -> &Arc<rustlink_config::PoTokens> {
+        self.config_auth.get_or_init(|| Arc::new(rustlink_config::PoTokens::from_config(config)))
+    }
+
+    pub(crate) fn effective_youtube_auth(&self, config: &Config) -> Arc<rustlink_config::PoTokens> {
+        self.sync_potoken_file(config);
+        if let Some(auth) = lock(&self.youtube_auth).as_ref() {
+            return Arc::clone(auth);
+        }
+        Arc::clone(self.base_youtube_auth(config))
+    }
+
     pub(crate) fn record_manual_youtube_auth(
         &self,
         config: &Config,
@@ -72,7 +85,7 @@ impl State {
             watch.stamp = stamp;
             watch.manual_override = true;
         }
-        *lock(&self.youtube_auth) = Some(tokens);
+        *lock(&self.youtube_auth) = Some(Arc::new(tokens));
         self.youtube_streams.clear();
         self.youtube_health.clear();
     }
@@ -99,15 +112,15 @@ impl State {
         }
         let next = if stamp.is_some() {
             let Ok(bundle) = rustlink_config::load_potoken_bundle(&path) else { return false };
-            bundle
+            Arc::new(bundle)
         } else {
-            rustlink_config::PoTokens::from_config(config)
+            Arc::clone(self.base_youtube_auth(config))
         };
         let changed = {
+            let fallback = self.base_youtube_auth(config);
             let mut held = lock(&self.youtube_auth);
-            let fallback = rustlink_config::PoTokens::from_config(config);
-            let cur = held.as_ref().unwrap_or(&fallback);
-            let diff = cur != &next;
+            let cur = held.as_deref().unwrap_or(fallback.as_ref());
+            let diff = cur != next.as_ref();
             *held = Some(next);
             diff
         };
@@ -119,7 +132,7 @@ impl State {
     }
 }
 
-fn wipe_string(secret: &mut String) {
+pub(crate) fn wipe_string(secret: &mut String) {
     // SAFETY: NUL (0x00) is valid UTF-8 before clearing length.
     unsafe {
         for byte in secret.as_bytes_mut() {

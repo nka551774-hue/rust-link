@@ -11,6 +11,8 @@ pub struct Config {
     pub password: String,
     pub rustlink_url: String,
     pub youtube_po_token: String,
+    pub youtube_gvs_po_token: String,
+    pub youtube_player_po_token: String,
     pub youtube_visitor_data: String,
     pub guilds: Option<HashSet<String>>,
     pub volume: i64,
@@ -20,18 +22,15 @@ pub struct Config {
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mask = |s: &str| if s.is_empty() { "" } else { "<redacted>" };
         f.debug_struct("Config")
             .field("token", &"<redacted>")
             .field("password", &"<redacted>")
             .field("rustlink_url", &self.rustlink_url)
-            .field(
-                "youtube_po_token",
-                &if self.youtube_po_token.is_empty() { "" } else { "<redacted>" },
-            )
-            .field(
-                "youtube_visitor_data",
-                &if self.youtube_visitor_data.is_empty() { "" } else { "<redacted>" },
-            )
+            .field("youtube_po_token", &mask(&self.youtube_po_token))
+            .field("youtube_gvs_po_token", &mask(&self.youtube_gvs_po_token))
+            .field("youtube_player_po_token", &mask(&self.youtube_player_po_token))
+            .field("youtube_visitor_data", &mask(&self.youtube_visitor_data))
             .field("guilds", &self.guilds)
             .field("volume", &self.volume)
             .field("max_queue", &self.max_queue)
@@ -88,6 +87,12 @@ impl Config {
             rustlink_url: get("RUSTLINK_URL").unwrap_or_else(|| "http://127.0.0.1:2333".into()),
             youtube_po_token: get("RUSTLINK_YOUTUBE_PO_TOKEN")
                 .or_else(|| get("YOUTUBE_PO_TOKEN"))
+                .unwrap_or_default(),
+            youtube_gvs_po_token: get("RUSTLINK_YOUTUBE_GVS_PO_TOKEN")
+                .or_else(|| get("YOUTUBE_GVS_PO_TOKEN"))
+                .unwrap_or_default(),
+            youtube_player_po_token: get("RUSTLINK_YOUTUBE_PLAYER_PO_TOKEN")
+                .or_else(|| get("YOUTUBE_PLAYER_PO_TOKEN"))
                 .unwrap_or_default(),
             youtube_visitor_data: get("RUSTLINK_YOUTUBE_VISITOR_DATA")
                 .or_else(|| get("YOUTUBE_VISITOR_DATA"))

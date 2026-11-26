@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read as _;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustlink_config::Config;
@@ -418,15 +419,16 @@ pub struct Catalog<'a> {
     pub agent: &'a ureq::Agent,
     pub config: &'a Config,
     state: Option<&'a CatalogState>,
+    auth: OnceLock<Arc<rustlink_config::PoTokens>>,
 }
 
 impl<'a> Catalog<'a> {
     pub fn new(agent: &'a ureq::Agent, config: &'a Config) -> Self {
-        Self { agent, config, state: None }
+        Self { agent, config, state: None, auth: OnceLock::new() }
     }
 
     pub fn with_state(agent: &'a ureq::Agent, config: &'a Config, state: &'a CatalogState) -> Self {
-        Self { agent, config, state: Some(state) }
+        Self { agent, config, state: Some(state), auth: OnceLock::new() }
     }
 
     fn visitor_cache(&self) -> Option<&'a CredentialCache> {
@@ -437,24 +439,22 @@ impl<'a> Catalog<'a> {
         self.state.filter(|_| is_https(&self.config.youtube_endpoint))
     }
 
-    fn configured_auth(&self) -> rustlink_config::PoTokens {
-        if let Some(state) = self.state {
-            state.sync_potoken_file(self.config);
-            if let Some(auth) = crate::lock(&state.youtube_auth).as_ref() {
-                return auth.clone();
+    fn configured_auth(&self) -> &rustlink_config::PoTokens {
+        self.auth.get_or_init(|| {
+            if let Some(state) = self.state {
+                return state.effective_youtube_auth(self.config);
             }
-        } else {
             let file = self.config.youtube_po_token_file.trim();
             if !file.is_empty() && std::path::Path::new(file).is_file() {
                 if let Ok(bundle) = rustlink_config::load_potoken_bundle(std::path::Path::new(file))
                 {
                     if bundle.is_configured() || !bundle.visitor_data.is_empty() {
-                        return bundle;
+                        return Arc::new(bundle);
                     }
                 }
             }
-        }
-        rustlink_config::PoTokens::from_config(self.config)
+            Arc::new(rustlink_config::PoTokens::from_config(self.config))
+        })
     }
 
     pub(crate) fn ensure_po_token(&self) -> Result<(), SourceError> {
@@ -540,17 +540,16 @@ impl<'a> Catalog<'a> {
         );
     }
 
-    fn effective_credentials(&self, bootstrap: bool) -> (rustlink_config::PoTokens, String) {
+    fn effective_credentials(&self, bootstrap: bool) -> (&rustlink_config::PoTokens, Cow<'_, str>) {
         let tokens = self.configured_auth();
         if !tokens.visitor_data.is_empty() {
-            let vd = tokens.visitor_data.clone();
-            return (tokens, vd);
+            return (tokens, Cow::Borrowed(tokens.visitor_data.as_str()));
         }
         if let Some(cached) = self.visitor_cache().and_then(CredentialCache::peek) {
-            return (tokens, cached);
+            return (tokens, Cow::Owned(cached));
         }
         if (!bootstrap && !tokens.is_configured()) || !is_https(&self.config.youtube_endpoint) {
-            return (tokens, String::new());
+            return (tokens, Cow::Borrowed(""));
         }
         let fetch = || {
             fetch_visitor_data(
@@ -563,7 +562,7 @@ impl<'a> Catalog<'a> {
             Some(cache) => cache.get_or_refresh(fetch).unwrap_or_default(),
             None => fetch().map(|(vd, _)| vd).unwrap_or_default(),
         };
-        (tokens, vd)
+        (tokens, Cow::Owned(vd))
     }
 
     fn has_explicit_visitor_data(&self) -> bool {
@@ -1123,9 +1122,11 @@ impl Media {
 
 fn with_po_token(url: String, token: &str) -> String {
     let token = token.trim();
+    if token.is_empty() {
+        return url;
+    }
     let Some(mut parsed) = http_url(&url) else { return url };
-    if token.is_empty()
-        || !parsed.host_str().is_some_and(|h| host_matches(h, "googlevideo.com"))
+    if !parsed.host_str().is_some_and(|h| host_matches(h, "googlevideo.com"))
         || parsed.query_pairs().any(|(k, _)| k == "pot")
     {
         return url;

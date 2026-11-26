@@ -248,7 +248,6 @@ impl Service {
         let writer_cache = Arc::clone(&self.catalog_state.youtube_visitor);
         (
             Arc::new(move || {
-                svc.sync_potoken_file();
                 let auth = svc.active_youtube_auth();
                 if !auth.visitor_data.is_empty() {
                     Some(auth.visitor_data.clone())
@@ -263,18 +262,17 @@ impl Service {
     pub fn youtube_po_token_reader(self: &Arc<Self>) -> VisitorReader {
         let svc = Arc::clone(self);
         Arc::new(move || {
-            svc.sync_potoken_file();
             let auth = svc.active_youtube_auth();
-            let pot = auth.effective_player().to_owned();
-            (!pot.is_empty()).then_some(pot)
+            let pot = auth.effective_player();
+            (!pot.is_empty()).then(|| pot.to_owned())
         })
     }
 
-    fn active_youtube_auth(&self) -> rustlink_config::PoTokens {
-        if let Some(auth) = lock(&self.catalog_state.youtube_auth).as_ref() {
-            return auth.clone();
+    fn active_youtube_auth(&self) -> Arc<rustlink_config::PoTokens> {
+        if self.catalog_state.sync_potoken_file(&self.config) {
+            lock(&self.cache).clear();
         }
-        rustlink_config::PoTokens::from_config(&self.config)
+        self.catalog_state.effective_youtube_auth(&self.config)
     }
 
     fn sync_potoken_file(&self) {

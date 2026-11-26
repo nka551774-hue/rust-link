@@ -122,6 +122,7 @@ impl PureFrames {
         &mut self,
         k_tail: &mut [f32],
         next_pcm: &mut [f32],
+        scratch_packet: &mut Vec<u8>,
     ) -> Result<(), AudioError> {
         if !next_pcm.is_empty() {
             self.dsp.process_pre(next_pcm);
@@ -152,8 +153,8 @@ impl PureFrames {
             .copy_from_slice(&next_pcm[..take_next * 2]);
         self.dsp.process_post(&mut prime);
 
-        let mut discard = Vec::new();
-        self.encoder.encode_float_frame_size(&mut prime, 480, &mut discard)?;
+        self.encoder.encode_float_frame_size(&mut prime, 480, scratch_packet)?;
+        scratch_packet.clear();
         self.encoded_any = true;
 
         if next_frames > take_next {
@@ -284,7 +285,7 @@ impl Frames for PureFrames {
                 }
                 PassthroughStep::FallbackToTranscode => {
                     self.passthrough = false;
-                    self.finish_passthrough_handoff(&mut k_tail, &mut next_pcm)?;
+                    self.finish_passthrough_handoff(&mut k_tail, &mut next_pcm, packet)?;
                 }
             }
         } else if self.handoff_pending {
@@ -296,7 +297,7 @@ impl Frames for PureFrames {
             if !self.decoder.decode(&mut next_pcm)? {
                 self.drained = true;
             }
-            self.finish_passthrough_handoff(&mut k_tail, &mut next_pcm)?;
+            self.finish_passthrough_handoff(&mut k_tail, &mut next_pcm, packet)?;
         }
 
         while self.staging.len() - self.staging_at < FRAME_SAMPLES_STEREO {

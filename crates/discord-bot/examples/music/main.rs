@@ -69,9 +69,19 @@ async fn run() -> Result<(), Failure> {
             }
         }
     }
-    if !config.youtube_po_token.is_empty() || !config.youtube_visitor_data.is_empty() {
+    if !config.youtube_po_token.is_empty()
+        || !config.youtube_gvs_po_token.is_empty()
+        || !config.youtube_player_po_token.is_empty()
+        || !config.youtube_visitor_data.is_empty()
+    {
         rustlink
-            .set_youtube_tokens(&config.youtube_po_token, &config.youtube_visitor_data)
+            .set_youtube_token_bundle(&rustlink_client::YoutubeTokens {
+                po_token: &config.youtube_po_token,
+                gvs_po_token: &config.youtube_gvs_po_token,
+                player_po_token: &config.youtube_player_po_token,
+                visitor_data: &config.youtube_visitor_data,
+                ..Default::default()
+            })
             .await
             .map_err(|e| format!("failed to push YouTube PO token to Rustlink: {e}"))?;
     }

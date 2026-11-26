@@ -528,16 +528,24 @@ impl Read for MediaBody {
     }
 }
 
+impl Drop for MediaBody {
+    fn drop(&mut self) {
+        crate::catalog::wipe_string(&mut self.origin_url);
+        crate::catalog::wipe_string(&mut self.url);
+    }
+}
+
 enum PrefetchItem {
-    Data(Vec<u8>),
+    Data(Vec<u8>, usize),
     Error(io::Error),
 }
 
-/// 2 MiB recycling chunk prefetcher decoupling HTTP range continuations from audio playback.
+/// 2 MiB zero-`memset` recycling prefetcher decoupling HTTP range continuations from playback.
 pub(crate) struct PrefetchReader {
     data_rx: Receiver<PrefetchItem>,
     recycle_tx: SyncSender<Vec<u8>>,
     current: Vec<u8>,
+    len: usize,
     pos: usize,
     done: bool,
 }
@@ -553,30 +561,54 @@ impl PrefetchReader {
         let spawned =
             std::thread::Builder::new().name("rustlink-prefetch".into()).spawn(move || {
                 let Ok(mut body) = body_rx.recv() else { return };
+                let mut first_chunk = true;
                 loop {
-                    let mut chunk = recycle_rx
-                        .try_recv()
-                        .unwrap_or_else(|_| Vec::with_capacity(PREFETCH_CHUNK_BYTES));
-                    chunk.resize(PREFETCH_CHUNK_BYTES, 0);
-                    match body.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            chunk.truncate(read);
-                            if data_tx.send(PrefetchItem::Data(chunk)).is_err() {
+                    let mut chunk =
+                        recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; PREFETCH_CHUNK_BYTES]);
+                    if chunk.len() != PREFETCH_CHUNK_BYTES {
+                        chunk.resize(PREFETCH_CHUNK_BYTES, 0);
+                    }
+                    let mut filled = 0usize;
+                    let mut pending_err = None;
+                    while filled < PREFETCH_CHUNK_BYTES {
+                        match body.read(&mut chunk[filled..]) {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                filled += read;
+                                if first_chunk {
+                                    first_chunk = false;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                pending_err = Some(e);
                                 break;
                             }
                         }
-                        Err(e) => {
-                            let _ = data_tx.send(PrefetchItem::Error(e));
-                            break;
-                        }
+                    }
+                    if filled > 0 && data_tx.send(PrefetchItem::Data(chunk, filled)).is_err() {
+                        break;
+                    }
+                    if let Some(e) = pending_err {
+                        let _ = data_tx.send(PrefetchItem::Error(e));
+                        break;
+                    }
+                    if filled == 0 {
+                        break;
                     }
                 }
             });
         match spawned {
             Ok(_) => {
                 let _ = body_tx.send(body);
-                Box::new(Self { data_rx, recycle_tx, current: Vec::new(), pos: 0, done: false })
+                Box::new(Self {
+                    data_rx,
+                    recycle_tx,
+                    current: Vec::new(),
+                    len: 0,
+                    pos: 0,
+                    done: false,
+                })
             }
             Err(_) => Box::new(body),
         }
@@ -588,14 +620,18 @@ impl Read for PrefetchReader {
         if buffer.is_empty() || self.done {
             return Ok(0);
         }
-        if self.pos >= self.current.len() {
+        if self.pos >= self.len {
             let prev = std::mem::take(&mut self.current);
-            if prev.capacity() >= PREFETCH_CHUNK_BYTES {
+            if prev.len() == PREFETCH_CHUNK_BYTES {
                 let _ = self.recycle_tx.try_send(prev);
             }
+            self.len = 0;
             self.pos = 0;
             match self.data_rx.recv() {
-                Ok(PrefetchItem::Data(chunk)) => self.current = chunk,
+                Ok(PrefetchItem::Data(chunk, len)) => {
+                    self.current = chunk;
+                    self.len = len;
+                }
                 Ok(PrefetchItem::Error(e)) => {
                     self.done = true;
                     return Err(e);
@@ -606,7 +642,7 @@ impl Read for PrefetchReader {
                 }
             }
         }
-        let avail = &self.current[self.pos..];
+        let avail = &self.current[self.pos..self.len];
         let count = avail.len().min(buffer.len());
         buffer[..count].copy_from_slice(&avail[..count]);
         self.pos += count;
@@ -957,5 +993,25 @@ mod tests {
         prefetched.read_exact(&mut head).unwrap();
         assert_eq!(&head, b"data");
         assert_eq!(prefetched.read(&mut head).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        // Subsequent reads coalesce small TLS-sized 8 KiB reads into full 64 KiB prefetch chunks.
+        struct SmallReads(usize);
+        impl Read for SmallReads {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Ok(0);
+                }
+                let n = self.0.min(buf.len()).min(8192);
+                buf[..n].fill(0x5a);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let total = 8192 + PREFETCH_CHUNK_BYTES;
+        let mut coalesced = PrefetchReader::boxed(dummy_body(SmallReads(total), total as i64));
+        let mut first = vec![0u8; PREFETCH_CHUNK_BYTES];
+        assert_eq!(coalesced.read(&mut first).unwrap(), 8192);
+        assert_eq!(coalesced.read(&mut first).unwrap(), PREFETCH_CHUNK_BYTES);
+        assert_eq!(coalesced.read(&mut first).unwrap(), 0);
     }
 }
