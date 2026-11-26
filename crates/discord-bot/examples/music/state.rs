@@ -34,7 +34,7 @@ impl Guild {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn enqueue(&mut self, tracks: Vec<Track>, max: usize) -> usize {
         self.enqueue_with_start(tracks, None, max)
     }
@@ -60,7 +60,7 @@ impl Guild {
         self.queue.push_front(QueuedItem { track, start_ms: None });
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn advance(&mut self) -> Option<Track> {
         self.advance_with_start().map(|(track, _)| track)
     }

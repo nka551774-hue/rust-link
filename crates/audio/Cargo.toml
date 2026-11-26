@@ -8,7 +8,6 @@ description = "Filter model, in-process DSP pipeline and the FFmpeg fallback eng
 
 [dependencies]
 rustlink-protocol.workspace = true
-rustlink-config.workspace = true
 # Keep common source codecs in-process so AAC/MP4, MP3, FLAC, Vorbis and WAV avoid FFmpeg.
 symphonia = { version = "0.5.5", default-features = false, features = [
     "aac",

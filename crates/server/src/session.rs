@@ -295,12 +295,6 @@ impl Session {
         state.disconnected = None;
     }
 
-    pub fn disconnect(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.connected = false;
-        state.disconnected = Some(Instant::now());
-    }
-
     pub(crate) fn rollback_connect(&self, had_connected: bool) {
         let mut state = self.state.lock().unwrap();
         state.connected = false;

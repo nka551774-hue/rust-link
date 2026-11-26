@@ -2247,7 +2247,6 @@ dependencies = [
  "rustlink-audio",
  "rustlink-config",
  "rustlink-lyrics",
- "rustlink-protocol",
  "rustlink-server",
  "rustlink-source",
  "rustlink-voice",
@@ -2262,7 +2261,6 @@ dependencies = [
 name = "rustlink-audio"
 version = "0.5.0"
 dependencies = [
- "rustlink-config",
  "rustlink-protocol",
  "serde_json",
  "symphonia",
@@ -2288,7 +2286,6 @@ name = "rustlink-config"
 version = "0.5.0"
 dependencies = [
  "serde",
- "serde_json",
  "serde_yaml",
  "thiserror",
 ]

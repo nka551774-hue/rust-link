@@ -300,11 +300,6 @@ impl<R: Read> OggOpusReader<R> {
         self.output_gain
     }
 
-    /// EOS granule (48 kHz samples including pre-skip) for the most recently completed page.
-    pub fn packet_end_granule(&self) -> Option<u64> {
-        self.packet_page_end.and_then(|(granule, eos)| eos.then_some(granule))
-    }
-
     pub(crate) fn packet_page_end(&self) -> Option<(u64, bool)> {
         self.packet_page_end
     }

@@ -304,11 +304,6 @@ impl Transport {
         send_udp(&self.socket, self.remote, self.connected, packet)
     }
 
-    pub fn write_mut(&mut self, payload: &[u8]) -> Result<(), VoiceError> {
-        let packet = self.state.get_mut().map_err(lock_error)?.seal_payload(self.ssrc, payload)?;
-        send_udp(&self.socket, self.remote, self.connected, packet)
-    }
-
     /// Seals `frame[HEADER_LEN..]` in place after writing the 12-byte RTP header into
     /// `frame[..HEADER_LEN]`, appends the 16-byte AEAD tag + 4-byte nonce suffix, and sends `&frame`.
     pub fn write_frame_in_place(&self, frame: &mut Vec<u8>) -> Result<(), VoiceError> {

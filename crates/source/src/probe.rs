@@ -35,10 +35,6 @@ fn le_i64(b: &[u8]) -> i64 {
 pub const MAX_PROBE: usize = 8 << 20;
 pub const FIRST_PROBE: usize = 16 << 10;
 
-pub fn may_index_later(head: &[u8]) -> bool {
-    head.get(4..8) == Some(b"ftyp")
-}
-
 pub fn can_gain_from_more(head: &[u8], size: i64) -> bool {
     if size <= 0 || head.len() as i64 >= size {
         return false;

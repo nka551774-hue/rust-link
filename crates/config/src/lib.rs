@@ -635,11 +635,6 @@ pub fn load_potoken_bundle(path: &Path) -> Result<PoTokens, ConfigError> {
     parsed
 }
 
-pub fn load_potoken_file(path: &Path) -> Result<(String, String), ConfigError> {
-    let b = load_potoken_bundle(path)?;
-    Ok((b.effective_player().to_owned(), b.visitor_data.clone()))
-}
-
 pub fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
     let config_path = discover(explicit);
     let base_dir =
