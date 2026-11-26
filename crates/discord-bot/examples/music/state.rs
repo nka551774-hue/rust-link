@@ -126,6 +126,24 @@ impl Guild {
     }
 }
 
+/// The first search hit that can stand in for `original`: about as long, and not a cover or
+/// other version the original title does not name.
+pub fn stand_in(original: &Track, hits: Vec<Track>) -> Option<Track> {
+    const VERSIONS: [&str; 8] =
+        ["cover", "remix", "karaoke", "nightcore", "slowed", "sped", "instrumental", "live"];
+    let versions = |title: &str| {
+        let title = title.to_lowercase();
+        VERSIONS.map(|v| title.split(|c: char| !c.is_alphanumeric()).any(|w| w == v))
+    };
+    let want = original.metadata.length;
+    let slack = 15_000.max(want / 8).unsigned_abs();
+    let own = versions(&original.metadata.title);
+    hits.into_iter().find(|hit| {
+        (want <= 0 || hit.metadata.length.abs_diff(want) <= slack)
+            && versions(&hit.metadata.title).iter().zip(own).all(|(&has, asked)| !has || asked)
+    })
+}
+
 pub fn normalize_query(text: &str) -> std::borrow::Cow<'_, str> {
     rustlink_discord_bot::normalize_query(text)
 }
@@ -183,6 +201,32 @@ mod tests {
         assert!(!guild.record(true));
         assert!(!guild.record(false) && !guild.record(false));
         assert!(guild.record(false) && !guild.busy());
+    }
+
+    #[test]
+    fn a_stand_in_is_about_as_long_and_not_an_unasked_cover() {
+        let song = |title: &str, length: i64| {
+            Track::new(
+                "rlt1.x".into(),
+                TrackInfo { title: title.into(), length, ..Default::default() },
+            )
+        };
+        let original = song("Never Gonna Give You Up (Official Video)", 213_000);
+        let pick = |hits| stand_in(&original, hits).map(|t| t.metadata.title);
+        assert_eq!(
+            pick(vec![
+                song("Never Gonna Give You Up (Rick Astley Cover)", 210_000),
+                song("Never Gonna Give You Up - 1 hour", 3_600_000),
+                song("Never Gonna Give You Up", 214_000),
+            ])
+            .as_deref(),
+            Some("Never Gonna Give You Up")
+        );
+        assert_eq!(pick(vec![song("Never Gonna Give You Up Remix", 213_000)]), None);
+        let live = song("Song (Live)", 0);
+        assert!(stand_in(&live, vec![song("Song live", 999_000)]).is_some());
+        let plain = song("Hello", 0);
+        assert!(stand_in(&plain, vec![song("Hello - Oliver", 1)]).is_some());
     }
 
     #[test]

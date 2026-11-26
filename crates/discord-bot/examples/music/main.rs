@@ -570,8 +570,7 @@ impl Bot {
         let failed = failed.filter(|t| t.metadata.source_name == "youtube")?;
         let query = format!("scsearch:{} {}", failed.metadata.author, failed.metadata.title);
         match self.rustlink.resolve(query.trim()).await.ok()? {
-            LoadResult::Search(tracks) => tracks.into_iter().next(),
-            LoadResult::Track(track) => Some(*track),
+            LoadResult::Search(tracks) => state::stand_in(&failed, tracks),
             _ => None,
         }
     }

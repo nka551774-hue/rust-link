@@ -21,7 +21,7 @@
 ## 各平台實作細節
 
 - **YouTube**：純 Rust InnerTube 依序嘗試 `VISIONOS`（自動引導快取匿名 `visitorData`，優先取得 48 kHz WebM Opus `itag 251` 直通）、`IOS_PRODUCER`、`ANDROID_VR`、`ANDROID`（未設 `youtubePoToken` 且大於 1 MiB 時先探測尾端 1 byte 防止 ~900 KiB 403 截斷）；搜尋與清單優先用 `ANDROID` 並以 `VISIONOS` 備援。googlevideo 以 **512 KiB** 驗證區間分段讀取搭配 **2 MiB** 背景預讀緩衝與強 `ETag` `If-Range` 校驗。詳見 [YouTube 專章](youtube.md)。
-- **SoundCloud**：公開 API v2 搭配自動抓取快取的 `client_id`，使用漸進式串流播放（純 HLS 曲目回傳來源錯誤）。
+- **SoundCloud**：公開 API v2 搭配自動抓取快取的 `client_id`，優先使用漸進式串流；沒有時改用 HLS（Opus > MP3 > AAC，分段串成單一串流在程序內解碼）。搜尋結果會略過只能播 30 秒試聽的 Go+ 曲目，加密（DRM）HLS 不支援。
 - **Spotify / Deezer**：透過官方 API 擷取曲目、專輯與歌單中繼資料（Spotify 支援 `/intl-*/`、`/embed/` 與 `spotifyRefreshToken`；分頁嚴格鎖定同一 API origin），播放時以 ISRC 優先與標題／歌手／時長雙向比對至 YouTube 完整音源，排除未要求的翻唱、現場、混音或預覽版本。
 - **Direct HTTP(S)**：直接探測 MP3、FLAC、Ogg Opus/Vorbis、MP4/M4A、WebM、WAV 標頭；最多跟隨 5 次安全轉址（禁止 HTTPS 降級 HTTP，跨主機自動剝除專屬標頭）。
 

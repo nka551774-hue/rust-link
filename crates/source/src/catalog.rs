@@ -443,7 +443,7 @@ fn get_json<T: DeserializeOwned>(
         .map_err(|e| SourceError::Http(format!("the catalogue sent an unreadable answer: {e}")))
 }
 
-fn get_text(agent: &ureq::Agent, url: &str) -> Result<String, SourceError> {
+pub(crate) fn get_text(agent: &ureq::Agent, url: &str) -> Result<String, SourceError> {
     read_checked_body(agent, url, None, false)?
         .with_config()
         .limit(MAX_BODY)
@@ -1186,6 +1186,15 @@ struct SoundCloudTrack {
     user: Option<SoundCloudUser>,
     #[serde(deserialize_with = "null_default")]
     streamable: bool,
+    #[serde(deserialize_with = "null_default")]
+    policy: String,
+}
+
+impl SoundCloudTrack {
+    /// Go+ tracks ("SNIP") stream only a 30-second preview to anonymous clients.
+    fn is_preview(&self) -> bool {
+        self.policy.eq_ignore_ascii_case("snip")
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1193,6 +1202,15 @@ struct SoundCloudTrack {
 struct SoundCloudList {
     #[serde(deserialize_with = "null_default")]
     collection: Vec<SoundCloudTrack>,
+}
+
+/// Where a SoundCloud recording's audio is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SoundCloudStream {
+    /// One audio file.
+    File(String),
+    /// An HLS media playlist of segments.
+    Playlist(String),
 }
 
 fn allowed_sc_url(parsed: &url::Url, origin: Option<&url::Url>) -> bool {
@@ -1260,7 +1278,11 @@ impl SoundCloud<'_> {
                 self.config.search_results.min(20)
             ))?;
             return Ok(finish_search(
-                list.collection.into_iter().filter_map(|e| self.track(e)).collect(),
+                list.collection
+                    .into_iter()
+                    .filter(|e| !e.is_preview())
+                    .filter_map(|e| self.track(e))
+                    .collect(),
             ));
         }
         let key = soundcloud_key(id);
@@ -1319,7 +1341,7 @@ impl SoundCloud<'_> {
         }
     }
 
-    pub fn media_url(&self, id: &str) -> Result<(String, BTreeMap<String, String>), SourceError> {
+    pub fn media_url(&self, id: &str) -> Result<SoundCloudStream, SourceError> {
         let key = soundcloud_key(id);
         if key.is_empty() && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit())) {
             return Err(SourceError::Url("invalid SoundCloud track identifier".into()));
@@ -1343,34 +1365,55 @@ impl SoundCloud<'_> {
             .and_then(Value::as_array)
             .ok_or_else(|| SourceError::Http("soundcloud offered no stream".into()))?;
         let api_origin = url::Url::parse(self.config.soundcloud_api_endpoint.trim()).ok();
-        let (mut chosen, mut fallback) = (None, None);
-        for entry in transcodings {
-            if entry.pointer("/format/protocol").and_then(Value::as_str) != Some("progressive") {
-                continue;
-            }
-            let Some(u) = entry.get("url").and_then(Value::as_str).filter(|u| {
-                !u.is_empty()
-                    && http_url(u).is_some_and(|p| allowed_sc_url(&p, api_origin.as_ref()))
-            }) else {
-                continue;
+        // Full recording before preview, single file before HLS, then Opus > MP3 > AAC.
+        // Only plain "hls": the encrypted-hls protocols are DRM.
+        let rank = |entry: &Value| -> Option<(bool, bool, u8)> {
+            let hls = match entry.pointer("/format/protocol").and_then(Value::as_str)? {
+                "progressive" => false,
+                "hls" => true,
+                _ => return None,
             };
-            if !entry.get("snipped").and_then(Value::as_bool).unwrap_or(false) {
-                chosen = Some(u);
-                break;
+            let mime = entry.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("");
+            let codec = if mime.contains("opus") {
+                0
+            } else if mime.contains("mpeg") {
+                1
+            } else {
+                2
+            };
+            let snipped = entry.get("snipped").and_then(Value::as_bool).unwrap_or(false);
+            Some((snipped, hls, codec))
+        };
+        let mut candidates: Vec<_> = transcodings
+            .iter()
+            .filter_map(|entry| {
+                let u = entry.get("url").and_then(Value::as_str).filter(|u| {
+                    !u.is_empty()
+                        && http_url(u).is_some_and(|p| allowed_sc_url(&p, api_origin.as_ref()))
+                })?;
+                Some((rank(entry)?, u))
+            })
+            .collect();
+        candidates.sort_by_key(|(rank, _)| *rank);
+        let auth =
+            track.get("track_authorization").and_then(Value::as_str).filter(|t| !t.is_empty());
+        // SoundCloud still lists formats it has retired and answers 404 for them; try the next.
+        let mut last = SourceError::Http("soundcloud offered no playable audio stream".into());
+        for ((_, hls, _), url) in candidates {
+            match self.stream_url(url, auth) {
+                Ok(direct) if hls => return Ok(SoundCloudStream::Playlist(direct)),
+                Ok(direct) => return Ok(SoundCloudStream::File(direct)),
+                Err(e @ SourceError::Media { status: 404 | 410 }) => last = e,
+                Err(e) => return Err(e),
             }
-            fallback.get_or_insert(u);
         }
-        let url = chosen.or(fallback).ok_or_else(|| {
-            SourceError::Http(
-                "soundcloud offered no progressive audio stream; HLS playlists are not supported"
-                    .into(),
-            )
-        })?;
+        Err(last)
+    }
+
+    /// Exchanges a transcoding URL for the short-lived URL of its audio.
+    fn stream_url(&self, url: &str, auth: Option<&str>) -> Result<String, SourceError> {
         netguard::validate_url(url)?;
-        let auth = track
-            .get("track_authorization")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty() && !url.contains("track_authorization="));
+        let auth = auth.filter(|_| !url.contains("track_authorization="));
         let sep = if url.contains('?') { '&' } else { '?' };
         #[derive(Deserialize)]
         struct StreamUrl {
@@ -1389,7 +1432,7 @@ impl SoundCloud<'_> {
             .filter(|u| !u.is_empty())
             .ok_or_else(|| SourceError::Http("soundcloud resolved to no stream".into()))?;
         netguard::validate_url(&direct)?;
-        Ok((direct, BTreeMap::new()))
+        Ok(direct)
     }
 
     fn track(&self, entry: SoundCloudTrack) -> Option<Track> {
@@ -1627,22 +1670,37 @@ mod tests {
         config.soundcloud_client_id = "configured".into();
         let result = SoundCloud::new(&netguard::agent(true), &config).media_url("42");
         server.join().unwrap();
-        assert_eq!(result.unwrap().0, "https://cdn.example/audio.mp3");
+        assert_eq!(result.unwrap(), SoundCloudStream::File("https://cdn.example/audio.mp3".into()));
     }
 
     #[test]
-    fn soundcloud_hls_only_reports_an_actionable_native_error() {
-        let (base, server) = crate::test_http::serve(1, |_, _, _| {
-            serde_json::json!({
-                "id":42,"media":{"transcodings":[{"url":"https://example.com/hls","format":{"protocol":"hls"}}]}
-            })
+    fn a_full_hls_stream_beats_a_progressive_preview_and_opus_beats_mp3() {
+        let mut req = 0;
+        let (base, server) = crate::test_http::serve(2, move |base, headers, _| {
+            req += 1;
+            if req == 1 {
+                serde_json::json!({"id":42,"media":{"transcodings":[
+                    {"url":format!("{base}/snip"),"snipped":true,"format":{"protocol":"progressive","mime_type":"audio/mpeg"}},
+                    {"url":format!("{base}/drm"),"format":{"protocol":"ctr-encrypted-hls","mime_type":"audio/ogg; codecs=\"opus\""}},
+                    {"url":format!("{base}/mp3"),"format":{"protocol":"hls","mime_type":"audio/mpeg"}},
+                    {"url":format!("{base}/opus"),"format":{"protocol":"hls","mime_type":"audio/ogg; codecs=\"opus\""}}
+                ]}})
+            } else {
+                assert!(headers.starts_with("GET /opus?client_id=id "), "{headers}");
+                serde_json::json!({"url":"https://cf-hls-opus-media.sndcdn.com/playlist/a.m3u8"})
+            }
         });
         let mut config = Config::default();
         config.soundcloud_api_endpoint = base;
         config.soundcloud_client_id = "id".into();
         let result = SoundCloud::new(&netguard::agent(true), &config).media_url("42");
         server.join().unwrap();
-        assert!(result.unwrap_err().to_string().contains("HLS"));
+        assert_eq!(
+            result.unwrap(),
+            SoundCloudStream::Playlist(
+                "https://cf-hls-opus-media.sndcdn.com/playlist/a.m3u8".into()
+            )
+        );
     }
 
     #[test]
@@ -1906,11 +1964,22 @@ mod tests {
                 user: Some(SoundCloudUser { username: "Someone".into() }),
                 streamable: true,
                 artwork_url: None,
+                policy: "ALLOW".into(),
             })
             .unwrap();
         assert_eq!(track.metadata.title, "A Song");
         assert_eq!(track.metadata.source_name, "soundcloud");
         assert_eq!(track.metadata.uri.as_deref(), Some("https://soundcloud.com/someone/a-song"));
+    }
+
+    #[test]
+    fn only_go_plus_previews_count_as_soundcloud_previews() {
+        let list: SoundCloudList = serde_json::from_str(
+            r#"{"collection":[{"id":1,"policy":"SNIP"},{"id":2,"policy":"ALLOW"},{"id":3,"policy":null},{"id":4}]}"#,
+        )
+        .unwrap();
+        let previews: Vec<bool> = list.collection.iter().map(SoundCloudTrack::is_preview).collect();
+        assert_eq!(previews, [true, false, false, false]);
     }
 
     #[test]

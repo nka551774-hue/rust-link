@@ -4,6 +4,7 @@ mod cache;
 pub mod catalog;
 mod deadline;
 mod flight;
+mod hls;
 pub mod innertube;
 pub mod matching;
 mod media;
@@ -578,7 +579,14 @@ impl Service {
                 "soundcloud" if self.config.soundcloud_native => {
                     catalog::SoundCloud::with_state(&self.agent, &self.config, &self.catalog_state)
                         .media_url(&track.metadata.identifier)
-                        .and_then(|(url, headers)| open_stream(&self.agent, url, headers))
+                        .and_then(|stream| match stream {
+                            catalog::SoundCloudStream::File(url) => {
+                                open_stream(&self.agent, url, BTreeMap::new())
+                            }
+                            catalog::SoundCloudStream::Playlist(url) => {
+                                Ok(PrefetchReader::spawn(hls::Body::open(&self.agent, &url)?))
+                            }
+                        })
                 }
                 source => Err(SourceError::Disabled(format!("{source} native source is disabled"))),
             };

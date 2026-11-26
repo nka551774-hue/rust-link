@@ -555,7 +555,11 @@ impl PrefetchReader {
         if body.is_empty() {
             return Box::new(io::empty());
         }
-        let (body_tx, body_rx) = sync_channel::<MediaBody>(1);
+        Self::spawn(body)
+    }
+
+    pub(crate) fn spawn<R: Read + Send + 'static>(body: R) -> Box<dyn Read + Send> {
+        let (body_tx, body_rx) = sync_channel::<R>(1);
         let (data_tx, data_rx) = sync_channel(PREFETCH_QUEUE_CHUNKS);
         let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(PREFETCH_QUEUE_CHUNKS);
         let spawned =
